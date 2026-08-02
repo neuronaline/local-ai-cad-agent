@@ -1,94 +1,121 @@
-# Local AI CAD Agent
+# 🏗️ Local AI CAD Agent
 
-A local-first web application for creating and refining parametric CAD models with an OpenRouter-backed coding agent. It combines a Flask API, build123d model generation, an in-browser STL viewer, and controlled project workspaces.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
+[![CI](https://github.com/neuronaline/local-ai-cad-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/neuronaline/local-ai-cad-agent/actions/workflows/ci.yml)
 
-## Features
+A local-first web app that lets you **chat with an AI agent to create parametric CAD models**. Built with [build123d](https://github.com/gumyr/build123d) for solid modeling, [Three.js](https://threejs.org/) for in-browser preview, and [OpenRouter](https://openrouter.ai/) for LLM access — all sandboxed with Bubblewrap.
 
-- Create separate CAD projects and retain their conversation history.
-- Ask an AI agent to inspect, edit, and render build123d models.
-- Follow model-provided reasoning live while a task is running.
-- Upload up to five reference images (10 MB each).
-- Preview generated STL files in the browser with Three.js.
-- Export a reviewed model as STEP, STL, and a report through the **Finalize** action.
-- Keep model workspaces local; AI-generated code cannot directly trigger final exports.
+<p align="center">
+  <em>(screenshot coming soon)</em>
+</p>
 
-## Requirements
+## ✨ Features
 
-- Python 3.10 or newer
-- Linux with `bubblewrap` and `libseccomp` for sandboxed model execution
-- An [OpenRouter](https://openrouter.ai/) API key for AI chat requests
+- **Chat-driven modeling** — Describe what you want in natural language; the agent writes and runs build123d Python code
+- **Live reasoning** — Watch the model's thinking stream in real-time while it works
+- **STL preview** — Rotate, pan, and inspect generated models directly in the browser
+- **Reference images** — Upload up to 5 images (10 MB each) to guide the agent
+- **Sandboxed execution** — All generated code runs in a Bubblewrap container with blocked network and resource limits
+- **Finalize** — Export validated models as STEP, STL, and a journey report
+- **Project management** — Create, rename, and switch between multiple CAD projects with persisted conversation history
+- **Dark theme UI** — Compact, responsive interface with Markdown rendering and syntax highlighting
 
-## Quick start
+## 📋 Requirements
+
+- **Python** 3.10+
+- **Linux** with `bubblewrap` and `libseccomp2`
+- **OpenRouter API key** ([get one here](https://openrouter.ai/keys))
+
+## 🚀 Quick Start
 
 ```bash
-cd local-ai-cad-agent
+# Install system dependencies
 sudo apt install bubblewrap libseccomp2
+
+# Clone and set up
+git clone https://github.com/neuronaline/local-ai-cad-agent.git
+cd local-ai-cad-agent
 python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
-cp .env.example .env
+.venv/bin/pip install -r requirements.txt
+
+# Configure
+cp .env.example .env          # add your OPENROUTER_API_KEY
 cp config.example.yaml config.yaml
-```
 
-Edit `.env` and add your key:
-
-```dotenv
-OPENROUTER_API_KEY=your_key_here
-```
-
-Start the application:
-
-```bash
+# Run
 ./run.sh
 ```
 
-Open the address printed by `run.sh` (from `server.host` and `server.port`). Run `./run.sh --help` to display the startup instructions.
+Open `http://127.0.0.1:5000` (or whatever `server.host`/`server.port` you configured).
 
-## Configuration
+## 📁 Project Structure
 
-Copy `config.example.yaml` to the ignored `config.yaml` file for project-local settings. Personal overrides may also be stored in `~/.cad-agent/config.yaml`. The two files are merged, with personal settings taking precedence. If neither file exists, the application uses the example values shown below.
-
-Example override:
-
-```yaml
-workspace_root: ~/CAD-Agent-Projects
-agent:
-  tool_call_limit: 12 # maximum model/tool rounds per task
-openrouter:
-  model: openai/gpt-4o-mini
-  reasoning_effort: "" # automatic, minimal, low, medium, or high
-  provider: ""         # optional slug, for example openai or deepinfra/turbo
-  force_provider: false
-server:
-  port: 5000
-ui:
-  show_info_messages: true # green task, tool, and usage messages
+```
+local-ai-cad-agent/
+├── app.py                     # Flask HTTP/SSE server
+├── agent/
+│   ├── core.py                # AgentRunner tool-calling loop
+│   ├── openrouter.py          # Streaming chat-completions client
+│   ├── finalize.py            # Model validation & atomic export
+│   ├── sandbox.py             # Bubblewrap workspace isolation
+│   ├── settings.py            # Config merging & Settings dataclass
+│   ├── prompt.py              # System prompt with build123d playbook
+│   ├── images.py              # Reference image normalization
+│   └── tools/                 # Agent tools (file, terminal, cad, question, experience)
+├── static/
+│   ├── js/app.js              # SSE client, chat & UI logic
+│   ├── js/viewer.js           # Three.js CadViewer
+│   └── css/style.css          # Dark theme
+├── templates/
+│   ├── index.html             # Chat + 3D viewer page
+│   └── projects.html          # Project management page
+├── tests/                     # 111 tests across 10 files
+├── run.sh                     # Startup script
+├── gunicorn.conf.py           # Single-worker WSGI config
+├── config.example.yaml        # Shareable defaults
+└── requirements.txt
 ```
 
-## Model, reasoning, and provider routing
+## ⚙️ Configuration
 
-Set the OpenRouter model, reasoning effort, and optional provider in `config.yaml`, then restart the application. These settings apply to every agent task.
+Copy `config.example.yaml` to `config.yaml` (git-ignored). Personal overrides go in `~/.cad-agent/config.yaml` — the two files merge, personal settings win.
 
-Selecting **Force this provider** sends OpenRouter `provider.only`, disables fallbacks, and requires the provider to support every requested parameter. This is intentionally strict: an unavailable provider or an unsupported model/parameter combination will fail instead of silently using another provider. Leave it unchecked to prioritize the provider while retaining OpenRouter fallbacks.
+| Key | Default | Description |
+|---|---|---|
+| `workspace_root` | `~/CAD-Agent-Projects` | Where project data lives |
+| `agent.tool_call_limit` | `12` | Max tool rounds per task |
+| `openrouter.model` | `openai/gpt-4o-mini` | OpenRouter model slug |
+| `openrouter.reasoning_effort` | `""` | `automatic`, `minimal`, `low`, `medium`, or `high` |
+| `openrouter.provider` | `""` | Preferred provider slug (e.g., `openai`, `deepinfra/turbo`) |
+| `openrouter.force_provider` | `false` | Disable fallbacks (strict `provider.only`) |
+| `server.host` / `server.port` | `127.0.0.1` / `5000` | Bind address |
+| `ui.show_info_messages` | `true` | Show tool-status info messages in chat |
 
-## Development checks
-
-Install the development dependencies first:
+## 🧪 Development
 
 ```bash
-.venv/bin/python -m pip install -r requirements-dev.txt
-```
+.venv/bin/pip install -r requirements-dev.txt
 
-```bash
+# Run tests
 .venv/bin/python -m pytest -q
+
+# Lint
 .venv/bin/python -m ruff check .
+
+# Verify dependencies
 .venv/bin/python -m pip check
-bash -n run.sh
 ```
 
-## Security and data
+The [CI workflow](.github/workflows/ci.yml) runs lint, tests, and dependency checks on every push.
 
-The local `.env` and `config.yaml` files are ignored by Git. Never commit API keys or other credentials. Project conversations, inputs, previews, and exports are stored under the configured local workspace. Generated Python runs in a Bubblewrap filesystem sandbox with a clean environment, blocked network syscalls, and resource limits. The sandbox assumes a standard Linux Filesystem Hierarchy Standard layout (`/usr`, `/etc`, `/bin`, `/lib`); non-standard distros (NixOS, Guix, Fedora Silverblue) may require adjustments. The application is designed for local use; do not expose it directly to the public internet.
+## 🔒 Security
 
-## License
+- `.env` and `config.yaml` are **git-ignored** — never commit API keys
+- All generated code runs in a **Bubblewrap sandbox** with clean environment, blocked network syscalls, and `prlimit` resource caps
+- The app is **local-only** — do not expose it to the public internet
+- Sandbox assumes standard FHS layout (`/usr`, `/etc`, `/bin`, `/lib`); non-standard distros (NixOS, Guix, Fedora Silverblue) may need adjustments
 
-Released under the [MIT License](LICENSE).
+## 📄 License
+
+[MIT](LICENSE)
