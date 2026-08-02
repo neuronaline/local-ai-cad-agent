@@ -1,0 +1,14 @@
+# Web application and configuration
+Flask>=3.0,<4
+PyYAML>=6.0,<7
+python-dotenv>=1.0,<2
+requests>=2.31,<3
+
+# CAD and image processing
+build123d==0.11.1
+numpy>=1.26,<3
+Pillow>=10.0,<13
+
+# Production server
+gevent>=24.2,<27
+gunicorn>=22.0,<27

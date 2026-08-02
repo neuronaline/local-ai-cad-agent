@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Local AI CAD Agent</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github-dark.min.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="chat-panel">
+        <header class="panel-header">
+          <div class="brand"><a href="/" class="back-link" title="Back to projects">← Projects</a><h1>{{ project_name }}</h1><span id="connection-status" class="connection-status" title="Connecting…"></span></div>
+        </header>
+        <div id="chat-feed" class="chat-feed" aria-live="polite"><div class="empty-state"><strong>Project: {{ project_name }}</strong><span>Describe the part you want to build.</span></div></div>
+        <div id="question-area"></div>
+        <form id="chat-form" class="composer">
+          <textarea id="message" placeholder="Describe the part you want to create…" rows="2" required></textarea>
+          <div class="action-bar">
+            <label id="dropzone" class="attach-button" for="attachments" title="Add reference images"><span aria-hidden="true">＋</span><span id="attachment-label">Attach</span><input id="attachments" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden></label>
+            <button id="finalize" type="button" class="quiet">Finalize</button>
+            <button id="stop" type="button" class="danger" hidden>Stop</button>
+            <button type="submit">Send</button>
+          </div>
+        </form>
+      </section>
+      <section class="viewer-panel">
+        <header class="viewer-toolbar"><div class="viewer-title"><h2>Preview</h2><span id="dimensions">No preview yet</span></div><div class="viewer-actions"><button id="toggle-wireframe" class="quiet">Wireframe</button><button id="toggle-grid" class="quiet">Grid</button><button id="reset-view" class="quiet">Reset</button></div></header>
+        <div id="viewer" class="viewer"><div id="viewer-empty" class="viewer-empty"><span class="preview-icon">◇</span><strong>No preview yet</strong></div></div>
+      </section>
+    </main>
+    <script>window.APP_CONFIG = {projectName: {{ project_name | tojson }}, showInfoMessages: {{ show_info_messages | tojson }}};</script>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+        }
+      }
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+    <script type="module" src="{{ url_for('static', filename='js/app.js') }}"></script>
+  </body>
+</html>

@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>CAD Agent — Projects</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+  </head>
+  <body>
+    <main class="projects-page">
+      <header class="projects-header">
+        <div class="brand"><h1>CAD Agent</h1></div>
+        <button id="new-project-btn" class="primary">New Project</button>
+      </header>
+
+      <div id="new-project-modal" class="modal hidden">
+        <div class="modal-content">
+          <h3>New Project</h3>
+          <form id="new-project-form">
+            <input id="new-project-name" type="text" placeholder="project-name" required
+                   pattern="[a-z0-9][a-z0-9-]{0,62}" autocomplete="off">
+            <p class="hint">Only lowercase letters, numbers, and hyphens.</p>
+            <div class="modal-actions">
+              <button type="button" id="cancel-new-project" class="quiet">Cancel</button>
+              <button type="submit">Create</button>
+            </div>
+          </form>
+        </div>
+      </div>
+
+      <div id="rename-modal" class="modal hidden">
+        <div class="modal-content">
+          <h3>Rename Project</h3>
+          <form id="rename-form">
+            <input id="rename-name" type="text" placeholder="new-name" required
+                   pattern="[a-z0-9][a-z0-9-]{0,62}" autocomplete="off">
+            <p class="hint">Only lowercase letters, numbers, and hyphens.</p>
+            <div class="modal-actions">
+              <button type="button" id="cancel-rename" class="quiet">Cancel</button>
+              <button type="submit">Rename</button>
+            </div>
+          </form>
+        </div>
+      </div>
+
+      <div id="delete-confirm" class="modal hidden">
+        <div class="modal-content">
+          <h3>Delete Project</h3>
+          <p>Are you sure you want to delete <strong id="delete-project-name"></strong>? This cannot be undone.</p>
+          <div class="modal-actions">
+            <button type="button" id="cancel-delete" class="quiet">Cancel</button>
+            <button type="button" id="confirm-delete" class="danger">Delete</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="projects-grid" class="projects-grid">
+        <div class="empty-projects">
+          <div class="empty-icon">◇</div>
+          <h2>No projects yet</h2>
+          <p>Create your first CAD project to get started.</p>
+          <button id="empty-cta" class="primary">Get Started</button>
+        </div>
+      </div>
+    </main>
+
+    <script src="{{ url_for('static', filename='js/projects.js') }}"></script>
+  </body>
+</html>

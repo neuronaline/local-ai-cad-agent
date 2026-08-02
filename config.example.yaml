@@ -1,0 +1,24 @@
+# Copy this file to config.yaml and adjust it for your machine.
+workspace_root: ~/CAD-Agent-Projects
+
+agent:
+  tool_call_limit: 12
+
+openrouter:
+  base_url: https://openrouter.ai/api/v1
+  model: openai/gpt-4o-mini
+  timeout_seconds: 60
+  app_title: Local AI CAD Agent
+  app_url: ""
+  session_prefix: local-ai-cad-agent
+  reasoning_effort: ""
+  provider: ""
+  force_provider: false
+  enable_anthropic_cache: true
+
+server:
+  host: 127.0.0.1
+  port: 5000
+
+ui:
+  show_info_messages: true
