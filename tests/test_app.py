@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 from io import BytesIO
 from pathlib import Path
@@ -426,3 +427,155 @@ def test_event_bus_disconnects_overflowed_subscriber(tmp_path: Path):
     assert subscriber.get_nowait()["type"] == "stream_reset"
     assert subscriber.get_nowait() is None
     assert not bus._subscribers
+
+
+# ── Setup page ──
+
+def test_setup_page_serves_when_no_api_key(tmp_path: Path, monkeypatch):
+    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "")
+    client = create_app(settings).test_client()
+
+    response = client.get("/setup")
+    assert response.status_code == 200
+    assert b"OpenRouter API Key" in response.data
+
+
+def test_setup_page_redirects_when_configured(tmp_path: Path, monkeypatch):
+    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-test")
+    client = create_app(settings).test_client()
+
+    response = client.get("/setup", follow_redirects=False)
+    assert response.status_code == 302
+
+
+def test_index_redirects_to_setup_when_no_api_key(tmp_path: Path, monkeypatch):
+    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "")
+    client = create_app(settings).test_client()
+
+    response = client.get("/", follow_redirects=False)
+    assert response.status_code == 302
+
+
+def test_project_view_redirects_to_setup_when_no_api_key(tmp_path: Path, monkeypatch):
+    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "")
+    client = create_app(settings).test_client()
+
+    response = client.get("/project/demo", follow_redirects=False)
+    assert response.status_code == 302
+
+
+def test_api_setup_saves_key_and_model(tmp_path: Path, monkeypatch):
+    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "")
+    # Point _project_root to tmp_path so we don't touch the real .env.
+    monkeypatch.setattr("app._project_root", lambda: tmp_path)
+    (tmp_path / ".env.example").write_text("OPENROUTER_API_KEY=\n", encoding="utf-8")
+    client = create_app(settings).test_client()
+
+    resp = client.post("/api/setup", json={"api_key": "sk-or-v1-mykey", "model": "openai/gpt-4o"})
+    assert resp.status_code == 200
+    assert resp.get_json() == {"ok": True}
+
+    env_content = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert "OPENROUTER_API_KEY=sk-or-v1-mykey" in env_content
+
+
+# ── Preflight ──
+
+def test_preflight_returns_check_results(tmp_path: Path, monkeypatch):
+    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-test")
+    client = create_app(settings).test_client()
+
+    resp = client.get("/api/preflight")
+    data = resp.get_json()
+    assert resp.status_code == 200
+    assert "api_key" in data
+    assert "model_configured" in data
+    assert "workspace_writable" in data
+    assert "bwrap_installed" in data
+    assert "seccomp" in data
+    assert "python_packages" in data
+
+
+# ── Example prompts ──
+
+def test_index_contains_example_prompts(tmp_path: Path, monkeypatch):
+    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-test")
+    client = create_app(settings).test_client()
+    client.post("/api/projects/new", json={"name": "demo"})
+
+    response = client.get("/project/demo")
+    assert response.status_code == 200
+    assert b"example-prompt" in response.data
+    assert b"mounting plate" in response.data
+
+
+# ── Local vendor assets ──
+
+def test_local_three_js_import_map_is_used(tmp_path: Path, monkeypatch):
+    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-test")
+    client = create_app(settings).test_client()
+    client.post("/api/projects/new", json={"name": "demo"})
+
+    response = client.get("/project/demo")
+    assert response.status_code == 200
+    assert b"vendor/three/three.module.js" in response.data
+    assert b"vendor/three/addons/" in response.data
+    assert b"vendor/marked/marked.min.js" in response.data
+    assert b"vendor/highlight/highlight.min.js" in response.data
+
+
+def test_frontend_source_has_no_cdn_urls():
+    project_root = Path(__file__).resolve().parents[1]
+    cdn_url = re.compile(r"https?://[^\"'\s]*(?:cdn|unpkg|jsdelivr|cdnjs|esm\.sh|skypack)[^\"'\s]*", re.IGNORECASE)
+    frontend_files = [*project_root.glob("templates/*.html"), *project_root.glob("static/css/*"), *project_root.glob("static/js/*")]
+
+    assert frontend_files
+    assert not [path for path in frontend_files if cdn_url.search(path.read_text(encoding="utf-8"))]
+
+
+# ── Error message mapping ──
+
+from agent.core import AgentRunner
+
+
+def test_user_error_message_maps_unauthorized():
+    msg = AgentRunner._user_error_message("HTTP 401 Unauthorized", "HTTPError")
+    assert "Invalid OpenRouter API key" in msg
+
+
+def test_user_error_message_maps_rate_limit():
+    msg = AgentRunner._user_error_message("429 Too Many Requests: rate limit exceeded", "HTTPError")
+    assert "rate limit" in msg.lower()
+
+
+def test_user_error_message_maps_timeout():
+    msg = AgentRunner._user_error_message("Connection timed out", "ConnectionError")
+    assert "timed out" in msg.lower()
+
+
+def test_user_error_message_maps_sandbox():
+    msg = AgentRunner._user_error_message("bubblewrap sandbox failed: bwrap not found", "RuntimeError")
+    assert "sandbox" in msg.lower()
+
+
+def test_user_error_message_maps_export():
+    msg = AgentRunner._user_error_message("STEP export failed: invalid geometry", "ValueError")
+    assert "Export failed" in msg
+
+
+def test_user_error_message_maps_permission():
+    msg = AgentRunner._user_error_message("Permission denied: cannot write to workspace", "OSError")
+    assert "permission" in msg.lower()
+
+
+def test_user_error_message_fallback():
+    msg = AgentRunner._user_error_message("Some unknown error occurred", "RuntimeError")
+    assert "Some unknown error occurred" in msg

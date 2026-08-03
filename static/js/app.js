@@ -775,3 +775,11 @@ async function initProject() {
 
 initProject().catch(error => addMessage(error.message, 'error'));
 setInterval(syncCurrentPreview, 1500);
+
+// Example prompt clicks — place text into input without sending.
+feed.addEventListener('click', event => {
+  const btn = event.target.closest('.example-prompt');
+  if (!btn) return;
+  message.value = btn.dataset.prompt || '';
+  message.focus();
+});

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import re
 import shutil
@@ -12,21 +13,25 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import yaml
 from dotenv import load_dotenv
 from flask import (
     Flask,
     Response,
     jsonify,
+    redirect,
     render_template,
     request,
     send_file,
     stream_with_context,
+    url_for,
 )
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from agent.core import AgentRunner
 from agent.finalize import finalize_project
 from agent.images import store_images
+from agent.sandbox import _BWRAP, seccomp_filter_fd
 from agent.settings import Settings, load_settings
 
 PROJECT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
@@ -141,6 +146,58 @@ def _model_status(project_dir: Path) -> str:
     return "none"
 
 
+def _api_key_configured(settings: Settings) -> bool:
+    """Return True when a non-empty OpenRouter API key is available."""
+    key = os.getenv("OPENROUTER_API_KEY", "")
+    return bool(key.strip()) and bool(settings.openrouter_model.strip())
+
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def _run_preflight(settings: Settings) -> dict[str, Any]:
+    """Return a dict with preflight check results."""
+    checks: dict[str, bool | str] = {}
+
+    # OpenRouter API key
+    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    checks["api_key"] = bool(api_key)
+
+    # Model configured
+    checks["model_configured"] = bool(settings.openrouter_model.strip())
+
+    # Workspace writable
+    try:
+        settings.workspace_root.mkdir(parents=True, exist_ok=True)
+        probe = settings.workspace_root / ".preflight-probe"
+        probe.write_text("ok")
+        probe.unlink()
+        checks["workspace_writable"] = True
+    except OSError:
+        checks["workspace_writable"] = False
+
+    # Bubblewrap installed
+    checks["bwrap_installed"] = _BWRAP is not None
+
+    # seccomp functional
+    try:
+        fd = seccomp_filter_fd()
+        os.close(fd)
+        checks["seccomp"] = True
+    except RuntimeError:
+        checks["seccomp"] = False
+
+    # Python packages
+    try:
+        import build123d  # noqa: F401
+        checks["python_packages"] = True
+    except ImportError:
+        checks["python_packages"] = False
+
+    return checks
+
+
 def _project_lock(app: Flask, project_name: str) -> threading.Lock:
     """Return a per-project lock to serialize concurrent operations on the same project."""
     locks: dict[str, threading.Lock] = app.config["PROJECT_LOCKS"]
@@ -177,6 +234,40 @@ def _project_modified_at(project_dir: Path) -> str:
     return datetime.fromtimestamp(modified, tz=timezone.utc).isoformat()
 
 
+def _save_env_key(env_path: Path, api_key: str) -> None:
+    """Write OPENROUTER_API_KEY to .env, preserving other lines."""
+    lines: list[str] = []
+    found = False
+    if env_path.is_file():
+        lines = env_path.read_text(encoding="utf-8").splitlines(keepends=True)
+    new_lines = []
+    for line in lines:
+        if line.strip().startswith("OPENROUTER_API_KEY"):
+            new_lines.append(f"OPENROUTER_API_KEY={api_key}\n")
+            found = True
+        else:
+            new_lines.append(line)
+    if not found:
+        new_lines.append(f"OPENROUTER_API_KEY={api_key}\n")
+    env_path.write_text("".join(new_lines), encoding="utf-8")
+
+
+def _save_config_model(config_path: Path, model: str) -> None:
+    """Set openrouter.model in config.yaml, preserving the rest."""
+    if config_path.is_file():
+        with config_path.open("r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+    else:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("openrouter", {})
+    if not isinstance(data["openrouter"], dict):
+        data["openrouter"] = {}
+    data["openrouter"]["model"] = model
+    config_path.write_text(yaml.dump(data, default_flow_style=False, allow_unicode=True), encoding="utf-8")
+
+
 def create_app(settings: Settings | None = None) -> Flask:
     load_dotenv(Path(__file__).resolve().with_name(".env"))
     settings = settings or load_settings()
@@ -196,10 +287,51 @@ def create_app(settings: Settings | None = None) -> Flask:
 
     @app.get("/")
     def index() -> str:
+        if not _api_key_configured(settings):
+            return redirect(url_for("setup_page"))
         return render_template("projects.html")
+
+    @app.get("/setup")
+    def setup_page() -> str:
+        if _api_key_configured(settings):
+            return redirect(url_for("index"))
+        return render_template("setup.html")
+
+    @app.post("/api/setup")
+    def setup_save():
+        payload = request.get_json(silent=True) or {}
+        api_key = str(payload.get("api_key", "")).strip()
+        model = str(payload.get("model", "")).strip()
+        if not api_key:
+            return jsonify({"error": "An API key is required."}), 400
+        if not model:
+            return jsonify({"error": "A model name is required."}), 400
+        root = _project_root()
+        env_path = root / ".env"
+        config_path = root / "config.yaml"
+        try:
+            _save_env_key(env_path, api_key)
+            _save_config_model(config_path, model)
+        except OSError as error:
+            return jsonify({"error": f"Could not save settings: {error}"}), 500
+        # Reload env so subsequent requests see the key.
+        load_dotenv(env_path, override=True)
+        # Rebuild settings with new model.
+        new_settings = load_settings()
+        app.config["SETTINGS"] = new_settings
+        app.config["AGENT_RUNNER"].settings = new_settings
+        return jsonify({"ok": True})
+
+    @app.get("/api/preflight")
+    def preflight():
+        current_settings = app.config["SETTINGS"]
+        checks = _run_preflight(current_settings)
+        return jsonify(checks)
 
     @app.get("/project/<name>")
     def project_view(name: str) -> str:
+        if not _api_key_configured(settings):
+            return redirect(url_for("setup_page"))
         try:
             _project_path(settings, name)
         except (ValueError, FileNotFoundError):

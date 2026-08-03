@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Setup — Local AI CAD Agent</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+  </head>
+  <body>
+    <main class="setup-page">
+      <div class="setup-card">
+        <div class="setup-icon">◇</div>
+        <h1>Welcome to Local AI CAD Agent</h1>
+        <p>Configure your OpenRouter connection to get started. You need an <a href="https://openrouter.ai/keys" target="_blank" rel="noopener">OpenRouter API key</a>.</p>
+
+        <form id="setup-form" class="setup-form">
+          <div class="setup-field">
+            <label for="api-key">OpenRouter API Key</label>
+            <input id="api-key" type="password" placeholder="sk-or-v1-…" required autocomplete="off">
+            <p class="hint">Your key is stored locally and never sent anywhere except OpenRouter.</p>
+          </div>
+
+          <div class="setup-field">
+            <label for="model">Model</label>
+            <select id="model" required>
+              <option value="">Select a model…</option>
+              <option value="openai/gpt-4o-mini">openai/gpt-4o-mini (fast, affordable)</option>
+              <option value="openai/gpt-4o">openai/gpt-4o (more capable)</option>
+              <option value="anthropic/claude-3.5-sonnet">anthropic/claude-3.5-sonnet</option>
+              <option value="google/gemini-2.0-flash-001">google/gemini-2.0-flash-001</option>
+              <option value="__custom__">Other model (enter below)</option>
+            </select>
+          </div>
+
+          <div id="custom-model-field" class="setup-field hidden">
+            <label for="custom-model">Custom Model ID</label>
+            <input id="custom-model" type="text" placeholder="e.g. openai/gpt-4o" autocomplete="off">
+          </div>
+
+          <div id="setup-error" class="setup-error hidden"></div>
+
+          <div class="setup-actions">
+            <button type="submit">Save and Continue</button>
+          </div>
+        </form>
+
+        <p class="setup-footer">You can also edit <code>.env</code> and <code>config.yaml</code> manually.</p>
+      </div>
+    </main>
+
+    <script>
+      const form = document.querySelector('#setup-form');
+      const modelSelect = document.querySelector('#model');
+      const customField = document.querySelector('#custom-model-field');
+      const customModel = document.querySelector('#custom-model');
+      const errorBox = document.querySelector('#setup-error');
+
+      modelSelect.addEventListener('change', () => {
+        if (modelSelect.value === '__custom__') {
+          customField.classList.remove('hidden');
+          customModel.required = true;
+        } else {
+          customField.classList.add('hidden');
+          customModel.required = false;
+          customModel.value = '';
+        }
+      });
+
+      form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        errorBox.classList.add('hidden');
+        const apiKey = document.querySelector('#api-key').value.trim();
+        const model = modelSelect.value === '__custom__' ? customModel.value.trim() : modelSelect.value;
+        if (!apiKey || !model) return;
+        try {
+          const resp = await fetch('/api/setup', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({api_key: apiKey, model: model}),
+          });
+          const data = await resp.json();
+          if (!resp.ok) throw new Error(data.error || 'Setup failed.');
+          window.location.href = '/';
+        } catch (err) {
+          errorBox.textContent = err.message;
+          errorBox.classList.remove('hidden');
+        }
+      });
+    </script>
+  </body>
+</html>

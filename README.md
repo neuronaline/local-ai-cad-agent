@@ -2,7 +2,6 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
-[![CI](https://github.com/neuronaline/local-ai-cad-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/neuronaline/local-ai-cad-agent/actions/workflows/ci.yml)
 
 A local-first web app that lets you **chat with an AI agent to create parametric CAD models**. Built with [build123d](https://github.com/gumyr/build123d) for solid modeling, [Three.js](https://threejs.org/) for in-browser preview, and [OpenRouter](https://openrouter.ai/) for LLM access — all sandboxed with Bubblewrap.
 
@@ -67,6 +66,7 @@ local-ai-cad-agent/
 │   ├── js/app.js              # SSE client, chat & UI logic
 │   ├── js/viewer.js           # Three.js CadViewer
 │   └── css/style.css          # Dark theme
+│   └── vendor/                # Pinned, local frontend dependencies
 ├── templates/
 │   ├── index.html             # Chat + 3D viewer page
 │   └── projects.html          # Project management page
@@ -107,7 +107,11 @@ Copy `config.example.yaml` to `config.yaml` (git-ignored). Personal overrides go
 .venv/bin/python -m pip check
 ```
 
-The [CI workflow](.github/workflows/ci.yml) runs lint, tests, and dependency checks on every push.
+## Frontend dependencies
+
+Three.js (including the STL loader and orbit controls), Marked, Highlight.js, and the Highlight.js theme are committed under `static/vendor/` at explicitly pinned versions. The UI does not depend on a CDN, so it remains usable offline and is not affected by third-party CDN availability.
+
+To update a frontend library, choose an exact upstream release, download its browser distribution and license from the project's official release or repository, and replace only that library's directory in `static/vendor/`. Preserve upstream notices, update the version and source URL in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md), verify the import paths in `templates/index.html`, then run `pytest -q`.
 
 ## 🔒 Security
 

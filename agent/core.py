@@ -330,13 +330,21 @@ class AgentRunner:
                 },
             )
         except Exception as error:  # noqa: BLE001 - Surface all agent failures to the local UI.
+            import traceback
+            detail = str(error)
+            err_type = type(error).__name__
+            # Log the full traceback server-side.
+            traceback.print_exc()
             if self._stop_event.is_set():
                 self.publish(
                     "agent_status",
                     {"project": project, "status": "stopped", "message": "Task stopped."},
                 )
             else:
-                self.publish("agent_error", {"project": project, "message": str(error)})
+                self.publish("agent_error", {
+                    "project": project,
+                    "message": self._user_error_message(detail, err_type),
+                })
         finally:
             with self._lock:
                 self._active_tools = None
@@ -582,6 +590,33 @@ class AgentRunner:
                 return self._active_tools.cad.receive_screenshot(request_id, image_base64, error)
             except (TypeError, ValueError):
                 return False
+
+    @staticmethod
+    def _user_error_message(detail: str, err_type: str) -> str:
+        """Map technical error messages to user-friendly messages."""
+        lower = detail.lower()
+
+        if "401" in detail or "unauthorized" in lower or "invalid api key" in lower:
+            return "Invalid OpenRouter API key. Check your key at https://openrouter.ai/keys."
+        if "429" in detail or "rate limit" in lower:
+            return "OpenRouter rate limit reached. Wait a moment and try again."
+        if "model" in lower and ("not found" in lower or "invalid" in lower or "not available" in lower):
+            return f"The configured model is not available: {detail}"
+        if "bubblewrap" in lower or "bwrap" in lower or "sandbox" in lower or "seccomp" in lower:
+            return "CAD sandbox failed. Ensure bubblewrap and libseccomp2 are installed (sudo apt install bubblewrap libseccomp2)."
+        if "openrouter" in lower and ("timeout" in lower or "timed out" in lower or "connection" in lower):
+            return "Connection to OpenRouter timed out. Check your internet connection."
+        if "timeout" in lower or "timed out" in lower:
+            return "CAD code execution timed out. Try simplifying the design or increasing the timeout."
+        if "export" in lower and ("step" in lower or "stl" in lower):
+            return f"Export failed: {detail}"
+        if "permission" in lower or "access denied" in lower or "not writable" in lower:
+            return f"Workspace permission error: {detail}"
+        if "cancelled" in lower or "stop" in lower:
+            return "Task was cancelled."
+
+        # Fallback: return the original detail (it will be logged fully server-side).
+        return detail
 
     def _register_preview(self, project: str, project_dir: Path) -> str:
         preview_path = project_dir / "preview.stl"

@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Local AI CAD Agent</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github-dark.min.css">
+    <link rel="stylesheet" href="{{ url_for('static', filename='vendor/highlight/styles/github-dark.min.css') }}">
   </head>
   <body>
     <main class="app-shell">
@@ -13,7 +13,18 @@
         <header class="panel-header">
           <div class="brand"><a href="/" class="back-link" title="Back to projects">← Projects</a><h1>{{ project_name }}</h1><span id="connection-status" class="connection-status" title="Connecting…"></span></div>
         </header>
-        <div id="chat-feed" class="chat-feed" aria-live="polite"><div class="empty-state"><strong>Project: {{ project_name }}</strong><span>Describe the part you want to build.</span></div></div>
+        <div id="chat-feed" class="chat-feed" aria-live="polite">
+          <div class="empty-state">
+            <strong>Project: {{ project_name }}</strong>
+            <span>Describe the part you want to build.</span>
+            <div class="example-prompts">
+              <span class="example-label">Try an example:</span>
+              <button type="button" class="example-prompt" data-prompt="Create a 60 × 30 × 4 mm mounting plate with four M3 holes.">Create a 60 × 30 × 4 mm mounting plate with four M3 holes.</button>
+              <button type="button" class="example-prompt" data-prompt="Create a wheel for a 6 mm D-shaped motor shaft.">Create a wheel for a 6 mm D-shaped motor shaft.</button>
+              <button type="button" class="example-prompt" data-prompt="Create a 40 mm cube with a centered 20 mm circular hole.">Create a 40 mm cube with a centered 20 mm circular hole.</button>
+            </div>
+          </div>
+        </div>
         <div id="question-area"></div>
         <form id="chat-form" class="composer">
           <textarea id="message" placeholder="Describe the part you want to create…" rows="2" required></textarea>
@@ -34,13 +45,13 @@
     <script type="importmap">
       {
         "imports": {
-          "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+          "three": "{{ url_for('static', filename='vendor/three/three.module.js') }}",
+          "three/addons/": "{{ url_for('static', filename='vendor/three/addons/') }}"
         }
       }
     </script>
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+    <script src="{{ url_for('static', filename='vendor/marked/marked.min.js') }}"></script>
+    <script src="{{ url_for('static', filename='vendor/highlight/highlight.min.js') }}"></script>
     <script type="module" src="{{ url_for('static', filename='js/app.js') }}"></script>
   </body>
 </html>
