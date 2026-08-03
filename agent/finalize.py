@@ -1,6 +1,8 @@
 """Validation and artifact generation for a finished CAD project."""
+
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -9,6 +11,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from agent.tool_results import is_failure
 from agent.tools.cad_tool import CadTool
 
 MIN_REASONABLE_DIMENSION_MM = 0.001
@@ -24,7 +27,9 @@ def _validate_metrics(metrics: dict[str, Any]) -> None:
     if not metrics["is_valid"]:
         raise ValueError("Finalization requires valid geometry.")
     dimension_values = [float(value) for value in dimensions.values()]
-    if len(dimension_values) != 3 or any(not math.isfinite(value) for value in dimension_values):
+    if len(dimension_values) != 3 or any(
+        not math.isfinite(value) for value in dimension_values
+    ):
         raise ValueError("Finalization requires finite X, Y, and Z dimensions.")
     if any(
         value < MIN_REASONABLE_DIMENSION_MM or value > MAX_REASONABLE_DIMENSION_MM
@@ -41,7 +46,9 @@ def _validate_metrics(metrics: dict[str, Any]) -> None:
 
 def _extract_limitations(summary: str) -> str | None:
     """Extract a `## Limitations` section from the summary if present."""
-    match = re.search(r"##\s+Limitations\s*\n((?:(?!##\s).*\n?)+)", summary, re.IGNORECASE)
+    match = re.search(
+        r"##\s+Limitations\s*\n((?:(?!##\s).*\n?)+)", summary, re.IGNORECASE
+    )
     if not match:
         return None
     content = match.group(1).strip()
@@ -82,7 +89,9 @@ def _parse_journey(project_dir: Path) -> dict[str, int | str]:
         if entry_type == "tool_status" and isinstance(data, dict):
             status = data.get("status")
             call_id = str(data.get("call_id", ""))
-            if status not in {"completed", "error"} or (call_id and call_id in seen_tool_calls):
+            if status not in {"completed", "error"} or (
+                call_id and call_id in seen_tool_calls
+            ):
                 continue
             if call_id:
                 seen_tool_calls.add(call_id)
@@ -90,7 +99,12 @@ def _parse_journey(project_dir: Path) -> dict[str, int | str]:
             if name:
                 tool_counts[name] = tool_counts.get(name, 0) + 1
             arguments = data.get("arguments")
-            if name == "cad" and isinstance(arguments, dict) and arguments.get("operation") == "run":
+            is_build = name == "cad_build_and_verify" or (
+                name == "cad"
+                and isinstance(arguments, dict)
+                and arguments.get("operation") == "run"
+            )
+            if is_build:
                 if status == "error":
                     cad_failures += 1
                 else:
@@ -99,19 +113,26 @@ def _parse_journey(project_dir: Path) -> dict[str, int | str]:
 
         # Tool events from _log
         content = entry.get("content")
-        if isinstance(content, dict) and content.get("name") == "cad":
+        if isinstance(content, dict) and content.get("name") in {
+            "cad",
+            "cad_build_and_verify",
+        }:
             call_id = str(content.get("call_id", ""))
             if call_id and call_id in seen_tool_calls:
                 continue
             if content.get("operation") not in {None, "run"}:
                 continue
             result = str(content.get("result", ""))
-            if result.startswith("ERROR:"):
+            if is_failure(result):
                 cad_failures += 1
-                tool_counts["cad"] = tool_counts.get("cad", 0) + 1
+                tool_counts["cad_build_and_verify"] = (
+                    tool_counts.get("cad_build_and_verify", 0) + 1
+                )
             else:
                 cad_runs += 1
-                tool_counts["cad"] = tool_counts.get("cad", 0) + 1
+                tool_counts["cad_build_and_verify"] = (
+                    tool_counts.get("cad_build_and_verify", 0) + 1
+                )
             continue
 
         # Tool content is a dict with name/result
@@ -125,7 +146,11 @@ def _parse_journey(project_dir: Path) -> dict[str, int | str]:
             continue
 
         # Assistant messages for fallback summary
-        if entry.get("role") == "assistant" and isinstance(content, str) and content.strip():
+        if (
+            entry.get("role") == "assistant"
+            and isinstance(content, str)
+            and content.strip()
+        ):
             last_assistant_message = content.strip()
 
     total_tokens = total_prompt_tokens + total_completion_tokens
@@ -181,20 +206,24 @@ def _build_report(
             journey_lines.append(f"- Total tokens: {total_tokens:,}")
         sections.extend(journey_lines)
 
-    sections.extend([
-        "",
-        "## Generated files",
-        "- `model.step`",
-        "- `model.stl`",
-        "- `report.md`",
-    ])
+    sections.extend(
+        [
+            "",
+            "## Generated files",
+            "- `model.step`",
+            "- `model.stl`",
+            "- `report.md`",
+        ]
+    )
 
     if limitations:
-        sections.extend([
-            "",
-            "## Known limitations",
-            limitations,
-        ])
+        sections.extend(
+            [
+                "",
+                "## Known limitations",
+                limitations,
+            ]
+        )
 
     return "\n".join(sections) + "\n"
 
@@ -217,7 +246,9 @@ def finalize_project(project_dir: Path) -> dict[str, Any]:
         journey = _parse_journey(project_dir)
 
         summary_path = project_dir / "summary.md"
-        summary = summary_path.read_text(encoding="utf-8") if summary_path.exists() else ""
+        summary = (
+            summary_path.read_text(encoding="utf-8") if summary_path.exists() else ""
+        )
         if PLACEHOLDER_MARKER in summary:
             fallback = journey.pop("_last_assistant", "")
             if fallback:
@@ -230,9 +261,24 @@ def finalize_project(project_dir: Path) -> dict[str, Any]:
 
         staged_output = project_dir / relative_output
         (staged_output / "report.md").write_text(report, encoding="utf-8")
-        expected = [staged_output / name for name in ("model.step", "model.stl", "report.md")]
+        # Record the source digest so stale exports can be detected later.
+        model_path = project_dir / "model.py"
+        model_digest = (
+            hashlib.sha256(model_path.read_bytes()).hexdigest()
+            if model_path.is_file()
+            else ""
+        )
+        (staged_output / ".finalize_meta.json").write_text(
+            json.dumps({"model_sha256": model_digest}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        expected = [
+            staged_output / name for name in ("model.step", "model.stl", "report.md")
+        ]
         if any(not path.is_file() or path.stat().st_size == 0 for path in expected):
-            raise RuntimeError("Finalization did not produce every required output artifact.")
+            raise RuntimeError(
+                "Finalization did not produce every required output artifact."
+            )
 
         output_dir = project_dir / "output"
         backup_dir = staging_root / "previous-output"
@@ -250,7 +296,11 @@ def finalize_project(project_dir: Path) -> dict[str, Any]:
 
     return {
         "metrics": metrics,
-        "exports": {"metrics": metrics, "step": "output/model.step", "stl": "output/model.stl"},
+        "exports": {
+            "metrics": metrics,
+            "step": "output/model.step",
+            "stl": "output/model.stl",
+        },
         "report": "output/report.md",
         "report_text": report,
     }

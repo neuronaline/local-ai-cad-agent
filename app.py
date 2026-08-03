@@ -1,6 +1,7 @@
 """Local AI CAD Agent web server."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import queue
@@ -10,6 +11,7 @@ import tempfile
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from difflib import unified_diff
 from pathlib import Path
 from typing import Any
 
@@ -28,11 +30,14 @@ from flask import (
 )
 from werkzeug.exceptions import RequestEntityTooLarge
 
+from agent.constraints import ConstraintError, ConstraintStore, ModelConstraintValidator
 from agent.core import AgentRunner
 from agent.finalize import finalize_project
 from agent.images import store_images
+from agent.revisions import RevisionIntegrityError, RevisionStore
 from agent.sandbox import _BWRAP, seccomp_filter_fd
 from agent.settings import Settings, load_settings
+from agent.tools.cad_tool import CadTool
 
 PROJECT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 INFO_EVENT_TYPES = frozenset({"agent_status", "tool_status", "agent_usage", "agent_stopped"})
@@ -139,6 +144,18 @@ def _model_status(project_dir: Path) -> str:
     output = project_dir / "output"
     finalized = [output / name for name in ("report.md", "model.step", "model.stl")]
     if all(path.is_file() and path.stat().st_size > 0 for path in finalized):
+        # Check if the finalized output matches the active model source.
+        model_path = project_dir / "model.py"
+        if not model_path.is_file():
+            return "stale"
+        active_digest = hashlib.sha256(model_path.read_bytes()).hexdigest()
+        meta_path = output / ".finalize_meta.json"
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return "stale"
+        if not isinstance(meta, dict) or meta.get("model_sha256") != active_digest:
+            return "stale"
         return "finalized"
     model = output / "model.stl"
     if model.is_file() and model.stat().st_size > 0:
@@ -726,6 +743,334 @@ def create_app(settings: Settings | None = None) -> Flask:
         if not runner.deliver_screenshot(project_name, request_id, image_b64, capture_error):
             return jsonify({"error": "No active screenshot request for this project."}), 409
         return jsonify({"captured": True})
+
+    # ------------------------------------------------------------------ #
+    #  Revision history APIs
+    # ------------------------------------------------------------------ #
+
+    _MAX_DIFF_LINES = 500
+
+    def _revision_summary(
+        store: RevisionStore, revision, active_id: str | None, lkg_id: str | None
+    ) -> dict[str, Any]:
+        build = None
+        try:
+            build = store.build_for(revision.id)
+        except RevisionIntegrityError:
+            pass
+        summary: dict[str, Any] = {
+            "id": revision.id,
+            "parent_id": revision.parent_id,
+            "created_at": revision.created_at,
+            "origin": revision.origin.to_dict(),
+            "restored_from": revision.restored_from,
+            "is_active": revision.id == active_id,
+            "is_last_known_good": revision.id == lkg_id,
+            "build_status": "not_run",
+        }
+        if build is not None:
+            summary["build_status"] = build.status
+            if build.metrics:
+                summary["metrics"] = build.metrics
+            if build.error:
+                summary["error"] = build.error
+        return summary
+
+    @app.get("/api/projects/<project_name>/revisions")
+    def list_revisions(project_name: str):
+        try:
+            project_dir = _project_path(settings, project_name)
+        except (ValueError, FileNotFoundError) as error:
+            return jsonify({"error": str(error)}), 404
+        store = RevisionStore(project_dir)
+        try:
+            store.reconcile()
+        except RevisionIntegrityError as error:
+            return jsonify({"error": str(error)}), 422
+        try:
+            limit = int(request.args.get("limit", 50))
+        except (TypeError, ValueError):
+            return jsonify({"error": "Revision limit must be an integer."}), 400
+        limit = max(1, min(limit, 200))
+        before = request.args.get("before")
+        try:
+            active = store.head()
+            lkg = store.last_known_good()
+            revisions = store.list(limit=limit, before=before)
+        except ValueError as error:
+            return jsonify({"error": str(error)}), 400
+        except RevisionIntegrityError as error:
+            return jsonify({"error": str(error)}), 422
+        next_before = None
+        if revisions and store.list(limit=1, before=revisions[-1].id):
+            next_before = revisions[-1].id
+        return jsonify({
+            "revisions": [
+                _revision_summary(
+                    store, r, active.id if active else None, lkg.id if lkg else None
+                )
+                for r in revisions
+            ],
+            "next_before": next_before,
+        })
+
+    @app.get("/api/projects/<project_name>/revisions/<revision_id>")
+    def revision_detail(project_name: str, revision_id: str):
+        try:
+            project_dir = _project_path(settings, project_name)
+        except (ValueError, FileNotFoundError) as error:
+            return jsonify({"error": str(error)}), 404
+        store = RevisionStore(project_dir)
+        try:
+            store.reconcile()
+            revision = store.get(revision_id)
+        except (ValueError, RevisionIntegrityError) as error:
+            return jsonify({"error": str(error)}), 404
+        active = store.head()
+        lkg = store.last_known_good()
+        summary = _revision_summary(
+            store, revision, active.id if active else None, lkg.id if lkg else None
+        )
+        try:
+            summary["source"] = store.source(revision_id)
+        except RevisionIntegrityError as error:
+            summary["source_error"] = str(error)
+        return jsonify(summary)
+
+    @app.get("/api/projects/<project_name>/revisions/<revision_id>/diff")
+    def revision_diff(project_name: str, revision_id: str):
+        try:
+            project_dir = _project_path(settings, project_name)
+        except (ValueError, FileNotFoundError) as error:
+            return jsonify({"error": str(error)}), 404
+        store = RevisionStore(project_dir)
+        try:
+            store.reconcile()
+            revision = store.get(revision_id)
+        except (ValueError, RevisionIntegrityError) as error:
+            return jsonify({"error": str(error)}), 404
+        against_id = request.args.get("against") or revision.parent_id
+        if against_id is None:
+            return jsonify({"diff": "", "truncated": False, "against": None})
+        try:
+            against = store.get(against_id)
+        except ValueError as error:
+            return jsonify({"error": str(error)}), 404
+        except RevisionIntegrityError as error:
+            # Retention can remove the parent manifest of the oldest retained
+            # revision. Show that boundary revision as an addition from empty.
+            if against_id != revision.parent_id or store.has_manifest(against_id):
+                return jsonify({"error": str(error)}), 404
+            against = None
+        try:
+            source_a = store.source(against_id) if against is not None else ""
+            source_b = store.source(revision_id)
+        except RevisionIntegrityError as error:
+            return jsonify({"error": str(error)}), 422
+        diff_lines = list(unified_diff(
+            source_a.splitlines(keepends=True),
+            source_b.splitlines(keepends=True),
+            fromfile=f"revision {against.id[:8]}" if against else "retention boundary",
+            tofile=f"revision {revision.id[:8]}",
+            n=3,
+        ))
+        truncated = len(diff_lines) > _MAX_DIFF_LINES
+        if truncated:
+            diff_lines = diff_lines[:_MAX_DIFF_LINES]
+        return jsonify({
+            "diff": "".join(diff_lines),
+            "truncated": truncated,
+            "against": against_id if against else None,
+        })
+
+    @app.post("/api/projects/<project_name>/revisions/<revision_id>/restore")
+    def restore_revision(project_name: str, revision_id: str):
+        try:
+            project_dir = _project_path(settings, project_name)
+        except (ValueError, FileNotFoundError) as error:
+            return jsonify({"error": str(error)}), 404
+        with _project_lock(app, project_name):
+            try:
+                project_dir = _project_path(settings, project_name)
+            except (ValueError, FileNotFoundError) as error:
+                return jsonify({"error": str(error)}), 404
+            runner = app.config["AGENT_RUNNER"]
+            if (
+                runner.is_running()
+                or runner.is_awaiting_preview(project_name)
+                or runner.waiting_question(project_name)
+            ):
+                return jsonify({"error": "Cannot restore while the agent is active."}), 409
+            store = RevisionStore(
+                project_dir,
+                retention_count=settings.revision_retention_count,
+            )
+            try:
+                store.reconcile()
+                if not store.has_source(revision_id):
+                    return jsonify({"error": "Revision source is missing or corrupt."}), 422
+                source = store.source(revision_id)
+                ModelConstraintValidator(ConstraintStore(project_dir)).validate(source)
+                revision = store.restore(revision_id)
+            except (ConstraintError, ValueError, RevisionIntegrityError) as error:
+                return jsonify({"error": str(error)}), 422
+
+            bus.publish("revision_updated", {"project": project_name})
+
+            bus.publish("agent_status", {
+                "project": project_name,
+                "status": "restoring",
+                "message": f"Restoring revision {revision.id[:8]} and rebuilding…",
+            })
+
+            # Full sandboxed CAD run on the restored source.
+            cad = CadTool(project_dir, bus.publish, store)
+            try:
+                metrics = cad.run()
+            except (RuntimeError, ValueError, TypeError) as error:
+                bus.publish("agent_error", {
+                    "project": project_name,
+                    "message": f"Restore succeeded but CAD rebuild failed: {error}",
+                })
+                return jsonify({
+                    "restored": True,
+                    "revision_id": revision.id,
+                    "build_status": "failed",
+                    "error": str(error),
+                })
+
+            # Register and publish the new preview.
+            preview_id = runner._register_preview(project_name, project_dir)
+            bus.publish("preview_updated", {
+                "project": project_name,
+                "preview_id": preview_id,
+            })
+            bus.publish("agent_status", {
+                "project": project_name,
+                "status": "rendering",
+                "message": "Restored model is being displayed…",
+            })
+            return jsonify({
+                "restored": True,
+                "revision_id": revision.id,
+                "build_status": "succeeded",
+                "metrics": metrics,
+                "preview_id": preview_id,
+            })
+
+    # ------------------------------------------------------------------ #
+    #  Constraint APIs
+    # ------------------------------------------------------------------ #
+
+    @app.get("/api/projects/<project_name>/constraints")
+    def list_constraints(project_name: str):
+        try:
+            project_dir = _project_path(settings, project_name)
+        except (ValueError, FileNotFoundError) as error:
+            return jsonify({"error": str(error)}), 404
+        with _project_lock(app, project_name):
+            store = ConstraintStore(project_dir)
+            try:
+                constraints = store.list()
+                model_path = project_dir / "model.py"
+                targets = (
+                    store.discover_targets(model_path.read_text(encoding="utf-8"))
+                    if model_path.is_file()
+                    else {"parameters": [], "features": []}
+                )
+            except (ConstraintError, OSError) as error:
+                return jsonify({"error": str(error)}), 422
+        return jsonify({
+            "constraints": [constraint.to_dict() for constraint in constraints],
+            "targets": targets,
+        })
+
+    @app.post("/api/projects/<project_name>/constraints")
+    def create_constraint(project_name: str):
+        try:
+            project_dir = _project_path(settings, project_name)
+        except (ValueError, FileNotFoundError) as error:
+            return jsonify({"error": str(error)}), 404
+        payload = request.get_json(silent=True) or {}
+        kind = str(payload.get("kind", ""))
+        name = str(payload.get("name", "")).strip()
+        if kind not in ("parameter", "source_feature"):
+            return jsonify({"error": "Constraint kind must be 'parameter' or 'source_feature'."}), 400
+        if not name:
+            return jsonify({"error": "Constraint name is required."}), 400
+        with _project_lock(app, project_name):
+            runner = app.config["AGENT_RUNNER"]
+            if (
+                (runner.is_running() and runner.active_project() == project_name)
+                or runner.is_awaiting_preview(project_name)
+                or runner.waiting_question(project_name)
+            ):
+                return jsonify({"error": "Cannot modify constraints while the agent is active."}), 409
+            try:
+                project_dir = _project_path(settings, project_name)
+            except (ValueError, FileNotFoundError) as error:
+                return jsonify({"error": str(error)}), 404
+            model_path = project_dir / "model.py"
+            if not model_path.is_file():
+                return jsonify({"error": "model.py does not exist."}), 400
+            source = model_path.read_text(encoding="utf-8")
+            store = ConstraintStore(project_dir)
+            try:
+                if kind == "parameter":
+                    constraint = store.create_parameter_constraint(name, source)
+                else:
+                    constraint = store.create_source_feature_constraint(name, source)
+                store.add(constraint)
+            except ConstraintError as error:
+                return jsonify({"error": str(error)}), 422
+            _append_conversation(project_dir, {
+                "timestamp": _utc_now(),
+                "type": "constraint_added",
+                "data": {"kind": kind, "name": name},
+            })
+        bus.publish("constraint_added", {
+            "project": project_name,
+            "kind": kind,
+            "name": name,
+        })
+        return jsonify({"constraint": constraint.to_dict()}), 201
+
+    @app.delete("/api/projects/<project_name>/constraints/<constraint_id>")
+    def delete_constraint(project_name: str, constraint_id: str):
+        try:
+            project_dir = _project_path(settings, project_name)
+        except (ValueError, FileNotFoundError) as error:
+            return jsonify({"error": str(error)}), 404
+        with _project_lock(app, project_name):
+            runner = app.config["AGENT_RUNNER"]
+            if (
+                (runner.is_running() and runner.active_project() == project_name)
+                or runner.is_awaiting_preview(project_name)
+                or runner.waiting_question(project_name)
+            ):
+                return jsonify({"error": "Cannot modify constraints while the agent is active."}), 409
+            try:
+                project_dir = _project_path(settings, project_name)
+            except (ValueError, FileNotFoundError) as error:
+                return jsonify({"error": str(error)}), 404
+            store = ConstraintStore(project_dir)
+            try:
+                removed = store.remove(constraint_id)
+            except ConstraintError as error:
+                return jsonify({"error": str(error)}), 422
+            if removed is None:
+                return jsonify({"error": "Constraint not found."}), 404
+            _append_conversation(project_dir, {
+                "timestamp": _utc_now(),
+                "type": "constraint_removed",
+                "data": {"kind": removed.kind, "name": removed.name},
+            })
+        bus.publish("constraint_removed", {
+            "project": project_name,
+            "kind": removed.kind,
+            "name": removed.name,
+        })
+        return jsonify({"removed": constraint_id})
 
     @app.get("/api/stream")
     def stream():

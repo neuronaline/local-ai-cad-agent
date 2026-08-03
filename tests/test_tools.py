@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
+from agent.revisions import RevisionStore
 from agent.tools.cad_tool import CadTool
 from agent.tools.file_tool import FileTool
 from agent.tools.terminal_tool import TerminalTool
@@ -105,7 +106,9 @@ def test_terminal_tool_runs_only_local_python_script(tmp_path: Path):
 
 
 def test_terminal_tool_reports_python_failures_as_errors(tmp_path: Path):
-    (tmp_path / "fail.py").write_text("print('before failure')\nraise ValueError('broken')\n", encoding="utf-8")
+    (tmp_path / "fail.py").write_text(
+        "print('before failure')\nraise ValueError('broken')\n", encoding="utf-8"
+    )
 
     with pytest.raises(RuntimeError, match="before failure") as error:
         TerminalTool(tmp_path).run(["python", "fail.py"])
@@ -113,7 +116,9 @@ def test_terminal_tool_reports_python_failures_as_errors(tmp_path: Path):
     assert "ValueError: broken" in str(error.value)
 
 
-def test_terminal_sandbox_hides_environment_and_blocks_network(tmp_path: Path, monkeypatch):
+def test_terminal_sandbox_hides_environment_and_blocks_network(
+    tmp_path: Path, monkeypatch
+):
     monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
     host_secret = tmp_path.parent / "host-secret.txt"
     host_secret.write_text("private", encoding="utf-8")
@@ -179,11 +184,15 @@ def test_screenshot_requires_matching_one_time_request(tmp_path: Path):
 def test_cad_inspect_invalidates_metrics_after_model_change(tmp_path: Path):
     pytest.importorskip("build123d")
     model = tmp_path / "model.py"
-    model.write_text("from build123d import Box\nresult = Box(10, 20, 30)\n", encoding="utf-8")
+    model.write_text(
+        "from build123d import Box\nresult = Box(10, 20, 30)\n", encoding="utf-8"
+    )
     cad = CadTool(tmp_path)
     assert cad.run()["dimensions_mm"] == {"x": 10.0, "y": 20.0, "z": 30.0}
 
-    model.write_text("from build123d import Box\nresult = Box(40, 20, 30)\n", encoding="utf-8")
+    model.write_text(
+        "from build123d import Box\nresult = Box(40, 20, 30)\n", encoding="utf-8"
+    )
 
     # inspect returns file info only when cache is stale (no auto re-run)
     info = cad.inspect()
@@ -211,7 +220,19 @@ ValueError: Failed creating a chamfer, try a smaller length value(s)
     assert "runner.py" not in detail
 
 
-def test_cad_render_is_deterministic_and_has_no_center_depth_hole_for_solid_box(tmp_path: Path):
+def test_cad_build_recording_is_best_effort(tmp_path: Path, monkeypatch):
+    cad = CadTool(tmp_path)
+    monkeypatch.setattr(
+        cad._revisions, "head", lambda: (_ for _ in ()).throw(OSError("disk full"))
+    )
+
+    cad._record_build_success({"solid_count": 1})
+    cad._record_build_failure("original CAD error")
+
+
+def test_cad_render_is_deterministic_and_has_no_center_depth_hole_for_solid_box(
+    tmp_path: Path,
+):
     pytest.importorskip("build123d")
     (tmp_path / "model.py").write_text(
         "from build123d import Box\nresult = Box(40, 30, 8)\n",
@@ -228,3 +249,145 @@ def test_cad_render_is_deterministic_and_has_no_center_depth_hole_for_solid_box(
         assert image.size == (512, 512)
         assert image.getpixel((256, 256)) != (23, 25, 29)
     assert first == second
+
+
+def test_cad_build_and_verify_runs_once_with_render(tmp_path: Path, monkeypatch):
+    cad = CadTool(tmp_path)
+    calls = []
+    metrics = {"solid_count": 1, "is_valid": True}
+    monkeypatch.setattr(
+        cad,
+        "_execute",
+        lambda **kwargs: calls.append(kwargs) or metrics,
+    )
+
+    result = cad.build_and_verify()
+
+    assert calls == [{"render": True}]
+    assert result == {
+        "metrics": metrics,
+        "preview": "preview.stl",
+        "render": "render.png",
+    }
+
+
+# --------------------------------------------------------------------------- #
+#  FileTool revision integration tests
+# --------------------------------------------------------------------------- #
+
+
+def test_file_write_creates_revision_after_preflight(tmp_path: Path):
+    tool = FileTool(tmp_path)
+    result = tool.write(
+        "model.py", "from build123d import Box\nresult = Box(10, 20, 30)\n"
+    )
+
+    assert "revision" in result
+    store = RevisionStore(tmp_path)
+    head = store.head()
+    assert head is not None
+    assert (
+        (tmp_path / "model.py").read_text(encoding="utf-8").startswith("from build123d")
+    )
+
+
+def test_file_replace_creates_revision(tmp_path: Path):
+    tool = FileTool(tmp_path)
+    tool.write("model.py", "from build123d import Box\nresult = Box(10, 20, 30)\n")
+    store = RevisionStore(tmp_path)
+    first_head = store.head().id
+
+    tool.replace("model.py", "Box(10, 20, 30)", "Box(40, 20, 30)")
+
+    second_head = store.head()
+    assert second_head.id != first_head
+    assert second_head.parent_id == first_head
+    assert second_head.origin.operation == "replace"
+
+
+def test_file_regex_replace_creates_revision(tmp_path: Path):
+    tool = FileTool(tmp_path)
+    tool.write("model.py", "WIDTH = 10\nresult = WIDTH\n")
+    store = RevisionStore(tmp_path)
+    first_head = store.head().id
+
+    tool.regex_replace("model.py", r"\d+", "20")
+
+    second_head = store.head()
+    assert second_head.id != first_head
+    assert second_head.origin.operation == "regex_replace"
+
+
+def test_file_missing_replace_target_creates_no_revision(tmp_path: Path):
+    tool = FileTool(tmp_path)
+    tool.write("model.py", "result = 1\n")
+    store = RevisionStore(tmp_path)
+    head_id = store.head().id
+
+    with pytest.raises(ValueError, match="not found"):
+        tool.replace("model.py", "nonexistent", "whatever")
+
+    # No new revision.
+    assert store.head().id == head_id
+
+
+def test_file_preflight_failure_creates_no_revision(tmp_path: Path):
+    tool = FileTool(tmp_path)
+    tool.write("model.py", "result = 1\n")
+    store = RevisionStore(tmp_path)
+    head_id = store.head().id
+
+    with pytest.raises(ValueError, match="Unsafe import blocked"):
+        tool.write("model.py", "import subprocess\n")
+
+    # No new revision, model.py unchanged.
+    assert store.head().id == head_id
+    assert (tmp_path / "model.py").read_text(encoding="utf-8") == "result = 1\n"
+
+
+def test_file_noop_write_creates_no_new_revision(tmp_path: Path):
+    tool = FileTool(tmp_path)
+    tool.write("model.py", "result = 1\n")
+    store = RevisionStore(tmp_path)
+    head_id = store.head().id
+
+    # Write the same content again.
+    tool.write("model.py", "result = 1\n")
+
+    # Same revision (deduplicated).
+    assert store.head().id == head_id
+
+
+def test_file_tool_result_includes_revision_id_without_paths(tmp_path: Path):
+    tool = FileTool(tmp_path)
+    result = tool.write("model.py", "result = 1\n")
+
+    assert "revision" in result
+    # No internal filesystem paths exposed.
+    assert ".cad-agent" not in result
+    assert "/" not in result.split("revision")[0]
+
+
+def test_file_tool_with_call_id_stores_origin(tmp_path: Path):
+    tool = FileTool(tmp_path, tool_call_id="call_abc")
+    tool.write("model.py", "result = 1\n")
+
+    store = RevisionStore(tmp_path)
+    head = store.head()
+    assert head.origin.tool_call_id == "call_abc"
+    assert head.origin.operation == "write"
+
+
+def test_file_tool_direct_construction_without_revisions_works(tmp_path: Path):
+    """Existing direct FileTool(tmp_path) test construction remains supported."""
+    tool = FileTool(tmp_path)
+    result = tool.write("summary.md", "# Test\n")
+    assert result == "Wrote summary.md (7 characters)."
+
+
+def test_file_summary_write_does_not_create_revision(tmp_path: Path):
+    tool = FileTool(tmp_path)
+    tool.write("summary.md", "# Test\n")
+
+    store = RevisionStore(tmp_path)
+    assert store.head() is None  # No model.py revision created.

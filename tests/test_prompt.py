@@ -6,7 +6,8 @@ def test_build123d_playbook_is_injected_once_into_the_static_system_prompt():
     assert "```markdown" not in BUILD123D_PLAYBOOK
     assert SYSTEM_PROMPT.count("<build123d_cli_playbook>") == 1
     assert BUILD123D_PLAYBOOK in SYSTEM_PROMPT
-    assert "When cad.run fails, fix model.py" in SYSTEM_PROMPT
+    assert "cad_build_and_verify performs the build" in SYSTEM_PROMPT
+    assert "cad.run" not in SYSTEM_PROMPT
 
 
 def test_build123d_playbook_has_versioned_curve_and_topology_guidance():

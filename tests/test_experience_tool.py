@@ -31,7 +31,9 @@ def populated(tool: ExperienceTool) -> ExperienceTool:
 # ── initial directory and file creation ───────────────────────────────
 
 
-def test_creates_memory_dir_and_file_on_first_write(tool: ExperienceTool, tmp_path: Path):
+def test_creates_memory_dir_and_file_on_first_write(
+    tool: ExperienceTool, tmp_path: Path
+):
     memory_dir = tmp_path / ".agent-memory"
     assert not memory_dir.exists()
     tool.add("empty preview", "Ensure result is a Part, not Compound.", ["cad"])
@@ -126,7 +128,11 @@ def test_add_creates_record_with_required_fields(tool: ExperienceTool):
 
 def test_add_detects_duplicate_and_updates(tool: ExperienceTool):
     first = tool.add("fillet fails on sharp edges", "Use chamfer first.", ["build123d"])
-    second = tool.add("fillet failing on sharp edges", "Better solution: chamfer first", ["build123d", "geometry"])
+    second = tool.add(
+        "fillet failing on sharp edges",
+        "Better solution: chamfer first",
+        ["build123d", "geometry"],
+    )
     assert second["id"] == first["id"]
     assert second["updated"] is True
     issues = tool._read()
@@ -263,7 +269,9 @@ def test_rejects_non_object_root(tool: ExperienceTool):
 
 def test_rejects_non_list_issues(tool: ExperienceTool):
     tool._memory_dir.mkdir(parents=True, exist_ok=True)
-    tool._memory_file.write_text('{"version": 1, "issues": "not-a-list"}', encoding="utf-8")
+    tool._memory_file.write_text(
+        '{"version": 1, "issues": "not-a-list"}', encoding="utf-8"
+    )
     with pytest.raises(RuntimeError, match="array"):
         tool.search("anything")
 
@@ -293,17 +301,22 @@ def test_each_record_has_unique_id(tool: ExperienceTool):
 
 def test_tool_schema_includes_experience():
     from agent.core import TOOL_SCHEMAS
+
     names = {schema["function"]["name"] for schema in TOOL_SCHEMAS}
-    assert "experience" in names
+    assert {"experience_search", "experience_add", "experience_update"} <= names
 
 
-def test_experience_schema_has_three_operations():
+def test_experience_schemas_have_operation_specific_required_fields():
     from agent.core import TOOL_SCHEMAS
-    schema = next(
-        s for s in TOOL_SCHEMAS if s["function"]["name"] == "experience"
-    )
-    operations = schema["function"]["parameters"]["properties"]["operation"]["enum"]
-    assert set(operations) == {"search", "add", "update"}
+
+    schemas = {s["function"]["name"]: s for s in TOOL_SCHEMAS}
+    assert schemas["experience_search"]["function"]["parameters"]["required"] == [
+        "query"
+    ]
+    assert schemas["experience_add"]["function"]["parameters"]["required"] == [
+        "problem",
+        "solution",
+    ]
 
 
 # ── prompt rules ───────────────────────────────────────────────────────
@@ -311,8 +324,9 @@ def test_experience_schema_has_three_operations():
 
 def test_prompt_includes_experience_memory_rules():
     from agent.prompt import SYSTEM_PROMPT
+
     assert "<experience_memory>" in SYSTEM_PROMPT
-    assert "Search experience memory proactively" in SYSTEM_PROMPT
+    assert "Use experience_search" in SYSTEM_PROMPT
     assert "failed attempts, or unverified workarounds" in SYSTEM_PROMPT
 
 
@@ -321,6 +335,7 @@ def test_prompt_includes_experience_memory_rules():
 
 def test_agent_memory_dir_not_visible_as_project():
     from app import PROJECT_NAME_RE
+
     assert PROJECT_NAME_RE.fullmatch(".agent-memory") is None
 
 
@@ -347,7 +362,9 @@ def test_project_tools_has_experience_attribute(tmp_path: Path):
 
 
 def test_search_ignores_short_words(tool: ExperienceTool):
-    tool.add("build123d fillet fails on sharp edges", "Use chamfer first.", ["build123d"])
+    tool.add(
+        "build123d fillet fails on sharp edges", "Use chamfer first.", ["build123d"]
+    )
     # "on" has 2 chars, should be ignored; only "fillet" (6) and "sharp" (5) and "edges" (5) match
     result = tool.search("on")
     assert result == {"matches": []}

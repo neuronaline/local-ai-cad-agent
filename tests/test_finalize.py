@@ -79,3 +79,35 @@ def test_journey_counts_only_cad_run_iterations(tmp_path: Path):
     assert journey["cad_runs"] == 1
     assert journey["cad_failures"] == 1
     assert journey["tools"] == "cad(3)"
+
+
+def test_journey_counts_unified_cad_builds(tmp_path: Path):
+    events = [
+        {
+            "type": "tool_status",
+            "data": {
+                "call_id": "build-ok",
+                "tool": "cad_build_and_verify",
+                "arguments": {},
+                "status": "completed",
+            },
+        },
+        {
+            "type": "tool_status",
+            "data": {
+                "call_id": "build-failed",
+                "tool": "cad_build_and_verify",
+                "arguments": {},
+                "status": "error",
+            },
+        },
+    ]
+    (tmp_path / "conversation.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8"
+    )
+
+    journey = _parse_journey(tmp_path)
+
+    assert journey["cad_runs"] == 1
+    assert journey["cad_failures"] == 1
+    assert journey["tools"] == "cad_build_and_verify(2)"

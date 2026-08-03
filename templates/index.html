@@ -30,6 +30,7 @@
           <textarea id="message" placeholder="Describe the part you want to create…" rows="2" required></textarea>
           <div class="action-bar">
             <label id="dropzone" class="attach-button" for="attachments" title="Add reference images"><span aria-hidden="true">＋</span><span id="attachment-label">Attach</span><input id="attachments" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden></label>
+            <button id="history-btn" type="button" class="quiet">History</button>
             <button id="finalize" type="button" class="quiet">Finalize</button>
             <button id="stop" type="button" class="danger" hidden>Stop</button>
             <button type="submit">Send</button>
@@ -41,7 +42,19 @@
         <div id="viewer" class="viewer"><div id="viewer-empty" class="viewer-empty"><span class="preview-icon">◇</span><strong>No preview yet</strong></div></div>
       </section>
     </main>
-    <script>window.APP_CONFIG = {projectName: {{ project_name | tojson }}, showInfoMessages: {{ show_info_messages | tojson }}};</script>
+    <aside id="history-drawer" class="history-drawer" hidden>
+      <header class="drawer-header">
+        <h2>History</h2>
+        <button id="history-close" type="button" class="quiet">✕</button>
+      </header>
+      <div id="history-content" class="drawer-content"></div>
+    </aside>
+    <script>
+      window.APP_CONFIG = {
+        projectName: {{ project_name | tojson }},
+        showInfoMessages: {{ show_info_messages | tojson }},
+      };
+    </script>
     <script type="importmap">
       {
         "imports": {

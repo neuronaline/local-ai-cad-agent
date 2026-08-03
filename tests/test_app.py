@@ -7,6 +7,7 @@ from pathlib import Path
 
 from PIL import Image
 
+from agent.revisions import RevisionOrigin, RevisionStore
 from agent.settings import Settings
 from app import SSE_QUEUE_SIZE, EventBus, create_app
 
@@ -579,3 +580,308 @@ def test_user_error_message_maps_permission():
 def test_user_error_message_fallback():
     msg = AgentRunner._user_error_message("Some unknown error occurred", "RuntimeError")
     assert "Some unknown error occurred" in msg
+
+
+# --------------------------------------------------------------------------- #
+#  Revision API tests
+# --------------------------------------------------------------------------- #
+
+def _setup_project_with_revisions(tmp_path: Path, count: int = 3):
+    """Create a project with the given number of model.py revisions."""
+    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    app = create_app(settings)
+    client = app.test_client()
+    client.post("/api/projects/new", json={"name": "demo"})
+    project_dir = settings.workspace_root / "demo"
+    store = RevisionStore(project_dir)
+    revisions = []
+    for i in range(count):
+        rev = store.commit(f"# model v{i}\nresult = {i}\n", RevisionOrigin(kind="agent_edit"))
+        revisions.append(rev)
+    return settings, app, client, project_dir, revisions
+
+
+def test_revision_list_returns_revisions_newest_first(tmp_path: Path):
+    _settings, _app, client, _dir, revisions = _setup_project_with_revisions(tmp_path, 3)
+
+    response = client.get("/api/projects/demo/revisions")
+    assert response.status_code == 200
+    data = response.get_json()
+    assert len(data["revisions"]) == 3
+    # Newest first.
+    assert data["revisions"][0]["id"] == revisions[2].id
+    assert data["revisions"][0]["is_active"] is True
+    assert data["revisions"][1]["is_active"] is False
+
+
+def test_revision_list_includes_build_status(tmp_path: Path):
+    _settings, _app, client, project_dir, revisions = _setup_project_with_revisions(tmp_path, 1)
+    store = RevisionStore(project_dir)
+    store.record_build_success(revisions[0].id, {"solid_count": 1}, project_dir / "preview.stl")
+
+    response = client.get("/api/projects/demo/revisions")
+    data = response.get_json()
+    rev0 = next(r for r in data["revisions"] if r["id"] == revisions[0].id)
+    assert rev0["build_status"] == "succeeded"
+    assert rev0["metrics"]["solid_count"] == 1
+
+
+def test_revision_detail_returns_source(tmp_path: Path):
+    _settings, _app, client, _dir, revisions = _setup_project_with_revisions(tmp_path, 1)
+
+    response = client.get(f"/api/projects/demo/revisions/{revisions[0].id}")
+    assert response.status_code == 200
+    data = response.get_json()
+    assert "source" in data
+    assert "result = 0" in data["source"]
+
+
+def test_revision_detail_404_for_unknown_id(tmp_path: Path):
+    _settings, _app, client, _dir, _revisions = _setup_project_with_revisions(tmp_path, 1)
+
+    response = client.get("/api/projects/demo/revisions/00000000-0000-0000-0000-000000000000")
+    assert response.status_code == 404
+
+
+def test_revision_diff_returns_unified_diff(tmp_path: Path):
+    _settings, _app, client, _dir, revisions = _setup_project_with_revisions(tmp_path, 2)
+
+    response = client.get(f"/api/projects/demo/revisions/{revisions[1].id}/diff")
+    assert response.status_code == 200
+    data = response.get_json()
+    assert "diff" in data
+    assert "result = 0" in data["diff"]
+    assert "result = 1" in data["diff"]
+    assert data["truncated"] is False
+
+
+def test_revision_diff_404_for_unknown_revision(tmp_path: Path):
+    _settings, _app, client, _dir, _revisions = _setup_project_with_revisions(tmp_path, 1)
+
+    response = client.get("/api/projects/demo/revisions/00000000-0000-0000-0000-000000000000/diff")
+    assert response.status_code == 404
+
+
+def test_revision_diff_handles_pruned_parent(tmp_path: Path):
+    _settings, _app, client, project_dir, _revisions = _setup_project_with_revisions(tmp_path, 0)
+    store = RevisionStore(project_dir, retention_count=2)
+    for i in range(3):
+        store.commit(f"result = {i}\n", RevisionOrigin(kind="agent_edit"))
+
+    oldest_retained = store.list(limit=200)[-1]
+    response = client.get(
+        f"/api/projects/demo/revisions/{oldest_retained.id}/diff"
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["against"] is None
+    assert "+result = 1" in data["diff"]
+
+
+def test_revision_list_404_for_unknown_project(tmp_path: Path):
+    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    client = create_app(settings).test_client()
+
+    response = client.get("/api/projects/nonexistent/revisions")
+    assert response.status_code == 404
+
+
+def test_restore_rejects_when_agent_active(tmp_path: Path):
+    _settings, app, client, _project_dir, revisions = _setup_project_with_revisions(tmp_path, 2)
+    runner = app.config["AGENT_RUNNER"]
+    # Simulate running agent.
+    runner._active_project = "demo"
+    runner._thread = type("T", (), {"is_alive": lambda self: True})()
+
+    try:
+        response = client.post(f"/api/projects/demo/revisions/{revisions[0].id}/restore")
+        assert response.status_code == 409
+        assert "active" in response.get_json()["error"].lower()
+    finally:
+        runner._active_project = None
+        runner._thread = None
+
+
+def test_restore_404_for_unknown_project(tmp_path: Path):
+    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    client = create_app(settings).test_client()
+
+    response = client.post("/api/projects/nonexistent/revisions/00000000-0000-0000-0000-000000000000/restore")
+    assert response.status_code == 404
+
+
+def test_restore_422_for_corrupt_revision(tmp_path: Path):
+    _settings, _app, client, project_dir, revisions = _setup_project_with_revisions(tmp_path, 2)
+    # Delete the source blob for the first revision.
+    blob = project_dir / ".cad-agent" / "history" / "blobs" / f"{revisions[0].model_sha256}.py"
+    blob.unlink()
+
+    response = client.post(f"/api/projects/demo/revisions/{revisions[0].id}/restore")
+    assert response.status_code == 422
+
+
+def test_model_status_stale_after_model_edit(tmp_path: Path):
+    """Finalized output should be marked stale after a source-changing revision."""
+    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    client = create_app(settings).test_client()
+    client.post("/api/projects/new", json={"name": "demo"})
+    project_dir = settings.workspace_root / "demo"
+
+    # Create a model and fake finalization.
+    (project_dir / "model.py").write_text("result = 1\n", encoding="utf-8")
+    output = project_dir / "output"
+    output.mkdir(exist_ok=True)
+    (output / "model.step").write_text("step", encoding="utf-8")
+    (output / "model.stl").write_text("stl", encoding="utf-8")
+    (output / "report.md").write_text("# Report", encoding="utf-8")
+    import hashlib
+    digest = hashlib.sha256(b"result = 1\n").hexdigest()
+    (output / ".finalize_meta.json").write_text(
+        json.dumps({"model_sha256": digest}), encoding="utf-8"
+    )
+
+    # Status should be finalized.
+    projects = client.get("/api/projects").get_json()["projects"]
+    assert projects[0]["model_status"] == "finalized"
+
+    # Edit model.py (changing the source digest).
+    (project_dir / "model.py").write_text("result = 2\n", encoding="utf-8")
+
+    # Status should now be stale.
+    projects = client.get("/api/projects").get_json()["projects"]
+    assert projects[0]["model_status"] == "stale"
+
+
+def test_model_status_stale_when_finalize_metadata_is_malformed(tmp_path: Path):
+    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    client = create_app(settings).test_client()
+    client.post("/api/projects/new", json={"name": "demo"})
+    project_dir = settings.workspace_root / "demo"
+    (project_dir / "model.py").write_text("result = 1\n", encoding="utf-8")
+    output = project_dir / "output"
+    for name in ("model.step", "model.stl", "report.md"):
+        (output / name).write_text("artifact", encoding="utf-8")
+    (output / ".finalize_meta.json").write_text("{broken", encoding="utf-8")
+
+    projects = client.get("/api/projects").get_json()["projects"]
+
+    assert projects[0]["model_status"] == "stale"
+
+
+def test_constraint_api_discovers_and_pins_parameters_and_features(tmp_path: Path):
+    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    client = create_app(settings).test_client()
+    client.post("/api/projects/new", json={"name": "demo"})
+    project_dir = settings.workspace_root / "demo"
+    RevisionStore(project_dir).commit(
+        "WIDTH: float = 10.0\n"
+        "# cad-feature: holes start\n"
+        "holes = WIDTH\n"
+        "# cad-feature: holes end\n"
+        "result = holes\n",
+        RevisionOrigin(kind="agent_edit"),
+    )
+
+    discovered = client.get("/api/projects/demo/constraints").get_json()
+    assert [item["name"] for item in discovered["targets"]["parameters"]] == ["WIDTH"]
+    assert [item["name"] for item in discovered["targets"]["features"]] == ["holes"]
+
+    parameter = client.post(
+        "/api/projects/demo/constraints",
+        json={"kind": "parameter", "name": "WIDTH"},
+    )
+    feature = client.post(
+        "/api/projects/demo/constraints",
+        json={"kind": "source_feature", "name": "holes"},
+    )
+
+    assert parameter.status_code == 201
+    assert feature.status_code == 201
+    listed = client.get("/api/projects/demo/constraints").get_json()
+    assert len(listed["constraints"]) == 2
+    assert listed["targets"]["parameters"][0]["pinned"] is True
+    assert listed["targets"]["features"][0]["pinned"] is True
+
+
+def test_restore_rejects_revision_that_violates_active_pin(tmp_path: Path):
+    _settings, _app, client, project_dir, _revisions = _setup_project_with_revisions(tmp_path, 0)
+    store = RevisionStore(project_dir)
+    old = store.commit("WIDTH: float = 10.0\nresult = WIDTH\n", RevisionOrigin(kind="agent_edit"))
+    current = store.commit("WIDTH: float = 20.0\nresult = WIDTH\n", RevisionOrigin(kind="agent_edit"))
+    pin = client.post(
+        "/api/projects/demo/constraints",
+        json={"kind": "parameter", "name": "WIDTH"},
+    )
+    assert pin.status_code == 201
+
+    response = client.post(f"/api/projects/demo/revisions/{old.id}/restore")
+
+    assert response.status_code == 422
+    assert "Protected constraint" in response.get_json()["error"]
+    assert store.head().id == current.id
+    assert "20.0" in (project_dir / "model.py").read_text(encoding="utf-8")
+
+
+def test_restore_reports_source_restored_when_rebuild_fails(tmp_path: Path, monkeypatch):
+    _settings, _app, client, project_dir, _revisions = _setup_project_with_revisions(tmp_path, 0)
+    store = RevisionStore(project_dir)
+    broken = store.commit(
+        "raise RuntimeError('broken revision')\n",
+        RevisionOrigin(kind="agent_edit"),
+    )
+    store.commit("result = 'working'\n", RevisionOrigin(kind="agent_edit"))
+    monkeypatch.setattr("app.CadTool.run", lambda _self: (_ for _ in ()).throw(RuntimeError("broken revision")))
+
+    response = client.post(f"/api/projects/demo/revisions/{broken.id}/restore")
+    data = response.get_json()
+
+    assert response.status_code == 200
+    assert data["restored"] is True
+    assert data["build_status"] == "failed"
+    assert "broken revision" in data["error"]
+    assert store.head().id == data["revision_id"]
+
+
+def test_restore_rebuilds_and_registers_preview(tmp_path: Path, monkeypatch):
+    _settings, _app, client, project_dir, _revisions = _setup_project_with_revisions(tmp_path, 0)
+    store = RevisionStore(project_dir)
+    old = store.commit("result = 'old'\n", RevisionOrigin(kind="agent_edit"))
+    store.commit("result = 'new'\n", RevisionOrigin(kind="agent_edit"))
+
+    def fake_run(self):
+        (self.project_dir / "preview.stl").write_bytes(b"solid preview\nendsolid preview\n")
+        return {"dimensions_mm": {"x": 10.0, "y": 20.0, "z": 30.0}}
+
+    monkeypatch.setattr("app.CadTool.run", fake_run)
+
+    response = client.post(f"/api/projects/demo/revisions/{old.id}/restore")
+    data = response.get_json()
+
+    assert response.status_code == 200
+    assert data["build_status"] == "succeeded"
+    assert data["metrics"]["dimensions_mm"] == {"x": 10.0, "y": 20.0, "z": 30.0}
+    displayed = client.post(
+        "/api/projects/demo/preview/displayed",
+        json={"preview_id": data["preview_id"]},
+    )
+    assert displayed.status_code == 200
+
+
+def test_revision_list_rejects_non_integer_limit(tmp_path: Path):
+    _settings, _app, client, _project_dir, _revisions = _setup_project_with_revisions(tmp_path, 1)
+
+    response = client.get("/api/projects/demo/revisions?limit=invalid")
+
+    assert response.status_code == 400
+
+
+def test_revision_list_reports_corrupt_history(tmp_path: Path):
+    _settings, _app, client, project_dir, _revisions = _setup_project_with_revisions(tmp_path, 1)
+    revisions_dir = project_dir / ".cad-agent" / "history" / "revisions"
+    (revisions_dir / "not-a-revision.json").write_text("{}", encoding="utf-8")
+
+    response = client.get("/api/projects/demo/revisions")
+
+    assert response.status_code == 422
+    assert "filename is invalid" in response.get_json()["error"]

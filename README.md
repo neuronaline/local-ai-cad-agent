@@ -18,6 +18,8 @@ A local-first web app that lets you **chat with an AI agent to create parametric
 - **Sandboxed execution** — All generated code runs in a Bubblewrap container with blocked network and resource limits
 - **Finalize** — Export validated models as STEP, STL, and a journey report
 - **Project management** — Create, rename, and switch between multiple CAD projects with persisted conversation history
+- **Model history** — Inspect source diffs, track successful builds, and restore any retained `model.py` revision
+- **Protected definitions** — Pin typed parameters and named source features so later agent edits cannot change them
 - **Dark theme UI** — Compact, responsive interface with Markdown rendering and syntax highlighting
 
 ## 📋 Requirements
@@ -51,9 +53,13 @@ local-ai-cad-agent/
 │   ├── core.py                # AgentRunner tool-calling loop
 │   ├── openrouter.py          # Streaming chat-completions client
 │   ├── finalize.py            # Model validation & atomic export
+│   ├── revisions.py           # Immutable model revisions, builds & rollback
+│   ├── constraints.py         # User-owned parameter & feature pins
 │   ├── sandbox.py             # Bubblewrap workspace isolation
 │   ├── settings.py            # Config merging & Settings dataclass
 │   ├── prompt.py              # System prompt with build123d playbook
+│   ├── tool_schemas.py        # Operation-specific model tool contracts
+│   ├── tool_results.py        # Structured success and error envelopes
 │   ├── images.py              # Reference image normalization
 │   └── tools/                 # Agent tools (file, terminal, cad, question, experience)
 ├── static/
@@ -64,7 +70,7 @@ local-ai-cad-agent/
 ├── templates/
 │   ├── index.html             # Chat + 3D viewer page
 │   └── projects.html          # Project management page
-├── tests/                     # 111 tests across 10 files
+├── tests/                     # Unit, API, sandbox & real-CAD acceptance tests
 ├── run.sh                     # Startup script
 ├── gunicorn.conf.py           # Single-worker WSGI config
 ├── config.example.yaml        # Shareable defaults
@@ -78,11 +84,12 @@ Copy `config.example.yaml` to `config.yaml` (git-ignored). Personal overrides go
 | Key | Default | Description |
 |---|---|---|
 | `workspace_root` | `~/CAD-Agent-Projects` | Where project data lives |
-| `agent.tool_call_limit` | `12` | Max tool rounds per task |
-| `openrouter.model` | `openai/gpt-4o-mini` | OpenRouter model slug |
-| `openrouter.reasoning_effort` | `""` | `automatic`, `minimal`, `low`, `medium`, or `high` |
-| `openrouter.provider` | `""` | Preferred provider slug (e.g., `openai`, `deepinfra/turbo`) |
-| `openrouter.force_provider` | `false` | Disable fallbacks (strict `provider.only`) |
+| `agent.tool_call_limit` | `30` | Max tool rounds per task |
+| `agent.revision_retention_count` | `0` | Model revisions to retain (`0` keeps all) |
+| `openrouter.model` | `google/gemini-3.6-flash` | OpenRouter model slug |
+| `openrouter.reasoning_effort` | `medium` | `minimal`, `low`, `medium`, or `high` |
+| `openrouter.provider` | `google-vertex/global` | Preferred provider slug |
+| `openrouter.force_provider` | `true` | Disable provider fallbacks |
 | `server.host` / `server.port` | `127.0.0.1` / `5000` | Bind address |
 | `ui.show_info_messages` | `true` | Show tool-status info messages in chat |
 

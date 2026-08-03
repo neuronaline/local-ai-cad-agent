@@ -8,6 +8,13 @@ import re
 from pathlib import Path
 from typing import ClassVar
 
+from agent.constraints import (
+    ConstraintStore,
+    ModelConstraintValidator,
+    parse_feature_regions,
+)
+from agent.revisions import RevisionOrigin, RevisionStore
+
 BLOCKED_IMPORTS = {
     "builtins",
     "importlib",
@@ -227,8 +234,31 @@ class FileTool:
         },
     }
 
-    def __init__(self, project_dir: Path) -> None:
+    def __init__(
+        self,
+        project_dir: Path,
+        revisions: RevisionStore | None = None,
+        tool_call_id: str | None = None,
+        constraints: ConstraintStore | None = None,
+    ) -> None:
         self.project_dir = project_dir.resolve()
+        self._revisions = revisions or RevisionStore(project_dir)
+        self._constraints = constraints or ConstraintStore(project_dir)
+        self._validator = ModelConstraintValidator(self._constraints)
+        self._tool_call_id = tool_call_id
+
+    def with_call_id(self, tool_call_id: str) -> FileTool:
+        """Return a copy of this tool bound to a specific tool-call ID.
+
+        Used by AgentRunner to pass the execution context without changing
+        the constructor signature for direct unit-test construction.
+        """
+        return FileTool(
+            self.project_dir,
+            self._revisions,
+            tool_call_id,
+            self._constraints,
+        )
 
     def _path(self, filename: str) -> Path:
         if filename not in EDITABLE_FILES:
@@ -257,12 +287,30 @@ class FileTool:
         return path.read_text(encoding="utf-8")
 
     def write(self, filename: str, content: str) -> str:
-        path = self._path(filename)
-        warnings: list[str] = []
         if filename == "model.py":
-            warnings = self.validate_model(content)
+            return self._write_model(content, "write")
+        # Non-model files: simple write without revision tracking.
+        path = self._path(filename)
         path.write_text(content, encoding="utf-8")
-        result = f"Wrote {filename} ({len(content)} characters)."
+        return f"Wrote {filename} ({len(content)} characters)."
+
+    def _write_model(self, content: str, operation: str) -> str:
+        """Validate, check constraints, commit revision, and atomically write model.py."""
+        warnings = self.validate_model(content)
+        # Feature marker syntax is part of the model contract even before a
+        # feature is pinned, so malformed markers cannot enter revision history.
+        parse_feature_regions(content)
+        # Enforce protected constraints before any write.
+        self._validator.validate(content)
+        revision = self._revisions.commit(
+            content,
+            RevisionOrigin(
+                kind="agent_edit",
+                operation=operation,
+                tool_call_id=self._tool_call_id,
+            ),
+        )
+        result = f"Wrote model.py ({len(content)} characters, revision {revision.id[:8]})."
         if warnings:
             result += "\nPRE-FLIGHT WARNING: " + " | ".join(warnings)
         return result
@@ -272,6 +320,8 @@ class FileTool:
         if old not in current:
             raise ValueError("The requested text was not found; file was not changed.")
         updated = current.replace(old, new, 1)
+        if filename == "model.py":
+            return self._write_model(updated, "replace")
         return self.write(filename, updated)
 
     def execute(self, args: dict) -> tuple[str, bool]:
@@ -304,5 +354,9 @@ class FileTool:
             raise ValueError(f"Invalid regex pattern: {error}") from error
         if replacements == 0:
             raise ValueError("The regex did not match; file was not changed.")
-        self.write(filename, updated)
-        return f"Updated {filename} with {replacements} regex replacement(s)."
+        detail = ""
+        if filename == "model.py":
+            detail = "\n" + self._write_model(updated, "regex_replace")
+        else:
+            self.write(filename, updated)
+        return f"Updated {filename} with {replacements} regex replacement(s).{detail}"

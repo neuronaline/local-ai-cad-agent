@@ -20,7 +20,7 @@ function formatDate(iso) {
 }
 
 function statusLabel(status) {
-  const labels = { none: 'Empty', has_model: 'Has Model', finalized: 'Finalized' };
+  const labels = { none: 'Empty', has_model: 'Has Model', finalized: 'Finalized', stale: 'Stale' };
   return labels[status] || status;
 }
 

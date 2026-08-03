@@ -3,7 +3,9 @@
 import hashlib
 from pathlib import Path
 
-_PLAYBOOK_PATH = Path(__file__).resolve().parent / "resources" / "build123d_cli_playbook.md"
+_PLAYBOOK_PATH = (
+    Path(__file__).resolve().parent / "resources" / "build123d_cli_playbook.md"
+)
 
 _SUFFIX_FORMAT = """\n<build123d_cli_playbook>\n{playbook}\n</build123d_cli_playbook>"""
 
@@ -20,12 +22,14 @@ _OPERATIONAL_RULES = """\
   read-only or managed by the system.
 - Write model.py with typed millimetre parameters at the top, clear variable
   names, and the final shape exposed as `result`.
-- After every model.py edit, run cad.run then cad.inspect to confirm a valid
-  solid before the next change.
-- Ask a question when a critical dimension, tolerance, or hole size is unknown.
-  When reference images exist, estimate proportions visually and ask about any
-  dimension you cannot confidently derive.
-- After every successful CAD inspection, update summary.md:
+- Follow one short loop: clarify blocking unknowns, edit model.py, call
+  cad_build_and_verify, review its metrics and image, then fix or finish.
+- cad_build_and_verify performs the build, geometry inspection, preview, and
+  render in one call. Call it exactly once after each model.py revision; do not
+  seek separate CAD inspection, render, or screenshot operations.
+- Ask with question only when a critical dimension, tolerance, or hole size is
+  unknown. Estimate non-critical proportions from reference images.
+- After the final successful verification, update summary.md once:
   - ## Summary — one sentence
   - ## Key dimensions — confirmed values only
   - ## Design decisions — notable choices (e.g. "Box + fillet over chamfer")
@@ -33,41 +37,44 @@ _OPERATIONAL_RULES = """\
 - Final export is performed by the UI Finalize action; do not attempt it yourself."""
 
 _BUILD123D_RULES = """\
-- After each CAD run, inspect the rendered preview and measured geometry. Fix
-  visible defects before proceeding. Report readiness only after cad.inspect
-  confirms a valid solid with plausible dimensions.
-- When cad.run fails, fix model.py before calling any other CAD operation;
-  cad.inspect runs the same code and will fail identically.
+- When cad_build_and_verify fails, use its structured error code, phase, message,
+  and hint to fix model.py before rebuilding.
+- Report readiness only when the returned geometry is valid, its dimensions are
+  plausible, and the rendered image matches the request.
 - For optional fillets or chamfers: if edge selectors fail repeatedly, drop the
   finishing operation and deliver the simpler valid solid.
 - Treat unexpected keyword arguments as API-contract errors. Consult the versioned
   playbook instead of guessing signatures.
 - Before RadiusArc, confirm radius >= half the endpoint chord distance.
 - After every fillet, chamfer, or boolean, discard any cached edge/face indices;
-  reselect targets by geometry type, position range, and measurable properties."""
+  reselect targets by geometry type, position range, and measurable properties.
+- Use named feature markers to identify logically independent regions that users
+  may want to protect from later edits:
 
-_VERIFICATION_RULES = """\
-- After each geometry-changing CAD operation, take a screenshot and visually
-  verify the result. Pick the most informative view (isometric, front, top).
-- Check: do dimensions look correct? Are features properly aligned? Is anything
-  missing or protruding that should not?
-- Before declaring the task complete, run a final cad.inspect and verify the
-  bounding box dimensions and volume match expectations.
-- Treat every preview as a checkpoint: if something looks wrong, diagnose and fix
-  it before moving on. A silent defect now becomes a hard bug later."""
+  # cad-feature: base_plate start
+  base = Box(WIDTH, DEPTH, THICKNESS)
+  # cad-feature: base_plate end
 
-_TOOL_STRATEGY = """\
-Use each tool for its stated purpose. Batch independent read-only calls together.
-Sequence model edits so each one is followed by cad.run + cad.inspect + screenshot
-to confirm correctness. Use screenshot as your primary visual feedback loop —
-inspect the 3D preview from the most informative angle and act on what you see.
-Act directly when the request is clear; do not enumerate alternatives for
-straightforward tasks."""
+  Features must be non-overlapping, uniquely named (lowercase letters, digits,
+  underscores), and cover a self-contained block of code. Do not mark the entire
+  model as one feature — only independent, preservable subsections.
+- Protected parameters and features are enforced outside the prompt. When a write
+  is rejected due to constraint violations, the error will name the exact
+  protected items; change only unprotected code and retry."""
+
+_CONSTRAINT_CONTEXT = """\
+- Some parameters and source regions may be protected by user-owned pins. These
+  are listed in the active constraints below. You cannot change, rename, or
+  delete them. Write operations that violate a pin will be rejected automatically.
+- When a pin violation is reported, read the error to identify the specific
+  protected names and adjust your edit to preserve them.
+- Do not attempt to create, remove, or modify constraints. Only the user can
+  manage pins through the UI."""
 
 _EXPERIENCE_MEMORY = """\
-- Search experience memory proactively when you hit a technical problem (build
-  error, topology issue, import trouble). A past solution may apply.
-- After you solve any error, store it in experience memory immediately: describe
+- Use experience_search when a build, topology, or import problem may have a
+  known solution.
+- After verifying a new solution, store it with experience_add: describe
   the problem briefly, the verified solution, and tag it (e.g. build123d,
   geometry, fillet, import). This is your self-recovery database — the more you
   record, the faster you recover in future sessions.
@@ -98,13 +105,9 @@ You are a pragmatic local CAD assistant using build123d.
 {_OPERATIONAL_RULES}
 </operational_rules>
 
-<verification_rules>
-{_VERIFICATION_RULES}
-</verification_rules>
-
-<tool_strategy>
-{_TOOL_STRATEGY}
-</tool_strategy>
+<constraint_rules>
+{_CONSTRAINT_CONTEXT}
+</constraint_rules>
 
 <experience_memory>
 {_EXPERIENCE_MEMORY}
@@ -127,7 +130,9 @@ class PromptCache:
             mtime = -1.0
         if self._content is not None and self._playbook_mtime == mtime:
             return self._content
-        playbook = playbook_path.read_text(encoding="utf-8").strip() if mtime >= 0 else ""
+        playbook = (
+            playbook_path.read_text(encoding="utf-8").strip() if mtime >= 0 else ""
+        )
         self._content = _BASE_PROMPT + _SUFFIX_FORMAT.format(playbook=playbook)
         self._playbook_mtime = mtime
         return self._content

@@ -15,12 +15,34 @@ class FakeOpenRouterClient:
     def chat(self, _messages, _tools):
         self.calls += 1
         if self.calls == 1:
-            return {"choices": [{"message": {"role": "assistant", "tool_calls": [{
-                "id": "call-1", "function": {"name": "file", "arguments": json.dumps({
-                    "operation": "write", "filename": "summary.md", "content": "# Confirmed\n"
-                })}
-            }]}}]}
-        return {"choices": [{"message": {"role": "assistant", "content": "Model plan is ready."}}]}
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "function": {
+                                        "name": "file_write",
+                                        "arguments": json.dumps(
+                                            {
+                                                "filename": "summary.md",
+                                                "content": "# Confirmed\n",
+                                            }
+                                        ),
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
+        return {
+            "choices": [
+                {"message": {"role": "assistant", "content": "Model plan is ready."}}
+            ]
+        }
 
 
 class FakeQuestionClient:
@@ -28,11 +50,29 @@ class FakeQuestionClient:
         pass
 
     def chat(self, _messages, _tools):
-        return {"choices": [{"message": {"role": "assistant", "tool_calls": [{
-            "id": "question-1", "function": {"name": "question", "arguments": json.dumps({
-                "question": "What hole diameter should I use?", "input_type": "number"
-            })}
-        }]}}]}
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "question-1",
+                                "function": {
+                                    "name": "question",
+                                    "arguments": json.dumps(
+                                        {
+                                            "question": "What hole diameter should I use?",
+                                            "input_type": "number",
+                                        }
+                                    ),
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
 
 
 class FakeFinalClient:
@@ -40,7 +80,11 @@ class FakeFinalClient:
         pass
 
     def chat(self, _messages, _tools):
-        return {"choices": [{"message": {"role": "assistant", "content": "Thanks, continuing."}}]}
+        return {
+            "choices": [
+                {"message": {"role": "assistant", "content": "Thanks, continuing."}}
+            ]
+        }
 
 
 class FailedCadRecoveryClient:
@@ -50,10 +94,34 @@ class FailedCadRecoveryClient:
     def chat(self, _messages, _tools):
         self.calls += 1
         if self.calls == 1:
-            return {"choices": [{"message": {"role": "assistant", "tool_calls": [{
-                "id": "cad-1", "function": {"name": "cad", "arguments": '{"operation":"run"}'}
-            }]}}]}
-        return {"choices": [{"message": {"role": "assistant", "content": "I can correct the failed model."}}]}
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "cad-1",
+                                    "function": {
+                                        "name": "cad_build_and_verify",
+                                        "arguments": "{}",
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "I can correct the failed model.",
+                    }
+                }
+            ]
+        }
 
 
 class MultiToolCadClient:
@@ -67,16 +135,31 @@ class MultiToolCadClient:
     def chat(self, messages, _tools):
         self.calls += 1
         if self.calls == 1:
-            return {"choices": [{"message": {"role": "assistant", "tool_calls": [
-                {"id": "cad-1", "function": {"name": "cad", "arguments": '{"operation":"run"}'}},
-                {
-                    "id": "file-1",
-                    "function": {
-                        "name": "file",
-                        "arguments": '{"operation":"read","filename":"summary.md"}',
-                    },
-                },
-            ]}}]}
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "cad-1",
+                                    "function": {
+                                        "name": "cad_build_and_verify",
+                                        "arguments": "{}",
+                                    },
+                                },
+                                {
+                                    "id": "file-1",
+                                    "function": {
+                                        "name": "file_read",
+                                        "arguments": '{"filename":"summary.md"}',
+                                    },
+                                },
+                            ],
+                        }
+                    }
+                ]
+            }
         self.second_messages = list(messages)
         return {"choices": [{"message": {"role": "assistant", "content": "Reviewed."}}]}
 
@@ -88,7 +171,9 @@ class LiveFinalClient:
 
     def chat(self, _messages, _tools):
         self.stream_callback({"type": "content", "delta": "Live response."})
-        return {"choices": [{"message": {"role": "assistant", "content": "Live response."}}]}
+        return {
+            "choices": [{"message": {"role": "assistant", "content": "Live response."}}]
+        }
 
 
 def test_agent_does_not_complete_without_a_new_drawing(tmp_path: Path, monkeypatch):
@@ -97,10 +182,13 @@ def test_agent_does_not_complete_without_a_new_drawing(tmp_path: Path, monkeypat
     project_root = tmp_path / "projects"
     project_dir = project_root / "demo"
     project_dir.mkdir(parents=True)
-    (project_dir / "conversation.jsonl").write_text('', encoding="utf-8")
+    (project_dir / "conversation.jsonl").write_text("", encoding="utf-8")
     events = []
     monkeypatch.setattr(agent.core, "OpenRouterClient", FakeOpenRouterClient)
-    runner = AgentRunner(Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000), lambda kind, data: events.append((kind, data)))
+    runner = AgentRunner(
+        Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000),
+        lambda kind, data: events.append((kind, data)),
+    )
 
     runner._run("demo", "Make a bracket")
 
@@ -118,9 +206,12 @@ def test_question_is_persisted_for_the_next_user_reply(tmp_path: Path, monkeypat
     project_root = tmp_path / "projects"
     project_dir = project_root / "demo"
     project_dir.mkdir(parents=True)
-    (project_dir / "conversation.jsonl").write_text('', encoding="utf-8")
+    (project_dir / "conversation.jsonl").write_text("", encoding="utf-8")
     monkeypatch.setattr(agent.core, "OpenRouterClient", FakeQuestionClient)
-    runner = AgentRunner(Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000), lambda *_: None)
+    runner = AgentRunner(
+        Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000),
+        lambda *_: None,
+    )
 
     runner._run("demo", "Make a bracket")
 
@@ -139,25 +230,37 @@ def test_answer_resumes_a_waiting_agent(tmp_path: Path, monkeypatch):
     project_root = tmp_path / "projects"
     project_dir = project_root / "demo"
     project_dir.mkdir(parents=True)
-    (project_dir / "conversation.jsonl").write_text('', encoding="utf-8")
+    (project_dir / "conversation.jsonl").write_text("", encoding="utf-8")
     monkeypatch.setattr(agent.core, "OpenRouterClient", FakeFinalClient)
-    runner = AgentRunner(Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000), lambda *_: None)
-    runner._waiting_questions["demo"] = {"title": "", "questions": [{"id": "q1", "question": "Hole size?", "input_type": "text"}]}
+    runner = AgentRunner(
+        Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000),
+        lambda *_: None,
+    )
+    runner._waiting_questions["demo"] = {
+        "title": "",
+        "questions": [{"id": "q1", "question": "Hole size?", "input_type": "text"}],
+    }
 
     assert runner.answer("demo", "6 mm")
     runner._thread.join(timeout=1)
     assert runner.waiting_question("demo") is None
-    assert '"content": "6 mm"' in (project_dir / "conversation.jsonl").read_text(encoding="utf-8")
+    assert '"content": "6 mm"' in (project_dir / "conversation.jsonl").read_text(
+        encoding="utf-8"
+    )
 
 
-def test_waiting_question_survives_runner_recreation_and_validates_answer(tmp_path: Path, monkeypatch):
+def test_waiting_question_survives_runner_recreation_and_validates_answer(
+    tmp_path: Path, monkeypatch
+):
     import agent.core
 
     project_root = tmp_path / "projects"
     project_dir = project_root / "demo"
     project_dir.mkdir(parents=True)
     (project_dir / "conversation.jsonl").write_text("", encoding="utf-8")
-    settings = Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000)
+    settings = Settings(
+        project_root, "https://example.test", "test", 1, "127.0.0.1", 5000
+    )
     monkeypatch.setattr(agent.core, "OpenRouterClient", FakeQuestionClient)
     AgentRunner(settings, lambda *_: None)._run("demo", "Make a bracket")
 
@@ -170,20 +273,137 @@ def test_waiting_question_survives_runner_recreation_and_validates_answer(tmp_pa
 
 
 def test_agent_tool_schema_and_dispatch_forbid_export(tmp_path: Path):
-    cad_schema = next(tool for tool in TOOL_SCHEMAS if tool["function"]["name"] == "cad")
-    assert cad_schema["function"]["parameters"]["properties"]["operation"]["enum"] == [
-        "run",
-        "inspect",
-        "render",
-    ]
+    names = {tool["function"]["name"] for tool in TOOL_SCHEMAS}
+    assert "cad_build_and_verify" in names
+    assert {
+        "file_read",
+        "file_write",
+        "file_replace",
+        "file_regex_replace",
+        "terminal_run",
+        "terminal_check",
+        "experience_search",
+        "experience_add",
+        "experience_update",
+    } <= names
+    assert {"cad", "file", "terminal", "experience", "screenshot"}.isdisjoint(names)
+    assert all(
+        "operation" not in schema["function"]["parameters"]["properties"]
+        for schema in TOOL_SCHEMAS
+    )
     project = tmp_path / "demo"
     project.mkdir()
     runner = AgentRunner(
         Settings(tmp_path, "https://example.test", "test", 1, "127.0.0.1", 5000),
         lambda *_: None,
     )
-    with pytest.raises(ValueError, match="Unsupported CAD operation"):
-        runner._execute(ProjectTools(project, lambda *_: None), "demo", "cad", {"operation": "export"})
+    with pytest.raises(AttributeError):
+        runner._execute(
+            ProjectTools(project, lambda *_: None), "demo", "cad_export", {}
+        )
+
+
+def test_successful_tool_result_uses_structured_envelope(tmp_path: Path):
+    project = tmp_path / "demo"
+    project.mkdir()
+    (project / "summary.md").write_text("# Ready\n", encoding="utf-8")
+    runner = AgentRunner(
+        Settings(tmp_path, "https://example.test", "test", 1, "127.0.0.1", 5000),
+        lambda *_: None,
+    )
+    messages = []
+    call = {
+        "id": "read-1",
+        "function": {
+            "name": "file_read",
+            "arguments": '{"filename":"summary.md"}',
+        },
+    }
+
+    runner._process_tool_call(
+        ProjectTools(project, lambda *_: None),
+        "demo",
+        project,
+        call,
+        False,
+        None,
+        None,
+        messages,
+    )
+
+    payload = json.loads(messages[-1]["content"])
+    assert payload == {"ok": True, "tool": "file_read", "data": "# Ready\n"}
+
+
+def test_missing_tool_argument_returns_structured_validation_error(tmp_path: Path):
+    project = tmp_path / "demo"
+    project.mkdir()
+    runner = AgentRunner(
+        Settings(tmp_path, "https://example.test", "test", 1, "127.0.0.1", 5000),
+        lambda *_: None,
+    )
+    messages = []
+    call = {
+        "id": "write-1",
+        "function": {
+            "name": "file_write",
+            "arguments": '{"filename":"model.py"}',
+        },
+    }
+
+    runner._process_tool_call(
+        ProjectTools(project, lambda *_: None),
+        "demo",
+        project,
+        call,
+        False,
+        None,
+        None,
+        messages,
+    )
+
+    payload = json.loads(messages[-1]["content"])
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "VALIDATION_ERROR"
+    assert payload["error"]["phase"] == "validation"
+
+
+def test_malformed_tool_call_returns_structured_error(tmp_path: Path):
+    project = tmp_path / "demo"
+    project.mkdir()
+    runner = AgentRunner(
+        Settings(tmp_path, "https://example.test", "test", 1, "127.0.0.1", 5000),
+        lambda *_: None,
+    )
+    messages = []
+
+    runner._process_tool_call(
+        ProjectTools(project, lambda *_: None),
+        "demo",
+        project,
+        {"function": {}},
+        False,
+        None,
+        None,
+        messages,
+    )
+
+    assert messages[-1]["tool_call_id"].startswith("invalid-")
+    payload = json.loads(messages[-1]["content"])
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "UNKNOWN_TOOL"
+
+
+def test_normalize_tool_calls_repairs_protocol_identifiers():
+    normalized = AgentRunner._normalize_tool_calls(
+        [{"function": {"name": "file_read", "arguments": "{}"}}, "invalid"]
+    )
+
+    assert [call["function"]["name"] for call in normalized] == [
+        "file_read",
+        "unknown_tool",
+    ]
+    assert all(call["id"].startswith("invalid-") for call in normalized)
 
 
 def test_failed_cad_run_is_not_reported_as_completed(tmp_path: Path, monkeypatch):
@@ -209,7 +429,9 @@ def test_failed_cad_run_is_not_reported_as_completed(tmp_path: Path, monkeypatch
     )
 
 
-def test_self_critique_is_added_after_all_tool_results(tmp_path: Path, monkeypatch):
+def test_visual_verification_is_added_after_all_tool_results(
+    tmp_path: Path, monkeypatch
+):
     pytest.importorskip("build123d")
     import agent.core
 
@@ -232,11 +454,19 @@ def test_self_critique_is_added_after_all_tool_results(tmp_path: Path, monkeypat
     runner._run("demo", "Review the part")
 
     messages = MultiToolCadClient.instances[0].second_messages
-    assistant_index = next(index for index, item in enumerate(messages) if item.get("tool_calls"))
-    assert [item["role"] for item in messages[assistant_index + 1 :]] == ["tool", "tool", "user"]
+    assistant_index = next(
+        index for index, item in enumerate(messages) if item.get("tool_calls")
+    )
+    assert [item["role"] for item in messages[assistant_index + 1 :]] == [
+        "tool",
+        "tool",
+        "user",
+    ]
 
 
-def test_protocol_history_is_append_only_and_preserves_tool_call_content(tmp_path: Path, monkeypatch):
+def test_protocol_history_is_append_only_and_preserves_tool_call_content(
+    tmp_path: Path, monkeypatch
+):
     import agent.core
 
     project_root = tmp_path / "projects"
@@ -254,8 +484,50 @@ def test_protocol_history_is_append_only_and_preserves_tool_call_content(tmp_pat
     messages = runner._context(project, "Add a chamfer", [])
 
     assert messages[0]["role"] == "system"
-    assert [message["role"] for message in messages[1:]] == ["user", "assistant", "tool", "assistant", "user"]
-    assert (project / "api_messages.jsonl").read_text(encoding="utf-8").startswith(initial)
+    assert [message["role"] for message in messages[1:]] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+        "user",
+    ]
+    assert (
+        (project / "api_messages.jsonl").read_text(encoding="utf-8").startswith(initial)
+    )
+
+
+def test_constraint_changes_are_appended_without_mutating_system_prefix(
+    tmp_path: Path, monkeypatch
+):
+    import agent.core
+
+    project = tmp_path / "demo"
+    project.mkdir()
+    runner = AgentRunner(
+        Settings(tmp_path, "https://example.test", "test", 1, "127.0.0.1", 5000),
+        lambda *_: None,
+    )
+    summaries = iter(["width = 40", "width = 40", "width = 50"])
+    monkeypatch.setattr(
+        agent.core.ModelConstraintValidator,
+        "constraint_summary",
+        lambda _self: next(summaries),
+    )
+
+    first = runner._context(project, "Create it", [])
+    second = runner._context(project, "Refine it", [])
+    third = runner._context(project, "Refine again", [])
+
+    assert first[0] == second[0] == third[0]
+    assert first[1]["content"].startswith("<runtime_active_constraints>")
+    assert sum(
+        message.get("content", "").startswith("<runtime_active_constraints>")
+        for message in second
+    ) == 1
+    assert sum(
+        message.get("content", "").startswith("<runtime_active_constraints>")
+        for message in third
+    ) == 2
 
 
 def test_configured_tool_call_limit_stops_the_agent_loop(tmp_path: Path, monkeypatch):
@@ -306,7 +578,9 @@ def test_content_delta_is_published_before_stream_end(tmp_path: Path, monkeypatc
     runner._run("demo", "Hello")
 
     event_types = [kind for kind, _data in events]
-    assert event_types.index("agent_content_delta") < event_types.index("agent_stream_end")
+    assert event_types.index("agent_content_delta") < event_types.index(
+        "agent_stream_end"
+    )
 
 
 def test_model_edit_invalidates_registered_preview(tmp_path: Path):
@@ -330,13 +604,15 @@ def test_model_edit_invalidates_registered_preview(tmp_path: Path):
     assert events[-1][0] == "agent_error"
 
 
-def test_failed_rerun_clears_previous_preview_and_blocks_inspect(tmp_path: Path):
+def test_failed_build_clears_preview_and_returns_structured_error(tmp_path: Path):
     project_root = tmp_path / "projects"
     project = project_root / "demo"
     project.mkdir(parents=True)
     (project / "conversation.jsonl").write_text("", encoding="utf-8")
     tools = ProjectTools(project, lambda *_: None)
-    tools.cad.run = lambda: (_ for _ in ()).throw(RuntimeError("broken model"))
+    tools.cad.build_and_verify = lambda: (_ for _ in ()).throw(
+        RuntimeError("broken model")
+    )
     runner = AgentRunner(
         Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000),
         lambda *_: None,
@@ -344,7 +620,7 @@ def test_failed_rerun_clears_previous_preview_and_blocks_inspect(tmp_path: Path)
     messages = []
     run_call = {
         "id": "run-1",
-        "function": {"name": "cad", "arguments": '{"operation":"run"}'},
+        "function": {"name": "cad_build_and_verify", "arguments": "{}"},
     }
 
     preview_id, error, fix_required, _critique, _waiting = runner._process_tool_call(
@@ -355,11 +631,7 @@ def test_failed_rerun_clears_previous_preview_and_blocks_inspect(tmp_path: Path)
     assert error == "broken model"
     assert fix_required
 
-    inspect_call = {
-        "id": "inspect-1",
-        "function": {"name": "cad", "arguments": '{"operation":"inspect"}'},
-    }
-    runner._process_tool_call(
-        tools, "demo", project, inspect_call, True, None, error, messages
-    )
-    assert "cad.inspect was skipped" in messages[-1]["content"]
+    payload = json.loads(messages[-1]["content"])
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "CAD_BUILD_FAILED"
+    assert payload["error"]["phase"] == "build"

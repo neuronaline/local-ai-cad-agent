@@ -17,6 +17,7 @@ from typing import Any, ClassVar
 
 from PIL import Image, UnidentifiedImageError
 
+from agent.revisions import RevisionIntegrityError, RevisionStore
 from agent.sandbox import command as sandbox_command
 from agent.tools.file_tool import FileTool
 
@@ -40,16 +41,25 @@ class CadTool:
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "operation": {"type": "string", "enum": ["run", "inspect", "render"]},
+                    "operation": {
+                        "type": "string",
+                        "enum": ["run", "inspect", "render"],
+                    },
                 },
                 "required": ["operation"],
             },
         },
     }
 
-    def __init__(self, project_dir: Path, publish: Callable[[str, dict], None] | None = None) -> None:
+    def __init__(
+        self,
+        project_dir: Path,
+        publish: Callable[[str, dict], None] | None = None,
+        revisions: RevisionStore | None = None,
+    ) -> None:
         self.project_dir = project_dir.resolve()
         self._publish = publish
+        self._revisions = revisions or RevisionStore(project_dir)
         self._process: subprocess.Popen[str] | None = None
         self._lock = threading.Lock()
         self._screenshot_lock = threading.Lock()
@@ -57,7 +67,9 @@ class CadTool:
         self._screenshot_data: dict[str, str] = {}
         self._pending_screenshot_id: str | None = None
 
-    def _execute(self, export_dir: str | None = None, render: bool = False) -> dict[str, Any]:
+    def _execute(
+        self, export_dir: str | None = None, render: bool = False
+    ) -> dict[str, Any]:
         model_path = self.project_dir / "model.py"
         if not model_path.exists():
             raise ValueError("model.py does not exist yet.")
@@ -69,7 +81,9 @@ class CadTool:
         target: Path | None = None
         if export_dir is not None:
             target = (self.project_dir / export_dir).resolve()
-            if target == self.project_dir or not target.is_relative_to(self.project_dir):
+            if target == self.project_dir or not target.is_relative_to(
+                self.project_dir
+            ):
                 raise ValueError("Export directory must be inside the active project.")
             target.mkdir(parents=True, exist_ok=True)
             code += (
@@ -110,35 +124,74 @@ class CadTool:
             except subprocess.TimeoutExpired as error:
                 self._terminate(process, force=True)
                 process.communicate()
-                raise RuntimeError("CAD operation timed out after 120 seconds.") from error
+                self._record_build_failure("CAD operation timed out after 120 seconds.")
+                raise RuntimeError(
+                    "CAD operation timed out after 120 seconds."
+                ) from error
             finally:
                 with self._lock:
                     self._process = None
             if process.returncode:
                 detail = self._failure_detail(stderr or stdout)
+                self._record_build_failure(detail)
                 raise RuntimeError(f"CAD execution failed:\n{detail}")
 
             metrics_path = workspace / ".cad_metrics.json"
             preview_path = workspace / "preview.stl"
             if not metrics_path.is_file() or not preview_path.is_file():
-                raise RuntimeError("CAD execution did not produce preview and geometry metrics.")
+                error_msg = (
+                    "CAD execution did not produce preview and geometry metrics."
+                )
+                self._record_build_failure(error_msg)
+                raise RuntimeError(error_msg)
             cached = json.loads(metrics_path.read_text(encoding="utf-8"))
-            if not isinstance(cached, dict) or not isinstance(cached.get("metrics"), dict):
-                raise TypeError("CAD geometry metrics are malformed.")
+            if not isinstance(cached, dict) or not isinstance(
+                cached.get("metrics"), dict
+            ):
+                error_msg = "CAD geometry metrics are malformed."
+                self._record_build_failure(error_msg)
+                raise TypeError(error_msg)
             self._atomic_copy(preview_path, self.project_dir / "preview.stl")
             if render:
                 render_path = workspace / "render.png"
                 if not render_path.is_file() or render_path.stat().st_size == 0:
-                    raise RuntimeError("CAD execution did not produce a render.")
+                    error_msg = "CAD execution did not produce a render."
+                    self._record_build_failure(error_msg)
+                    raise RuntimeError(error_msg)
                 self._atomic_copy(render_path, self.project_dir / "render.png")
             if target is not None:
                 for name in ("model.step", "model.stl"):
                     artifact = workspace / "output" / name
                     if not artifact.is_file() or artifact.stat().st_size == 0:
-                        raise RuntimeError(f"CAD execution did not produce {name}.")
+                        error_msg = f"CAD execution did not produce {name}."
+                        self._record_build_failure(error_msg)
+                        raise RuntimeError(error_msg)
                     self._atomic_copy(artifact, target / name)
             self._atomic_copy(metrics_path, self.project_dir / ".cad_metrics.json")
+            self._record_build_success(cached["metrics"])
             return cached["metrics"]
+
+    def _record_build_success(self, metrics: dict[str, Any]) -> None:
+        """Record a successful build against the active revision."""
+        try:
+            head = self._revisions.head()
+            if head is None:
+                return
+            self._revisions.record_build_success(
+                head.id, metrics, self.project_dir / "preview.stl"
+            )
+        except (OSError, RevisionIntegrityError):
+            pass  # Best-effort; don't block CAD results on revision issues.
+
+    def _record_build_failure(self, error: str) -> None:
+        """Record a failed build against the active revision."""
+        try:
+            head = self._revisions.head()
+            if head is None:
+                return
+            self._revisions.record_build_failure(head.id, error)
+        except (OSError, RevisionIntegrityError):
+            pass  # Best-effort; don't block CAD errors on revision issues.
 
     @staticmethod
     def _atomic_copy(source: Path, target: Path) -> None:
@@ -173,7 +226,7 @@ class CadTool:
                 continue
             if in_traceback:
                 if line.startswith("  File "):
-                    if 'runner.py' not in line and '.cad_runner' not in line:
+                    if "runner.py" not in line and ".cad_runner" not in line:
                         frames.append(line)
                         if i + 1 < len(lines) and lines[i + 1].startswith("    "):
                             frames.append(lines[i + 1])
@@ -186,12 +239,23 @@ class CadTool:
                     frames.append(line)
                     if i + 1 < len(lines):
                         frames.append(lines[i + 1])
-            final = next((l for l in reversed(lines) if l.strip()), "Unknown CAD error.")
+            final = next(
+                (l for l in reversed(lines) if l.strip()), "Unknown CAD error."
+            )
             frames.append(final)
         return "\n".join(dict.fromkeys(frames))[-2000:]
 
     def run(self) -> dict[str, Any]:
         return self._execute()
+
+    def build_and_verify(self) -> dict[str, Any]:
+        """Build once, validate metrics, and produce both preview and render."""
+        metrics = self._execute(render=True)
+        return {
+            "metrics": metrics,
+            "preview": "preview.stl",
+            "render": "render.png",
+        }
 
     def execute(self, args: dict) -> tuple[str, bool]:
         """Dispatch CAD operations. Returns (result_json, waiting=False)."""
@@ -206,14 +270,18 @@ class CadTool:
         metrics_path = self.project_dir / ".cad_metrics.json"
         info: dict[str, Any] = {}
         if model_path.is_file():
-            info["model_lines"] = len(model_path.read_text(encoding="utf-8").splitlines())
+            info["model_lines"] = len(
+                model_path.read_text(encoding="utf-8").splitlines()
+            )
             info["render_available"] = (self.project_dir / "render.png").is_file()
             info["preview_available"] = (self.project_dir / "preview.stl").is_file()
         if model_path.is_file() and metrics_path.is_file():
             try:
                 cached = json.loads(metrics_path.read_text(encoding="utf-8"))
                 digest = hashlib.sha256(model_path.read_bytes()).hexdigest()
-                if cached.get("model_sha256") == digest and isinstance(cached.get("metrics"), dict):
+                if cached.get("model_sha256") == digest and isinstance(
+                    cached.get("metrics"), dict
+                ):
                     info |= cached["metrics"]
                     return info
             except (OSError, json.JSONDecodeError, AttributeError):
@@ -232,7 +300,9 @@ class CadTool:
         try:
             metrics = self._execute(export_dir=export_dir, render=True)
         except RuntimeError as error:
-            raise RuntimeError(str(error).replace("CAD execution", "CAD finalization")) from error
+            raise RuntimeError(
+                str(error).replace("CAD execution", "CAD finalization")
+            ) from error
         export_step_path = self.project_dir / export_dir / "model.step"
         export_stl_path = self.project_dir / export_dir / "model.stl"
         if not export_step_path.is_file() or not export_stl_path.is_file():
@@ -258,7 +328,16 @@ class CadTool:
     def screenshot(self, view: str, proximity: float = 1.0) -> dict[str, str]:
         if not self._publish:
             raise RuntimeError("Screenshot capture is not available in this context.")
-        if view not in {"front", "back", "top", "bottom", "left", "right", "isometric", "current"}:
+        if view not in {
+            "front",
+            "back",
+            "top",
+            "bottom",
+            "left",
+            "right",
+            "isometric",
+            "current",
+        }:
             raise ValueError("Unsupported screenshot view.")
         proximity = float(proximity)
         if not 0.1 <= proximity <= 5:
@@ -270,12 +349,15 @@ class CadTool:
             self._screenshot_event.clear()
             self._screenshot_data.clear()
             self._pending_screenshot_id = request_id
-        self._publish("screenshot_request", {
-            "project": self.project_dir.name,
-            "request_id": request_id,
-            "view": view,
-            "proximity": proximity,
-        })
+        self._publish(
+            "screenshot_request",
+            {
+                "project": self.project_dir.name,
+                "request_id": request_id,
+                "view": view,
+                "proximity": proximity,
+            },
+        )
         if not self._screenshot_event.wait(timeout=30):
             with self._screenshot_lock:
                 self._pending_screenshot_id = None
@@ -295,14 +377,18 @@ class CadTool:
                 raise ValueError("Screenshot exceeds 5 MB.")
             with Image.open(BytesIO(raw)) as image:
                 if image.format != "PNG" or image.width > 4096 or image.height > 4096:
-                    raise ValueError("Screenshot must be a PNG no larger than 4096 × 4096.")
+                    raise ValueError(
+                        "Screenshot must be a PNG no larger than 4096 × 4096."
+                    )
                 image.verify()
             path.write_bytes(raw)
         except (ValueError, UnidentifiedImageError, OSError) as error:
             raise RuntimeError(f"Failed to save screenshot: {error}") from error
         return {"screenshot": "screenshot.png", "view": view, "proximity": proximity}
 
-    def receive_screenshot(self, request_id: str, image_base64: str = "", error: str = "") -> bool:
+    def receive_screenshot(
+        self, request_id: str, image_base64: str = "", error: str = ""
+    ) -> bool:
         with self._screenshot_lock:
             if request_id != self._pending_screenshot_id:
                 return False

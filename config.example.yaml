@@ -2,18 +2,19 @@
 workspace_root: ~/CAD-Agent-Projects
 
 agent:
-  tool_call_limit: 12
+  tool_call_limit: 30
+  revision_retention_count: 0  # 0 keeps all model revisions
 
 openrouter:
   base_url: https://openrouter.ai/api/v1
-  model: openai/gpt-4o-mini
+  model: google/gemini-3.6-flash
   timeout_seconds: 60
   app_title: Local AI CAD Agent
   app_url: ""
   session_prefix: local-ai-cad-agent
-  reasoning_effort: ""
-  provider: ""
-  force_provider: false
+  reasoning_effort: "medium"
+  provider: "google-vertex/global"
+  force_provider: true
   enable_anthropic_cache: true
 
 server:

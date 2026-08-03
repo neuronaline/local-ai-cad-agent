@@ -27,6 +27,7 @@ class Settings:
     openrouter_force_provider: bool = False
     show_info_messages: bool = True
     agent_tool_call_limit: int = 12
+    revision_retention_count: int = 0  # 0 = unlimited, >0 = keep at most N revisions
 
 def _read_yaml(path: Path) -> dict[str, Any]:
     if not path.exists():
@@ -72,6 +73,7 @@ def load_settings(project_root: Path | None = None, home: Path | None = None) ->
         openrouter_force_provider=bool(openrouter.get("force_provider", False)),
         show_info_messages=bool(ui.get("show_info_messages", True)),
         agent_tool_call_limit=_positive_int(agent.get("tool_call_limit", 12), "agent.tool_call_limit"),
+        revision_retention_count=_non_negative_int(agent.get("revision_retention_count", 0), "agent.revision_retention_count"),
     )
 
 
@@ -94,4 +96,14 @@ def _positive_int(value: Any, name: str) -> int:
         raise ValueError(f"{name} must be a positive integer.") from error
     if number < 1:
         raise ValueError(f"{name} must be a positive integer.")
+    return number
+
+
+def _non_negative_int(value: Any, name: str) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be a non-negative integer.") from error
+    if number < 0:
+        raise ValueError(f"{name} must be a non-negative integer.")
     return number

@@ -776,6 +776,390 @@ async function initProject() {
 initProject().catch(error => addMessage(error.message, 'error'));
 setInterval(syncCurrentPreview, 1500);
 
+// ── History Drawer ──
+
+const historyBtn = document.querySelector('#history-btn');
+const historyDrawer = document.querySelector('#history-drawer');
+const historyClose = document.querySelector('#history-close');
+const historyContent = document.querySelector('#history-content');
+
+function openHistory() {
+  historyDrawer.hidden = false;
+  loadRevisions();
+}
+
+function closeHistory() {
+  historyDrawer.hidden = true;
+}
+
+historyBtn.addEventListener('click', openHistory);
+historyClose.addEventListener('click', closeHistory);
+
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && !historyDrawer.hidden) closeHistory();
+});
+
+function formatRevisionTime(iso) {
+  if (!iso) return '';
+  try {
+    const d = new Date(iso);
+    return d.toLocaleString(undefined, {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'});
+  } catch {
+    return iso;
+  }
+}
+
+function formatOrigin(origin) {
+  if (!origin) return '';
+  const kind = origin.kind || '';
+  const labels = {agent_edit: 'Edit', restore: 'Restore', import: 'Import', recovery: 'Recovery'};
+  let label = labels[kind] || kind;
+  if (origin.operation && kind === 'agent_edit') label += ` (${origin.operation})`;
+  return label;
+}
+
+async function loadRevisions(before = '') {
+  if (!before) historyContent.innerHTML = '<div class="history-empty">Loading…</div>';
+  try {
+    const query = new URLSearchParams({limit: '50'});
+    if (before) query.set('before', before);
+    const data = await api(`/api/projects/${encodeURIComponent(currentProject)}/revisions?${query}`);
+    if (!data.revisions || !data.revisions.length) {
+      if (before) return;
+      historyContent.innerHTML = `
+        <div class="history-empty">No revisions yet. Edit model.py to create one.</div>
+        <div class="history-info">
+          The agent may edit only part of model.py; each preview rebuilds the
+          complete script in a fresh sandbox.
+        </div>`;
+      loadConstraintPanel();
+      return;
+    }
+    const constraintSection = historyContent.querySelector('.constraint-section');
+    constraintSection?.remove();
+    historyContent.querySelector('.revision-more')?.remove();
+    if (!before) {
+      historyContent.replaceChildren();
+      const info = document.createElement('div');
+      info.className = 'history-info';
+      info.textContent = 'The agent may edit only part of model.py; each preview rebuilds the complete script in a fresh sandbox.';
+      historyContent.append(info);
+    }
+    for (const rev of data.revisions) {
+      historyContent.append(createRevisionCard(rev));
+    }
+    if (data.next_before) {
+      const more = document.createElement('button');
+      more.className = 'quiet revision-more';
+      more.textContent = 'Load older revisions';
+      more.addEventListener('click', () => loadRevisions(data.next_before));
+      historyContent.append(more);
+    }
+    if (constraintSection) historyContent.append(constraintSection);
+    else loadConstraintPanel();
+  } catch (error) {
+    const item = document.createElement('div');
+    item.className = 'history-error';
+    item.textContent = error.message;
+    historyContent.replaceChildren(item);
+  }
+}
+
+function createRevisionCard(rev) {
+  const card = document.createElement('div');
+  card.className = 'revision-item';
+  if (rev.is_active) card.classList.add('active');
+  if (rev.is_last_known_good) card.classList.add('lkg');
+
+  const badges = document.createElement('div');
+  badges.className = 'revision-badges';
+  if (rev.is_active) badges.append(makeBadge('active', 'Active'));
+  if (rev.is_last_known_good) badges.append(makeBadge('lkg', 'Last Good'));
+  badges.append(makeBadge(rev.build_status, rev.build_status.replace('_', ' ')));
+
+  const time = document.createElement('span');
+  time.className = 'revision-time';
+  time.textContent = formatRevisionTime(rev.created_at);
+
+  const top = document.createElement('div');
+  top.className = 'revision-top';
+  top.append(badges, time);
+
+  const origin = document.createElement('div');
+  origin.className = 'revision-origin';
+  origin.textContent = formatOrigin(rev.origin);
+
+  card.append(top, origin);
+
+  if (rev.metrics) {
+    const m = rev.metrics;
+    const dims = m.dimensions_mm || {};
+    const metrics = document.createElement('div');
+    metrics.className = 'revision-metrics';
+    metrics.textContent = [
+      m.solid_count != null ? `${m.solid_count} solid(s)` : '',
+      m.volume_mm3 != null ? `${m.volume_mm3} mm³` : '',
+      dims.x ? `${dims.x}×${dims.y}×${dims.z} mm` : '',
+    ].filter(Boolean).join(' · ');
+    card.append(metrics);
+  }
+
+  if (rev.error) {
+    const err = document.createElement('div');
+    err.className = 'revision-metrics';
+    err.style.color = '#ff9eaa';
+    err.textContent = rev.error.slice(0, 200);
+    card.append(err);
+  }
+
+  // Diff (lazy-loaded on click).
+  const diffContainer = document.createElement('div');
+  diffContainer.className = 'revision-diff';
+  diffContainer.hidden = true;
+  card.append(diffContainer);
+
+  const actions = document.createElement('div');
+  actions.className = 'revision-actions';
+
+  const diffBtn = document.createElement('button');
+  diffBtn.className = 'quiet';
+  diffBtn.textContent = 'Diff';
+  diffBtn.addEventListener('click', async () => {
+    if (!diffContainer.hidden) {
+      diffContainer.hidden = true;
+      return;
+    }
+    diffContainer.hidden = false;
+    diffContainer.textContent = 'Loading diff…';
+    try {
+      const data = await api(`/api/projects/${encodeURIComponent(currentProject)}/revisions/${rev.id}/diff`);
+      diffContainer.textContent = data.diff || '(no changes)';
+      diffContainer.classList.toggle('truncated', data.truncated);
+    } catch (error) {
+      diffContainer.textContent = error.message;
+    }
+  });
+  actions.append(diffBtn);
+
+  if (!rev.is_active) {
+    const restoreBtn = document.createElement('button');
+    restoreBtn.className = 'quiet';
+    restoreBtn.textContent = 'Restore';
+    if (rev.build_status === 'failed' || rev.build_status === 'not_run') {
+      restoreBtn.title = 'This revision has no successful build; restore at your own risk.';
+    }
+    restoreBtn.addEventListener('click', () => restoreRevision(rev.id, rev.build_status));
+    actions.append(restoreBtn);
+  }
+
+  if (rev.is_last_known_good && !rev.is_active) {
+    const lkgBtn = document.createElement('button');
+    lkgBtn.textContent = 'Restore Last Good';
+    lkgBtn.addEventListener('click', () => restoreRevision(rev.id, 'succeeded'));
+    actions.prepend(lkgBtn);
+  }
+
+  card.append(actions);
+  return card;
+}
+
+function makeBadge(status, label) {
+  const badge = document.createElement('span');
+  badge.className = `rev-badge ${status}`;
+  badge.textContent = label;
+  return badge;
+}
+
+// ── Constraint Panel ──
+
+async function loadConstraintPanel() {
+  const section = document.createElement('div');
+  section.className = 'constraint-section';
+  section.innerHTML = `
+    <h3 class="constraint-heading">Protected</h3>
+    <p class="constraint-note">Pins protect named source definitions, not arbitrary mesh faces.</p>
+    <div class="constraint-loading">Loading…</div>`;
+  historyContent.append(section);
+
+  try {
+    const data = await api(`/api/projects/${encodeURIComponent(currentProject)}/constraints`);
+    const constraints = data.constraints || [];
+    const targets = data.targets || {parameters: [], features: []};
+    const container = section.querySelector('.constraint-loading');
+    container.replaceChildren();
+    container.className = 'constraint-list';
+
+    if (!constraints.length) {
+      const empty = document.createElement('div');
+      empty.className = 'constraint-empty';
+      empty.textContent = 'No parameters or features are pinned.';
+      container.append(empty);
+    }
+
+    for (const c of constraints) {
+      const row = document.createElement('div');
+      row.className = 'constraint-row';
+      row.dataset.constraintId = c.id;
+
+      const badge = document.createElement('span');
+      badge.className = `rev-badge ${c.kind === 'parameter' ? 'active' : 'lkg'}`;
+      badge.textContent = c.kind === 'parameter' ? 'param' : 'feature';
+      row.append(badge);
+
+      const name = document.createElement('span');
+      name.className = 'constraint-name';
+      name.textContent = c.name;
+      row.append(name);
+
+      const unpin = document.createElement('button');
+      unpin.className = 'quiet';
+      unpin.textContent = 'Unpin';
+      unpin.style.fontSize = '.68rem';
+      unpin.style.padding = '.2rem .4rem';
+      unpin.addEventListener('click', () => unpinConstraint(c.id, c.name));
+      row.append(unpin);
+
+      container.append(row);
+    }
+
+    const available = [
+      ...(targets.parameters || []).filter(target => !target.pinned).map(target => ({
+        ...target,
+        kind: 'parameter',
+        detail: target.value,
+      })),
+      ...(targets.features || []).filter(target => !target.pinned).map(target => ({
+        ...target,
+        kind: 'source_feature',
+        detail: `lines ${target.start_line}–${target.end_line}`,
+      })),
+    ];
+
+    if (available.length) {
+      const heading = document.createElement('h4');
+      heading.className = 'constraint-subheading';
+      heading.textContent = 'Available to protect';
+      container.append(heading);
+    }
+
+    for (const target of available) {
+      const row = document.createElement('div');
+      row.className = 'constraint-row available';
+
+      const badge = document.createElement('span');
+      badge.className = `rev-badge ${target.kind === 'parameter' ? 'active' : 'lkg'}`;
+      badge.textContent = target.kind === 'parameter' ? 'param' : 'feature';
+
+      const label = document.createElement('span');
+      label.className = 'constraint-name';
+      label.textContent = target.name;
+      if (target.detail) label.title = target.detail;
+
+      const pin = document.createElement('button');
+      pin.className = 'quiet';
+      pin.textContent = 'Pin';
+      pin.addEventListener('click', () => pinConstraint(target.kind, target.name));
+
+      row.append(badge, label, pin);
+      container.append(row);
+    }
+
+    if (!available.length && !constraints.length) {
+      const hint = document.createElement('div');
+      hint.className = 'constraint-empty';
+      hint.textContent = 'Add typed parameters or named cad-feature regions to model.py to make them protectable.';
+      container.append(hint);
+    }
+  } catch (error) {
+    const container = section.querySelector('.constraint-loading, .constraint-list');
+    if (container) {
+      container.className = 'history-error';
+      container.textContent = error.message;
+    }
+  }
+}
+
+async function reloadConstraintPanel() {
+  historyContent.querySelector('.constraint-section')?.remove();
+  await loadConstraintPanel();
+}
+
+async function pinConstraint(kind, name) {
+  try {
+    await api(`/api/projects/${encodeURIComponent(currentProject)}/constraints`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({kind, name}),
+    });
+    await reloadConstraintPanel();
+  } catch (error) {
+    addMessage(`Pin failed: ${error.message}`, 'error');
+  }
+}
+
+async function unpinConstraint(id, name) {
+  if (!confirm(`Remove pin from '${name}'? The agent will be able to modify it again.`)) return;
+  try {
+    await api(`/api/projects/${encodeURIComponent(currentProject)}/constraints/${id}`, {
+      method: 'DELETE',
+      headers: {'Content-Type': 'application/json'},
+    });
+    // Reload the constraint panel.
+    await reloadConstraintPanel();
+  } catch (error) {
+    addMessage(`Unpin failed: ${error.message}`, 'error');
+  }
+}
+
+// ── Restore ──
+
+function setRestoring(active, drawerButtons) {
+  drawerButtons.forEach(button => { button.disabled = active; });
+  chatForm.querySelector('button[type="submit"]').disabled = active;
+  message.disabled = active;
+  attachments.disabled = active;
+  finalizeBtn.disabled = active;
+  historyBtn.disabled = active;
+  setThinking(active);
+  if (active) stopButton.hidden = true;
+}
+
+async function restoreRevision(revisionId, buildStatus) {
+  const warning = buildStatus === 'failed' || buildStatus === 'not_run'
+    ? '\n\nThis revision has no successful build. Restore anyway?'
+    : '';
+  if (!confirm(`Restore this revision? It will rebuild in the sandbox.${warning}`)) return;
+
+  // Disable conflicting actions during restore.
+  const buttons = historyContent.querySelectorAll('button');
+  setRestoring(true, buttons);
+
+  try {
+    const result = await api(`/api/projects/${encodeURIComponent(currentProject)}/revisions/${revisionId}/restore`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+    });
+    if (result.build_status === 'failed') {
+      addMessage(`Source restored, but CAD rebuild failed. The displayed preview may be from an older model: ${result.error}`, 'error');
+    } else {
+      addMessage(`Restored revision ${result.revision_id.slice(0, 8)} and rebuilt successfully.`, 'tool');
+    }
+    closeHistory();
+  } catch (error) {
+    addMessage(`Restore failed: ${error.message}`, 'error');
+  } finally {
+    setRestoring(false, buttons);
+  }
+}
+
+function refreshHistoryIfOpen() {
+  if (!historyDrawer.hidden) loadRevisions();
+}
+
+onProjectEvent('revision_updated', refreshHistoryIfOpen);
+onProjectEvent('constraint_added', refreshHistoryIfOpen);
+onProjectEvent('constraint_removed', refreshHistoryIfOpen);
+
 // Example prompt clicks — place text into input without sending.
 feed.addEventListener('click', event => {
   const btn = event.target.closest('.example-prompt');
