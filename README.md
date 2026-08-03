@@ -29,18 +29,12 @@ A local-first web app that lets you **chat with an AI agent to create parametric
 ## 🚀 Quick Start
 
 ```bash
-# Install system dependencies
-sudo apt install bubblewrap libseccomp2
-
-# Clone and set up
+# Clone and install dependencies
 git clone https://github.com/neuronaline/local-ai-cad-agent.git
 cd local-ai-cad-agent
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+./install.sh
 
-# Configure
-cp .env.example .env          # add your OPENROUTER_API_KEY
-cp config.example.yaml config.yaml
+# Add your OPENROUTER_API_KEY to .env (or use the setup page on first launch)
 
 # Run
 ./run.sh
