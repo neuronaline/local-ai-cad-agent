@@ -186,6 +186,14 @@ export class CadViewer {
     return dataUrl.replace(/^data:image\/png;base64,/, '');
   }
 
+  getCameraState() {
+    const round = value => Math.round(value * 1000) / 1000;
+    return {
+      position: [this.camera.position.x, this.camera.position.y, this.camera.position.z].map(round),
+      target: [this.controls.target.x, this.controls.target.y, this.controls.target.z].map(round),
+    };
+  }
+
   _showSpinner() {
     if (!this._spinner) {
       this._spinner = document.createElement('div');

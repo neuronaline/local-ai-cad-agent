@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import platform
 import threading
 import uuid
 from collections.abc import Callable
@@ -14,6 +15,9 @@ from agent.constraints import ConstraintStore, ModelConstraintValidator
 from agent.images import as_openrouter_image
 from agent.openrouter import OpenRouterClient, sanitize_assistant_message
 from agent.prompt import get_system_prompt
+from agent.quality.errors import normalize_error
+from agent.quality.models import Attempt, EnvironmentInfo, ModelInfo
+from agent.quality.store import QualityError, QualityStore
 from agent.revisions import RevisionStore
 from agent.settings import Settings
 from agent.tool_results import failure as tool_failure
@@ -69,6 +73,10 @@ class AgentRunner:
         self._waiting_questions: dict[str, dict[str, object]] = {}
         self._preview_attempts: dict[tuple[str, str], dict[str, str]] = {}
         self._pending_completions: dict[str, dict[str, str]] = {}
+        # Active quality run bookkeeping so preview-time finalization can reach
+        # the run record after the agent thread has returned.
+        self._run_ids: dict[str, str] = {}
+        self._quality_stores: dict[str, QualityStore] = {}
 
     def is_running(self) -> bool:
         return bool(self._thread and self._thread.is_alive())
@@ -120,6 +128,16 @@ class AgentRunner:
                 should_publish = True
         if should_publish:
             self.publish("agent_error", {"project": project, "message": error_message})
+            self._finalize_run(
+                project,
+                "failed",
+                {
+                    "code": "PREVIEW_LOAD_FAILED",
+                    "category": "Delivery",
+                    "phase": "delivery",
+                    "message": error_message,
+                },
+            )
         return True
 
     def waiting_question(self, project: str) -> dict[str, object] | None:
@@ -205,6 +223,7 @@ class AgentRunner:
             (
                 self.settings.workspace_root / target_project / ".agent_state.json"
             ).unlink(missing_ok=True)
+            self._finalize_run(target_project, "stopped")
 
     def _run(
         self,
@@ -224,7 +243,41 @@ class AgentRunner:
         tools = ProjectTools(project_dir, self.publish, self.settings)
         with self._lock:
             self._active_tools = tools
+        quality: QualityStore | None = None
+        run_id: str | None = None
+        run_outcome: str | None = None
+        run_error: dict | None = None
         try:
+            if self.settings.quality_enabled:
+                quality = QualityStore(project_dir)
+                quality.reconcile()
+                run = quality.start_run(
+                    project=project,
+                    request_message_id=uuid.uuid4().hex,
+                    request_sha256=hashlib.sha256(
+                        message.encode("utf-8")
+                    ).hexdigest(),
+                    system_prompt_sha256=hashlib.sha256(
+                        get_system_prompt().encode("utf-8")
+                    ).hexdigest(),
+                    model=ModelInfo(
+                        provider=self.settings.openrouter_provider,
+                        name=self.settings.openrouter_model,
+                        reasoning_effort=self.settings.openrouter_reasoning_effort,
+                    ),
+                    environment=EnvironmentInfo(
+                        python_version=platform.python_version(),
+                        build123d_version=self._build123d_version(),
+                    ),
+                )
+                run_id = run.run_id
+                with self._lock:
+                    self._run_ids[project] = run_id
+                    self._quality_stores[project] = quality
+                self.publish(
+                    "quality_run_started",
+                    {"project": project, "run_id": run_id},
+                )
             messages = self._context(project_dir, message, image_paths or [])
             preview_id: str | None = None
             cad_error: str | None = None
@@ -237,6 +290,7 @@ class AgentRunner:
             client.session_id = f"{self.settings.openrouter_session_prefix}:{project}"
             for _ in range(self.settings.agent_tool_call_limit):
                 if self._stop_event.is_set():
+                    run_outcome = "stopped"
                     self.publish(
                         "agent_status",
                         {
@@ -288,6 +342,13 @@ class AgentRunner:
                     content = assistant_message.get("content") or "Task completed."
                     if not preview_id:
                         if cad_error:
+                            run_outcome = "failed"
+                            run_error = {
+                                "code": "CAD_BUILD_FAILED",
+                                "category": "Execution",
+                                "phase": "execution",
+                                "message": cad_error,
+                            }
                             self.publish(
                                 "agent_error",
                                 {
@@ -308,6 +369,13 @@ class AgentRunner:
                                 messages.append(reminder)
                                 self._append_api_message(project_dir, reminder)
                                 continue
+                            run_outcome = "failed"
+                            run_error = {
+                                "code": "CAD_BUILD_FAILED",
+                                "category": "Execution",
+                                "phase": "execution",
+                                "message": "the task did not produce a new CAD preview",
+                            }
                             self.publish(
                                 "agent_error",
                                 {
@@ -341,6 +409,8 @@ class AgentRunner:
                         preview_id,
                         cad_error,
                         messages,
+                        run_id=run_id,
+                        quality=quality,
                     )
                     if needs_critique:
                         needs_visual_review = True
@@ -376,14 +446,21 @@ class AgentRunner:
                     critique = self._verification_context(project, project_dir)
                     messages.append(critique)
                     self._append_api_message(project_dir, critique)
+            run_outcome = "failed"
+            run_error = {
+                "code": "TOOL_CALL_LIMIT",
+                "category": "System",
+                "phase": "execution",
+                "message": (
+                    f"Tool-call limit ({self.settings.agent_tool_call_limit}) reached; "
+                    "increase agent.tool_call_limit or continue with a narrower request."
+                ),
+            }
             self.publish(
                 "agent_error",
                 {
                     "project": project,
-                    "message": (
-                        f"Tool-call limit ({self.settings.agent_tool_call_limit}) reached; "
-                        "increase agent.tool_call_limit or continue with a narrower request."
-                    ),
+                    "message": run_error["message"],
                 },
             )
         except Exception as error:  # noqa: BLE001 - Surface all agent failures to the local UI.
@@ -394,6 +471,7 @@ class AgentRunner:
             # Log the full traceback server-side.
             traceback.print_exc()
             if self._stop_event.is_set():
+                run_outcome = "stopped"
                 self.publish(
                     "agent_status",
                     {
@@ -403,6 +481,13 @@ class AgentRunner:
                     },
                 )
             else:
+                run_outcome = "failed"
+                run_error = {
+                    "code": "UNKNOWN_ERROR",
+                    "category": "System",
+                    "phase": "execution",
+                    "message": detail,
+                }
                 self.publish(
                     "agent_error",
                     {
@@ -415,6 +500,19 @@ class AgentRunner:
                 self._active_tools = None
                 if self._active_project == project:
                     self._active_project = None
+            if run_id is not None and quality is not None:
+                try:
+                    current = quality.get_run(run_id)
+                except QualityError:
+                    current = None
+                if current is not None and current.status == "running":
+                    # A running run left behind by this thread is either
+                    # stopped/failed here, or awaiting preview confirmation —
+                    # in which case `_complete`/`confirm_preview` finalizes it.
+                    if run_outcome == "stopped" or self._stop_event.is_set():
+                        self._finalize_run(project, "stopped")
+                    elif run_outcome == "failed":
+                        self._finalize_run(project, "failed", run_error)
 
     def _context(
         self, project_dir: Path, message: str, image_paths: list[Path]
@@ -675,8 +773,14 @@ class AgentRunner:
         prev_preview_id: str | None,
         cad_error: str | None,
         messages: list[dict],
+        run_id: str | None = None,
+        quality: QualityStore | None = None,
     ) -> tuple[str | None, str | None, bool, bool, bool]:
         """Execute a single tool call, update state, and feed visual results back.
+
+        When a quality run is active, every CAD build creates one immutable
+        attempt record: started before execution and completed with the tool
+        result envelope (success or classified failure).
 
         Returns:
             (preview_id, cad_error, cad_fix_required, needs_visual_review, waiting)
@@ -691,6 +795,29 @@ class AgentRunner:
         preview_id = prev_preview_id
         waiting = False
         arguments: dict = {}
+        attempt: Attempt | None = None
+        if run_id is not None and quality is not None and name in (
+            "cad",
+            "cad_build_and_verify",
+        ):
+            try:
+                probe = json.loads(function.get("arguments") or "{}")
+                probe = probe if isinstance(probe, dict) else {}
+            except json.JSONDecodeError:
+                probe = {}
+            if self._is_cad_build(name, probe):
+                try:
+                    head = tools.revisions.head()
+                    revision_id = head.id if head is not None else None
+                except Exception:  # noqa: BLE001 - Revision linkage is best-effort.
+                    revision_id = None
+                attempt = quality.start_attempt(
+                    run_id,
+                    revision_id=revision_id,
+                    source_sha256=self._model_digest(project_dir),
+                    tool_call_id=call_id,
+                    phase="execution",
+                )
         try:
             argument_text = (
                 function.get("arguments") if isinstance(function, dict) else ""
@@ -730,6 +857,30 @@ class AgentRunner:
                 preview_id = self._register_preview(project, project_dir)
                 cad_error = None
                 cad_fix_required = False
+                if attempt is not None:
+                    metrics = raw_result if isinstance(raw_result, dict) else None
+                    if isinstance(metrics, dict) and isinstance(
+                        metrics.get("metrics"), dict
+                    ):
+                        metrics = metrics["metrics"]
+                    attempt = quality.complete_attempt(
+                        attempt.run_id,
+                        attempt.attempt_id,
+                        status="succeeded",
+                        phase="kernel",
+                        metrics=metrics,
+                        artifact_paths=self._attempt_artifact_paths(project_dir),
+                    )
+                    self.publish(
+                        "quality_attempt_completed",
+                        {
+                            "project": project,
+                            "run_id": attempt.run_id,
+                            "attempt_id": attempt.attempt_id,
+                            "status": "succeeded",
+                            "phase": attempt.phase,
+                        },
+                    )
                 self.publish(
                     "preview_updated",
                     {"project": project, "preview_id": preview_id},
@@ -744,6 +895,28 @@ class AgentRunner:
                 cad_error = str(error)
                 cad_fix_required = True
                 preview_id = None
+            if attempt is not None:
+                attempt_error = normalize_error(
+                    json.loads(result).get("error")
+                )
+                attempt = quality.complete_attempt(
+                    attempt.run_id,
+                    attempt.attempt_id,
+                    status="failed",
+                    phase=attempt_error["phase"],
+                    error=attempt_error,
+                )
+                self.publish(
+                    "quality_attempt_completed",
+                    {
+                        "project": project,
+                        "run_id": attempt.run_id,
+                        "attempt_id": attempt.attempt_id,
+                        "status": "failed",
+                        "phase": attempt.phase,
+                        "error": attempt.error,
+                    },
+                )
             self.publish(
                 "tool_status",
                 {
@@ -778,6 +951,22 @@ class AgentRunner:
             messages,
         )
         return preview_id, cad_error, cad_fix_required, needs_visual_review, waiting
+
+    @staticmethod
+    def _attempt_artifact_paths(project_dir: Path) -> dict[str, Path]:
+        """Collect the project artifacts produced by a successful build."""
+        paths: dict[str, Path] = {}
+        for name, relative in (
+            ("source", "model.py"),
+            ("preview", "preview.stl"),
+        ):
+            path = project_dir / relative
+            if path.is_file() and path.stat().st_size > 0:
+                paths[name] = path
+        render = project_dir / "render.png"
+        if render.is_file() and render.stat().st_size > 0:
+            paths["render"] = render
+        return paths
 
     @staticmethod
     def _post_process_tool_result(
@@ -958,6 +1147,38 @@ class AgentRunner:
         project_dir = self.settings.workspace_root / project
         self._log(project_dir, "assistant", message)
         self.publish("agent_message", {"project": project, "message": message})
+        self._finalize_run(project, "completed")
+
+    def _finalize_run(
+        self, project: str, status: str, error: dict | None = None
+    ) -> None:
+        """Mark the active run terminal and publish the completion event."""
+        with self._lock:
+            run_id = self._run_ids.get(project)
+            quality = self._quality_stores.get(project)
+        if run_id is None or quality is None:
+            return
+        try:
+            run = quality.complete_run(run_id, status=status, error=error)
+        except QualityError:
+            run = None  # Already terminal or corrupted; never block task progress.
+        if run is not None and run.status == status:
+            self.publish(
+                "quality_run_completed",
+                {"project": project, "run_id": run_id, "status": run.status},
+            )
+        with self._lock:
+            self._run_ids.pop(project, None)
+            self._quality_stores.pop(project, None)
+
+    @staticmethod
+    def _build123d_version() -> str | None:
+        try:
+            from importlib.metadata import version
+
+            return version("build123d")
+        except Exception:  # noqa: BLE001 - Version lookup is best-effort.
+            return None
 
     @staticmethod
     def _validate_answer(question: dict[str, object], answer: str) -> bool:

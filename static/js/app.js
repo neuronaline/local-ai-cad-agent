@@ -17,6 +17,13 @@ let lastStreamedAgent = null;
 let previewProject = '';
 let loadedPreviewRevision = '';
 let previewLoadPromise = null;
+let decisionAttempt = null; // {run_id, attempt_id, revision_id} awaiting a decision
+const decisionBar = document.querySelector('#decision-bar');
+const acceptDesignBtn = document.querySelector('#accept-design');
+const reportIssueBtn = document.querySelector('#report-issue');
+const continueEditingBtn = document.querySelector('#continue-editing');
+const issueModal = document.querySelector('#issue-modal');
+const issueForm = document.querySelector('#issue-form');
 const agentStreams = new Map();
 const streamedTools = new Map();
 const toolMessages = new Map();
@@ -191,12 +198,16 @@ async function loadCurrentPreview(previewId = '') {
         loadedPreviewRevision = meta.revision;
       }
     }
-    if (!previewId || project !== currentProject) return;
+    if (!previewId || project !== currentProject) {
+      refreshDecisionBar();
+      return;
+    }
     await api(`/api/projects/${encodeURIComponent(project)}/preview/displayed`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({preview_id: previewId}),
     });
+    refreshDecisionBar();
   } catch (error) {
     if (!previewId || project !== currentProject) return;
     try {
@@ -229,6 +240,107 @@ async function syncCurrentPreview() {
     // SSE remains the primary path; polling is only a reconnect fallback.
   }
 }
+
+function hideDecisionBar() {
+  decisionAttempt = null;
+  decisionBar.hidden = true;
+}
+
+async function refreshDecisionBar() {
+  if (!currentProject) return hideDecisionBar();
+  const project = currentProject;
+  try {
+    const meta = await api(`/api/projects/${encodeURIComponent(project)}/preview/meta`);
+    if (!meta.available || meta.revision !== loadedPreviewRevision || !viewer.hasModel()) {
+      return hideDecisionBar();
+    }
+    const listed = await api(`/api/projects/${encodeURIComponent(project)}/quality/runs?limit=1`);
+    const run = listed.runs && listed.runs[0];
+    if (!run) return hideDecisionBar();
+    const detail = await api(`/api/projects/${encodeURIComponent(project)}/quality/runs/${run.run_id}`);
+    const attempt = (detail.attempts || []).find(a => a.status === 'succeeded');
+    if (!attempt || attempt.source_sha256 !== meta.model_sha256) return hideDecisionBar();
+    if ((detail.decisions || []).some(d => d.attempt_id === attempt.attempt_id)) {
+      return hideDecisionBar();
+    }
+    decisionAttempt = {run_id: run.run_id, attempt_id: attempt.attempt_id, revision_id: attempt.revision_id};
+    decisionBar.hidden = false;
+  } catch {
+    hideDecisionBar();
+  }
+}
+
+function openIssueModal() {
+  if (!decisionAttempt) return;
+  issueForm.reset();
+  issueModal.hidden = false;
+  document.querySelector('#issue-message').focus();
+}
+
+function closeIssueModal() {
+  issueModal.hidden = true;
+  reportIssueBtn.focus();
+}
+
+acceptDesignBtn.addEventListener('click', async () => {
+  if (!decisionAttempt) return;
+  const attemptId = decisionAttempt.attempt_id;
+  try {
+    await api(`/api/projects/${encodeURIComponent(currentProject)}/quality/attempts/${attemptId}/decision`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({decision: 'accepted'}),
+    });
+    hideDecisionBar();
+    addMessage('Design accepted.');
+  } catch (error) {
+    addMessage(error.message, 'error');
+  }
+});
+
+reportIssueBtn.addEventListener('click', openIssueModal);
+
+continueEditingBtn.addEventListener('click', hideDecisionBar);
+
+document.querySelector('#issue-cancel').addEventListener('click', () => {
+  closeIssueModal();
+});
+
+issueModal.addEventListener('click', event => {
+  if (event.target === issueModal) closeIssueModal();
+});
+
+issueForm.addEventListener('submit', async event => {
+  event.preventDefault();
+  if (!decisionAttempt) return;
+  const submitButton = issueForm.querySelector('button[type="submit"]');
+  submitButton.disabled = true;
+  try {
+    const payload = {
+      category: document.querySelector('#issue-category').value,
+      severity: document.querySelector('#issue-severity').value,
+      message: document.querySelector('#issue-message').value,
+      camera: viewer.getCameraState(),
+    };
+    try {
+      if (viewer.hasModel()) payload.screenshot = viewer.captureScreenshot('current');
+    } catch {
+      // Camera capture is best-effort; the report still records camera state.
+    }
+    await api(`/api/projects/${encodeURIComponent(currentProject)}/quality/attempts/${decisionAttempt.attempt_id}/issues`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    });
+    hideDecisionBar();
+    closeIssueModal();
+    addMessage('Issue reported — ask the agent to fix it.');
+  } catch (error) {
+    addMessage(error.message, 'error');
+  } finally {
+    submitButton.disabled = false;
+  }
+});
 
 async function loadCurrentState() {
   if (!currentProject) return;
@@ -339,7 +451,7 @@ chatForm.addEventListener('submit', async event => {
     body.append('message', text);
     selectedFiles.forEach(file => body.append('attachments', file));
     const response = await api('/api/chat', {method: 'POST', body});
-    if (response.attachments.length) {
+    if (response.attachments?.length) {
       addMessage(`${response.attachments.length} reference image(s) uploaded.`, 'tool');
     }
     selectedFiles = [];
@@ -359,7 +471,7 @@ chatForm.addEventListener('submit', async event => {
         retryBody.append('message', text);
         selectedFiles.forEach(file => retryBody.append('attachments', file));
         const retryResponse = await api('/api/chat', {method: 'POST', body: retryBody});
-        if (retryResponse.attachments.length) {
+        if (retryResponse.attachments?.length) {
           addMessage(`${retryResponse.attachments.length} reference image(s) uploaded.`, 'tool');
         }
         selectedFiles = [];
@@ -747,6 +859,14 @@ onProjectEvent('finalized', data => {
   addFinalizedCard(data);
   loadCurrentPreview().catch(() => {});
 });
+onProjectEvent('design_accepted', data => {
+  hideDecisionBar();
+  addMessage('Design accepted.', 'user', {});
+});
+onProjectEvent('design_rejected', data => {
+  hideDecisionBar();
+  addMessage('Design rejected — revision requires correction.', 'user', {});
+});
 events.addEventListener('agent_stopped', event => {
   const data = JSON.parse(event.data);
   if (data.project === currentProject) {
@@ -796,7 +916,9 @@ historyBtn.addEventListener('click', openHistory);
 historyClose.addEventListener('click', closeHistory);
 
 document.addEventListener('keydown', event => {
-  if (event.key === 'Escape' && !historyDrawer.hidden) closeHistory();
+  if (event.key !== 'Escape') return;
+  if (!issueModal.hidden) closeIssueModal();
+  else if (!historyDrawer.hidden) closeHistory();
 });
 
 function formatRevisionTime(iso) {
@@ -876,6 +998,12 @@ function createRevisionCard(rev) {
   if (rev.is_active) badges.append(makeBadge('active', 'Active'));
   if (rev.is_last_known_good) badges.append(makeBadge('lkg', 'Last Good'));
   badges.append(makeBadge(rev.build_status, rev.build_status.replace('_', ' ')));
+  if (rev.acceptance) {
+    badges.append(makeBadge(
+      `acceptance-${rev.acceptance.decision}`,
+      rev.acceptance.decision.replace(/_/g, ' '),
+    ));
+  }
 
   const time = document.createElement('span');
   time.className = 'revision-time';
@@ -912,6 +1040,19 @@ function createRevisionCard(rev) {
     card.append(err);
   }
 
+  if (rev.open_issues > 0) {
+    const issues = document.createElement('div');
+    issues.className = 'revision-metrics';
+    issues.style.color = '#ffb4a8';
+    issues.textContent = `${rev.open_issues} open issue${rev.open_issues === 1 ? '' : 's'}`;
+    card.append(issues);
+  }
+
+  const issueDetails = document.createElement('div');
+  issueDetails.className = 'revision-issues';
+  issueDetails.hidden = true;
+  card.append(issueDetails);
+
   // Diff (lazy-loaded on click).
   const diffContainer = document.createElement('div');
   diffContainer.className = 'revision-diff';
@@ -940,6 +1081,53 @@ function createRevisionCard(rev) {
     }
   });
   actions.append(diffBtn);
+
+  if (rev.open_issues > 0) {
+    const issuesBtn = document.createElement('button');
+    issuesBtn.className = 'quiet';
+    issuesBtn.textContent = 'Issues';
+    issuesBtn.addEventListener('click', async () => {
+      if (!issueDetails.hidden) {
+        issueDetails.hidden = true;
+        return;
+      }
+      issueDetails.hidden = false;
+      issueDetails.textContent = 'Loading issues…';
+      try {
+        const query = new URLSearchParams({open: 'true', revision_id: rev.id});
+        const data = await api(`/api/projects/${encodeURIComponent(currentProject)}/quality/issues?${query}`);
+        issueDetails.replaceChildren();
+        for (const issue of data.issues || []) {
+          const row = document.createElement('div');
+          row.className = 'revision-metrics';
+          const resolveBtn = document.createElement('button');
+          resolveBtn.className = 'quiet';
+          resolveBtn.textContent = 'Resolve';
+          resolveBtn.addEventListener('click', async () => {
+            resolveBtn.disabled = true;
+            try {
+              await api(`/api/projects/${encodeURIComponent(currentProject)}/quality/issues/${issue.issue_id}/resolve`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({confirmed_by: 'user'}),
+              });
+              loadRevisions();
+            } catch (error) {
+              resolveBtn.disabled = false;
+              addMessage(error.message, 'error');
+            }
+          });
+          row.textContent = `${issue.severity}: ${issue.message || issue.category} `;
+          row.append(resolveBtn);
+          issueDetails.append(row);
+        }
+        if (!issueDetails.childElementCount) issueDetails.textContent = 'No open issues.';
+      } catch (error) {
+        issueDetails.textContent = error.message;
+      }
+    });
+    actions.append(issuesBtn);
+  }
 
   if (!rev.is_active) {
     const restoreBtn = document.createElement('button');
@@ -1156,7 +1344,10 @@ function refreshHistoryIfOpen() {
   if (!historyDrawer.hidden) loadRevisions();
 }
 
-onProjectEvent('revision_updated', refreshHistoryIfOpen);
+onProjectEvent('revision_updated', () => {
+  hideDecisionBar();
+  refreshHistoryIfOpen();
+});
 onProjectEvent('constraint_added', refreshHistoryIfOpen);
 onProjectEvent('constraint_removed', refreshHistoryIfOpen);
 

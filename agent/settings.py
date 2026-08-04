@@ -28,6 +28,8 @@ class Settings:
     show_info_messages: bool = True
     agent_tool_call_limit: int = 12
     revision_retention_count: int = 0  # 0 = unlimited, >0 = keep at most N revisions
+    quality_enabled: bool = True  # passive run/attempt observability (plan Phase 1)
+    quality_require_acceptance_before_finalize: bool = False  # plan Phase 2 gate (rollout stage 7)
 
 def _read_yaml(path: Path) -> dict[str, Any]:
     if not path.exists():
@@ -57,6 +59,7 @@ def load_settings(project_root: Path | None = None, home: Path | None = None) ->
     server = config.get("server", {})
     ui = config.get("ui", {})
     agent = config.get("agent", {})
+    quality = config.get("quality", {})
     return Settings(
         workspace_root=Path(config.get("workspace_root", "~/CAD-Agent-Projects")).expanduser(),
         openrouter_base_url=str(openrouter.get("base_url", "https://openrouter.ai/api/v1")).rstrip("/"),
@@ -74,6 +77,10 @@ def load_settings(project_root: Path | None = None, home: Path | None = None) ->
         show_info_messages=bool(ui.get("show_info_messages", True)),
         agent_tool_call_limit=_positive_int(agent.get("tool_call_limit", 12), "agent.tool_call_limit"),
         revision_retention_count=_non_negative_int(agent.get("revision_retention_count", 0), "agent.revision_retention_count"),
+        quality_enabled=bool(quality.get("enabled", True)),
+        quality_require_acceptance_before_finalize=bool(
+            quality.get("require_acceptance_before_finalize", False)
+        ),
     )
 
 

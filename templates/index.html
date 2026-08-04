@@ -25,6 +25,12 @@
             </div>
           </div>
         </div>
+        <div id="decision-bar" class="decision-bar" hidden>
+          <span class="decision-label">Review the preview before moving on:</span>
+          <button id="accept-design" type="button" class="primary">Accept design</button>
+          <button id="report-issue" type="button" class="danger">Report issue</button>
+          <button id="continue-editing" type="button" class="quiet">Continue editing</button>
+        </div>
         <div id="question-area"></div>
         <form id="chat-form" class="composer">
           <textarea id="message" placeholder="Describe the part you want to create…" rows="2" required></textarea>
@@ -49,6 +55,39 @@
       </header>
       <div id="history-content" class="drawer-content"></div>
     </aside>
+    <div id="issue-modal" class="issue-modal" hidden>
+      <form id="issue-form" class="issue-form">
+        <h2>Report issue</h2>
+        <label>Category
+          <select id="issue-category" required>
+            <option value="">Select a category…</option>
+            <option value="missing_or_extra_feature">Missing or extra feature</option>
+            <option value="wrong_size">Wrong size</option>
+            <option value="wrong_position_alignment">Wrong position or alignment</option>
+            <option value="disconnected_or_intersecting">Parts disconnected or intersecting</option>
+            <option value="hole_or_clearance">Hole or clearance problem</option>
+            <option value="printing_problem">Printing problem</option>
+            <option value="intent_mismatch">Does not match request</option>
+            <option value="other">Other</option>
+          </select>
+        </label>
+        <label>Severity
+          <select id="issue-severity">
+            <option value="blocking">Blocking</option>
+            <option value="major">Major</option>
+            <option value="minor">Minor</option>
+          </select>
+        </label>
+        <label>Description
+          <textarea id="issue-message" rows="3" placeholder="What is wrong with this design?" required></textarea>
+        </label>
+        <p class="issue-note">A screenshot from the current camera view is attached automatically.</p>
+        <div class="issue-actions">
+          <button type="button" id="issue-cancel" class="quiet">Cancel</button>
+          <button type="submit" class="danger">Report</button>
+        </div>
+      </form>
+    </div>
     <script>
       window.APP_CONFIG = {
         projectName: {{ project_name | tojson }},

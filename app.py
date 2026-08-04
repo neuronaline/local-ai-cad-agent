@@ -9,6 +9,7 @@ import re
 import shutil
 import tempfile
 import threading
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from difflib import unified_diff
@@ -34,6 +35,17 @@ from agent.constraints import ConstraintError, ConstraintStore, ModelConstraintV
 from agent.core import AgentRunner
 from agent.finalize import finalize_project
 from agent.images import store_images
+from agent.quality.errors import (
+    ACCEPTED_DECISION_TYPES,
+    DECISION_TYPES,
+    ISSUE_SEVERITIES,
+)
+from agent.quality.store import (
+    QualityError,
+    QualityIntegrityError,
+    QualityLimitError,
+    QualityStore,
+)
 from agent.revisions import RevisionIntegrityError, RevisionStore
 from agent.sandbox import _BWRAP, seccomp_filter_fd
 from agent.settings import Settings, load_settings
@@ -41,7 +53,12 @@ from agent.tools.cad_tool import CadTool
 
 PROJECT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 INFO_EVENT_TYPES = frozenset({"agent_status", "tool_status", "agent_usage", "agent_stopped"})
-HISTORY_EVENT_TYPES = INFO_EVENT_TYPES | {"agent_error", "finalized"}
+HISTORY_EVENT_TYPES = INFO_EVENT_TYPES | {
+    "agent_error",
+    "finalized",
+    "design_accepted",
+    "design_rejected",
+}
 SSE_QUEUE_SIZE = 512
 
 
@@ -110,6 +127,15 @@ def _project_path(settings: Settings, project_name: str) -> Path:
     if not path.is_dir():
         raise FileNotFoundError("Project not found.")
     return path
+
+
+def _valid_uuid(value: str) -> bool:
+    """Accept both dashed and compact hex UUID forms used by quality records."""
+    try:
+        uuid.UUID(value)
+    except (ValueError, AttributeError, TypeError):
+        return False
+    return True
 
 
 def _append_conversation(project_dir: Path, event: dict[str, Any]) -> None:
@@ -613,6 +639,64 @@ def create_app(settings: Settings | None = None) -> Flask:
                     or runner.waiting_question(project_name)
                 ):
                     return jsonify({"error": "Stop or finish the active agent task before finalizing."}), 409
+                if settings.quality_require_acceptance_before_finalize:
+                    body = request.get_json(silent=True) or {}
+                    force = bool(body.get("force"))
+                    quality = QualityStore(project_dir)
+                    head = RevisionStore(project_dir).head()
+                    decision = (
+                        quality.latest_decision_for_revision(head.id)
+                        if head is not None
+                        else None
+                    )
+                    accepted = (
+                        decision is not None
+                        and decision.decision in ACCEPTED_DECISION_TYPES
+                    )
+                    blocking_issues = (
+                        [
+                            issue
+                            for issue in quality.issues_for_revision(head.id)
+                            if issue.status == "open" and issue.severity == "blocking"
+                        ]
+                        if head is not None
+                        else []
+                    )
+                    if not accepted or blocking_issues:
+                        if not force:
+                            if blocking_issues:
+                                return jsonify({
+                                    "error": "Resolve or explicitly bypass open blocking issues before finalizing.",
+                                    "code": "BLOCKING_ISSUES_OPEN",
+                                }), 409
+                            return jsonify({
+                                "error": "The current design has not been explicitly accepted. Review the preview and click Accept design first (or force a recorded local bypass).",
+                                "code": "ACCEPTANCE_REQUIRED",
+                            }), 409
+                        # Recorded manual bypass: never silent.
+                        try:
+                            runs = quality.list_runs(limit=1)
+                            bypass_run = runs[0] if runs else quality.start_run(
+                                project=project_name
+                            )
+                            quality.append_event(
+                                bypass_run.run_id,
+                                "finalize_bypassed",
+                                {
+                                    "revision_id": head.id if head else None,
+                                    "decision": decision.decision if decision else None,
+                                    "blocking_issue_count": len(blocking_issues),
+                                },
+                            )
+                            if not runs:
+                                quality.complete_run(
+                                    bypass_run.run_id, status="completed"
+                                )
+                        except (QualityError, QualityIntegrityError) as error:
+                            return jsonify({
+                                "error": f"Cannot audit finalization bypass: {error}",
+                                "code": "BYPASS_AUDIT_FAILED",
+                            }), 422
                 bus.publish("agent_status", {
                     "project": project_name,
                     "status": "finalizing",
@@ -683,15 +767,23 @@ def create_app(settings: Settings | None = None) -> Flask:
     @app.get("/api/projects/<project_name>/preview/meta")
     def preview_meta(project_name: str):
         try:
-            preview_path = _project_path(settings, project_name) / "preview.stl"
+            project_dir = _project_path(settings, project_name)
+            preview_path = project_dir / "preview.stl"
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         if not preview_path.is_file() or preview_path.stat().st_size == 0:
             return jsonify({"available": False})
         stat = preview_path.stat()
+        model_path = project_dir / "model.py"
+        model_sha256 = (
+            hashlib.sha256(model_path.read_bytes()).hexdigest()
+            if model_path.is_file()
+            else None
+        )
         return jsonify({
             "available": True,
             "revision": f"{stat.st_mtime_ns}-{stat.st_size}",
+            "model_sha256": model_sha256,
         })
 
     @app.post("/api/projects/<project_name>/preview/displayed")
@@ -751,7 +843,11 @@ def create_app(settings: Settings | None = None) -> Flask:
     _MAX_DIFF_LINES = 500
 
     def _revision_summary(
-        store: RevisionStore, revision, active_id: str | None, lkg_id: str | None
+        store: RevisionStore,
+        revision,
+        active_id: str | None,
+        lkg_id: str | None,
+        project_dir: Path,
     ) -> dict[str, Any]:
         build = None
         try:
@@ -774,6 +870,22 @@ def create_app(settings: Settings | None = None) -> Flask:
                 summary["metrics"] = build.metrics
             if build.error:
                 summary["error"] = build.error
+        # User acceptance state + open issues from the quality store (Phase 2).
+        try:
+            quality = QualityStore(project_dir)
+            decision = quality.latest_decision_for_revision(revision.id)
+            if decision is not None:
+                summary["acceptance"] = {
+                    "decision": decision.decision,
+                    "comment": decision.comment,
+                    "created_at": decision.created_at,
+                    "attempt_id": decision.attempt_id,
+                }
+            summary["open_issues"] = sum(
+                1 for issue in quality.issues_for_revision(revision.id) if issue.status == "open"
+            )
+        except (QualityError, QualityIntegrityError):
+            pass
         return summary
 
     @app.get("/api/projects/<project_name>/revisions")
@@ -807,7 +919,11 @@ def create_app(settings: Settings | None = None) -> Flask:
         return jsonify({
             "revisions": [
                 _revision_summary(
-                    store, r, active.id if active else None, lkg.id if lkg else None
+                    store,
+                    r,
+                    active.id if active else None,
+                    lkg.id if lkg else None,
+                    project_dir,
                 )
                 for r in revisions
             ],
@@ -829,7 +945,11 @@ def create_app(settings: Settings | None = None) -> Flask:
         active = store.head()
         lkg = store.last_known_good()
         summary = _revision_summary(
-            store, revision, active.id if active else None, lkg.id if lkg else None
+            store,
+            revision,
+            active.id if active else None,
+            lkg.id if lkg else None,
+            project_dir,
         )
         try:
             summary["source"] = store.source(revision_id)
@@ -1071,6 +1191,367 @@ def create_app(settings: Settings | None = None) -> Flask:
             "name": removed.name,
         })
         return jsonify({"removed": constraint_id})
+
+    @app.get("/api/projects/<project_name>/quality/runs")
+    def quality_runs(project_name: str):
+        try:
+            project_dir = _project_path(settings, project_name)
+        except (ValueError, FileNotFoundError) as error:
+            return jsonify({"error": str(error)}), 404
+        try:
+            limit = int(request.args.get("limit", 50))
+        except (TypeError, ValueError):
+            return jsonify({"error": "Run limit must be an integer."}), 400
+        store = QualityStore(project_dir)
+        before = request.args.get("before")
+        try:
+            runs = store.list_runs(limit=limit, before=before)
+        except (QualityError, QualityIntegrityError) as error:
+            return jsonify({"error": str(error)}), 400
+        next_before = None
+        if runs:
+            try:
+                if store.list_runs(limit=1, before=runs[-1].run_id):
+                    next_before = runs[-1].run_id
+            except QualityError:
+                next_before = None
+        return jsonify({
+            "runs": [run.to_dict() for run in runs],
+            "next_before": next_before,
+        })
+
+    @app.get("/api/projects/<project_name>/quality/runs/<run_id>")
+    def quality_run_detail(project_name: str, run_id: str):
+        if not _valid_uuid(run_id):
+            return jsonify({"error": "Invalid run id."}), 404
+        try:
+            project_dir = _project_path(settings, project_name)
+        except (ValueError, FileNotFoundError) as error:
+            return jsonify({"error": str(error)}), 404
+        store = QualityStore(project_dir)
+        try:
+            run = store.get_run(run_id)
+            attempts = store.list_attempts(run_id)
+            events = store.get_events(run_id)
+            decisions = store.list_decisions(run_id)
+        except (QualityError, QualityIntegrityError) as error:
+            return jsonify({"error": str(error)}), 404
+        return jsonify({
+            "run": run.to_dict(),
+            "attempts": [attempt.to_dict() for attempt in attempts],
+            "events": events,
+            "decisions": [decision.to_dict() for decision in decisions],
+        })
+
+    @app.get("/api/projects/<project_name>/quality/runs/<run_id>/events")
+    def quality_run_events(project_name: str, run_id: str):
+        if not _valid_uuid(run_id):
+            return jsonify({"error": "Invalid run id."}), 404
+        try:
+            project_dir = _project_path(settings, project_name)
+        except (ValueError, FileNotFoundError) as error:
+            return jsonify({"error": str(error)}), 404
+        try:
+            limit = int(request.args.get("limit", 200))
+        except (TypeError, ValueError):
+            return jsonify({"error": "Event limit must be an integer."}), 400
+        store = QualityStore(project_dir)
+        try:
+            events = store.get_events(run_id, limit=limit)
+        except (QualityError, QualityIntegrityError) as error:
+            return jsonify({"error": str(error)}), 404
+        return jsonify({"events": events})
+
+    @app.get("/api/projects/<project_name>/quality/attempts/<attempt_id>")
+    def quality_attempt_detail(project_name: str, attempt_id: str):
+        if not _valid_uuid(attempt_id):
+            return jsonify({"error": "Invalid attempt id."}), 404
+        try:
+            project_dir = _project_path(settings, project_name)
+        except (ValueError, FileNotFoundError) as error:
+            return jsonify({"error": str(error)}), 404
+        store = QualityStore(project_dir)
+        try:
+            runs = store.list_runs(limit=500)
+        except (QualityError, QualityIntegrityError) as error:
+            return jsonify({"error": str(error)}), 400
+        for run in runs:
+            try:
+                attempt = store.get_attempt(run.run_id, attempt_id)
+            except QualityIntegrityError:
+                continue
+            return jsonify({"run": run.to_dict(), "attempt": attempt.to_dict()})
+        return jsonify({"error": "Attempt not found."}), 404
+
+    def _resolve_quality_attempt(
+        store: QualityStore, attempt_id: str
+    ) -> tuple[dict[str, Any] | None, Any]:
+        """Locate the run+attempt for an attempt id, or return an error response."""
+        try:
+            runs = store.list_runs(limit=500)
+        except (QualityError, QualityIntegrityError) as error:
+            return None, (jsonify({"error": str(error)}), 400)
+        for run in runs:
+            try:
+                attempt = store.get_attempt(run.run_id, attempt_id)
+            except QualityIntegrityError:
+                continue
+            return {"run": run, "attempt": attempt}, None
+        return None, (jsonify({"error": "Attempt not found."}), 404)
+
+    def _require_current_attempt(
+        store: QualityStore, found: dict[str, Any], project_name: str
+    ) -> Any:
+        """Ensure the attempt targets the current head revision (delivery gate)."""
+        try:
+            with _project_lock(app, project_name):
+                head = RevisionStore(_project_path(settings, project_name)).head()
+        except (ValueError, RevisionIntegrityError) as error:
+            return jsonify({"error": str(error)}), 422
+        if head is None or head.id != found["attempt"].revision_id:
+            return jsonify(
+                {
+                    "error": "This attempt belongs to an outdated revision. Refresh the preview before deciding.",
+                    "code": "STALE_PREVIEW",
+                }
+            ), 409
+        return None
+
+    @app.post("/api/projects/<project_name>/quality/attempts/<attempt_id>/decision")
+    def quality_record_decision(project_name: str, attempt_id: str):
+        if not _valid_uuid(attempt_id):
+            return jsonify({"error": "Invalid attempt id."}), 404
+        try:
+            project_dir = _project_path(settings, project_name)
+        except (ValueError, FileNotFoundError) as error:
+            return jsonify({"error": str(error)}), 404
+        store = QualityStore(project_dir)
+        found, error_response = _resolve_quality_attempt(store, attempt_id)
+        if error_response is not None:
+            return error_response
+        if found["attempt"].status != "succeeded":
+            return jsonify({
+                "error": "Only a successfully built design can be accepted or rejected.",
+                "code": "ATTEMPT_NOT_SUCCEEDED",
+            }), 409
+        stale_response = _require_current_attempt(store, found, project_name)
+        if stale_response is not None:
+            return stale_response
+        body = request.get_json(silent=True) or {}
+        decision = body.get("decision")
+        if not isinstance(decision, str) or decision not in DECISION_TYPES:
+            return jsonify(
+                {
+                    "error": "decision must be one of: accepted, accepted_with_limitations, rejected."
+                }
+            ), 400
+        categories = body.get("categories")
+        categories = (
+            [item for item in categories if isinstance(item, str)]
+            if isinstance(categories, list)
+            else []
+        )
+        comment = body.get("comment")
+        camera = body.get("camera") if isinstance(body.get("camera"), dict) else None
+        try:
+            record = store.record_decision(
+                found["run"].run_id,
+                revision_id=found["attempt"].revision_id,
+                attempt_id=attempt_id,
+                decision=decision,
+                categories=categories,
+                comment=str(comment) if comment is not None else "",
+                camera=camera,
+            )
+        except (QualityError, QualityIntegrityError) as error:
+            return jsonify({"error": str(error)}), 422
+        accepted = decision in ACCEPTED_DECISION_TYPES
+        bus.publish(
+            "design_accepted" if accepted else "design_rejected",
+            {
+                "project": project_name,
+                "run_id": found["run"].run_id,
+                "attempt_id": attempt_id,
+                "revision_id": found["attempt"].revision_id,
+                "decision": decision,
+            },
+        )
+        return jsonify(record.to_dict()), 201
+
+    @app.post("/api/projects/<project_name>/quality/attempts/<attempt_id>/issues")
+    def quality_create_issue(project_name: str, attempt_id: str):
+        if not _valid_uuid(attempt_id):
+            return jsonify({"error": "Invalid attempt id."}), 404
+        try:
+            project_dir = _project_path(settings, project_name)
+        except (ValueError, FileNotFoundError) as error:
+            return jsonify({"error": str(error)}), 404
+        store = QualityStore(project_dir)
+        found, error_response = _resolve_quality_attempt(store, attempt_id)
+        if error_response is not None:
+            return error_response
+        if found["attempt"].status != "succeeded":
+            return jsonify({
+                "error": "Issues can only be reported for a successfully built design.",
+                "code": "ATTEMPT_NOT_SUCCEEDED",
+            }), 409
+        stale_response = _require_current_attempt(store, found, project_name)
+        if stale_response is not None:
+            return stale_response
+        body = request.get_json(silent=True) or {}
+        category = body.get("category")
+        if not isinstance(category, str) or not category:
+            return jsonify({"error": "category is required."}), 400
+        severity = body.get("severity") or "blocking"
+        if severity not in ISSUE_SEVERITIES:
+            return jsonify({"error": "severity must be one of: blocking, major, minor."}), 400
+        requirement_ids = body.get("requirement_ids")
+        requirement_ids = (
+            [str(item) for item in requirement_ids if isinstance(item, str)]
+            if isinstance(requirement_ids, list)
+            else []
+        )
+        message = body.get("message") or ""
+        camera = body.get("camera") if isinstance(body.get("camera"), dict) else None
+        from agent.quality.models import new_id
+
+        issue_id = new_id()
+        evidence: list[str] = []
+        screenshot = body.get("screenshot")
+        if isinstance(screenshot, str) and screenshot:
+            try:
+                import base64
+
+                png = base64.b64decode(screenshot, validate=True)
+            except Exception:  # noqa: BLE001 - Malformed base64 from the browser.
+                return jsonify({"error": "screenshot must be a base64 PNG."}), 400
+            if not png.startswith(b"\x89PNG\r\n\x1a\n"):
+                return jsonify({"error": "screenshot must be a PNG image."}), 400
+            try:
+                evidence.append(
+                    store.save_issue_evidence(
+                        found["run"].run_id, attempt_id, issue_id, png
+                    )
+                )
+            except QualityLimitError as error:
+                return jsonify({"error": str(error)}), 413
+        try:
+            issue = store.create_issue(
+                found["run"].run_id,
+                attempt_id=attempt_id,
+                revision_id=found["attempt"].revision_id,
+                category=category,
+                severity=severity,
+                message=str(message),
+                requirement_ids=requirement_ids,
+                evidence=evidence,
+                issue_id=issue_id,
+            )
+            # An explicit issue report marks the targeted revision rejected.
+            store.record_decision(
+                found["run"].run_id,
+                revision_id=found["attempt"].revision_id,
+                attempt_id=attempt_id,
+                decision="rejected",
+                categories=[category],
+                comment=str(message)[:2000],
+                camera=camera,
+            )
+        except (QualityError, QualityIntegrityError, QualityLimitError) as error:
+            return jsonify({"error": str(error)}), 422
+        bus.publish(
+            "design_rejected",
+            {
+                "project": project_name,
+                "run_id": found["run"].run_id,
+                "attempt_id": attempt_id,
+                "revision_id": found["attempt"].revision_id,
+                "issue_id": issue.issue_id,
+            },
+        )
+        return jsonify({"issue": issue.to_dict()}), 201
+
+    @app.get("/api/projects/<project_name>/quality/issues")
+    def quality_issues(project_name: str):
+        try:
+            project_dir = _project_path(settings, project_name)
+        except (ValueError, FileNotFoundError) as error:
+            return jsonify({"error": str(error)}), 404
+        try:
+            limit = int(request.args.get("limit", 200))
+        except (TypeError, ValueError):
+            return jsonify({"error": "Issue limit must be an integer."}), 400
+        open_only = request.args.get("open") in {"1", "true"}
+        revision_id = request.args.get("revision_id")
+        store = QualityStore(project_dir)
+        try:
+            issues = store.list_issues(
+                revision_id=revision_id,
+                open_only=open_only,
+                limit=limit,
+            )
+        except (QualityError, QualityIntegrityError) as error:
+            return jsonify({"error": str(error)}), 400
+        return jsonify({"issues": [issue.to_dict() for issue in issues]})
+
+    @app.post("/api/projects/<project_name>/quality/issues/<issue_id>/resolve")
+    def quality_resolve_issue(project_name: str, issue_id: str):
+        if not _valid_uuid(issue_id):
+            return jsonify({"error": "Invalid issue id."}), 404
+        try:
+            project_dir = _project_path(settings, project_name)
+        except (ValueError, FileNotFoundError) as error:
+            return jsonify({"error": str(error)}), 404
+        try:
+            store = QualityStore(project_dir)
+            issue = next(
+                (item for item in store.list_issues(limit=500) if item.issue_id == issue_id),
+                None,
+            )
+            head = RevisionStore(project_dir).head()
+        except (QualityError, QualityIntegrityError, RevisionIntegrityError) as error:
+            return jsonify({"error": str(error)}), 422
+        if issue is None:
+            return jsonify({"error": "Issue not found."}), 404
+        if head is None:
+            return jsonify({"error": "No current revision is available."}), 409
+        if head.id == issue.revision_id or not store.has_successful_attempt_for_revision(
+            head.id
+        ):
+            return jsonify({
+                "error": "Resolve an issue only after a newer revision has a successful build.",
+                "code": "RESOLUTION_REVIEW_REQUIRED",
+            }), 409
+        body = request.get_json(silent=True) or {}
+        confirmed_by = str(body.get("confirmed_by") or "user")[:200]
+        try:
+            resolved = store.resolve_issue(
+                issue.run_id,
+                issue.issue_id,
+                resolved_by_revision_id=head.id,
+                confirmed_by=confirmed_by,
+            )
+        except (QualityError, QualityIntegrityError) as error:
+            return jsonify({"error": str(error)}), 422
+        bus.publish("issue_resolved", {
+            "project": project_name,
+            "issue_id": resolved.issue_id,
+            "revision_id": resolved.revision_id,
+            "resolved_by_revision_id": head.id,
+        })
+        return jsonify({"issue": resolved.to_dict()})
+
+    @app.get("/api/projects/<project_name>/quality/metrics")
+    def quality_metrics(project_name: str):
+        try:
+            project_dir = _project_path(settings, project_name)
+        except (ValueError, FileNotFoundError) as error:
+            return jsonify({"error": str(error)}), 404
+        store = QualityStore(project_dir)
+        try:
+            return jsonify(store.get_metrics())
+        except (QualityError, QualityIntegrityError) as error:
+            return jsonify({"error": str(error)}), 400
 
     @app.get("/api/stream")
     def stream():

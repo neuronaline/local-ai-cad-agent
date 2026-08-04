@@ -23,3 +23,15 @@ server:
 
 ui:
   show_info_messages: true
+
+# CAD quality observability and verification (feature-flagged rollout).
+# Phase 1 (passive run/attempt logging) is on by default; later gates are
+# disabled until their UI and verifier work lands.
+quality:
+  enabled: true
+  structured_spec: false
+  deterministic_validation: false
+  multi_view_review: false
+  independent_judge: false
+  require_user_acceptance: false
+  require_acceptance_before_finalize: false

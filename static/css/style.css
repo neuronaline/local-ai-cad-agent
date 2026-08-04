@@ -6,7 +6,7 @@ button, input, select, textarea { font: inherit; }
 button, .button-link { cursor: pointer; border: 1px solid transparent; border-radius: 8px; padding: .5rem .72rem; background: #7898f4; color: #071225; font-weight: 750; text-decoration: none; transition: transform .16s ease, border-color .16s ease, background .16s ease; }
 button:hover, .button-link:hover { transform: translateY(-1px); }
 button:disabled { cursor: not-allowed; opacity: .45; transform: none; }
-button[hidden] { display: none; }
+[hidden] { display: none !important; }
 button.quiet, .button-link.quiet { background: #182235; border-color: #2c3b54; color: #d6deed; }
 button.danger { background: #3a1f2a; border-color: #60303d; color: #ffc9d0; }
 .app-shell { display: grid; grid-template-columns: minmax(380px, 42%) 1fr; height: 100dvh; min-height: 0; overflow: hidden; }
@@ -293,6 +293,9 @@ button.primary { background: #7898f4; color: #071225; font-weight: 750; }
 .rev-badge.succeeded { background: #1c3a2a; color: #68d694; }
 .rev-badge.failed { background: #3a1f2a; color: #ff9eaa; }
 .rev-badge.not_run { background: #212e41; color: #6f80a0; }
+.rev-badge.acceptance-accepted { background: #1c3a2a; color: #68d694; }
+.rev-badge.acceptance-accepted_with_limitations { background: #3a351f; color: #d6c868; }
+.rev-badge.acceptance-rejected { background: #3a1f2a; color: #ff9eaa; }
 .revision-time { color: #7e8ea8; font-size: .68rem; margin-left: auto; }
 .revision-origin { color: #8d9bb0; font-size: .7rem; margin-top: .2rem; }
 .revision-metrics {
@@ -406,3 +409,70 @@ button.primary { background: #7898f4; color: #071225; font-weight: 750; }
   font-size: .72rem;
   padding: .5rem;
 }
+
+/* --- Phase 2: user acceptance and feedback --- */
+.decision-bar {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  margin: .5rem .75rem 0;
+  padding: .5rem .65rem;
+  border: 1px solid #3a4a68;
+  border-radius: 10px;
+  background: #17233a;
+  flex-wrap: wrap;
+}
+.decision-bar[hidden] { display: none; }
+.decision-bar .decision-label {
+  margin-right: auto;
+  color: #c5d1e5;
+  font-size: .75rem;
+  font-weight: 700;
+}
+.decision-bar button { padding: .4rem .65rem; font-size: .74rem; }
+
+.issue-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  background: #020617cc;
+}
+.issue-modal[hidden] { display: none; }
+.issue-form {
+  width: min(440px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: .65rem;
+  padding: 1rem;
+  border: 1px solid #2c3b54;
+  border-radius: 12px;
+  background: #0e1727;
+  box-shadow: 0 18px 48px #02061766;
+}
+.issue-form h2 { margin: 0; font-size: 1rem; }
+.issue-form label {
+  display: flex;
+  flex-direction: column;
+  gap: .3rem;
+  color: #b8c8e0;
+  font-size: .74rem;
+  font-weight: 700;
+}
+.issue-form select,
+.issue-form textarea {
+  padding: .45rem .5rem;
+  border: 1px solid #2c3b54;
+  border-radius: 8px;
+  background: #0b1321;
+  color: #d6deed;
+  font-size: .8rem;
+  font-family: inherit;
+}
+.issue-form textarea { resize: vertical; min-height: 70px; }
+.issue-note { margin: 0; color: #6f80a0; font-size: .68rem; line-height: 1.4; }
+.issue-actions { display: flex; justify-content: flex-end; gap: .5rem; }
+.issue-actions button { padding: .45rem .8rem; font-size: .76rem; }

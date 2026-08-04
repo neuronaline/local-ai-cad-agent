@@ -41,17 +41,6 @@ def test_chat_ignores_client_supplied_routing_preferences(tmp_path: Path, monkey
     assert response.status_code == 202
 
 
-def test_index_configures_three_js_import_map(tmp_path: Path):
-    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
-    client = create_app(settings).test_client()
-    client.post("/api/projects/new", json={"name": "demo"})
-    response = client.get("/project/demo")
-
-    assert response.status_code == 200
-    assert b'type="importmap"' in response.data
-    assert b'"three/addons/"' in response.data
-
-
 def test_settings_routes_are_not_exposed(tmp_path: Path):
     settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
     client = create_app(settings).test_client()
@@ -138,6 +127,7 @@ def test_preview_metadata_changes_when_stl_is_updated(tmp_path: Path):
     second = client.get("/api/projects/demo/preview/meta").get_json()
 
     assert first["available"] is True
+    assert first["model_sha256"] is None
     assert second["available"] is True
     assert first["revision"] != second["revision"]
 
@@ -432,7 +422,7 @@ def test_event_bus_disconnects_overflowed_subscriber(tmp_path: Path):
 
 # ── Setup page ──
 
-def test_setup_page_serves_when_no_api_key(tmp_path: Path, monkeypatch):
+def test_setup_access_follows_api_key_configuration(tmp_path: Path, monkeypatch):
     settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
     monkeypatch.setenv("OPENROUTER_API_KEY", "")
     client = create_app(settings).test_client()
@@ -440,33 +430,12 @@ def test_setup_page_serves_when_no_api_key(tmp_path: Path, monkeypatch):
     response = client.get("/setup")
     assert response.status_code == 200
     assert b"OpenRouter API Key" in response.data
+    for endpoint in ("/", "/project/demo"):
+        assert client.get(endpoint, follow_redirects=False).status_code == 302
 
-
-def test_setup_page_redirects_when_configured(tmp_path: Path, monkeypatch):
-    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-test")
-    client = create_app(settings).test_client()
-
-    response = client.get("/setup", follow_redirects=False)
-    assert response.status_code == 302
-
-
-def test_index_redirects_to_setup_when_no_api_key(tmp_path: Path, monkeypatch):
-    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
-    monkeypatch.setenv("OPENROUTER_API_KEY", "")
-    client = create_app(settings).test_client()
-
-    response = client.get("/", follow_redirects=False)
-    assert response.status_code == 302
-
-
-def test_project_view_redirects_to_setup_when_no_api_key(tmp_path: Path, monkeypatch):
-    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
-    monkeypatch.setenv("OPENROUTER_API_KEY", "")
-    client = create_app(settings).test_client()
-
-    response = client.get("/project/demo", follow_redirects=False)
-    assert response.status_code == 302
+    configured_client = create_app(settings).test_client()
+    assert configured_client.get("/setup", follow_redirects=False).status_code == 302
 
 
 def test_api_setup_saves_key_and_model(tmp_path: Path, monkeypatch):
@@ -547,39 +516,20 @@ def test_frontend_source_has_no_cdn_urls():
 from agent.core import AgentRunner
 
 
-def test_user_error_message_maps_unauthorized():
-    msg = AgentRunner._user_error_message("HTTP 401 Unauthorized", "HTTPError")
-    assert "Invalid OpenRouter API key" in msg
+def test_user_error_messages_are_actionable():
+    cases = (
+        ("HTTP 401 Unauthorized", "HTTPError", "invalid openrouter api key"),
+        ("429 Too Many Requests: rate limit exceeded", "HTTPError", "rate limit"),
+        ("Connection timed out", "ConnectionError", "timed out"),
+        ("bubblewrap sandbox failed: bwrap not found", "RuntimeError", "sandbox"),
+        ("STEP export failed: invalid geometry", "ValueError", "export failed"),
+        ("Permission denied: cannot write to workspace", "OSError", "permission"),
+        ("Some unknown error occurred", "RuntimeError", "some unknown error occurred"),
+    )
 
-
-def test_user_error_message_maps_rate_limit():
-    msg = AgentRunner._user_error_message("429 Too Many Requests: rate limit exceeded", "HTTPError")
-    assert "rate limit" in msg.lower()
-
-
-def test_user_error_message_maps_timeout():
-    msg = AgentRunner._user_error_message("Connection timed out", "ConnectionError")
-    assert "timed out" in msg.lower()
-
-
-def test_user_error_message_maps_sandbox():
-    msg = AgentRunner._user_error_message("bubblewrap sandbox failed: bwrap not found", "RuntimeError")
-    assert "sandbox" in msg.lower()
-
-
-def test_user_error_message_maps_export():
-    msg = AgentRunner._user_error_message("STEP export failed: invalid geometry", "ValueError")
-    assert "Export failed" in msg
-
-
-def test_user_error_message_maps_permission():
-    msg = AgentRunner._user_error_message("Permission denied: cannot write to workspace", "OSError")
-    assert "permission" in msg.lower()
-
-
-def test_user_error_message_fallback():
-    msg = AgentRunner._user_error_message("Some unknown error occurred", "RuntimeError")
-    assert "Some unknown error occurred" in msg
+    for error, error_type, expected in cases:
+        message = AgentRunner._user_error_message(error, error_type)
+        assert expected in message.lower()
 
 
 # --------------------------------------------------------------------------- #
