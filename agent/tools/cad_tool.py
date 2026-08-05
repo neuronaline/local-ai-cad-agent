@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 import shutil
-import signal
 import subprocess
 import tempfile
 import threading
@@ -20,6 +19,7 @@ from PIL import Image, UnidentifiedImageError
 from agent.revisions import RevisionIntegrityError, RevisionStore
 from agent.sandbox import command as sandbox_command
 from agent.tools.file_tool import FileTool
+from agent.tools.terminal_tool import _drain_remaining, _stream_with_limit, _terminate, _TimedOut
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent / "cad_scripts"
 
@@ -117,13 +117,11 @@ class CadTool:
                 finally:
                     os.close(seccomp_fd)
                 try:
-                    stdout, stderr = process.communicate(timeout=120)
+                    stdout, stderr = _stream_with_limit(process, timeout=120)
                 finally:
                     with self._lock:
                         self._process = None
-            except subprocess.TimeoutExpired as error:
-                self._terminate(process, force=True)
-                process.communicate()
+            except _TimedOut as error:
                 self._record_build_failure("CAD operation timed out after 120 seconds.")
                 raise RuntimeError(
                     "CAD operation timed out after 120 seconds."
@@ -203,15 +201,6 @@ class CadTool:
             temporary_path.replace(target)
         finally:
             temporary_path.unlink(missing_ok=True)
-
-    @staticmethod
-    def _terminate(process: subprocess.Popen[str], *, force: bool) -> None:
-        if process.poll() is not None:
-            return
-        try:
-            os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
-        except ProcessLookupError:
-            pass
 
     @staticmethod
     def _failure_detail(output: str) -> str:
@@ -405,4 +394,4 @@ class CadTool:
                 self._screenshot_event.set()
         with self._lock:
             if self._process and self._process.poll() is None:
-                self._terminate(self._process, force=True)
+                _terminate(self._process, force=True)

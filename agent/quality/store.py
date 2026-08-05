@@ -32,6 +32,7 @@ from agent.quality.errors import (
     ATTEMPT_STATUSES,
     DECISION_TYPES,
     ISSUE_SEVERITIES,
+    RUN_STATUSES,
     TERMINAL_ATTEMPT_STATUSES,
     TERMINAL_RUN_STATUSES,
 )
@@ -168,6 +169,33 @@ class QualityStore:
             self._append_event_locked(
                 run_id,
                 "run_completed",
+                {"run_id": run_id, "status": status},
+            )
+            return self.get_run(run_id)
+
+    def transition_run(self, run_id: str, *, status: str) -> TaskRun:
+        """Transition a non-terminal run to another non-terminal status."""
+        if status not in RUN_STATUSES:
+            raise QualityError(f"Unknown run status: {status!r}")
+        if status in TERMINAL_RUN_STATUSES:
+            raise QualityError(
+                f"Use complete_run() for terminal status {status!r}."
+            )
+        with self._lock:
+            run = self.get_run(run_id)
+            if run.status in TERMINAL_RUN_STATUSES:
+                raise QualityIntegrityError(
+                    f"Run {run_id} is already terminal ({run.status}); "
+                    f"cannot transition to {status}."
+                )
+            if run.status == status:
+                return run
+            data = run.to_dict()
+            data["status"] = status
+            self._write_json_atomic(self._run_file(run_id), data)
+            self._append_event_locked(
+                run_id,
+                "run_transitioned",
                 {"run_id": run_id, "status": status},
             )
             return self.get_run(run_id)
@@ -312,15 +340,38 @@ class QualityStore:
             stream.write(line)
 
     # ------------------------------------------------------------------ reads
+    def _all_run_ids(self) -> list[str]:
+        """Return every run id on disk, sorted by created_at descending."""
+        runs_dir = self._runs_dir()
+        if not runs_dir.is_dir():
+            return []
+        ids: list[tuple[str, str]] = []
+        for run_file in sorted(runs_dir.glob("*/run.json")):
+            try:
+                data = self._read_json_required(run_file)
+                created_at = data.get("created_at", "")
+                run_id = data.get("run_id", "")
+                if run_id:
+                    ids.append((created_at, run_id))
+            except QualityIntegrityError:
+                continue
+        ids.sort(key=lambda item: item[0], reverse=True)
+        return [item[1] for item in ids]
+
     def reconcile(self) -> int:
         """Mark runs left ``running`` by a dead process as ``interrupted``.
 
         Called before a new run starts; the runner is single-flight, so any
         leftover running record belongs to an aborted process.
+        ``waiting_for_user`` runs are left alone — they are paused, not dead.
         """
         interrupted = 0
-        for run in self.list_runs(limit=500):
-            if run.status != "running":
+        for run_id in self._all_run_ids():
+            try:
+                run = self.get_run(run_id)
+            except QualityIntegrityError:
+                continue
+            if run.status not in ("running",):
                 continue
             with self._lock:
                 try:
@@ -486,10 +537,14 @@ class QualityStore:
         return decisions[:limit]
 
     def latest_decision_for_revision(self, revision_id: str) -> UserDecision | None:
-        """Latest explicit decision across runs for one revision (or None)."""
+        """Latest explicit decision across all runs for one revision (or None)."""
         latest: UserDecision | None = None
-        for run in self.list_runs(limit=500):
-            for decision in self.list_decisions(run.run_id, limit=500):
+        for run_id in self._all_run_ids():
+            try:
+                decisions = self.list_decisions(run_id, limit=500)
+            except QualityIntegrityError:
+                continue
+            for decision in decisions:
                 if decision.revision_id != revision_id:
                     continue
                 if latest is None or decision.created_at > latest.created_at:
@@ -498,12 +553,15 @@ class QualityStore:
 
     def decisions_for_revision(self, revision_id: str) -> list[UserDecision]:
         decisions: list[UserDecision] = []
-        for run in self.list_runs(limit=500):
-            decisions.extend(
-                decision
-                for decision in self.list_decisions(run.run_id, limit=500)
-                if decision.revision_id == revision_id
-            )
+        for run_id in self._all_run_ids():
+            try:
+                decisions.extend(
+                    decision
+                    for decision in self.list_decisions(run_id, limit=500)
+                    if decision.revision_id == revision_id
+                )
+            except QualityIntegrityError:
+                continue
         return sorted(decisions, key=lambda item: item.created_at)
 
     def create_issue(
@@ -569,9 +627,7 @@ class QualityStore:
             limit = max(1, min(int(limit), 500))
         except (TypeError, ValueError) as error:
             raise QualityError("Issue limit must be an integer.") from error
-        run_ids = [run_id] if run_id is not None else [
-            run.run_id for run in self.list_runs(limit=500)
-        ]
+        run_ids = [run_id] if run_id is not None else self._all_run_ids()
         issues: list[Issue] = []
         for current_run_id in run_ids:
             issue_dir = self._run_dir(current_run_id) / "issues"
@@ -592,8 +648,12 @@ class QualityStore:
 
     def has_successful_attempt_for_revision(self, revision_id: str) -> bool:
         """Return whether a revision has at least one successful CAD attempt."""
-        for run in self.list_runs(limit=500):
-            for attempt in self.list_attempts(run.run_id, limit=500):
+        for run_id in self._all_run_ids():
+            try:
+                attempts = self.list_attempts(run_id, limit=500)
+            except QualityIntegrityError:
+                continue
+            for attempt in attempts:
                 if attempt.revision_id == revision_id and attempt.status == "succeeded":
                     return True
         return False

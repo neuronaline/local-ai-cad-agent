@@ -72,17 +72,10 @@ if ! "$PYTHON_BIN" -c 'import ctypes; ctypes.CDLL("libseccomp.so.2")' 2>/dev/nul
 fi
 
 # ── API key ──
-if [ -f "$PROJECT_DIR/.env" ]; then
-    set -a
-    # shellcheck source=/dev/null
-    source "$PROJECT_DIR/.env"
-    set +a
-fi
-
-if [ -z "${OPENROUTER_API_KEY:-}" ]; then
-    if ! grep -qE '^[[:space:]]*OPENROUTER_API_KEY[[:space:]]*=[[:space:]]*[^[:space:]]' "$PROJECT_DIR/.env" 2>/dev/null; then
-        warn "OPENROUTER_API_KEY is not configured. The setup page will guide you on first launch."
-    fi
+# Python loads .env via dotenv; this shell only checks that the file exists.
+if [ -f "$PROJECT_DIR/.env" ] \
+    && ! grep -qE '^[[:space:]]*OPENROUTER_API_KEY[[:space:]]*=[[:space:]]*[^[:space:]]' "$PROJECT_DIR/.env" 2>/dev/null; then
+    warn "OPENROUTER_API_KEY is not configured. The setup page will guide you on first launch."
 fi
 
 # ── Port check ──

@@ -51,8 +51,17 @@ class QuestionValidator:
                     return False
             elif input_type == "multiselect":
                 options = q.get("options", [])
-                selected = [v.strip() for v in value.split(",") if v.strip()]
-                if not isinstance(options, list) or not selected:
+                if not isinstance(options, list):
+                    return False
+                # Accept JSON arrays (preferred) or legacy comma-separated strings.
+                if isinstance(value, list):
+                    selected = [str(v).strip() for v in value if str(v).strip()]
+                else:
+                    selected = [v.strip() for v in str(value).split(",") if v.strip()]
+                if not selected:
+                    # All-optional: treat empty selection as valid.
+                    if required is False:
+                        continue
                     return False
                 if not all(v in options for v in selected):
                     return False

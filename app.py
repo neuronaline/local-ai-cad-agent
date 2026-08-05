@@ -277,26 +277,61 @@ def _project_modified_at(project_dir: Path) -> str:
     return datetime.fromtimestamp(modified, tz=timezone.utc).isoformat()
 
 
+_ENV_API_KEY_LINE = re.compile(r"^[ \t]*OPENROUTER_API_KEY[ \t]*=[ \t]*(.*)$")
+
+
+def _reject_newlines(value: str, name: str) -> None:
+    if "\n" in value or "\r" in value:
+        raise ValueError(f"{name} must not contain line breaks.")
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Atomically replace a file: write a temp sibling, then rename over it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent, text=True
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    except BaseException:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+
+
 def _save_env_key(env_path: Path, api_key: str) -> None:
-    """Write OPENROUTER_API_KEY to .env, preserving other lines."""
+    """Write OPENROUTER_API_KEY to .env, preserving other lines.
+
+    The key is matched strictly (`OPENROUTER_API_KEY=...` assignments only,
+    never a prefix such as `OPENROUTER_API_KEY_FOO`) and the file is replaced
+    atomically so a crash cannot leave a truncated .env behind.
+    """
+    _reject_newlines(api_key, "API key")
     lines: list[str] = []
-    found = False
     if env_path.is_file():
         lines = env_path.read_text(encoding="utf-8").splitlines(keepends=True)
-    new_lines = []
+    new_lines: list[str] = []
+    found = False
     for line in lines:
-        if line.strip().startswith("OPENROUTER_API_KEY"):
+        if _ENV_API_KEY_LINE.match(line):
             new_lines.append(f"OPENROUTER_API_KEY={api_key}\n")
             found = True
         else:
             new_lines.append(line)
     if not found:
         new_lines.append(f"OPENROUTER_API_KEY={api_key}\n")
-    env_path.write_text("".join(new_lines), encoding="utf-8")
+    _atomic_write_text(env_path, "".join(new_lines))
 
 
 def _save_config_model(config_path: Path, model: str) -> None:
     """Set openrouter.model in config.yaml, preserving the rest."""
+    _reject_newlines(model, "Model")
     if config_path.is_file():
         with config_path.open("r", encoding="utf-8") as fh:
             data = yaml.safe_load(fh) or {}
@@ -308,7 +343,10 @@ def _save_config_model(config_path: Path, model: str) -> None:
     if not isinstance(data["openrouter"], dict):
         data["openrouter"] = {}
     data["openrouter"]["model"] = model
-    config_path.write_text(yaml.dump(data, default_flow_style=False, allow_unicode=True), encoding="utf-8")
+    _atomic_write_text(
+        config_path,
+        yaml.dump(data, default_flow_style=False, allow_unicode=True),
+    )
 
 
 def create_app(settings: Settings | None = None) -> Flask:
@@ -324,19 +362,86 @@ def create_app(settings: Settings | None = None) -> Flask:
     app.config["PROJECT_LOCKS"]: dict[str, threading.Lock] = {}
     app.config["PROJECT_LOCKS_LOCK"] = threading.Lock()
 
+    @app.after_request
+    def add_security_headers(response):
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: blob:; "
+            "script-src 'self' 'unsafe-inline'; "
+            "object-src 'none'; "
+            "frame-ancestors 'none'; "
+            "form-action 'self'",
+        )
+        return response
+
     @app.errorhandler(RequestEntityTooLarge)
     def upload_too_large(_error):
         return jsonify({"error": "The request is too large; upload at most five 10 MB images."}), 413
 
+    def _hostname(header_value: str) -> str:
+        """Extract the bare hostname from a Host or Origin header."""
+        if not header_value:
+            return ""
+        # Strip scheme for Origin headers.
+        value = header_value.split("://")[-1]
+        # Strip port and path.
+        value = value.split("/")[0]
+        # Handle IPv6 brackets: [::1]:5000 → ::1
+        if value.startswith("["):
+            value = value.lstrip("[").split("]")[0]
+        else:
+            value = value.split(":")[0]
+        return value
+
+    @app.before_request
+    def validate_origin():
+        """Reject cross-origin mutation requests when bound to localhost.
+
+        GET/HEAD/OPTIONS are always allowed. For state-changing methods the
+        Origin / Host headers must match the configured bind address so a
+        malicious page on another origin cannot drive the local service.
+
+        When the bind address is a wildcard (0.0.0.0, ::) the check falls back
+        to a same-origin comparison between the Host and Origin headers.
+        """
+        if request.method in ("GET", "HEAD", "OPTIONS"):
+            return None
+        origin = request.headers.get("Origin", "")
+        host = request.headers.get("Host", "")
+        if not origin and not host:
+            return None  # No headers to check (e.g., direct curl).
+        host_name = _hostname(host)
+        origin_name = _hostname(origin)
+
+        bind_host = settings.host
+        _WILDCARD_BINDS = frozenset({"0.0.0.0", "::", ""})
+        if bind_host in _WILDCARD_BINDS:
+            # Wildcard bind — must be same-origin.
+            if origin and host and origin_name and origin_name != host_name:
+                return jsonify({"error": "Cross-origin requests are not allowed."}), 403
+            if host_name not in ("localhost", "127.0.0.1", "::1") or not host_name:
+                return jsonify({"error": "Cross-origin requests are not allowed."}), 403
+        else:
+            allowed = {bind_host, "localhost", "127.0.0.1", "::1"}
+            if host_name and host_name not in allowed:
+                return jsonify({"error": "Cross-origin requests are not allowed."}), 403
+            if origin_name and origin_name not in allowed:
+                return jsonify({"error": "Cross-origin requests are not allowed."}), 403
+        return None
+
     @app.get("/")
     def index() -> str:
-        if not _api_key_configured(settings):
+        current = app.config["SETTINGS"]
+        if not _api_key_configured(current):
             return redirect(url_for("setup_page"))
         return render_template("projects.html")
 
     @app.get("/setup")
     def setup_page() -> str:
-        if _api_key_configured(settings):
+        current = app.config["SETTINGS"]
+        if _api_key_configured(current):
             return redirect(url_for("index"))
         return render_template("setup.html")
 
@@ -349,12 +454,18 @@ def create_app(settings: Settings | None = None) -> Flask:
             return jsonify({"error": "An API key is required."}), 400
         if not model:
             return jsonify({"error": "A model name is required."}), 400
+        if "\n" in api_key or "\r" in api_key:
+            return jsonify({"error": "The API key must not contain line breaks."}), 400
+        if "\n" in model or "\r" in model:
+            return jsonify({"error": "The model name must not contain line breaks."}), 400
         root = _project_root()
         env_path = root / ".env"
         config_path = root / "config.yaml"
         try:
             _save_env_key(env_path, api_key)
             _save_config_model(config_path, model)
+        except ValueError as error:
+            return jsonify({"error": str(error)}), 400
         except OSError as error:
             return jsonify({"error": f"Could not save settings: {error}"}), 500
         # Reload env so subsequent requests see the key.
@@ -373,16 +484,17 @@ def create_app(settings: Settings | None = None) -> Flask:
 
     @app.get("/project/<name>")
     def project_view(name: str) -> str:
-        if not _api_key_configured(settings):
+        current = app.config["SETTINGS"]
+        if not _api_key_configured(current):
             return redirect(url_for("setup_page"))
         try:
-            _project_path(settings, name)
+            _project_path(current, name)
         except (ValueError, FileNotFoundError):
             return "Project not found.", 404
         return render_template(
             "index.html",
             project_name=name,
-            show_info_messages=settings.show_info_messages,
+            show_info_messages=current.show_info_messages,
         )
 
     @app.get("/api/projects")
@@ -472,12 +584,14 @@ def create_app(settings: Settings | None = None) -> Flask:
                 or runner.waiting_question(project_name)
             ):
                 return jsonify({"error": "Cannot rename a project with active agent state."}), 409
-            project_dir.rename(target)
-            metadata = _read_project_metadata(target)
+            # Prepare all updated file contents before moving anything so a
+            # mid-rename failure cannot leave project.json behind the rename.
+            metadata = _read_project_metadata(project_dir)
+            original_metadata = dict(metadata)
             metadata["name"] = new_name
             metadata["created_at"] = metadata.get("created_at") or _utc_now()
-            _write_project_metadata(target, metadata)
-            summary_path = target / "summary.md"
+            summary_content: str | None = None
+            summary_path = project_dir / "summary.md"
             if summary_path.is_file():
                 content = summary_path.read_text(encoding="utf-8")
                 lines = content.split("\n")
@@ -485,7 +599,42 @@ def create_app(settings: Settings | None = None) -> Flask:
                     if line.startswith("# "):
                         lines[i] = f"# {new_name}"
                         break
-                summary_path.write_text("\n".join(lines), encoding="utf-8")
+                summary_content = "\n".join(lines)
+
+            # Stage the new metadata in a temp file inside the source dir so
+            # the write cannot fail after the directory has moved.
+            with tempfile.NamedTemporaryFile(
+                mode="w", dir=project_dir, encoding="utf-8", delete=False
+            ) as temporary:
+                metadata_tmp_name = Path(temporary.name).name
+                json.dump(metadata, temporary, ensure_ascii=False, indent=2)
+
+            renamed = False
+            try:
+                project_dir.rename(target)
+                renamed = True
+                # Rebuild the staged path: the directory moved under it.
+                (target / metadata_tmp_name).replace(target / "project.json")
+                if summary_content is not None:
+                    with tempfile.NamedTemporaryFile(
+                        mode="w", dir=target, encoding="utf-8", delete=False
+                    ) as temporary:
+                        summary_tmp = Path(temporary.name)
+                        temporary.write(summary_content)
+                    summary_tmp.replace(target / "summary.md")
+            except Exception:
+                (target if renamed else project_dir).joinpath(metadata_tmp_name).unlink(
+                    missing_ok=True
+                )
+                if renamed and target.exists():
+                    # Best-effort rollback so a failed update never leaves a
+                    # half-renamed project; restore the original metadata.
+                    try:
+                        target.rename(project_dir)
+                        _write_project_metadata(project_dir, original_metadata)
+                    except OSError:
+                        pass
+                raise
         return jsonify({"project": new_name})
 
     @app.post("/api/chat")
@@ -494,6 +643,7 @@ def create_app(settings: Settings | None = None) -> Flask:
         payload = payload or {}
         project_name = str(payload.get("project", ""))
         message = str(payload.get("message", "")).strip()
+        idempotency_key = str(payload.get("idempotency_key", "")).strip()
         if not message:
             return jsonify({"error": "Message is required."}), 400
         try:
@@ -503,6 +653,21 @@ def create_app(settings: Settings | None = None) -> Flask:
         runner = app.config["AGENT_RUNNER"]
         if runner.waiting_question(project_name):
             return jsonify({"error": "Answer the pending question before sending another message."}), 409
+        # Idempotency: check before the running guard so the retry of a
+        # successfully accepted submission receives a graceful response.
+        if idempotency_key:
+            cache = app.config.setdefault("IDEMPOTENCY_CACHE", {})
+            if idempotency_key in cache:
+                if runner.is_running() or runner.is_awaiting_preview():
+                    return jsonify(
+                        {
+                            "accepted": True,
+                            "duplicate": True,
+                            "error": "Your message is already being processed.",
+                        }
+                    ), 202
+                # Stale entry: runner finished but key was never cleaned.
+                cache.pop(idempotency_key, None)
         if runner.is_running() or runner.is_awaiting_preview():
             return jsonify({"error": "An agent task is already running."}), 409
         with _project_lock(app, project_name):
@@ -534,6 +699,13 @@ def create_app(settings: Settings | None = None) -> Flask:
             started = runner.start(project_name, message, image_paths)
             if started:
                 _append_conversation(project_dir, event)
+                if idempotency_key:
+                    cache = app.config.setdefault("IDEMPOTENCY_CACHE", {})
+                    cache[idempotency_key] = True
+                    if len(cache) > 1000:
+                        oldest_keys = list(cache.keys())[:-500]
+                        for key in oldest_keys:
+                            cache.pop(key, None)
         if not started:
             for image_path in image_paths:
                 image_path.unlink(missing_ok=True)
@@ -580,10 +752,15 @@ def create_app(settings: Settings | None = None) -> Flask:
             except (ValueError, FileNotFoundError) as error:
                 return jsonify({"error": str(error)}), 404
         runner = app.config["AGENT_RUNNER"]
+        affected = runner.stop(project_name)
         event_project = project_name or runner.active_project()
-        runner.stop(project_name)
-        bus.publish("agent_stopped", {"project": event_project})
-        return jsonify({"stopped": True})
+        if event_project is None and affected:
+            event_project = affected[0]
+        bus.publish(
+            "agent_stopped",
+            {"project": event_project, "affected_projects": affected},
+        )
+        return jsonify({"stopped": True, "affected_projects": affected})
 
     @app.get("/api/projects/<project_name>/state")
     def project_state(project_name: str):
@@ -641,9 +818,12 @@ def create_app(settings: Settings | None = None) -> Flask:
                     return jsonify({"error": "Stop or finish the active agent task before finalizing."}), 409
                 if settings.quality_require_acceptance_before_finalize:
                     body = request.get_json(silent=True) or {}
-                    force = bool(body.get("force"))
+                    force_value = body.get("force")
+                    force = force_value is True
                     quality = QualityStore(project_dir)
-                    head = RevisionStore(project_dir).head()
+                    revisions = RevisionStore(project_dir)
+                    revisions.reconcile()
+                    head = revisions.head()
                     decision = (
                         quality.latest_decision_for_revision(head.id)
                         if head is not None
@@ -1305,7 +1485,9 @@ def create_app(settings: Settings | None = None) -> Flask:
         """Ensure the attempt targets the current head revision (delivery gate)."""
         try:
             with _project_lock(app, project_name):
-                head = RevisionStore(_project_path(settings, project_name)).head()
+                revisions = RevisionStore(_project_path(settings, project_name))
+                revisions.reconcile()
+                head = revisions.head()
         except (ValueError, RevisionIntegrityError) as error:
             return jsonify({"error": str(error)}), 422
         if head is None or head.id != found["attempt"].revision_id:

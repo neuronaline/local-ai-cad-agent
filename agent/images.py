@@ -12,6 +12,9 @@ from werkzeug.datastructures import FileStorage
 ALLOWED_MIME_TYPES = {"image/png", "image/jpeg", "image/webp"}
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_IMAGE_DIMENSION = 1600
+MAX_IMAGE_PIXELS = 100_000_000
+# Reject image bombs at decode time across the process: 100 MP ≈ 400 MB RGB.
+Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
 
 
 def store_images(files: list[FileStorage], project_dir: Path) -> list[Path]:
@@ -29,7 +32,15 @@ def store_images(files: list[FileStorage], project_dir: Path) -> list[Path]:
             if len(raw) > MAX_IMAGE_BYTES:
                 raise ValueError("Each image must be 10 MB or smaller.")
             try:
-                image = Image.open(io.BytesIO(raw))
+                image = Image.open(io.BytesIO(raw), formats=["PNG", "JPEG", "WEBP"])
+                # The header is parsed but pixels are not decoded yet: reject
+                # oversized dimensions before any full decode.
+                if image.width * image.height > MAX_IMAGE_PIXELS:
+                    raise ValueError(
+                        f"Image dimensions exceed {MAX_IMAGE_PIXELS // 1_000_000} megapixels."
+                    )
+                # Progressively decode JPEG (no-op for PNG/WebP) before load.
+                image.draft("RGB", (MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION))
                 image.load()
             except (UnidentifiedImageError, Image.DecompressionBombError, OSError) as error:
                 raise ValueError(f"Invalid image: {upload.filename}") from error

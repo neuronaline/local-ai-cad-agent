@@ -11,6 +11,109 @@ from typing import ClassVar
 
 from agent.sandbox import command as sandbox_command
 
+# Maximum bytes to buffer from subprocess stdout/stderr to prevent OOM.
+_MAX_OUTPUT_BYTES = 1 * 1024 * 1024  # 1 MB per stream
+
+
+class _TimedOut(RuntimeError):
+    """Subprocess timed out; carries partial output captured before the kill."""
+
+    def __init__(self, stdout: str, stderr: str) -> None:
+        super().__init__(f"Command timed out.\n{stdout}{stderr}")
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _terminate(process: subprocess.Popen[str], *, force: bool) -> None:
+    """Kill a subprocess process group."""
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+
+def _stream_with_limit(
+    process: subprocess.Popen[str],
+    timeout: float,
+) -> tuple[str, str]:
+    """Read stdout/stderr with a per-stream ring buffer; kill on overflow."""
+    stdout_buf = _RingBuffer(_MAX_OUTPUT_BYTES)
+    stderr_buf = _RingBuffer(_MAX_OUTPUT_BYTES)
+    killed = threading.Event()
+
+    def _reader(pipe, buf):
+        try:
+            for chunk in iter(lambda: pipe.read(65536), ""):
+                if killed.is_set():
+                    break
+                if not buf.append(chunk):
+                    killed.set()
+                    _terminate(process, force=True)
+                    break
+        except (OSError, ValueError):
+            pass
+
+    stdout_thread = threading.Thread(
+        target=_reader, args=(process.stdout, stdout_buf), daemon=True
+    )
+    stderr_thread = threading.Thread(
+        target=_reader, args=(process.stderr, stderr_buf), daemon=True
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        killed.set()
+        _terminate(process, force=True)
+        stdout_thread.join(timeout=1)
+        stderr_thread.join(timeout=1)
+        raise _TimedOut(stdout_buf.value(), stderr_buf.value())
+    finally:
+        stdout_thread.join(timeout=1)
+        stderr_thread.join(timeout=1)
+
+    if killed.is_set():
+        raise RuntimeError("Subprocess output exceeded the memory limit; terminated.")
+
+    return stdout_buf.value(), stderr_buf.value()
+
+
+def _drain_remaining(process: subprocess.Popen[str]) -> tuple[str, str]:
+    """Best-effort drain after process has been terminated."""
+    try:
+        out, err = process.communicate(timeout=2)
+        return (out or ""), (err or "")
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        return "", ""
+
+
+class _RingBuffer:
+    """Thread-safe circular buffer capped at ``max_bytes`` bytes."""
+
+    def __init__(self, max_bytes: int) -> None:
+        self._max = max_bytes
+        self._buf: list[bytes] = []
+        self._size = 0
+        self._lock = threading.Lock()
+
+    def append(self, chunk: str) -> bool:
+        """Append a string chunk. Returns False if the buffer overflowed."""
+        data = chunk.encode("utf-8", errors="replace")
+        with self._lock:
+            if self._size + len(data) > self._max:
+                return False
+            self._buf.append(data)
+            self._size += len(data)
+            return True
+
+    def value(self) -> str:
+        with self._lock:
+            return b"".join(self._buf).decode("utf-8", errors="replace")
+
 _ALLOWED_CHECK_IMPORTS = {"build123d", "cadquery", "math", "numpy", "ocp_vscode"}
 _BLOCKED_CHECK_NAMES = frozenset(
     {
@@ -189,11 +292,9 @@ class TerminalTool:
                     process = self._process
             finally:
                 os.close(seccomp_fd)
-            stdout, stderr = process.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            self._terminate(process, force=True)
-            stdout, stderr = process.communicate()
-            raise RuntimeError(f"Command timed out.\n{stdout}{stderr}")
+            stdout, stderr = _stream_with_limit(process, timeout=timeout)
+        except _TimedOut:
+            raise  # The exception carries the partial output in its message.
         finally:
             with self._lock:
                 self._process = None
@@ -216,16 +317,7 @@ class TerminalTool:
             raise ValueError("Python script must exist in the active project directory.")
         return self._run_command([script.name], timeout_seconds)
 
-    @staticmethod
-    def _terminate(process: subprocess.Popen[str], *, force: bool) -> None:
-        if process.poll() is not None:
-            return
-        try:
-            os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-
     def stop(self) -> None:
         with self._lock:
             if self._process and self._process.poll() is None:
-                self._terminate(self._process, force=True)
+                _terminate(self._process, force=True)

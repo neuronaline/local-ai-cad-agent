@@ -44,15 +44,23 @@ def _validate_metrics(metrics: dict[str, Any]) -> None:
         raise ValueError("Finalization requires a finite, positive solid volume.")
 
 
-def _extract_limitations(summary: str) -> str | None:
-    """Extract a `## Limitations` section from the summary if present."""
+def _split_summary(summary: str) -> tuple[str, str | None]:
+    """Return (body, limitations), moving the `## Limitations` section out.
+
+    The limitations section belongs in the report's dedicated section; keeping
+    it inside the design summary would duplicate it in the final report.
+    """
     match = re.search(
         r"##\s+Limitations\s*\n((?:(?!##\s).*\n?)+)", summary, re.IGNORECASE
     )
     if not match:
-        return None
+        return summary, None
     content = match.group(1).strip()
-    return content if content else None
+    if not content:
+        return summary, None
+    # Preserve all content: body before Limitations + body after Limitations.
+    body = (summary[: match.start()] + summary[match.end() :]).strip()
+    return body, content
 
 
 def _parse_journey(project_dir: Path) -> dict[str, int | str]:
@@ -256,8 +264,8 @@ def finalize_project(project_dir: Path) -> dict[str, Any]:
             else:
                 summary = "No project summary was provided (placeholder detected)."
 
-        limitations = _extract_limitations(summary)
-        report = _build_report(summary, metrics, limitations, journey)
+        summary_body, limitations = _split_summary(summary)
+        report = _build_report(summary_body, metrics, limitations, journey)
 
         staged_output = project_dir / relative_output
         (staged_output / "report.md").write_text(report, encoding="utf-8")

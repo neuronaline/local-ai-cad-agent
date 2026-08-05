@@ -201,29 +201,48 @@ class AgentRunner:
             (project_dir / ".agent_state.json").unlink(missing_ok=True)
             return True
 
-    def stop(self, project: str | None = None) -> None:
+    def stop(self, project: str | None = None) -> list[str]:
+        """Stop agent work and clear pending state.
+
+        A project-scoped stop clears that project's waiting question, pending
+        completion, and preview attempts. A projectless stop clears that state
+        for every project. Returns the list of affected projects.
+        """
+        affected: list[str] = []
         with self._lock:
             target_project = project or self._active_project
             stop_active_task = (
                 target_project is None or target_project == self._active_project
             )
-            if target_project:
-                self._waiting_questions.pop(target_project, None)
-                self._pending_completions.pop(target_project, None)
-                stale_attempts = [
-                    key for key in self._preview_attempts if key[0] == target_project
-                ]
-                for key in stale_attempts:
+            if project is None:
+                affected = list(
+                    dict.fromkeys(
+                        list(self._waiting_questions)
+                        + list(self._pending_completions)
+                        + [key[0] for key in self._preview_attempts]
+                    )
+                )
+                self._waiting_questions.clear()
+                self._pending_completions.clear()
+                self._preview_attempts.clear()
+            else:
+                self._waiting_questions.pop(project, None)
+                self._pending_completions.pop(project, None)
+                for key in [
+                    key for key in self._preview_attempts if key[0] == project
+                ]:
                     self._preview_attempts.pop(key, None)
+                affected = [project]
             if stop_active_task:
                 self._stop_event.set()
             if stop_active_task and self._active_tools:
                 self._active_tools.stop()
-        if target_project:
+        for cleared in affected:
             (
-                self.settings.workspace_root / target_project / ".agent_state.json"
+                self.settings.workspace_root / cleared / ".agent_state.json"
             ).unlink(missing_ok=True)
-            self._finalize_run(target_project, "stopped")
+            self._finalize_run(cleared, "stopped")
+        return affected
 
     def _run(
         self,
@@ -391,8 +410,13 @@ class AgentRunner:
                     return
                 any_tool_used = True
                 needs_visual_review = False
+                processed_call_ids: set[str] = set()
                 for call in tool_calls:
+                    call_id = call.get("id", "")
                     if self._stop_event.is_set():
+                        self._cancel_remaining_tool_calls(
+                            project_dir, tool_calls, processed_call_ids, messages
+                        )
                         return
                     (
                         preview_id,
@@ -412,6 +436,7 @@ class AgentRunner:
                         run_id=run_id,
                         quality=quality,
                     )
+                    processed_call_ids.add(call_id)
                     if needs_critique:
                         needs_visual_review = True
                     if waiting:
@@ -441,6 +466,14 @@ class AgentRunner:
                                 "message": "Waiting for user input.",
                             },
                         )
+                        self._cancel_remaining_tool_calls(
+                            project_dir, tool_calls, processed_call_ids, messages
+                        )
+                        if quality is not None and run_id is not None:
+                            try:
+                                quality.transition_run(run_id, status="waiting_for_user")
+                            except QualityError:
+                                pass
                         return
                 if needs_visual_review and not cad_fix_required:
                     critique = self._verification_context(project, project_dir)
@@ -557,9 +590,72 @@ class AgentRunner:
     def _api_history_path(project_dir: Path) -> Path:
         return project_dir / "api_messages.jsonl"
 
+    # Cap the API message history; older turns are truncated on load.
+    MAX_API_HISTORY = 100
+
+    @staticmethod
+    def _strip_image_parts(item: dict) -> dict:
+        """Replace inline image parts with placeholders when loading history.
+
+        Base64 image payloads are only sent for the turn that introduces them;
+        on later turns they are replaced with a readable placeholder so the
+        full image is not re-sent. Other message metadata is preserved.
+        """
+        content = item.get("content")
+        if item.get("role") != "user" or not isinstance(content, list):
+            return item
+        parts: list[object] = []
+        replaced = False
+        image_index = 0
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                replaced = True
+                image_index += 1
+                name = part.get("filename") or f"reference-{image_index}"
+                parts.append({"type": "text", "text": f"[image: {name}]"})
+            else:
+                parts.append(part)
+        if not replaced:
+            return item
+        cleaned = dict(item)
+        cleaned["content"] = parts
+        return cleaned
+
+    @staticmethod
+    def _is_constraint_message(item: dict) -> bool:
+        content = item.get("content")
+        return (
+            item.get("role") == "user"
+            and isinstance(content, str)
+            and content.startswith("<runtime_active_constraints>")
+        )
+
+    @classmethod
+    def _truncate_history(cls, history: list[dict]) -> list[dict]:
+        """Keep at most MAX_API_HISTORY messages, preserving the newest constraint context."""
+        if len(history) <= cls.MAX_API_HISTORY:
+            return history
+        tail_start = len(history) - cls.MAX_API_HISTORY
+        newest_constraint = next(
+            (
+                index
+                for index in range(len(history) - 1, -1, -1)
+                if cls._is_constraint_message(history[index])
+            ),
+            None,
+        )
+        indices = list(range(tail_start, len(history)))
+        if newest_constraint is not None and newest_constraint < tail_start:
+            indices[0] = newest_constraint
+        return [history[index] for index in sorted(indices)]
+
     @classmethod
     def _load_api_history(cls, project_dir: Path) -> list[dict]:
-        """Load the append-only, protocol-level history for cache-stable turns."""
+        """Load the append-only, protocol-level history for cache-stable turns.
+
+        Inline image payloads are stripped to placeholders and the history is
+        truncated to MAX_API_HISTORY messages so old turns are not re-sent.
+        """
         history: list[dict] = []
         history_path = cls._api_history_path(project_dir)
         if history_path.exists():
@@ -574,24 +670,24 @@ class AgentRunner:
                     "tool",
                 }:
                     history.append(item)
-            return history
-
-        # Projects created by earlier releases retain their readable transcript.
-        # Convert it only once into the protocol history; never rewrite it.
-        log_path = project_dir / "conversation.jsonl"
-        if log_path.exists():
-            for line in log_path.read_text(encoding="utf-8").splitlines():
-                try:
-                    item = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if item.get("role") in {"user", "assistant"} and isinstance(
-                    item.get("content"), str
-                ):
-                    history.append({"role": item["role"], "content": item["content"]})
-        for item in history:
-            cls._append_api_message(project_dir, item)
-        return history
+        else:
+            # Projects created by earlier releases retain their readable transcript.
+            # Convert it only once into the protocol history; never rewrite it.
+            log_path = project_dir / "conversation.jsonl"
+            if log_path.exists():
+                for line in log_path.read_text(encoding="utf-8").splitlines():
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if item.get("role") in {"user", "assistant"} and isinstance(
+                        item.get("content"), str
+                    ):
+                        history.append({"role": item["role"], "content": item["content"]})
+            for item in history:
+                cls._append_api_message(project_dir, item)
+        history = [cls._strip_image_parts(item) for item in history]
+        return cls._truncate_history(history)
 
     @classmethod
     def _append_api_message(cls, project_dir: Path, message: dict) -> None:
@@ -951,6 +1047,29 @@ class AgentRunner:
             messages,
         )
         return preview_id, cad_error, cad_fix_required, needs_visual_review, waiting
+
+    @classmethod
+    def _cancel_remaining_tool_calls(
+        cls,
+        project_dir: Path,
+        tool_calls: list[dict],
+        processed_call_ids: set[str],
+        messages: list[dict],
+    ) -> None:
+        """Write cancelled tool-result entries for unprocessed calls.
+
+        Required by the OpenAI chat-completions protocol: every tool call in
+        an assistant message must have a matching tool result before the next
+        assistant turn.  Without these entries the API will reject the
+        conversation.
+        """
+        cancelled = json.dumps({"error": "Tool call cancelled (question or stop)."})
+        for tc in tool_calls:
+            cid = tc.get("id", "")
+            if cid and cid not in processed_call_ids:
+                entry = {"role": "tool", "tool_call_id": cid, "content": cancelled}
+                messages.append(entry)
+                cls._append_api_message(project_dir, entry)
 
     @staticmethod
     def _attempt_artifact_paths(project_dir: Path) -> dict[str, Path]:

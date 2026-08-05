@@ -27,16 +27,49 @@ const issueForm = document.querySelector('#issue-form');
 const agentStreams = new Map();
 const streamedTools = new Map();
 const toolMessages = new Map();
+const ALLOWED_TAGS = new Set([
+  'p', 'br', 'b', 'strong', 'i', 'em', 'u', 's', 'del',
+  'code', 'pre', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+  'ul', 'ol', 'li', 'a', 'blockquote', 'hr',
+  'table', 'thead', 'tbody', 'tr', 'th', 'td',
+  'span', 'div', 'details', 'summary',
+]);
+const ALLOWED_ATTRS = new Set(['href', 'title', 'class', 'id']);
+// Content that must be dropped entirely (their text could confuse the UI).
+const DROP_TAGS = new Set(['script', 'style', 'iframe', 'object', 'embed', 'link', 'meta', 'base', 'noscript', 'template']);
+
+function isSafeHref(value) {
+  // Normalize away control chars (browsers strip these before URL resolution).
+  const url = value.replace(/[\u0000-\u001F\u007F]/g, '').trim();
+  if (/^(https?:|mailto:)/i.test(url)) return true;
+  // Anything without a scheme is a relative URL; block every other scheme.
+  return !/^[a-z][a-z0-9+.-]*:/i.test(url);
+}
+
 function sanitizeHTML(html) {
-  const div = document.createElement('div');
-  div.innerHTML = html;
-  div.querySelectorAll('script').forEach(el => el.remove());
-  div.querySelectorAll('*').forEach(el => {
-    [...el.attributes].forEach(attr => {
-      if (attr.name.startsWith('on')) el.removeAttribute(attr.name);
-    });
-  });
-  return div.innerHTML;
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_ELEMENT);
+  const elements = [];
+  while (walker.nextNode()) elements.push(walker.currentNode);
+  for (const el of elements) {
+    if (el === doc.body) continue;
+    const tag = el.tagName.toLowerCase();
+    if (DROP_TAGS.has(tag)) {
+      el.remove();
+    } else if (!ALLOWED_TAGS.has(tag)) {
+      el.replaceWith(...el.childNodes);
+    } else {
+      for (const attr of [...el.attributes]) {
+        const name = attr.name.toLowerCase();
+        if (!ALLOWED_ATTRS.has(name)) {
+          el.removeAttribute(attr.name);
+        } else if (name === 'href' && !isSafeHref(attr.value)) {
+          el.removeAttribute('href');
+        }
+      }
+    }
+  }
+  return doc.body.innerHTML;
 }
 
 marked.setOptions({
@@ -254,16 +287,24 @@ async function refreshDecisionBar() {
     if (!meta.available || meta.revision !== loadedPreviewRevision || !viewer.hasModel()) {
       return hideDecisionBar();
     }
-    const listed = await api(`/api/projects/${encodeURIComponent(project)}/quality/runs?limit=1`);
-    const run = listed.runs && listed.runs[0];
-    if (!run) return hideDecisionBar();
-    const detail = await api(`/api/projects/${encodeURIComponent(project)}/quality/runs/${run.run_id}`);
-    const attempt = (detail.attempts || []).find(a => a.status === 'succeeded');
-    if (!attempt || attempt.source_sha256 !== meta.model_sha256) return hideDecisionBar();
-    if ((detail.decisions || []).some(d => d.attempt_id === attempt.attempt_id)) {
-      return hideDecisionBar();
+    const listed = await api(`/api/projects/${encodeURIComponent(project)}/quality/runs?limit=50`);
+    const runs = listed.runs || [];
+    if (!runs.length) return hideDecisionBar();
+    let foundAttempt = null;
+    let foundRun = null;
+    for (const run of runs) {
+      const detail = await api(`/api/projects/${encodeURIComponent(project)}/quality/runs/${run.run_id}`);
+      const attempt = (detail.attempts || []).find(a => a.status === 'succeeded'
+        && a.source_sha256 === meta.model_sha256
+        && !(detail.decisions || []).some(d => d.attempt_id === a.attempt_id));
+      if (attempt) {
+        foundAttempt = attempt;
+        foundRun = run;
+        break;
+      }
     }
-    decisionAttempt = {run_id: run.run_id, attempt_id: attempt.attempt_id, revision_id: attempt.revision_id};
+    if (!foundAttempt || !foundRun) return hideDecisionBar();
+    decisionAttempt = {run_id: foundRun.run_id, attempt_id: foundAttempt.attempt_id, revision_id: foundAttempt.revision_id};
     decisionBar.hidden = false;
   } catch {
     hideDecisionBar();
@@ -446,11 +487,19 @@ chatForm.addEventListener('submit', async event => {
     addMessage(text, 'user');
     setThinking(true);
     message.value = '';
+    const idempotencyKey = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const body = new FormData();
     body.append('project', currentProject);
     body.append('message', text);
+    body.append('idempotency_key', idempotencyKey);
     selectedFiles.forEach(file => body.append('attachments', file));
     const response = await api('/api/chat', {method: 'POST', body});
+    if (response.duplicate) {
+      // Retry hit a submission that is already in-flight — the SSE stream
+      // is active; clear thinking state so the user sees streaming progress.
+      setThinking(false);
+      return;
+    }
     if (response.attachments?.length) {
       addMessage(`${response.attachments.length} reference image(s) uploaded.`, 'tool');
     }
@@ -469,6 +518,7 @@ chatForm.addEventListener('submit', async event => {
         const retryBody = new FormData();
         retryBody.append('project', currentProject);
         retryBody.append('message', text);
+        retryBody.append('idempotency_key', idempotencyKey);
         selectedFiles.forEach(file => retryBody.append('attachments', file));
         const retryResponse = await api('/api/chat', {method: 'POST', body: retryBody});
         if (retryResponse.attachments?.length) {

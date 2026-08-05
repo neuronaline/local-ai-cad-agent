@@ -316,6 +316,8 @@ class FileTool:
         return result
 
     def replace(self, filename: str, old: str, new: str) -> str:
+        if not old:
+            raise ValueError("The text to replace must not be empty.")
         current = self.read(filename)
         if old not in current:
             raise ValueError("The requested text was not found; file was not changed.")
@@ -343,13 +345,21 @@ class FileTool:
         return json.dumps(result) if not isinstance(result, str) else result, False
 
     def regex_replace(self, filename: str, pattern: str, replacement: str, count: int = 1) -> str:
-        if len(pattern) > 2000 or len(replacement) > 10000:
-            raise ValueError("Patch pattern or replacement is too large.")
+        if not pattern:
+            raise ValueError("Regex pattern must not be empty.")
+        # The length cap bounds catastrophic-backtracking risk: Python's re
+        # engine has no timeout, so a short pattern is the safe default.
+        if len(pattern) > 500:
+            raise ValueError("Regex pattern is too long (max 500 characters).")
+        if len(replacement) > 10000:
+            raise ValueError("Patch replacement is too large.")
         if not 1 <= count <= 20:
             raise ValueError("Regex replacement count must be between 1 and 20.")
         current = self.read(filename)
         try:
-            updated, replacements = re.subn(pattern, replacement, current, count=count)
+            updated, replacements = re.subn(
+                pattern, replacement, current, count=count, flags=re.DOTALL
+            )
         except re.error as error:
             raise ValueError(f"Invalid regex pattern: {error}") from error
         if replacements == 0:

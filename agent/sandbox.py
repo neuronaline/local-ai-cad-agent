@@ -33,6 +33,7 @@ _DENIED_SYSCALLS = (
     "open_by_handle_at",
     "bpf",
     "perf_event_open",
+    "uselib",
 )
 
 
@@ -121,6 +122,7 @@ def command(
         f"--cpu={timeout_seconds + 5}",
         "--fsize=536870912",
         "--nofile=128",
+        "--nproc=64",
         "--as=8589934592",
         "--",
         "/venv/bin/python",

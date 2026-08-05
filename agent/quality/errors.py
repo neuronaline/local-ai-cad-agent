@@ -20,7 +20,7 @@ VALIDATION_STATUSES = frozenset(
 REQUIRED_FAIL_STATUSES = frozenset({"failed", "not_implemented"})
 
 # --- Run lifecycle statuses. ---
-RUN_STATUSES = frozenset({"running", "completed", "failed", "stopped", "interrupted"})
+RUN_STATUSES = frozenset({"running", "waiting_for_user", "completed", "failed", "stopped", "interrupted"})
 TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "stopped", "interrupted"})
 
 # --- Attempt lifecycle statuses. ---

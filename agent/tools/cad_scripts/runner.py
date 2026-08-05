@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 from pathlib import Path
 
 from build123d import export_step, export_stl
@@ -14,14 +15,22 @@ if shape is None:
     raise ValueError("model.py must expose the final build123d shape as `result`.")
 box = shape.bounding_box()
 solids = shape.solids()
+volume = float(shape.volume)
+dim_x = float(box.size.X)
+dim_y = float(box.size.Y)
+dim_z = float(box.size.Z)
+if not math.isfinite(volume) or not all(
+    math.isfinite(d) for d in (dim_x, dim_y, dim_z)
+):
+    raise ValueError("The generated CAD shape has non-finite (NaN/Infinity) geometry.")
 metrics = {
     "solid_count": len(solids),
     "is_valid": bool(shape.is_valid),
-    "volume_mm3": round(float(shape.volume), 3),
+    "volume_mm3": round(volume, 3),
     "dimensions_mm": {
-        "x": round(float(box.size.X), 3),
-        "y": round(float(box.size.Y), 3),
-        "z": round(float(box.size.Z), 3),
+        "x": round(dim_x, 3),
+        "y": round(dim_y, 3),
+        "z": round(dim_z, 3),
     },
 }
 if not metrics["is_valid"] or metrics["solid_count"] < 1 or metrics["volume_mm3"] <= 0:
