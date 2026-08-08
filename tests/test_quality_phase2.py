@@ -203,7 +203,7 @@ def test_finalize_gate_accepts_explicit_decision_or_audited_bypass(
     monkeypatch.setattr(
         app_module,
         "finalize_project",
-        lambda _project_dir: {"report_text": "ok"},
+        lambda _project_dir, **_: {"report_text": "ok"},
     )
 
     blocked = scenario.client.post("/api/projects/demo/finalize")
@@ -231,7 +231,7 @@ def test_finalize_gate_is_opt_in(scenario: QualityScenario, monkeypatch):
     monkeypatch.setattr(
         app_module,
         "finalize_project",
-        lambda _project_dir: {"report_text": "ok"},
+        lambda _project_dir, **_: {"report_text": "ok"},
     )
 
     assert scenario.client.post("/api/projects/demo/finalize").status_code == 200
@@ -255,7 +255,7 @@ def test_forced_finalize_creates_an_audit_run_when_none_exists(tmp_path: Path, m
     source = "result = 1\n"
     (project_dir / "model.py").write_text(source, encoding="utf-8")
     RevisionStore(project_dir).commit(source, RevisionOrigin(kind="agent_edit"))
-    monkeypatch.setattr(app_module, "finalize_project", lambda _project_dir: {"report_text": "ok"})
+    monkeypatch.setattr(app_module, "finalize_project", lambda _project_dir, **_: {"report_text": "ok"})
 
     assert client.post("/api/projects/demo/finalize", json={"force": True}).status_code == 200
     run = QualityStore(project_dir).list_runs()[0]
@@ -270,7 +270,7 @@ def test_resolving_issue_updates_open_count_and_finalize_gate(tmp_path: Path, mo
     import app as app_module
 
     scenario = _scenario(tmp_path, require_acceptance=True)
-    monkeypatch.setattr(app_module, "finalize_project", lambda _project_dir: {"report_text": "ok"})
+    monkeypatch.setattr(app_module, "finalize_project", lambda _project_dir, **_: {"report_text": "ok"})
     issue = scenario.client.post(
         f"/api/projects/demo/quality/attempts/{scenario.attempt_id}/issues",
         json={"category": "other", "severity": "blocking", "message": "Fix this"},

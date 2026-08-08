@@ -257,6 +257,49 @@ async function loadCurrentPreview(previewId = '') {
   }
 }
 
+async function refreshRequirementsPanel() {
+  const panel = document.querySelector('#requirements-panel');
+  const list = document.querySelector('#requirements-list');
+  const empty = document.querySelector('#requirements-empty');
+  const version = document.querySelector('#requirements-version');
+  if (!panel || !list || !currentProject) {
+    if (panel) panel.hidden = true;
+    return;
+  }
+  try {
+    const payload = await api(
+      `/api/projects/${encodeURIComponent(currentProject)}/quality/spec`,
+    );
+    const spec = payload && payload.spec;
+    if (!spec || !Array.isArray(spec.requirements) || !spec.requirements.length) {
+      panel.hidden = true;
+      list.innerHTML = '';
+      return;
+    }
+    panel.hidden = false;
+    empty.hidden = true;
+    version.textContent = `v${spec.version}`;
+    list.innerHTML = '';
+    for (const req of spec.requirements) {
+      const item = document.createElement('li');
+      item.className = `kind-${(req.kind || 'manual_review').replace(/[^a-z0-9_]/gi, '_')}`;
+      const id = document.createElement('code');
+      id.textContent = req.id;
+      const source = document.createElement('span');
+      source.className = 'req-source';
+      source.textContent = req.source_text || '(no source text)';
+      const tag = document.createElement('span');
+      tag.className = `req-required${req.required ? ' is-required' : ''}`;
+      tag.textContent = req.required ? req.kind : `${req.kind} · optional`;
+      item.append(id, source, tag);
+      list.append(item);
+    }
+  } catch (error) {
+    panel.hidden = true;
+    addMessage(error.message, 'error');
+  }
+}
+
 async function syncCurrentPreview() {
   if (!currentProject || previewLoadPromise) return;
   const project = currentProject;
@@ -555,12 +598,53 @@ function setFinalizing(active) {
 
 finalizeBtn.addEventListener('click', async () => {
   if (!currentProject) return addMessage('Create a project first.', 'error');
-  setFinalizing(true);
-  setThinking(true);
+  let force = false;
   try {
-    await api(`/api/projects/${encodeURIComponent(currentProject)}/finalize`, {method: 'POST'});
+    setFinalizing(true);
+    setThinking(true);
+    const response = await fetch(
+      `/api/projects/${encodeURIComponent(currentProject)}/finalize`,
+      {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({force}),
+      },
+    );
+    const payload = await response.json().catch(() => ({}));
     setThinking(false);
     setFinalizing(false);
+    if (!response.ok) {
+      const hint = payload.hint || 'Accept this design or record a manual bypass.';
+      if (
+        payload.code === 'ACCEPTANCE_REQUIRED' ||
+        payload.code === 'BLOCKING_ISSUES_OPEN'
+      ) {
+        const bypass = window.confirm(`${payload.error}\n\n${hint}\n\nBypass and finalize anyway?`);
+        if (!bypass) {
+          addMessage(payload.error, 'error');
+          return;
+        }
+        force = true;
+        setFinalizing(true);
+        setThinking(true);
+        const retry = await fetch(
+          `/api/projects/${encodeURIComponent(currentProject)}/finalize`,
+          {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({force: true}),
+          },
+        );
+        const retryPayload = await retry.json().catch(() => ({}));
+        setThinking(false);
+        setFinalizing(false);
+        if (!retry.ok) {
+          addMessage(retryPayload.error || 'Finalize failed.', 'error');
+        }
+        return;
+      }
+      addMessage(payload.error || 'Finalize failed.', 'error');
+    }
   } catch (error) {
     setThinking(false);
     setFinalizing(false);
@@ -884,6 +968,7 @@ onProjectEvent('question', data => {
 });
 onProjectEvent('preview_updated', data => {
   loadCurrentPreview(data.preview_id).catch(error => addMessage(error.message, 'error'));
+  refreshRequirementsPanel();
 });
 onProjectEvent('screenshot_request', data => {
   const path = `/api/projects/${encodeURIComponent(currentProject)}/screenshot`;
@@ -941,6 +1026,7 @@ async function initProject() {
   await loadHistory(currentProject);
   loadCurrentPreview();
   await loadCurrentState();
+  refreshRequirementsPanel();
 }
 
 initProject().catch(error => addMessage(error.message, 'error'));

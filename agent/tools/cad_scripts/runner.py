@@ -37,14 +37,65 @@ if not metrics["is_valid"] or metrics["solid_count"] < 1 or metrics["volume_mm3"
     raise ValueError("The generated CAD shape is empty or invalid.")
 if any(value <= 0 for value in metrics["dimensions_mm"].values()):
     raise ValueError("The generated CAD shape has no renderable 3D dimensions.")
+
+# --- Phase 2: deterministic verifiers (if a spec is on disk) -----------------
+validation_results: list[dict] = []
+spec_version = 0
+spec_path = Path("spec.json")
+if spec_path.is_file():
+    try:
+        spec_payload = json.loads(spec_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        spec_payload = {}
+    try:
+        from verifiers import run as _run_verifiers  # type: ignore
+
+        if isinstance(spec_payload, dict):
+            spec_version = int(spec_payload.get("version", 0) or 0)
+            requirements = spec_payload.get("requirements") or []
+            if isinstance(requirements, list) and requirements:
+                # The runner does not know the active attempt id; the host
+                # agent stamps it when it consumes ``.cad_validation.json``.
+                validation_results = _run_verifiers(
+                    requirements, shape, attempt_id=""
+                )
+    except Exception as error:  # noqa: BLE001 - verifier errors must not block the build
+        validation_results = [
+            {
+                "requirement_id": "",
+                "verifier": "spec.parse",
+                "status": "unclear",
+                "severity": "minor",
+                "message": f"Spec could not be evaluated: {type(error).__name__}: {error}",
+            }
+        ]
+
 preview = Path("preview.stl")
 preview_tmp = Path(".preview.stl.tmp")
 export_stl(shape, preview_tmp)
 preview_tmp.replace(preview)
 if not preview.is_file() or preview.stat().st_size == 0:
     raise RuntimeError("CAD execution did not save a usable preview.")
+
+# Persist the bounded validation/evidence artifact (used by the API and tests;
+# never returned to the LLM).
+evidence_path = Path(".cad_validation.json")
+evidence_path.write_text(
+    json.dumps(
+        {
+            "schema_version": 1,
+            "spec_version": spec_version,
+            "results": validation_results,
+        },
+        ensure_ascii=False,
+    ),
+    encoding="utf-8",
+)
+
 cache = {
     "model_sha256": hashlib.sha256(model_code.encode("utf-8")).hexdigest(),
     "metrics": metrics,
+    "spec_version": spec_version,
+    "validation_count": len(validation_results),
 }
 Path(".cad_metrics.json").write_text(json.dumps(cache), encoding="utf-8")

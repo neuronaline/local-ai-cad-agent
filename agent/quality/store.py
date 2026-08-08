@@ -39,11 +39,13 @@ from agent.quality.errors import (
 from agent.quality.models import (
     SCHEMA_VERSION,
     Attempt,
+    DesignSpec,
     EnvironmentInfo,
     Issue,
     ModelInfo,
     TaskRun,
     UserDecision,
+    ValidationResult,
     _utc_now,
     new_id,
 )
@@ -108,6 +110,21 @@ class QualityStore:
 
     def _evidence_dir(self, run_id: str, attempt_id: str) -> Path:
         return self._artifacts_dir(run_id, attempt_id) / "evidence"
+
+    def _spec_dir(self, run_id: str) -> Path:
+        return self._run_dir(run_id) / "specs"
+
+    def _spec_file(self, run_id: str, version: int) -> Path:
+        return self._spec_dir(run_id) / f"version-{int(version)}.json"
+
+    def _validation_dir(self, run_id: str) -> Path:
+        return self._run_dir(run_id) / "validations"
+
+    def _validation_file(self, run_id: str, validation_id: str) -> Path:
+        return self._validation_dir(run_id) / f"{validation_id}.json"
+
+    def _validation_index_file(self, run_id: str) -> Path:
+        return self._validation_dir(run_id) / "index.jsonl"
 
     @staticmethod
     def _validate_id(value: str) -> None:
@@ -708,6 +725,140 @@ class QualityStore:
             path = evidence_dir / f"issue-{issue_id}.png"
             self._write_bytes_atomic(path, png_bytes)
         return self._relative_posix(path)
+
+    # -------------------------------------------------------------- specs & verifiers
+
+    def save_spec(self, spec: DesignSpec) -> DesignSpec:
+        """Persist a :class:`DesignSpec` for a run and return it unchanged.
+
+        Each spec version is immutable on disk; saving an existing version is a
+        :class:`QualityIntegrityError`.
+        """
+        with self._lock:
+            self._require_run(spec.run_id)
+            spec_dir = self._spec_dir(spec.run_id)
+            spec_dir.mkdir(parents=True, exist_ok=True)
+            spec_file = self._spec_file(spec.run_id, spec.version)
+            if spec_file.exists():
+                raise QualityIntegrityError(
+                    f"Spec version {spec.version} for run {spec.run_id} already exists."
+                )
+            self._write_json_atomic(spec_file, spec.to_dict())
+            self._append_event_locked(
+                spec.run_id,
+                "spec_saved",
+                {"version": spec.version, "requirement_count": len(spec.requirements)},
+            )
+        return spec
+
+    def latest_spec(self, run_id: str) -> DesignSpec | None:
+        """Return the highest-version :class:`DesignSpec` for a run, or ``None``."""
+        self._validate_id(run_id)
+        spec_dir = self._spec_dir(run_id)
+        if not spec_dir.is_dir():
+            return None
+        latest: DesignSpec | None = None
+        with self._lock:
+            for spec_file in sorted(spec_dir.glob("version-*.json")):
+                try:
+                    data = self._read_json_required(spec_file)
+                    spec = DesignSpec.from_dict(data)
+                except QualityIntegrityError:
+                    continue
+                if latest is None or spec.version > latest.version:
+                    latest = spec
+        return latest
+
+    def get_spec(self, run_id: str, version: int) -> DesignSpec | None:
+        """Return a specific :class:`DesignSpec` version, or ``None`` if missing."""
+        self._validate_id(run_id)
+        with self._lock:
+            spec_file = self._spec_file(run_id, version)
+            if not spec_file.is_file():
+                return None
+            try:
+                return DesignSpec.from_dict(self._read_json_required(spec_file))
+            except QualityIntegrityError:
+                return None
+
+    def save_validation(
+        self,
+        result: ValidationResult,
+        *,
+        run_id: str | None = None,
+    ) -> ValidationResult:
+        """Persist a :class:`ValidationResult` and index it for fast lookup.
+
+        ``run_id`` is optional but recommended: passing it avoids an O(runs)
+        disk scan to locate the attempt. When omitted the scan runs under the
+        store lock so concurrent readers cannot see a stale mapping.
+        """
+        with self._lock:
+            if run_id is None:
+                run_id = self._run_id_for_attempt(result.attempt_id)
+            else:
+                self._validate_id(run_id)
+                self._validate_id(result.attempt_id)
+            self._require_run(run_id)
+            validation_dir = self._validation_dir(run_id)
+            validation_dir.mkdir(parents=True, exist_ok=True)
+            validation_file = self._validation_file(run_id, result.validation_id)
+            if validation_file.exists():
+                raise QualityIntegrityError(
+                    f"Validation {result.validation_id} already exists."
+                )
+            self._write_json_atomic(validation_file, result.to_dict())
+            index_file = self._validation_index_file(run_id)
+            entry = {
+                "validation_id": result.validation_id,
+                "attempt_id": result.attempt_id,
+                "requirement_id": result.requirement_id,
+                "verifier": result.verifier,
+                "status": result.status,
+                "severity": result.severity,
+                "created_at": result.created_at,
+            }
+            with index_file.open("a", encoding="utf-8") as stream:
+                stream.write(
+                    json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n"
+                )
+        return result
+
+    def _run_id_for_attempt(self, attempt_id: str) -> str:
+        """Locate the run id that owns an attempt by scanning disk manifests."""
+        self._validate_id(attempt_id)
+        for run_id in self._all_run_ids():
+            try:
+                if (self._run_dir(run_id) / "attempts" / f"{attempt_id}.json").is_file():
+                    return run_id
+            except QualityIntegrityError:
+                continue
+        raise QualityIntegrityError(f"Unknown attempt id: {attempt_id!r}")
+
+    def validations_for_attempt(self, attempt_id: str) -> list[ValidationResult]:
+        """Return every validation result for one attempt, newest first."""
+        results: list[ValidationResult] = []
+        with self._lock:
+            try:
+                run_id = self._run_id_for_attempt(attempt_id)
+            except QualityIntegrityError:
+                return []
+            validation_dir = self._validation_dir(run_id)
+            if not validation_dir.is_dir():
+                return []
+            for validation_file in sorted(validation_dir.glob("*.json")):
+                if validation_file.name == "index.jsonl":
+                    continue
+                try:
+                    results.append(
+                        ValidationResult.from_dict(
+                            self._read_json_required(validation_file)
+                        )
+                    )
+                except QualityIntegrityError:
+                    continue
+        results.sort(key=lambda item: item.created_at, reverse=True)
+        return results
 
     def get_metrics(self) -> dict[str, Any]:
         """Aggregate observability metrics for the project."""

@@ -255,10 +255,11 @@ def test_cad_build_and_verify_runs_once_with_render(tmp_path: Path, monkeypatch)
     cad = CadTool(tmp_path)
     calls = []
     metrics = {"solid_count": 1, "is_valid": True}
+    wrapped = {"metrics": metrics, "validation": [], "spec_version": 0}
     monkeypatch.setattr(
         cad,
         "_execute",
-        lambda **kwargs: calls.append(kwargs) or metrics,
+        lambda **kwargs: calls.append(kwargs) or wrapped,
     )
 
     result = cad.build_and_verify()
@@ -266,6 +267,8 @@ def test_cad_build_and_verify_runs_once_with_render(tmp_path: Path, monkeypatch)
     assert calls == [{"render": True}]
     assert result == {
         "metrics": metrics,
+        "validation": [],
+        "spec_version": 0,
         "preview": "preview.stl",
         "render": "render.png",
     }

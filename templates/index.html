@@ -31,6 +31,17 @@
           <button id="report-issue" type="button" class="danger">Report issue</button>
           <button id="continue-editing" type="button" class="quiet">Continue editing</button>
         </div>
+        <section id="requirements-panel" class="requirements-panel" hidden>
+          <header class="requirements-header">
+            <h3>Parsed requirements</h3>
+            <span id="requirements-version" class="requirements-version"></span>
+          </header>
+          <ul id="requirements-list" class="requirements-list"></ul>
+          <p id="requirements-empty" class="requirements-empty" hidden>
+            No parsed requirements yet. They will appear here as soon as a spec
+            is saved for the active run.
+          </p>
+        </section>
         <div id="question-area"></div>
         <form id="chat-form" class="composer">
           <textarea id="message" placeholder="Describe the part you want to create…" rows="2" required></textarea>

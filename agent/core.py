@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from agent.constraints import ConstraintStore, ModelConstraintValidator
+from agent.build_feedback import sanitize_build_result
 from agent.images import as_chat_image
 from agent.llm_base import create_llm_client, provider_label, sanitize_assistant_message
 from agent.prompt import get_system_prompt
@@ -300,6 +301,13 @@ class AgentRunner:
                 self.publish(
                     "quality_run_started",
                     {"project": project, "run_id": run_id},
+                )
+                # Write a fresh parsed spec for the new run so the next
+                # ``cad_build_and_verify`` can pick it up without re-parsing
+                # the conversation. Persist the same spec on disk for the
+                # runner and in the QualityStore for the API.
+                self._write_active_spec(
+                    quality, run_id, project_dir, message
                 )
             messages = self._context(project_dir, message, image_paths or [])
             preview_id: str | None = None
@@ -745,7 +753,11 @@ class AgentRunner:
             raise ValueError(f"Missing required argument(s): {', '.join(missing)}.")
 
         if name == "cad_build_and_verify":
-            return tools.cad.build_and_verify(), False
+            payload = tools.cad.build_and_verify()
+            # Persist the complete payload to disk; only the compact envelope
+            # goes back to the LLM so it cannot rediscover the design from raw
+            # metrics, evidence, or duplicated requirements.
+            return payload, False
         if name.startswith("file_"):
             tool = tools.file.with_call_id(call_id) if call_id else tools.file
             operation = name.removeprefix("file_")
@@ -972,6 +984,33 @@ class AgentRunner:
                         metrics=metrics,
                         artifact_paths=self._attempt_artifact_paths(project_dir),
                     )
+                    # Persist validation results from the build envelope next
+                    # to the attempt so the API and UI can show per-requirement
+                    # outcomes. The LLM never sees this raw payload.
+                    if isinstance(raw_result, dict):
+                        validation_items = raw_result.get("validation") or []
+                        if validation_items and quality is not None:
+                            persisted = 0
+                            for item in validation_items:
+                                if not isinstance(item, dict):
+                                    continue
+                                vr = self._coerce_validation_result(item, attempt.attempt_id)
+                                if vr is None:
+                                    continue
+                                try:
+                                    quality.save_validation(vr, run_id=attempt.run_id)
+                                    persisted += 1
+                                except QualityError:
+                                    pass
+                            if persisted:
+                                quality.append_event(
+                                    attempt.run_id,
+                                    "validation_recorded",
+                                    {
+                                        "attempt_id": attempt.attempt_id,
+                                        "count": persisted,
+                                    },
+                                )
                     self.publish(
                         "quality_attempt_completed",
                         {
@@ -982,6 +1021,15 @@ class AgentRunner:
                             "phase": attempt.phase,
                         },
                     )
+                # Replace the LLM-facing tool result with the compact envelope
+                # defined in agent/build_feedback.py so the model does not
+                # rediscover the design from raw metrics, evidence, or
+                # duplicated requirement dumps.
+                envelope = sanitize_build_result(raw_result)
+                result = json.dumps(
+                    {"ok": True, "tool": name, "data": envelope},
+                    ensure_ascii=False,
+                )
                 self.publish(
                     "preview_updated",
                     {"project": project, "preview_id": preview_id},
@@ -1347,6 +1395,64 @@ class AgentRunner:
         with (project_dir / "conversation.jsonl").open("a", encoding="utf-8") as log:
             log.write(json.dumps(item, ensure_ascii=False) + "\n")
 
+    @staticmethod
+    def _write_active_spec(quality, run_id, project_dir, message):
+        """Parse the request and persist the spec for both runner and API."""
+        from agent.quality.specification import parse_request
+
+        try:
+            spec = parse_request(run_id=run_id, request_text=message or "")
+        except Exception:  # noqa: BLE001 - spec failures must never block the run
+            return None
+        # Persist on disk for the runner.
+        try:
+            (project_dir / ".cad_spec.json").write_text(
+                json.dumps(spec.to_dict(), ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+        # Persist in the QualityStore for the API.
+        try:
+            quality.save_spec(spec)
+        except QualityError:
+            pass
+        return spec
+
+    @staticmethod
+    def _coerce_validation_result(item: dict, attempt_id: str):
+        """Turn a verifier dict (from the runner artifact) into a ValidationResult."""
+        from agent.quality.models import ValidationResult, _utc_now, new_validation_id
+
+        try:
+            tolerance = item.get("tolerance")
+            evidence = tuple(
+                str(value)
+                for value in (item.get("evidence") or ())
+                if isinstance(value, str)
+            )
+            expected = item.get("expected")
+            observed = item.get("observed")
+            return ValidationResult(
+                validation_id=new_validation_id(),
+                attempt_id=attempt_id,
+                requirement_id=str(item.get("requirement_id") or ""),
+                verifier=str(item.get("verifier") or ""),
+                status=str(item.get("status") or "unclear"),
+                severity=str(item.get("severity") or "blocking"),
+                confidence=float(item.get("confidence", 1.0) or 1.0),
+                expected=dict(expected) if isinstance(expected, dict) else {},
+                observed=dict(observed) if isinstance(observed, dict) else {},
+                tolerance=float(tolerance)
+                if isinstance(tolerance, (int, float))
+                else None,
+                evidence=evidence,
+                message=str(item.get("message") or "")[:4000],
+                created_at=str(item.get("created_at") or _utc_now()),
+            )
+        except Exception:  # noqa: BLE001 - malformed verifier rows must never break the build
+            return None
+
     def _verification_context(self, project: str, project_dir: Path) -> dict:
         self.publish(
             "agent_status",
@@ -1357,10 +1463,46 @@ class AgentRunner:
             },
         )
         render_path = project_dir / "render.png"
-        text = (
+        # The spec-driven envelope tells the agent exactly what to fix; the
+        # image is only for sanity, not for re-deriving the design.
+        envelope_path = project_dir / ".cad_validation.json"
+        base_text = (
             "Review the image and verified geometry from cad_build_and_verify against "
             "the user's request. Fix model.py if anything is missing, misaligned, or implausible."
         )
+        if envelope_path.is_file():
+            try:
+                import json as _json
+
+                payload = _json.loads(envelope_path.read_text(encoding="utf-8"))
+                actionable = [
+                    result
+                    for result in (payload.get("results") or [])
+                    if isinstance(result, dict)
+                    and result.get("status") in {"failed", "unclear", "not_implemented"}
+                ]
+                if actionable:
+                    summary = "\n".join(
+                        "- [{rid}] {status}: {msg}".format(
+                            rid=item.get("requirement_id", ""),
+                            status=item.get("status", ""),
+                            msg=(item.get("message") or "")[:160],
+                        )
+                        for item in actionable[:5]
+                    )
+                    text = base_text + "\n\nParsed spec findings:\n" + summary
+                    if render_path.is_file():
+                        return {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": text},
+                                as_chat_image(render_path),
+                            ],
+                        }
+                    return {"role": "user", "content": text}
+            except (OSError, ValueError):
+                pass
+        text = base_text
         if render_path.is_file():
             return {
                 "role": "user",

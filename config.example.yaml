@@ -27,7 +27,7 @@ openrouter:
 
 openai:
   base_url: https://api.openai.com/v1
-  model: gpt-4o-mini
+  model: gpt-5.6-terra
   timeout_seconds: 60
   reasoning_effort: ""
 

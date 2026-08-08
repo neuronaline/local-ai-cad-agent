@@ -3,10 +3,15 @@
 Phase 1 of the CAD quality plan. Each record is serialized as a JSON manifest
 and stored immutable inside the project. ``from_dict`` tolerates unknown keys
 and absent optional fields so newer readers do not break older records.
+
+Phase 2 adds :class:`DesignSpec` (parsed user requirement list) and
+:class:`ValidationResult` (deterministic verifier outcomes). They share the same
+``SCHEMA_VERSION`` and the same forward-compatibility rules.
 """
 
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -313,3 +318,210 @@ class Issue:
             confirmed_by=_as_str(data.get("confirmed_by")) or None,
             created_at=_as_str(data.get("created_at"), _utc_now()),
         )
+
+
+# --- Phase 2: DesignSpec + ValidationResult -------------------------------
+
+# Stable kinds implemented by the Phase 2 verifier registry. Unknown kinds are
+# kept in the spec as ``manual_review`` so the generator does not silently lose
+# the user's request — see ``agent/quality/specification.py`` for the parser.
+SPEC_KINDS = frozenset(
+    {
+        "solid_count",
+        "body_count",
+        "dimension",
+        "hole",
+        "hole_pattern",
+        "axis_alignment",
+        "position",
+        "symmetry",
+        "clearance",
+        "clearance_path",
+        "connectivity",
+        "non_intersection",
+        "minimum_thickness",
+        "bed_contact",
+        "forbidden_feature",
+        "visual_shape",
+        "manual_review",
+    }
+)
+
+
+def _slug_requirement_id(prefix: str, source_text: str, index: int) -> str:
+    """Stable, human-readable requirement ID (e.g. ``REQ-BASE-X``)."""
+    text = source_text or ""
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_").upper()
+    if not slug:
+        slug = f"ITEM{index:03d}"
+    slug = slug[:32]
+    return f"{prefix}-{slug}"
+
+
+@dataclass(frozen=True)
+class Requirement:
+    """One parsed requirement from a :class:`DesignSpec`."""
+
+    id: str
+    kind: str
+    required: bool = True
+    source_text: str = ""
+    target: float | None = None
+    tolerance: float = 0.05
+    units: str = "mm"
+    selector: dict[str, Any] = field(default_factory=dict)
+    extras: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "id": self.id,
+            "kind": self.kind,
+            "required": self.required,
+            "source_text": self.source_text,
+            "tolerance": self.tolerance,
+            "units": self.units,
+        }
+        if self.target is not None:
+            data["target"] = self.target
+        if self.selector:
+            data["selector"] = dict(self.selector)
+        if self.extras:
+            data["extras"] = dict(self.extras)
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Requirement:
+        selector = data.get("selector")
+        extras = data.get("extras")
+        return cls(
+            id=_as_str(data.get("id")),
+            kind=_as_str(data.get("kind"), "manual_review"),
+            required=bool(data.get("required", True)),
+            source_text=_as_str(data.get("source_text")),
+            target=float(data["target"]) if isinstance(data.get("target"), (int, float)) else None,
+            tolerance=float(data.get("tolerance", 0.05) or 0.05),
+            units=_as_str(data.get("units"), "mm") or "mm",
+            selector=dict(selector) if isinstance(selector, dict) else {},
+            extras=dict(extras) if isinstance(extras, dict) else {},
+        )
+
+
+@dataclass(frozen=True)
+class DesignSpec:
+    """A parsed, persisted list of requirements for one task run.
+
+    Persisted next to the run it belongs to at
+    ``runs/<run_id>/specs/<version>.json``. ``spec_version`` is referenced from
+    every :class:`Attempt` so later attempts can be interpreted against the
+    exact spec that drove them.
+    """
+
+    run_id: str
+    version: int
+    requirements: tuple[Requirement, ...]
+    forbidden: tuple[dict[str, Any], ...] = ()
+    units: str = "mm"
+    schema_version: int = SCHEMA_VERSION
+    request_text: str = ""
+    created_at: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "run_id": self.run_id,
+            "version": self.version,
+            "units": self.units,
+            "request_text": self.request_text,
+            "created_at": self.created_at,
+            "requirements": [req.to_dict() for req in self.requirements],
+            "forbidden": [dict(item) for item in self.forbidden],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> DesignSpec:
+        requirements_raw = data.get("requirements") or []
+        requirements = tuple(
+            Requirement.from_dict(item) for item in requirements_raw
+            if isinstance(item, dict)
+        )
+        forbidden_raw = data.get("forbidden") or []
+        forbidden = tuple(
+            dict(item) for item in forbidden_raw if isinstance(item, dict)
+        )
+        return cls(
+            schema_version=int(data.get("schema_version", SCHEMA_VERSION)),
+            run_id=_as_str(data.get("run_id")),
+            version=int(data.get("version", 1) or 1),
+            requirements=requirements,
+            forbidden=forbidden,
+            units=_as_str(data.get("units"), "mm") or "mm",
+            request_text=_as_str(data.get("request_text")),
+            created_at=_as_str(data.get("created_at"), _utc_now()),
+        )
+
+
+@dataclass(frozen=True)
+class ValidationResult:
+    """One deterministic verifier outcome against one requirement."""
+
+    validation_id: str
+    attempt_id: str
+    requirement_id: str
+    verifier: str
+    status: str
+    created_at: str
+    schema_version: int = SCHEMA_VERSION
+    expected: dict[str, Any] = field(default_factory=dict)
+    observed: dict[str, Any] = field(default_factory=dict)
+    tolerance: float | None = None
+    confidence: float = 1.0
+    severity: str = "blocking"
+    evidence: tuple[str, ...] = ()
+    message: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "schema_version": self.schema_version,
+            "validation_id": self.validation_id,
+            "attempt_id": self.attempt_id,
+            "requirement_id": self.requirement_id,
+            "verifier": self.verifier,
+            "status": self.status,
+            "severity": self.severity,
+            "confidence": self.confidence,
+            "expected": dict(self.expected),
+            "observed": dict(self.observed),
+            "evidence": list(self.evidence),
+            "message": self.message,
+            "created_at": self.created_at,
+        }
+        if self.tolerance is not None:
+            data["tolerance"] = self.tolerance
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ValidationResult:
+        evidence = data.get("evidence")
+        return cls(
+            schema_version=int(data.get("schema_version", SCHEMA_VERSION)),
+            validation_id=_as_str(data.get("validation_id")),
+            attempt_id=_as_str(data.get("attempt_id")),
+            requirement_id=_as_str(data.get("requirement_id")),
+            verifier=_as_str(data.get("verifier")),
+            status=_as_str(data.get("status"), "unclear"),
+            severity=_as_str(data.get("severity"), "blocking"),
+            confidence=float(data.get("confidence", 1.0) or 1.0),
+            expected=dict(data.get("expected") or {}) if isinstance(data.get("expected"), dict) else {},
+            observed=dict(data.get("observed") or {}) if isinstance(data.get("observed"), dict) else {},
+            tolerance=float(data["tolerance"]) if isinstance(data.get("tolerance"), (int, float)) else None,
+            evidence=tuple(str(item) for item in evidence if isinstance(item, str))
+            if isinstance(evidence, list)
+            else (),
+            message=_as_str(data.get("message")),
+            created_at=_as_str(data.get("created_at"), _utc_now()),
+        )
+
+
+def new_validation_id() -> str:
+    """UUID4 hex identifier for a :class:`ValidationResult` record."""
+    return uuid.uuid4().hex

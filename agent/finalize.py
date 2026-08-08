@@ -180,10 +180,13 @@ def _build_report(
     metrics: dict[str, Any],
     limitations: str | None,
     journey: dict[str, int | str],
+    finalization_status: str = "accepted",
 ) -> str:
     dimensions = metrics["dimensions_mm"]
     sections: list[str] = [
         "# CAD Finalization Report",
+        "",
+        f"## Finalization status: {finalization_status}",
         "",
         "## Design summary",
         summary.strip() or "No project summary was provided.",
@@ -236,8 +239,9 @@ def _build_report(
     return "\n".join(sections) + "\n"
 
 
-def finalize_project(project_dir: Path) -> dict[str, Any]:
+def finalize_project(project_dir: Path, *, finalization_status: str | None = None) -> dict[str, Any]:
     cad = CadTool(project_dir)
+    resolved_status = str(finalization_status or "accepted")
 
     with tempfile.TemporaryDirectory(prefix=".finalize-", dir=project_dir) as temporary:
         staging_root = Path(temporary)
@@ -265,7 +269,7 @@ def finalize_project(project_dir: Path) -> dict[str, Any]:
                 summary = "No project summary was provided (placeholder detected)."
 
         summary_body, limitations = _split_summary(summary)
-        report = _build_report(summary_body, metrics, limitations, journey)
+        report = _build_report(summary_body, metrics, limitations, journey, resolved_status)
 
         staged_output = project_dir / relative_output
         (staged_output / "report.md").write_text(report, encoding="utf-8")
@@ -277,7 +281,13 @@ def finalize_project(project_dir: Path) -> dict[str, Any]:
             else ""
         )
         (staged_output / ".finalize_meta.json").write_text(
-            json.dumps({"model_sha256": model_digest}, ensure_ascii=False),
+            json.dumps(
+                {
+                    "model_sha256": model_digest,
+                    "finalization_status": resolved_status,
+                },
+                ensure_ascii=False,
+            ),
             encoding="utf-8",
         )
         expected = [
@@ -303,6 +313,7 @@ def finalize_project(project_dir: Path) -> dict[str, Any]:
             shutil.rmtree(backup_dir)
 
     return {
+        "finalization_status": resolved_status,
         "metrics": metrics,
         "exports": {
             "metrics": metrics,

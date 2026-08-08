@@ -30,6 +30,7 @@ def _read_script(name: str) -> str:
 
 RUNNER = _read_script("runner.py")
 RENDERER = _read_script("renderer.py")
+VERIFIERS = _read_script("verifiers.py")
 
 
 class CadTool:
@@ -92,10 +93,21 @@ class CadTool:
                 "export_stl(shape, 'output/model.stl')\n"
             )
 
+        spec_payload = self._read_active_spec()
+
         with tempfile.TemporaryDirectory(prefix="cad-agent-") as temporary:
             workspace = Path(temporary)
             (workspace / "model.py").write_text(model_code, encoding="utf-8")
             (workspace / "runner.py").write_text(code, encoding="utf-8")
+            # Bundled verifier implementations live in the workspace so the
+            # sandboxed subprocess can ``import verifiers`` without touching
+            # the agent package source tree.
+            (workspace / "verifiers.py").write_text(VERIFIERS, encoding="utf-8")
+            if spec_payload is not None:
+                (workspace / "spec.json").write_text(
+                    json.dumps(spec_payload, ensure_ascii=False),
+                    encoding="utf-8",
+                )
             command, seccomp_fd = sandbox_command(
                 workspace,
                 ["runner.py"],
@@ -150,6 +162,7 @@ class CadTool:
                 self._record_build_failure(error_msg)
                 raise TypeError(error_msg)
             self._atomic_copy(preview_path, self.project_dir / "preview.stl")
+            validation_results = self._collect_validation_results(workspace)
             if render:
                 render_path = workspace / "render.png"
                 if not render_path.is_file() or render_path.stat().st_size == 0:
@@ -167,7 +180,12 @@ class CadTool:
                     self._atomic_copy(artifact, target / name)
             self._atomic_copy(metrics_path, self.project_dir / ".cad_metrics.json")
             self._record_build_success(cached["metrics"])
-            return cached["metrics"]
+            payload = {
+                "metrics": cached["metrics"],
+                "validation": validation_results,
+                "spec_version": int(cached.get("spec_version", 0) or 0),
+            }
+            return payload
 
     def _record_build_success(self, metrics: dict[str, Any]) -> None:
         """Record a successful build against the active revision."""
@@ -180,6 +198,36 @@ class CadTool:
             )
         except (OSError, RevisionIntegrityError):
             pass  # Best-effort; don't block CAD results on revision issues.
+
+    def _read_active_spec(self) -> dict[str, Any] | None:
+        """Read the spec the agent most recently committed for this build."""
+        path = self.project_dir / ".cad_spec.json"
+        if not path.is_file():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _collect_validation_results(self, workspace: Path) -> list[dict[str, Any]]:
+        """Read ``.cad_validation.json`` and copy it next to ``.cad_metrics.json``."""
+        validation_path = workspace / ".cad_validation.json"
+        if not validation_path.is_file():
+            return []
+        try:
+            payload = json.loads(validation_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        if not isinstance(payload, dict):
+            return []
+        results = payload.get("results")
+        target = self.project_dir / ".cad_validation.json"
+        try:
+            self._atomic_copy(validation_path, target)
+        except OSError:
+            pass  # The artifact is best-effort; the in-memory result still works.
+        return [dict(item) for item in results] if isinstance(results, list) else []
 
     def _record_build_failure(self, error: str) -> None:
         """Record a failed build against the active revision."""
@@ -235,13 +283,20 @@ class CadTool:
         return "\n".join(dict.fromkeys(frames))[-2000:]
 
     def run(self) -> dict[str, Any]:
-        return self._execute()
+        """Return the raw build metrics (legacy shape used by ``cad.run``)."""
+        payload = self._execute()
+        if isinstance(payload, dict) and isinstance(payload.get("metrics"), dict):
+            return dict(payload["metrics"])
+        return payload if isinstance(payload, dict) else {}
 
     def build_and_verify(self) -> dict[str, Any]:
         """Build once, validate metrics, and produce both preview and render."""
-        metrics = self._execute(render=True)
+        payload = self._execute(render=True)
+        metrics = payload.get("metrics") if isinstance(payload, dict) else None
         return {
             "metrics": metrics,
+            "validation": payload.get("validation", []) if isinstance(payload, dict) else [],
+            "spec_version": payload.get("spec_version", 0) if isinstance(payload, dict) else 0,
             "preview": "preview.stl",
             "render": "render.png",
         }
@@ -287,11 +342,12 @@ class CadTool:
             raise ValueError("Export directory must be inside the active project.")
         target.mkdir(parents=True, exist_ok=True)
         try:
-            metrics = self._execute(export_dir=export_dir, render=True)
+            payload = self._execute(export_dir=export_dir, render=True)
         except RuntimeError as error:
             raise RuntimeError(
                 str(error).replace("CAD execution", "CAD finalization")
             ) from error
+        metrics = payload.get("metrics") if isinstance(payload, dict) else None
         export_step_path = self.project_dir / export_dir / "model.step"
         export_stl_path = self.project_dir / export_dir / "model.stl"
         if not export_step_path.is_file() or not export_stl_path.is_file():
@@ -307,7 +363,8 @@ class CadTool:
         return {"render": "render.png"}
 
     def export(self, output_dir: str = "output") -> dict[str, Any]:
-        metrics = self._execute(export_dir=output_dir)
+        payload = self._execute(export_dir=output_dir)
+        metrics = payload.get("metrics") if isinstance(payload, dict) else None
         return {
             "metrics": metrics,
             "step": f"{output_dir}/model.step",

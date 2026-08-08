@@ -843,6 +843,8 @@ def create_app(settings: Settings | None = None) -> Flask:
                     or runner.waiting_question(project_name)
                 ):
                     return jsonify({"error": "Stop or finish the active agent task before finalizing."}), 409
+                finalization_status = "accepted"
+                bypassed = False
                 if settings.quality_require_acceptance_before_finalize:
                     body = request.get_json(silent=True) or {}
                     force_value = body.get("force")
@@ -875,10 +877,12 @@ def create_app(settings: Settings | None = None) -> Flask:
                                 return jsonify({
                                     "error": "Resolve or explicitly bypass open blocking issues before finalizing.",
                                     "code": "BLOCKING_ISSUES_OPEN",
+                                    "hint": "Accept this design or record a manual bypass.",
                                 }), 409
                             return jsonify({
                                 "error": "The current design has not been explicitly accepted. Review the preview and click Accept design first (or force a recorded local bypass).",
                                 "code": "ACCEPTANCE_REQUIRED",
+                                "hint": "Accept this design or record a manual bypass.",
                             }), 409
                         # Recorded manual bypass: never silent.
                         try:
@@ -904,12 +908,18 @@ def create_app(settings: Settings | None = None) -> Flask:
                                 "error": f"Cannot audit finalization bypass: {error}",
                                 "code": "BYPASS_AUDIT_FAILED",
                             }), 422
+                        finalization_status = "finalized_with_bypass"
+                        bypassed = True
+                    elif decision is not None and decision.decision == "accepted_with_limitations":
+                        finalization_status = "accepted_with_limitations"
                 bus.publish("agent_status", {
                     "project": project_name,
                     "status": "finalizing",
                     "message": "Finalization started — running CAD, rendering, and exporting in one pass…",
                 })
-                result = finalize_project(project_dir)
+                result = finalize_project(
+                    project_dir, finalization_status=finalization_status
+                )
         except (ValueError, RuntimeError, TypeError, KeyError, OSError) as error:
             bus.publish("agent_error", {"project": project_name, "message": str(error)})
             return jsonify({"error": str(error)}), 400
@@ -919,9 +929,18 @@ def create_app(settings: Settings | None = None) -> Flask:
             "message": "Report written and output artifacts verified.",
         })
         report_text = result.pop("report_text", "")
-        bus.publish("finalized", {"project": project_name, **result, "report_text": report_text})
+        bus.publish(
+            "finalized",
+            {
+                "project": project_name,
+                **result,
+                "report_text": report_text,
+                "bypassed": bypassed,
+            },
+        )
         bus.publish("preview_updated", {"project": project_name})
         result["report_text"] = report_text
+        result["bypassed"] = bypassed
         return jsonify(result)
 
     @app.get("/api/projects/<project_name>/render")
@@ -943,6 +962,22 @@ def create_app(settings: Settings | None = None) -> Flask:
         if not report_path.is_file():
             return jsonify({"error": "No report has been generated."}), 404
         return send_file(report_path, mimetype="text/markdown", max_age=0)
+
+    @app.get("/api/projects/<project_name>/output/finalize-meta")
+    def project_finalize_meta(project_name: str):
+        """Return ``.finalize_meta.json`` (or 404) for the active finalization."""
+        try:
+            project_dir = _project_path(settings, project_name)
+        except (ValueError, FileNotFoundError) as error:
+            return jsonify({"error": str(error)}), 404
+        meta_path = project_dir / "output" / ".finalize_meta.json"
+        if not meta_path.is_file():
+            return jsonify({"error": "No finalization metadata found."}), 404
+        try:
+            payload = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return jsonify({"error": "Finalization metadata is unreadable."}), 404
+        return jsonify(payload)
 
     @app.get("/api/projects/<project_name>/output/<path:filename>")
     def project_output_file(project_name: str, filename: str):
@@ -1468,6 +1503,49 @@ def create_app(settings: Settings | None = None) -> Flask:
         except (QualityError, QualityIntegrityError) as error:
             return jsonify({"error": str(error)}), 404
         return jsonify({"events": events})
+
+    @app.get("/api/projects/<project_name>/quality/spec")
+    def quality_latest_spec(project_name: str):
+        """Return the most recent DesignSpec for the active run (read-only)."""
+        try:
+            project_dir = _project_path(settings, project_name)
+        except (ValueError, FileNotFoundError) as error:
+            return jsonify({"error": str(error)}), 404
+        store = QualityStore(project_dir)
+        try:
+            run_id = request.args.get("run_id")
+            spec = None
+            if run_id and _valid_uuid(run_id):
+                spec = store.latest_spec(run_id)
+            if spec is None:
+                # Fall back to the most recent run's spec.
+                for run in store.list_runs(limit=20):
+                    spec = store.latest_spec(run.run_id)
+                    if spec is not None:
+                        break
+        except (QualityError, QualityIntegrityError) as error:
+            return jsonify({"error": str(error)}), 404
+        if spec is None:
+            return jsonify({"spec": None, "requirements": []})
+        return jsonify({"spec": spec.to_dict()})
+
+    @app.get("/api/projects/<project_name>/quality/validations/<attempt_id>")
+    def quality_attempt_validations(project_name: str, attempt_id: str):
+        """Return every ValidationResult for one attempt."""
+        if not _valid_uuid(attempt_id):
+            return jsonify({"error": "Invalid attempt id."}), 404
+        try:
+            project_dir = _project_path(settings, project_name)
+        except (ValueError, FileNotFoundError) as error:
+            return jsonify({"error": str(error)}), 404
+        store = QualityStore(project_dir)
+        try:
+            results = store.validations_for_attempt(attempt_id)
+        except (QualityError, QualityIntegrityError) as error:
+            return jsonify({"error": str(error)}), 404
+        return jsonify(
+            {"validations": [r.to_dict() for r in results]}
+        )
 
     @app.get("/api/projects/<project_name>/quality/attempts/<attempt_id>")
     def quality_attempt_detail(project_name: str, attempt_id: str):

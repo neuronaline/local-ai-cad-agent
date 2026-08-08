@@ -431,6 +431,84 @@ button.primary { background: #7898f4; color: #071225; font-weight: 750; }
 }
 .decision-bar button { padding: .4rem .65rem; font-size: .74rem; }
 
+.requirements-panel {
+  border: 1px solid #2c3b54;
+  border-radius: 9px;
+  background: #142037;
+  padding: .55rem .65rem;
+  font-size: .78rem;
+  color: #c5d1e5;
+  display: flex;
+  flex-direction: column;
+  gap: .45rem;
+  max-height: 220px;
+  overflow: auto;
+}
+.requirements-panel[hidden] { display: none; }
+.requirements-header {
+  display: flex;
+  align-items: center;
+  gap: .4rem;
+  justify-content: space-between;
+}
+.requirements-header h3 {
+  margin: 0;
+  font-size: .75rem;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: #95a6c4;
+}
+.requirements-version {
+  font-size: .68rem;
+  color: #6f81a3;
+}
+.requirements-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: .35rem;
+}
+.requirements-list li {
+  display: grid;
+  grid-template-columns: 6.5rem 1fr auto;
+  gap: .5rem;
+  align-items: baseline;
+  padding: .25rem .35rem;
+  border-radius: 5px;
+  background: #0c1424;
+}
+.requirements-list li.kind-manual_review { background: #18243a; }
+.requirements-list code {
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: .72rem;
+  color: #93b2eb;
+}
+.requirements-list .req-source {
+  color: #c5d1e5;
+  font-size: .75rem;
+  white-space: pre-wrap;
+}
+.requirements-list .req-kind {
+  font-size: .68rem;
+  text-transform: uppercase;
+  color: #7c93bd;
+  font-weight: 600;
+}
+.requirements-list .req-required {
+  font-size: .68rem;
+  color: #b0c0e0;
+}
+.requirements-list .req-required.is-required {
+  color: #f0a070;
+}
+.requirements-empty {
+  margin: 0;
+  font-size: .74rem;
+  color: #7c93bd;
+}
+
 .issue-modal {
   position: fixed;
   inset: 0;
