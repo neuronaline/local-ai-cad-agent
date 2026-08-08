@@ -57,6 +57,16 @@ def store_images(files: list[FileStorage], project_dir: Path) -> list[Path]:
     return stored
 
 
-def as_openrouter_image(path: Path) -> dict[str, object]:
+def as_chat_image(path: Path) -> dict[str, object]:
+    """Encode an image as an OpenAI-compatible ``image_url`` chat content part.
+
+    Both OpenRouter and OpenAI Chat Completions accept the same
+    ``{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}``
+    shape, so a single helper serves both providers.
+    """
     encoded = base64.b64encode(path.read_bytes()).decode("ascii")
     return {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}}
+
+
+# Backward-compat alias for callers and tests still importing the old name.
+as_openrouter_image = as_chat_image

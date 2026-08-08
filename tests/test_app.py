@@ -5,6 +5,7 @@ import time
 from io import BytesIO
 from pathlib import Path
 
+import yaml
 from PIL import Image
 
 from agent.revisions import RevisionOrigin, RevisionStore
@@ -429,7 +430,10 @@ def test_setup_access_follows_api_key_configuration(tmp_path: Path, monkeypatch)
 
     response = client.get("/setup")
     assert response.status_code == 200
-    assert b"OpenRouter API Key" in response.data
+    # The setup form must offer both providers and a generic API-key label.
+    assert b'name="provider" value="openrouter"' in response.data
+    assert b'name="provider" value="openai"' in response.data
+    assert b"API Key" in response.data
     for endpoint in ("/", "/project/demo"):
         assert client.get(endpoint, follow_redirects=False).status_code == 302
 
@@ -452,6 +456,44 @@ def test_api_setup_saves_key_and_model(tmp_path: Path, monkeypatch):
 
     env_content = (tmp_path / ".env").read_text(encoding="utf-8")
     assert "OPENROUTER_API_KEY=sk-or-v1-mykey" in env_content
+
+
+def test_api_setup_saves_openai_key_and_model(tmp_path: Path, monkeypatch):
+    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    monkeypatch.setenv("OPENAI_API_KEY", "")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "")
+    monkeypatch.setattr("app._project_root", lambda: tmp_path)
+    (tmp_path / ".env.example").write_text("OPENAI_API_KEY=\n", encoding="utf-8")
+    client = create_app(settings).test_client()
+
+    resp = client.post(
+        "/api/setup",
+        json={"api_key": "sk-myopenai", "model": "gpt-4o-mini", "provider": "openai"},
+    )
+    assert resp.status_code == 200
+    assert resp.get_json() == {"ok": True}
+
+    env_content = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert "OPENAI_API_KEY=sk-myopenai" in env_content
+    # Existing OPENROUTER_API_KEY line should be preserved, not stomped.
+    assert "OPENAI_API_KEY=" in env_content
+
+    config = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+    assert config["llm"]["provider"] == "openai"
+    assert config["openai"]["model"] == "gpt-4o-mini"
+
+
+def test_api_setup_rejects_unknown_provider(tmp_path: Path, monkeypatch):
+    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    monkeypatch.setattr("app._project_root", lambda: tmp_path)
+    client = create_app(settings).test_client()
+
+    resp = client.post(
+        "/api/setup",
+        json={"api_key": "sk-x", "model": "m", "provider": "bogus"},
+    )
+    assert resp.status_code == 400
+    assert "Unknown provider" in resp.get_json()["error"]
 
 
 # ── Preflight ──

@@ -8,6 +8,7 @@ from typing import Any
 import yaml
 
 REASONING_EFFORTS = {"minimal", "low", "medium", "high"}
+LLM_PROVIDERS = {"openrouter", "openai"}
 
 
 @dataclass(frozen=True)
@@ -25,11 +26,27 @@ class Settings:
     openrouter_reasoning_effort: str | None = None
     openrouter_provider: str | None = None
     openrouter_force_provider: bool = False
+    # ── LLM provider selection ──
+    llm_provider: str = "openrouter"
+    # OpenAI Chat Completions adapter.
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_model: str = "gpt-4o-mini"
+    openai_timeout_seconds: int = 60
+    openai_reasoning_effort: str | None = None
+    # ── end provider selection ──
     show_info_messages: bool = True
     agent_tool_call_limit: int = 12
     revision_retention_count: int = 0  # 0 = unlimited, >0 = keep at most N revisions
     quality_enabled: bool = True  # passive run/attempt observability (plan Phase 1)
     quality_require_acceptance_before_finalize: bool = False  # plan Phase 2 gate (rollout stage 7)
+
+    @property
+    def llm_model(self) -> str:
+        """Return the model name of the active provider."""
+        if self.llm_provider == "openai":
+            return self.openai_model
+        return self.openrouter_model
+
 
 def _read_yaml(path: Path) -> dict[str, Any]:
     if not path.exists():
@@ -76,7 +93,9 @@ def load_settings(project_root: Path | None = None, home: Path | None = None) ->
     project_root = project_root or Path(__file__).resolve().parents[1]
     home = home or Path.home()
     config = _merge(_read_yaml(project_root / "config.yaml"), _read_yaml(home / ".cad-agent" / "config.yaml"))
+    llm = config.get("llm", {})
     openrouter = config.get("openrouter", {})
+    openai = config.get("openai", {})
     server = config.get("server", {})
     ui = config.get("ui", {})
     agent = config.get("agent", {})
@@ -93,6 +112,19 @@ def load_settings(project_root: Path | None = None, home: Path | None = None) ->
             "Enable quality or disable the acceptance gate."
         )
 
+    # llm.provider selects which adapter AgentRunner should use. Settings
+    # for the inactive provider are still loaded so users can switch without
+    # losing their previous model choice.
+    llm_provider_raw = _optional_string(llm.get("provider")) or "openrouter"
+    if llm_provider_raw not in LLM_PROVIDERS:
+        raise ValueError(
+            f"llm.provider must be one of {sorted(LLM_PROVIDERS)}, got {llm_provider_raw!r}."
+        )
+    llm_provider = llm_provider_raw
+
+    # Each provider keeps its own model; ``settings.llm_model`` returns the
+    # active one so callers do not need to branch on the provider.
+
     return Settings(
         workspace_root=Path(config.get("workspace_root", "~/CAD-Agent-Projects")).expanduser(),
         openrouter_base_url=str(openrouter.get("base_url", "https://openrouter.ai/api/v1")).rstrip("/"),
@@ -107,6 +139,11 @@ def load_settings(project_root: Path | None = None, home: Path | None = None) ->
         openrouter_reasoning_effort=_optional_effort(openrouter.get("reasoning_effort")),
         openrouter_provider=_optional_string(openrouter.get("provider")),
         openrouter_force_provider=_strict_bool(openrouter.get("force_provider", False), "openrouter.force_provider"),
+        llm_provider=llm_provider,
+        openai_base_url=str(openai.get("base_url", "https://api.openai.com/v1")).rstrip("/"),
+        openai_model=str(openai.get("model", "gpt-4o-mini")),
+        openai_timeout_seconds=_validate_timeout_seconds(openai.get("timeout_seconds", 60), "openai.timeout_seconds"),
+        openai_reasoning_effort=_optional_effort(openai.get("reasoning_effort")),
         show_info_messages=_strict_bool(ui.get("show_info_messages", True), "ui.show_info_messages"),
         agent_tool_call_limit=_positive_int(agent.get("tool_call_limit", 12), "agent.tool_call_limit"),
         revision_retention_count=_non_negative_int(agent.get("revision_retention_count", 0), "agent.revision_retention_count"),
@@ -123,7 +160,7 @@ def _optional_string(value: Any) -> str | None:
 def _optional_effort(value: Any) -> str | None:
     effort = _optional_string(value)
     if effort is not None and effort not in REASONING_EFFORTS:
-        raise ValueError("openrouter.reasoning_effort must be minimal, low, medium, or high.")
+        raise ValueError("reasoning_effort must be minimal, low, medium, or high.")
     return effort
 
 

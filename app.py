@@ -189,10 +189,16 @@ def _model_status(project_dir: Path) -> str:
     return "none"
 
 
+def _active_api_key_env(settings: Settings) -> str:
+    """Return the env var name that supplies the API key for the active provider."""
+    from agent.llm_base import api_key_env
+    return api_key_env(settings.llm_provider)
+
+
 def _api_key_configured(settings: Settings) -> bool:
-    """Return True when a non-empty OpenRouter API key is available."""
-    key = os.getenv("OPENROUTER_API_KEY", "")
-    return bool(key.strip()) and bool(settings.openrouter_model.strip())
+    """Return True when a non-empty API key is available for the active provider."""
+    key = os.getenv(_active_api_key_env(settings), "")
+    return bool(key.strip()) and bool(settings.llm_model.strip())
 
 
 def _project_root() -> Path:
@@ -203,12 +209,13 @@ def _run_preflight(settings: Settings) -> dict[str, Any]:
     """Return a dict with preflight check results."""
     checks: dict[str, bool | str] = {}
 
-    # OpenRouter API key
-    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    # Active provider's API key (OpenRouter or OpenAI)
+    api_key = os.getenv(_active_api_key_env(settings), "").strip()
     checks["api_key"] = bool(api_key)
+    checks["provider"] = settings.llm_provider
 
-    # Model configured
-    checks["model_configured"] = bool(settings.openrouter_model.strip())
+    # Model configured for the active provider
+    checks["model_configured"] = bool(settings.llm_model.strip())
 
     # Workspace writable
     try:
@@ -277,12 +284,36 @@ def _project_modified_at(project_dir: Path) -> str:
     return datetime.fromtimestamp(modified, tz=timezone.utc).isoformat()
 
 
-_ENV_API_KEY_LINE = re.compile(r"^[ \t]*OPENROUTER_API_KEY[ \t]*=[ \t]*(.*)$")
-
-
 def _reject_newlines(value: str, name: str) -> None:
     if "\n" in value or "\r" in value:
         raise ValueError(f"{name} must not contain line breaks.")
+
+
+def _save_env_api_key(env_path: Path, env_var: str, api_key: str) -> None:
+    """Write ``env_var=api_key`` to ``.env``, preserving other lines.
+
+    The key is matched strictly against ``<env_var>=...`` assignments only
+    (never a prefix such as ``OPENAI_API_KEY_FOO``) and the file is replaced
+    atomically so a crash cannot leave a truncated .env behind.
+    """
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]*", env_var):
+        raise ValueError(f"Invalid environment variable name: {env_var!r}")
+    _reject_newlines(api_key, "API key")
+    lines: list[str] = []
+    if env_path.is_file():
+        lines = env_path.read_text(encoding="utf-8").splitlines(keepends=True)
+    new_lines: list[str] = []
+    pattern = re.compile(rf"^[ \t]*{re.escape(env_var)}[ \t]*=[ \t]*(.*)$")
+    found = False
+    for line in lines:
+        if pattern.match(line):
+            new_lines.append(f"{env_var}={api_key}\n")
+            found = True
+        else:
+            new_lines.append(line)
+    if not found:
+        new_lines.append(f"{env_var}={api_key}\n")
+    _atomic_write_text(env_path, "".join(new_lines))
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
@@ -305,32 +336,16 @@ def _atomic_write_text(path: Path, content: str) -> None:
         raise
 
 
-def _save_env_key(env_path: Path, api_key: str) -> None:
-    """Write OPENROUTER_API_KEY to .env, preserving other lines.
+def _save_config_setup(config_path: Path, provider: str, model: str) -> None:
+    """Persist the active provider and its model into ``config.yaml``.
 
-    The key is matched strictly (`OPENROUTER_API_KEY=...` assignments only,
-    never a prefix such as `OPENROUTER_API_KEY_FOO`) and the file is replaced
-    atomically so a crash cannot leave a truncated .env behind.
+    Always writes ``llm.provider`` and the model under the matching namespace
+    (``openrouter.model`` or ``openai.model``). Other sections are preserved.
     """
-    _reject_newlines(api_key, "API key")
-    lines: list[str] = []
-    if env_path.is_file():
-        lines = env_path.read_text(encoding="utf-8").splitlines(keepends=True)
-    new_lines: list[str] = []
-    found = False
-    for line in lines:
-        if _ENV_API_KEY_LINE.match(line):
-            new_lines.append(f"OPENROUTER_API_KEY={api_key}\n")
-            found = True
-        else:
-            new_lines.append(line)
-    if not found:
-        new_lines.append(f"OPENROUTER_API_KEY={api_key}\n")
-    _atomic_write_text(env_path, "".join(new_lines))
+    from agent.settings import LLM_PROVIDERS
 
-
-def _save_config_model(config_path: Path, model: str) -> None:
-    """Set openrouter.model in config.yaml, preserving the rest."""
+    if provider not in LLM_PROVIDERS:
+        raise ValueError(f"Unknown LLM provider: {provider!r}")
     _reject_newlines(model, "Model")
     if config_path.is_file():
         with config_path.open("r", encoding="utf-8") as fh:
@@ -339,10 +354,16 @@ def _save_config_model(config_path: Path, model: str) -> None:
         data = {}
     if not isinstance(data, dict):
         data = {}
-    data.setdefault("openrouter", {})
-    if not isinstance(data["openrouter"], dict):
-        data["openrouter"] = {}
-    data["openrouter"]["model"] = model
+    llm = data.setdefault("llm", {})
+    if not isinstance(llm, dict):
+        llm = {}
+        data["llm"] = llm
+    llm["provider"] = provider
+    section = data.setdefault(provider, {})
+    if not isinstance(section, dict):
+        section = {}
+        data[provider] = section
+    section["model"] = model
     _atomic_write_text(
         config_path,
         yaml.dump(data, default_flow_style=False, allow_unicode=True),
@@ -447,9 +468,14 @@ def create_app(settings: Settings | None = None) -> Flask:
 
     @app.post("/api/setup")
     def setup_save():
+        from agent.settings import LLM_PROVIDERS
+
         payload = request.get_json(silent=True) or {}
         api_key = str(payload.get("api_key", "")).strip()
         model = str(payload.get("model", "")).strip()
+        provider = str(payload.get("provider", "openrouter")).strip().lower() or "openrouter"
+        if provider not in LLM_PROVIDERS:
+            return jsonify({"error": f"Unknown provider: {provider!r}."}), 400
         if not api_key:
             return jsonify({"error": "An API key is required."}), 400
         if not model:
@@ -461,16 +487,17 @@ def create_app(settings: Settings | None = None) -> Flask:
         root = _project_root()
         env_path = root / ".env"
         config_path = root / "config.yaml"
+        env_var = "OPENAI_API_KEY" if provider == "openai" else "OPENROUTER_API_KEY"
         try:
-            _save_env_key(env_path, api_key)
-            _save_config_model(config_path, model)
+            _save_env_api_key(env_path, env_var, api_key)
+            _save_config_setup(config_path, provider, model)
         except ValueError as error:
             return jsonify({"error": str(error)}), 400
         except OSError as error:
             return jsonify({"error": f"Could not save settings: {error}"}), 500
         # Reload env so subsequent requests see the key.
         load_dotenv(env_path, override=True)
-        # Rebuild settings with new model.
+        # Rebuild settings with new provider + model.
         new_settings = load_settings()
         app.config["SETTINGS"] = new_settings
         app.config["AGENT_RUNNER"].settings = new_settings

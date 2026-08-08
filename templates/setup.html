@@ -11,25 +11,34 @@
       <div class="setup-card">
         <div class="setup-icon">◇</div>
         <h1>Welcome to Local AI CAD Agent</h1>
-        <p>Configure your OpenRouter connection to get started. You need an <a href="https://openrouter.ai/keys" target="_blank" rel="noopener">OpenRouter API key</a>.</p>
+        <p>Configure your AI provider to get started. You need an API key from
+          <a href="https://openrouter.ai/keys" target="_blank" rel="noopener">OpenRouter</a> or
+          <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener">OpenAI</a>.
+        </p>
 
         <form id="setup-form" class="setup-form">
+          <fieldset class="setup-field">
+            <legend>Provider</legend>
+            <label class="radio">
+              <input type="radio" name="provider" value="openrouter" checked>
+              <span><strong>OpenRouter</strong> — access many models (OpenAI, Anthropic, Google, …)</span>
+            </label>
+            <label class="radio">
+              <input type="radio" name="provider" value="openai">
+              <span><strong>OpenAI</strong> — direct Chat Completions (gpt-4o, gpt-4o-mini, …)</span>
+            </label>
+          </fieldset>
+
           <div class="setup-field">
-            <label for="api-key">OpenRouter API Key</label>
+            <label for="api-key">API Key</label>
             <input id="api-key" type="password" placeholder="sk-or-v1-…" required autocomplete="off">
-            <p class="hint">Your key is stored locally and never sent anywhere except OpenRouter.</p>
+            <p class="hint" id="api-key-hint">Your key is stored locally and never sent anywhere except OpenRouter.</p>
           </div>
 
           <div class="setup-field">
             <label for="model">Model</label>
             <select id="model" required>
-              <option value="">Select a model…</option>
-              <option value="openai/gpt-4o-mini">openai/gpt-4o-mini (fast, affordable)</option>
-              <option value="google/gemini-2.0-flash-001">google/gemini-2.0-flash-001</option>
-              <option value="google/gemini-3.6-flash">google/gemini-3.6-flash</option>
-              <option value="openai/gpt-4o">openai/gpt-4o (more capable)</option>
-              <option value="anthropic/claude-3.5-sonnet">anthropic/claude-3.5-sonnet</option>
-              <option value="__custom__">Other model (enter below)</option>
+              <!-- Populated by JavaScript when the provider changes. -->
             </select>
           </div>
 
@@ -51,10 +60,70 @@
 
     <script>
       const form = document.querySelector('#setup-form');
+      const apiKeyInput = document.querySelector('#api-key');
+      const apiKeyHint = document.querySelector('#api-key-hint');
       const modelSelect = document.querySelector('#model');
       const customField = document.querySelector('#custom-model-field');
       const customModel = document.querySelector('#custom-model');
       const errorBox = document.querySelector('#setup-error');
+
+      // Each provider lists a few curated defaults; users can always pick
+      // "Other" to enter a model ID by hand.
+      const PRESETS = {
+        openrouter: [
+          {value: '', label: 'Select a model…'},
+          {value: 'openai/gpt-4o-mini', label: 'openai/gpt-4o-mini (fast, affordable)'},
+          {value: 'google/gemini-2.0-flash-001', label: 'google/gemini-2.0-flash-001'},
+          {value: 'google/gemini-3.6-flash', label: 'google/gemini-3.6-flash'},
+          {value: 'openai/gpt-4o', label: 'openai/gpt-4o (more capable)'},
+          {value: 'anthropic/claude-3.5-sonnet', label: 'anthropic/claude-3.5-sonnet'},
+          {value: '__custom__', label: 'Other model (enter below)'},
+        ],
+        openai: [
+          {value: '', label: 'Select a model…'},
+          {value: 'gpt-4o-mini', label: 'gpt-4o-mini (fast, affordable)'},
+          {value: 'gpt-4o', label: 'gpt-4o (more capable)'},
+          {value: 'gpt-4.1', label: 'gpt-4.1'},
+          {value: 'gpt-4.1-mini', label: 'gpt-4.1-mini'},
+          {value: 'o4-mini', label: 'o4-mini (reasoning)'},
+          {value: '__custom__', label: 'Other model (enter below)'},
+        ],
+      };
+
+      const HINTS = {
+        openrouter: {
+          placeholder: 'sk-or-v1-…',
+          hint: 'Your key is stored locally and never sent anywhere except OpenRouter.',
+        },
+        openai: {
+          placeholder: 'sk-…',
+          hint: 'Your key is stored locally and never sent anywhere except OpenAI.',
+        },
+      };
+
+      function currentProvider() {
+        const checked = document.querySelector('input[name="provider"]:checked');
+        return checked ? checked.value : 'openrouter';
+      }
+
+      function renderModelOptions() {
+        const provider = currentProvider();
+        const presets = PRESETS[provider] || PRESETS.openrouter;
+        modelSelect.innerHTML = '';
+        for (const preset of presets) {
+          const option = document.createElement('option');
+          option.value = preset.value;
+          option.textContent = preset.label;
+          modelSelect.appendChild(option);
+        }
+        const hint = HINTS[provider] || HINTS.openrouter;
+        apiKeyInput.placeholder = hint.placeholder;
+        apiKeyHint.textContent = hint.hint;
+      }
+
+      document.querySelectorAll('input[name="provider"]').forEach((radio) => {
+        radio.addEventListener('change', renderModelOptions);
+      });
 
       modelSelect.addEventListener('change', () => {
         if (modelSelect.value === '__custom__') {
@@ -70,14 +139,15 @@
       form.addEventListener('submit', async (e) => {
         e.preventDefault();
         errorBox.classList.add('hidden');
-        const apiKey = document.querySelector('#api-key').value.trim();
+        const provider = currentProvider();
+        const apiKey = apiKeyInput.value.trim();
         const model = modelSelect.value === '__custom__' ? customModel.value.trim() : modelSelect.value;
         if (!apiKey || !model) return;
         try {
           const resp = await fetch('/api/setup', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({api_key: apiKey, model: model}),
+            body: JSON.stringify({api_key: apiKey, model: model, provider: provider}),
           });
           const data = await resp.json();
           if (!resp.ok) throw new Error(data.error || 'Setup failed.');
@@ -87,6 +157,8 @@
           errorBox.classList.remove('hidden');
         }
       });
+
+      renderModelOptions();
     </script>
   </body>
 </html>

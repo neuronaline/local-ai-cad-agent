@@ -151,7 +151,7 @@ def test_openrouter_retries_transient_failure(monkeypatch, tmp_path):
 
     monkeypatch.setenv("OPENROUTER_API_KEY", "test")
     monkeypatch.setattr("agent.openrouter.requests.post", post)
-    monkeypatch.setattr("agent.openrouter.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("agent.openrouter.sleep_with_cancel", lambda _delay, _event: None)
     settings = Settings(tmp_path, "https://example.test", "test", 1, "127.0.0.1", 5000)
     assert OpenRouterClient(settings).chat([{"role": "user", "content": "hi"}]) == {"choices": []}
     assert len(calls) == 2
@@ -227,7 +227,9 @@ def test_openrouter_honors_retry_after(monkeypatch, tmp_path):
 
     monkeypatch.setenv("OPENROUTER_API_KEY", "test")
     monkeypatch.setattr("agent.openrouter.requests.post", post)
-    monkeypatch.setattr("agent.openrouter.time.sleep", delays.append)
+    # The retry path uses ``sleep_with_cancel``; patch it so the assertion can
+    # observe the requested delay without actually sleeping.
+    monkeypatch.setattr("agent.openrouter.sleep_with_cancel", lambda delay, _event: delays.append(delay))
     settings = Settings(tmp_path, "https://example.test", "test", 1, "127.0.0.1", 5000)
 
     assert OpenRouterClient(settings).chat([{"role": "user", "content": "hi"}]) == {"choices": []}

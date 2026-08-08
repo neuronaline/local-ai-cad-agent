@@ -12,8 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from agent.constraints import ConstraintStore, ModelConstraintValidator
-from agent.images import as_openrouter_image
-from agent.openrouter import OpenRouterClient, sanitize_assistant_message
+from agent.images import as_chat_image
+from agent.llm_base import create_llm_client, provider_label, sanitize_assistant_message
 from agent.prompt import get_system_prompt
 from agent.quality.errors import normalize_error
 from agent.quality.models import Attempt, EnvironmentInfo, ModelInfo
@@ -280,9 +280,13 @@ class AgentRunner:
                         get_system_prompt().encode("utf-8")
                     ).hexdigest(),
                     model=ModelInfo(
-                        provider=self.settings.openrouter_provider,
-                        name=self.settings.openrouter_model,
-                        reasoning_effort=self.settings.openrouter_reasoning_effort,
+                        provider=self.settings.llm_provider,
+                        name=self.settings.llm_model,
+                        reasoning_effort=(
+                            self.settings.openai_reasoning_effort
+                            if self.settings.llm_provider == "openai"
+                            else self.settings.openrouter_reasoning_effort
+                        ),
                     ),
                     environment=EnvironmentInfo(
                         python_version=platform.python_version(),
@@ -304,9 +308,10 @@ class AgentRunner:
             any_tool_used = False
             nudged_cad = False
             # Keep one-argument construction compatible with test doubles and older integrations.
-            client = OpenRouterClient(self.settings)
+            client = create_llm_client(self.settings)
             client.stop_event = self._stop_event
-            client.session_id = f"{self.settings.openrouter_session_prefix}:{project}"
+            client.session_id = f"{self.settings.llm_provider}:{project}"
+            AgentRunner._current_provider = self.settings.llm_provider
             for _ in range(self.settings.agent_tool_call_limit):
                 if self._stop_event.is_set():
                     run_outcome = "stopped"
@@ -557,7 +562,7 @@ class AgentRunner:
             user_message = {
                 "role": "user",
                 "content": [{"type": "text", "text": message}]
-                + [as_openrouter_image(path) for path in image_paths],
+                + [as_chat_image(path) for path in image_paths],
             }
         if not history or history[-1] != user_message:
             history.append(user_message)
@@ -1112,7 +1117,7 @@ class AgentRunner:
                             "type": "text",
                             "text": f"Screenshot of the 3D preview from the {arguments.get('view', 'current')} view.",
                         },
-                        as_openrouter_image(ss_path),
+                        as_chat_image(ss_path),
                     ],
                 }
                 messages.append(ss_msg)
@@ -1147,11 +1152,17 @@ class AgentRunner:
     def _user_error_message(detail: str, err_type: str) -> str:
         """Map technical error messages to user-friendly messages."""
         lower = detail.lower()
+        provider_name = provider_label(AgentRunner._current_provider)
+        key_url = (
+            "https://platform.openai.com/api-keys"
+            if AgentRunner._current_provider == "openai"
+            else "https://openrouter.ai/keys"
+        )
 
         if "401" in detail or "unauthorized" in lower or "invalid api key" in lower:
-            return "Invalid OpenRouter API key. Check your key at https://openrouter.ai/keys."
+            return f"Invalid {provider_name} API key. Check your key at {key_url}."
         if "429" in detail or "rate limit" in lower:
-            return "OpenRouter rate limit reached. Wait a moment and try again."
+            return f"{provider_name} rate limit reached. Wait a moment and try again."
         if "model" in lower and (
             "not found" in lower or "invalid" in lower or "not available" in lower
         ):
@@ -1163,10 +1174,10 @@ class AgentRunner:
             or "seccomp" in lower
         ):
             return "CAD sandbox failed. Ensure bubblewrap and libseccomp2 are installed (sudo apt install bubblewrap libseccomp2)."
-        if "openrouter" in lower and (
+        if ("openrouter" in lower or "openai" in lower) and (
             "timeout" in lower or "timed out" in lower or "connection" in lower
         ):
-            return "Connection to OpenRouter timed out. Check your internet connection."
+            return f"Connection to {provider_name} timed out. Check your internet connection."
         if "timeout" in lower or "timed out" in lower:
             return "CAD code execution timed out. Try simplifying the design or increasing the timeout."
         if "export" in lower and ("step" in lower or "stl" in lower):
@@ -1178,6 +1189,8 @@ class AgentRunner:
 
         # Fallback: return the original detail (it will be logged fully server-side).
         return detail
+
+    _current_provider: str = "openrouter"  # set by AgentRunner.start; defaults to Settings.llm_provider
 
     def _register_preview(self, project: str, project_dir: Path) -> str:
         preview_path = project_dir / "preview.stl"
@@ -1353,7 +1366,7 @@ class AgentRunner:
                 "role": "user",
                 "content": [
                     {"type": "text", "text": text},
-                    as_openrouter_image(render_path),
+                    as_chat_image(render_path),
                 ],
             }
         return {"role": "user", "content": text}

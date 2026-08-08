@@ -120,7 +120,7 @@ def test_mvp_acceptance_flow(tmp_path: Path, monkeypatch):
     )
     build_client = BuildClient()
     clients = iter([QuestionClient(), build_client])
-    monkeypatch.setattr(agent.core, "OpenRouterClient", lambda _settings: next(clients))
+    monkeypatch.setattr(agent.core, "create_llm_client", lambda _settings: next(clients))
     app = create_app(settings)
     client = app.test_client()
     assert (

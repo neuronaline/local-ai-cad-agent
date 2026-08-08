@@ -5,6 +5,13 @@ agent:
   tool_call_limit: 30
   revision_retention_count: 0  # 0 keeps all model revisions
 
+# LLM provider selection. Set ``provider`` to either ``openrouter`` or
+# ``openai``; the matching namespace below supplies its model + endpoint.
+# Both namespaces are kept in sync so you can switch providers without
+# losing either configuration.
+llm:
+  provider: openrouter
+
 openrouter:
   base_url: https://openrouter.ai/api/v1
   model: google/gemini-3.6-flash
@@ -17,6 +24,12 @@ openrouter:
   force_provider: true
   enable_anthropic_cache: true
 
+openai:
+  base_url: https://api.openai.com/v1
+  model: gpt-4o-mini
+  timeout_seconds: 60
+  reasoning_effort: ""
+
 server:
   host: 127.0.0.1
   port: 5000
@@ -24,14 +37,9 @@ server:
 ui:
   show_info_messages: true
 
-# CAD quality observability and verification (feature-flagged rollout).
-# Phase 1 (passive run/attempt logging) is on by default; later gates are
-# disabled until their UI and verifier work lands.
+# CAD quality observability. `enabled` is on by default; setting
+# `require_acceptance_before_finalize: true` gates Finalize behind an explicit
+# accept/reject decision from the UI.
 quality:
   enabled: true
-  structured_spec: false
-  deterministic_validation: false
-  multi_view_review: false
-  independent_judge: false
-  require_user_acceptance: false
   require_acceptance_before_finalize: false

@@ -118,7 +118,7 @@ def test_failed_cad_build_records_actionable_quality_failure(
     project = settings.workspace_root / "demo"
     project.mkdir(parents=True)
     (project / "conversation.jsonl").write_text("", encoding="utf-8")
-    monkeypatch.setattr(agent.core, "OpenRouterClient", FailedCadClient)
+    monkeypatch.setattr(agent.core, "create_llm_client", lambda _settings, _ignored=None: FailedCadClient(_settings))
     events = []
     runner = agent.core.AgentRunner(
         settings,

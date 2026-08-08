@@ -5,8 +5,10 @@
 
 A local-first web app that lets you **chat with an AI agent to create parametric CAD models**. Built with [build123d](https://github.com/gumyr/build123d) for solid modeling, [Three.js](https://threejs.org/) for in-browser preview, and [OpenRouter](https://openrouter.ai/) for LLM access — all sandboxed with Bubblewrap.
 
+> **⚠️ Status:** This project is in **early development** and is also a **hobby project**. It is currently best suited for **simple, non-complex mechanical parts**. It may not yet be a good fit for finely detailed, large, or intricate models.
+
 <p align="center">
-  <em>(screenshot coming soon)</em>
+  <img src="screenshot.png" alt="Local AI CAD Agent screenshot" width="800">
 </p>
 
 ## ✨ Features
