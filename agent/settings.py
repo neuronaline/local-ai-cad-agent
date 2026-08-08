@@ -23,6 +23,7 @@ class Settings:
     openrouter_app_url: str = ""
     openrouter_session_prefix: str = "local-ai-cad-agent"
     openrouter_enable_anthropic_cache: bool = True
+    openrouter_enable_gemini_cache: bool = True
     openrouter_reasoning_effort: str | None = None
     openrouter_provider: str | None = None
     openrouter_force_provider: bool = False
@@ -136,6 +137,7 @@ def load_settings(project_root: Path | None = None, home: Path | None = None) ->
         openrouter_app_url=str(openrouter.get("app_url", "")).rstrip("/"),
         openrouter_session_prefix=str(openrouter.get("session_prefix", "local-ai-cad-agent")),
         openrouter_enable_anthropic_cache=_strict_bool(openrouter.get("enable_anthropic_cache", True), "openrouter.enable_anthropic_cache"),
+        openrouter_enable_gemini_cache=_strict_bool(openrouter.get("enable_gemini_cache", True), "openrouter.enable_gemini_cache"),
         openrouter_reasoning_effort=_optional_effort(openrouter.get("reasoning_effort")),
         openrouter_provider=_optional_string(openrouter.get("provider")),
         openrouter_force_provider=_strict_bool(openrouter.get("force_provider", False), "openrouter.force_provider"),

@@ -217,6 +217,35 @@ def test_openrouter_builds_cache_safe_sticky_payload_and_keeps_tool_content(monk
     assert captured["headers"]["HTTP-Referer"] == "https://cad.example"
 
 
+def test_openrouter_marks_stable_system_prompt_cacheable_for_gemini(monkeypatch, tmp_path):
+    captured = {}
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test")
+    monkeypatch.setattr(
+        "agent.openrouter.requests.post",
+        lambda *_args, **kwargs: captured.update(kwargs) or Response(),
+    )
+    settings = Settings(
+        tmp_path,
+        "https://example.test",
+        "google/gemini-2.5-flash",
+        1,
+        "127.0.0.1",
+        5000,
+    )
+
+    OpenRouterClient(settings).chat([
+        {"role": "system", "content": "Stable CAD instructions."},
+        {"role": "user", "content": "Build a bracket."},
+    ])
+
+    system = captured["json"]["messages"][0]
+    assert system["content"] == [{
+        "type": "text",
+        "text": "Stable CAD instructions.",
+        "cache_control": {"type": "ephemeral"},
+    }]
+
+
 def test_openrouter_honors_retry_after(monkeypatch, tmp_path):
     calls = []
     delays = []

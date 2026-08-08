@@ -23,6 +23,7 @@ openrouter:
   provider: "google-vertex/global"
   force_provider: true
   enable_anthropic_cache: true
+  enable_gemini_cache: true
 
 openai:
   base_url: https://api.openai.com/v1

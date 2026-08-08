@@ -86,6 +86,28 @@ class OpenRouterClient:
                 )
             payload["provider"] = provider
 
+    def _apply_gemini_cache_breakpoint(self, payload: dict[str, Any]) -> None:
+        """Mark the stable system prompt cacheable for Gemini on OpenRouter.
+
+        Gemini prompt caching requires a ``cache_control`` marker on a content
+        block. The system prompt is stable across agent turns, so it is the
+        safest cache boundary; dynamic constraints remain later user messages.
+        """
+        if (
+            not self.settings.openrouter_enable_gemini_cache
+            or not self.settings.openrouter_model.startswith("google/gemini-")
+        ):
+            return
+        for message in payload["messages"]:
+            if message.get("role") != "system" or not isinstance(message.get("content"), str):
+                continue
+            message["content"] = [{
+                "type": "text",
+                "text": message["content"],
+                "cache_control": {"type": "ephemeral"},
+            }]
+            return
+
     def _build_payload(self, messages, tools):
         payload: dict[str, Any] = {
             "model": self.settings.openrouter_model,
@@ -96,6 +118,7 @@ class OpenRouterClient:
         if tools:
             payload["tools"] = tools
         self._apply_provider_payload(payload)
+        self._apply_gemini_cache_breakpoint(payload)
         return payload
 
     def _post(self, payload, headers):
