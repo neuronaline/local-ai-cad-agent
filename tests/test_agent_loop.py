@@ -286,7 +286,7 @@ def test_agent_tool_schema_and_dispatch_forbid_export(tmp_path: Path):
         "experience_add",
         "experience_update",
     } <= names
-    assert {"cad", "file", "terminal", "experience", "screenshot"}.isdisjoint(names)
+    assert {"cad", "file", "terminal", "experience"}.isdisjoint(names)
     assert all(
         "operation" not in schema["function"]["parameters"]["properties"]
         for schema in TOOL_SCHEMAS
@@ -391,7 +391,7 @@ def test_malformed_tool_call_returns_structured_error(tmp_path: Path):
     assert messages[-1]["tool_call_id"].startswith("invalid-")
     payload = json.loads(messages[-1]["content"])
     assert payload["ok"] is False
-    assert payload["error"]["code"] == "UNKNOWN_TOOL"
+    assert payload["error"]["code"] == "TOOL_EXECUTION_FAILED"
 
 
 def test_normalize_tool_calls_repairs_protocol_identifiers():
@@ -429,41 +429,6 @@ def test_failed_cad_run_is_not_reported_as_completed(tmp_path: Path, monkeypatch
     )
 
 
-def test_visual_verification_is_added_after_all_tool_results(
-    tmp_path: Path, monkeypatch
-):
-    pytest.importorskip("build123d")
-    import agent.core
-
-    project_root = tmp_path / "projects"
-    project = project_root / "demo"
-    project.mkdir(parents=True)
-    (project / "conversation.jsonl").write_text("", encoding="utf-8")
-    (project / "summary.md").write_text("# Demo\n", encoding="utf-8")
-    (project / "model.py").write_text(
-        "from build123d import Box\nresult = Box(10, 20, 30)\n",
-        encoding="utf-8",
-    )
-    MultiToolCadClient.instances.clear()
-    monkeypatch.setattr(agent.core, "create_llm_client", lambda _settings, _ignored=None: MultiToolCadClient(_settings))
-    runner = AgentRunner(
-        Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000),
-        lambda *_: None,
-    )
-
-    runner._run("demo", "Review the part")
-
-    messages = MultiToolCadClient.instances[0].second_messages
-    assistant_index = next(
-        index for index, item in enumerate(messages) if item.get("tool_calls")
-    )
-    assert [item["role"] for item in messages[assistant_index + 1 :]] == [
-        "tool",
-        "tool",
-        "user",
-    ]
-
-
 def test_protocol_history_is_append_only_and_preserves_tool_call_content(
     tmp_path: Path, monkeypatch
 ):
@@ -480,7 +445,7 @@ def test_protocol_history_is_append_only_and_preserves_tool_call_content(
     )
 
     runner._run("demo", "Make a bracket")
-    initial = (project / "api_messages.jsonl").read_text(encoding="utf-8")
+    initial = (project / "conversation.jsonl").read_text(encoding="utf-8")
     messages = runner._context(project, "Add a chamfer", [])
 
     assert messages[0]["role"] == "system"
@@ -492,11 +457,11 @@ def test_protocol_history_is_append_only_and_preserves_tool_call_content(
         "user",
     ]
     assert (
-        (project / "api_messages.jsonl").read_text(encoding="utf-8").startswith(initial)
+        (project / "conversation.jsonl").read_text(encoding="utf-8").startswith(initial)
     )
 
 
-def test_legacy_history_migration_does_not_duplicate_conversation(tmp_path: Path):
+def test_legacy_history_is_loaded_from_conversation_jsonl(tmp_path: Path):
     project = tmp_path / "demo"
     project.mkdir()
     transcript = (
@@ -505,48 +470,13 @@ def test_legacy_history_migration_does_not_duplicate_conversation(tmp_path: Path
     )
     (project / "conversation.jsonl").write_text(transcript, encoding="utf-8")
 
-    history = AgentRunner._load_api_history(project)
+    history = AgentRunner._load_history(project)
 
     assert history == [
         {"role": "user", "content": "Make a bracket"},
         {"role": "assistant", "content": "I will make it."},
     ]
     assert (project / "conversation.jsonl").read_text(encoding="utf-8") == transcript
-    assert (project / "api_messages.jsonl").read_text(encoding="utf-8").count("\n") == 2
-
-
-def test_constraint_changes_are_appended_without_mutating_system_prefix(
-    tmp_path: Path, monkeypatch
-):
-    import agent.core
-
-    project = tmp_path / "demo"
-    project.mkdir()
-    runner = AgentRunner(
-        Settings(tmp_path, "https://example.test", "test", 1, "127.0.0.1", 5000),
-        lambda *_: None,
-    )
-    summaries = iter(["width = 40", "width = 40", "width = 50"])
-    monkeypatch.setattr(
-        agent.core.ModelConstraintValidator,
-        "constraint_summary",
-        lambda _self: next(summaries),
-    )
-
-    first = runner._context(project, "Create it", [])
-    second = runner._context(project, "Refine it", [])
-    third = runner._context(project, "Refine again", [])
-
-    assert first[0] == second[0] == third[0]
-    assert first[1]["content"].startswith("<runtime_active_constraints>")
-    assert sum(
-        message.get("content", "").startswith("<runtime_active_constraints>")
-        for message in second
-    ) == 1
-    assert sum(
-        message.get("content", "").startswith("<runtime_active_constraints>")
-        for message in third
-    ) == 2
 
 
 def test_configured_tool_call_limit_stops_the_agent_loop(tmp_path: Path, monkeypatch):
@@ -642,7 +572,7 @@ def test_failed_build_clears_preview_and_returns_structured_error(tmp_path: Path
         "function": {"name": "cad_build_and_verify", "arguments": "{}"},
     }
 
-    preview_id, error, fix_required, _critique, _waiting = runner._process_tool_call(
+    preview_id, error, fix_required, _waiting = runner._process_tool_call(
         tools, "demo", project, run_call, False, "old-preview", None, messages
     )
 

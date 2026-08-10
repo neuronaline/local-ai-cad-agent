@@ -153,47 +153,6 @@ export class CadViewer {
     return this.gridHelper.visible;
   }
 
-  captureScreenshot(view = 'current', proximity = 1.0) {
-    if (!this.model) throw new Error('No model to capture.');
-    const scale = Number.isFinite(proximity) && proximity > 0 ? proximity : 1.0;
-    const directions = {
-      front: [0, 0, 1],
-      back: [0, 0, -1],
-      top: [0, 1, 0],
-      bottom: [0, -1, 0],
-      left: [-1, 0, 0],
-      right: [1, 0, 0],
-      isometric: [1, 0.82, 1],
-    };
-    if (view !== 'current' && directions[view]) {
-      const box = new THREE.Box3().setFromObject(this.model);
-      const center = box.getCenter(new THREE.Vector3());
-      const size = box.getSize(new THREE.Vector3());
-      const largest = Math.max(size.x, size.y, size.z, 1);
-      const direction = new THREE.Vector3(...directions[view]).normalize();
-      const distance = largest * 2.2 * scale;
-      this.camera.position.copy(center).addScaledVector(direction, distance);
-      this.camera.near = Math.max(largest / 10000, 0.001);
-      this.camera.far = Math.max(10000, distance + largest * 4);
-      this.camera.updateProjectionMatrix();
-      this.camera.lookAt(center);
-      this.controls.target.copy(center);
-      this.controls.update();
-      this.renderer.render(this.scene, this.camera);
-    }
-    this.renderer.render(this.scene, this.camera);
-    const dataUrl = this.renderer.domElement.toDataURL('image/png');
-    return dataUrl.replace(/^data:image\/png;base64,/, '');
-  }
-
-  getCameraState() {
-    const round = value => Math.round(value * 1000) / 1000;
-    return {
-      position: [this.camera.position.x, this.camera.position.y, this.camera.position.z].map(round),
-      target: [this.controls.target.x, this.controls.target.y, this.controls.target.z].map(round),
-    };
-  }
-
   _showSpinner() {
     if (!this._spinner) {
       this._spinner = document.createElement('div');

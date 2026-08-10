@@ -8,11 +8,6 @@ import re
 from pathlib import Path
 from typing import ClassVar
 
-from agent.constraints import (
-    ConstraintStore,
-    ModelConstraintValidator,
-    parse_feature_regions,
-)
 from agent.revisions import RevisionOrigin, RevisionStore
 
 BLOCKED_IMPORTS = {
@@ -239,25 +234,17 @@ class FileTool:
         project_dir: Path,
         revisions: RevisionStore | None = None,
         tool_call_id: str | None = None,
-        constraints: ConstraintStore | None = None,
     ) -> None:
         self.project_dir = project_dir.resolve()
         self._revisions = revisions or RevisionStore(project_dir)
-        self._constraints = constraints or ConstraintStore(project_dir)
-        self._validator = ModelConstraintValidator(self._constraints)
         self._tool_call_id = tool_call_id
 
     def with_call_id(self, tool_call_id: str) -> FileTool:
-        """Return a copy of this tool bound to a specific tool-call ID.
-
-        Used by AgentRunner to pass the execution context without changing
-        the constructor signature for direct unit-test construction.
-        """
+        """Return a copy of this tool bound to a specific tool-call ID."""
         return FileTool(
             self.project_dir,
             self._revisions,
             tool_call_id,
-            self._constraints,
         )
 
     def _path(self, filename: str) -> Path:
@@ -295,13 +282,8 @@ class FileTool:
         return f"Wrote {filename} ({len(content)} characters)."
 
     def _write_model(self, content: str, operation: str) -> str:
-        """Validate, check constraints, commit revision, and atomically write model.py."""
+        """Validate, commit revision, and atomically write model.py."""
         warnings = self.validate_model(content)
-        # Feature marker syntax is part of the model contract even before a
-        # feature is pinned, so malformed markers cannot enter revision history.
-        parse_feature_regions(content)
-        # Enforce protected constraints before any write.
-        self._validator.validate(content)
         revision = self._revisions.commit(
             content,
             RevisionOrigin(

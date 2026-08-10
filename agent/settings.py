@@ -38,8 +38,6 @@ class Settings:
     show_info_messages: bool = True
     agent_tool_call_limit: int = 12
     revision_retention_count: int = 0  # 0 = unlimited, >0 = keep at most N revisions
-    quality_enabled: bool = True  # passive run/attempt observability (plan Phase 1)
-    quality_require_acceptance_before_finalize: bool = False  # plan Phase 2 gate (rollout stage 7)
 
     @property
     def llm_model(self) -> str:
@@ -90,28 +88,15 @@ def _validate_timeout_seconds(value: Any, name: str) -> int:
     return _positive_int(value, name)
 
 
-def load_settings(project_root: Path | None = None, home: Path | None = None) -> Settings:
+def load_settings(project_root: Path | None = None) -> Settings:
     project_root = project_root or Path(__file__).resolve().parents[1]
-    home = home or Path.home()
-    config = _merge(_read_yaml(project_root / "config.yaml"), _read_yaml(home / ".cad-agent" / "config.yaml"))
+    config = _read_yaml(project_root / "config.yaml")
     llm = config.get("llm", {})
     openrouter = config.get("openrouter", {})
     openai = config.get("openai", {})
     server = config.get("server", {})
     ui = config.get("ui", {})
     agent = config.get("agent", {})
-    quality = config.get("quality", {})
-
-    quality_enabled = _strict_bool(quality.get("enabled", True), "quality.enabled")
-    quality_require_acceptance = _strict_bool(
-        quality.get("require_acceptance_before_finalize", False),
-        "quality.require_acceptance_before_finalize",
-    )
-    if not quality_enabled and quality_require_acceptance:
-        raise ValueError(
-            "quality.require_acceptance_before_finalize=true requires quality.enabled=true. "
-            "Enable quality or disable the acceptance gate."
-        )
 
     # llm.provider selects which adapter AgentRunner should use. Settings
     # for the inactive provider are still loaded so users can switch without
@@ -149,8 +134,6 @@ def load_settings(project_root: Path | None = None, home: Path | None = None) ->
         show_info_messages=_strict_bool(ui.get("show_info_messages", True), "ui.show_info_messages"),
         agent_tool_call_limit=_positive_int(agent.get("tool_call_limit", 12), "agent.tool_call_limit"),
         revision_retention_count=_non_negative_int(agent.get("revision_retention_count", 0), "agent.revision_retention_count"),
-        quality_enabled=quality_enabled,
-        quality_require_acceptance_before_finalize=quality_require_acceptance,
     )
 
 

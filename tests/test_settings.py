@@ -11,7 +11,7 @@ def test_tool_call_limit_is_loaded_from_config(tmp_path: Path):
         encoding="utf-8",
     )
 
-    settings = load_settings(project_root=tmp_path, home=tmp_path / "home")
+    settings = load_settings(project_root=tmp_path)
 
     assert settings.agent_tool_call_limit == 24
 
@@ -23,4 +23,4 @@ def test_tool_call_limit_must_be_positive(tmp_path: Path):
     )
 
     with pytest.raises(ValueError, match="agent.tool_call_limit must be a positive integer"):
-        load_settings(project_root=tmp_path, home=tmp_path / "home")
+        load_settings(project_root=tmp_path)

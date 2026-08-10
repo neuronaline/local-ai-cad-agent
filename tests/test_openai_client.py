@@ -210,7 +210,7 @@ def test_settings_uses_openai_model_when_provider_is_openai(tmp_path):
         "llm:\n  provider: openai\nopenai:\n  model: gpt-4.1\nopenrouter:\n  model: openai/gpt-4o\n",
         encoding="utf-8",
     )
-    settings = load_settings(project_root=tmp_path, home=tmp_path)
+    settings = load_settings(project_root=tmp_path)
     assert settings.llm_provider == "openai"
     assert settings.llm_model == "gpt-4.1"
     # The other provider's model is still remembered.
@@ -224,7 +224,7 @@ def test_settings_rejects_unknown_provider(tmp_path):
     config_path = tmp_path / "config.yaml"
     config_path.write_text("llm:\n  provider: bogus\n", encoding="utf-8")
     with pytest.raises(ValueError, match="llm.provider"):
-        load_settings(project_root=tmp_path, home=tmp_path)
+        load_settings(project_root=tmp_path)
 
 
 def test_llm_providers_constant_lists_supported_values():

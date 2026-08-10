@@ -25,30 +25,12 @@
             </div>
           </div>
         </div>
-        <div id="decision-bar" class="decision-bar" hidden>
-          <span class="decision-label">Review the preview before moving on:</span>
-          <button id="accept-design" type="button" class="primary">Accept design</button>
-          <button id="report-issue" type="button" class="danger">Report issue</button>
-          <button id="continue-editing" type="button" class="quiet">Continue editing</button>
-        </div>
-        <section id="requirements-panel" class="requirements-panel" hidden>
-          <header class="requirements-header">
-            <h3>Parsed requirements</h3>
-            <span id="requirements-version" class="requirements-version"></span>
-          </header>
-          <ul id="requirements-list" class="requirements-list"></ul>
-          <p id="requirements-empty" class="requirements-empty" hidden>
-            No parsed requirements yet. They will appear here as soon as a spec
-            is saved for the active run.
-          </p>
-        </section>
         <div id="question-area"></div>
         <form id="chat-form" class="composer">
           <textarea id="message" placeholder="Describe the part you want to create…" rows="2" required></textarea>
           <div class="action-bar">
             <label id="dropzone" class="attach-button" for="attachments" title="Add reference images"><span aria-hidden="true">＋</span><span id="attachment-label">Attach</span><input id="attachments" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden></label>
             <button id="history-btn" type="button" class="quiet">History</button>
-            <button id="finalize" type="button" class="quiet">Finalize</button>
             <button id="stop" type="button" class="danger" hidden>Stop</button>
             <button type="submit">Send</button>
           </div>
@@ -57,6 +39,15 @@
       <section class="viewer-panel">
         <header class="viewer-toolbar"><div class="viewer-title"><h2>Preview</h2><span id="dimensions">No preview yet</span></div><div class="viewer-actions"><button id="toggle-wireframe" class="quiet">Wireframe</button><button id="toggle-grid" class="quiet">Grid</button><button id="reset-view" class="quiet">Reset</button></div></header>
         <div id="viewer" class="viewer"><div id="viewer-empty" class="viewer-empty"><span class="preview-icon">◇</span><strong>No preview yet</strong></div></div>
+        <section class="render-section" id="render-section" hidden>
+          <header class="render-header">
+            <h3>Render</h3>
+            <button id="render-toggle" type="button" class="quiet" aria-expanded="false">Show</button>
+          </header>
+          <div id="render-body" class="render-body" hidden>
+            <img id="render-image" alt="Latest render of the current model" loading="lazy">
+          </div>
+        </section>
       </section>
     </main>
     <aside id="history-drawer" class="history-drawer" hidden>
@@ -64,41 +55,13 @@
         <h2>History</h2>
         <button id="history-close" type="button" class="quiet">✕</button>
       </header>
+      <nav class="drawer-tabs">
+        <button id="history-tab" type="button" class="drawer-tab" aria-pressed="true">Conversation</button>
+        <button id="model-tab" type="button" class="drawer-tab" aria-pressed="false">Model</button>
+      </nav>
       <div id="history-content" class="drawer-content"></div>
+      <div id="model-content" class="drawer-content" hidden></div>
     </aside>
-    <div id="issue-modal" class="issue-modal" hidden>
-      <form id="issue-form" class="issue-form">
-        <h2>Report issue</h2>
-        <label>Category
-          <select id="issue-category" required>
-            <option value="">Select a category…</option>
-            <option value="missing_or_extra_feature">Missing or extra feature</option>
-            <option value="wrong_size">Wrong size</option>
-            <option value="wrong_position_alignment">Wrong position or alignment</option>
-            <option value="disconnected_or_intersecting">Parts disconnected or intersecting</option>
-            <option value="hole_or_clearance">Hole or clearance problem</option>
-            <option value="printing_problem">Printing problem</option>
-            <option value="intent_mismatch">Does not match request</option>
-            <option value="other">Other</option>
-          </select>
-        </label>
-        <label>Severity
-          <select id="issue-severity">
-            <option value="blocking">Blocking</option>
-            <option value="major">Major</option>
-            <option value="minor">Minor</option>
-          </select>
-        </label>
-        <label>Description
-          <textarea id="issue-message" rows="3" placeholder="What is wrong with this design?" required></textarea>
-        </label>
-        <p class="issue-note">A screenshot from the current camera view is attached automatically.</p>
-        <div class="issue-actions">
-          <button type="button" id="issue-cancel" class="quiet">Cancel</button>
-          <button type="submit" class="danger">Report</button>
-        </div>
-      </form>
-    </div>
     <script>
       window.APP_CONFIG = {
         projectName: {{ project_name | tojson }},

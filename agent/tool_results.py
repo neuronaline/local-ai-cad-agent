@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from agent.constraints import ConstraintError
 from agent.revisions import RevisionIntegrityError
 
 
@@ -44,26 +43,12 @@ def _classify(tool: str, error: Exception, message: str) -> tuple[str, str, bool
             True,
             "Send one valid JSON object matching the tool schema.",
         )
-    if isinstance(error, ConstraintError):
-        return (
-            "CONSTRAINT_VIOLATION",
-            "validation",
-            True,
-            "Preserve every protected parameter and feature named in the message.",
-        )
     if isinstance(error, RevisionIntegrityError):
         return (
             "REVISION_INTEGRITY_ERROR",
             "persistence",
             False,
             "Do not retry the same edit; revision history needs user attention.",
-        )
-    if isinstance(error, AttributeError):
-        return (
-            "UNKNOWN_TOOL",
-            "arguments",
-            False,
-            "Use one of the tool names provided in the current tool schema.",
         )
     if "timed out" in lower or "timeout" in lower:
         return "TIMEOUT", "execution", True, "Simplify the operation before retrying."

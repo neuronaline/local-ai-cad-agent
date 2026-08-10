@@ -1,6 +1,3 @@
-import base64
-import threading
-import time
 from io import BytesIO
 from pathlib import Path
 
@@ -153,57 +150,6 @@ def test_cad_sandbox_does_not_inherit_api_key(tmp_path: Path, monkeypatch):
     assert CadTool(tmp_path).run()["dimensions_mm"]["x"] == 1
 
 
-def test_screenshot_requires_matching_one_time_request(tmp_path: Path):
-    events = []
-    result = {}
-    cad = CadTool(tmp_path, lambda kind, data: events.append((kind, data)))
-
-    worker = threading.Thread(
-        target=lambda: result.update(cad.screenshot("front")),
-        daemon=True,
-    )
-    worker.start()
-    for _ in range(100):
-        if events:
-            break
-        time.sleep(0.01)
-    request_id = events[0][1]["request_id"]
-    image = BytesIO()
-    Image.new("RGB", (16, 16), "red").save(image, "PNG")
-    encoded = base64.b64encode(image.getvalue()).decode()
-
-    assert not cad.receive_screenshot("wrong", encoded)
-    assert cad.receive_screenshot(request_id, encoded)
-    assert not cad.receive_screenshot(request_id, encoded)
-    worker.join(timeout=1)
-
-    assert result["screenshot"] == "screenshot.png"
-    assert (tmp_path / "screenshot.png").is_file()
-
-
-def test_cad_inspect_invalidates_metrics_after_model_change(tmp_path: Path):
-    pytest.importorskip("build123d")
-    model = tmp_path / "model.py"
-    model.write_text(
-        "from build123d import Box\nresult = Box(10, 20, 30)\n", encoding="utf-8"
-    )
-    cad = CadTool(tmp_path)
-    assert cad.run()["dimensions_mm"] == {"x": 10.0, "y": 20.0, "z": 30.0}
-
-    model.write_text(
-        "from build123d import Box\nresult = Box(40, 20, 30)\n", encoding="utf-8"
-    )
-
-    # inspect returns file info only when cache is stale (no auto re-run)
-    info = cad.inspect()
-    assert "dimensions_mm" not in info
-    assert info["model_lines"] == 2
-    assert info["preview_available"] is True
-
-    # fresh run updates metrics
-    assert cad.run()["dimensions_mm"] == {"x": 40.0, "y": 20.0, "z": 30.0}
-
-
 def test_cad_failure_detail_keeps_model_location_and_final_error():
     output = """Traceback (most recent call last):
   File "/tmp/runner.py", line 9, in <module>
@@ -230,32 +176,10 @@ def test_cad_build_recording_is_best_effort(tmp_path: Path, monkeypatch):
     cad._record_build_failure("original CAD error")
 
 
-def test_cad_render_is_deterministic_and_has_no_center_depth_hole_for_solid_box(
-    tmp_path: Path,
-):
-    pytest.importorskip("build123d")
-    (tmp_path / "model.py").write_text(
-        "from build123d import Box\nresult = Box(40, 30, 8)\n",
-        encoding="utf-8",
-    )
-    cad = CadTool(tmp_path)
-
-    cad.render()
-    first = (tmp_path / "render.png").read_bytes()
-    cad.render()
-    second = (tmp_path / "render.png").read_bytes()
-
-    with Image.open(tmp_path / "render.png") as image:
-        assert image.size == (512, 512)
-        assert image.getpixel((256, 256)) != (23, 25, 29)
-    assert first == second
-
-
-def test_cad_build_and_verify_runs_once_with_render(tmp_path: Path, monkeypatch):
     cad = CadTool(tmp_path)
     calls = []
     metrics = {"solid_count": 1, "is_valid": True}
-    wrapped = {"metrics": metrics, "validation": [], "spec_version": 0}
+    wrapped = {"metrics": metrics}
     monkeypatch.setattr(
         cad,
         "_execute",
@@ -267,8 +191,6 @@ def test_cad_build_and_verify_runs_once_with_render(tmp_path: Path, monkeypatch)
     assert calls == [{"render": True}]
     assert result == {
         "metrics": metrics,
-        "validation": [],
-        "spec_version": 0,
         "preview": "preview.stl",
         "render": "render.png",
     }

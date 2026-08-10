@@ -153,10 +153,6 @@ def test_mvp_acceptance_flow(tmp_path: Path, monkeypatch):
     assert (project / "model.py").is_file()
     assert (project / "preview.stl").is_file()
     assert (project / "render.png").is_file()
-    critique = build_client.messages[2][-1]
-    assert critique["role"] == "user"
-    assert critique["content"][1]["type"] == "image_url"
-    assert "cad_build_and_verify" in critique["content"][0]["text"]
 
     state = client.get("/api/projects/mounting-bracket/state").get_json()
     assert state["status"] == "rendering"
@@ -171,9 +167,3 @@ def test_mvp_acceptance_flow(tmp_path: Path, monkeypatch):
         and event.get("content") == "The bracket is ready for finalization."
         for event in history
     )
-
-    response = client.post("/api/projects/mounting-bracket/finalize")
-    assert response.status_code == 200
-    assert response.get_json()["metrics"]["volume_mm3"] < 60 * 40 * 8
-    for filename in ("model.step", "model.stl", "report.md"):
-        assert (project / "output" / filename).is_file()
