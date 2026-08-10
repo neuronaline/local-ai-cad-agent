@@ -182,9 +182,8 @@ def test_malformed_build_record_raises_integrity_error(tmp_path: Path):
     store = RevisionStore(tmp_path)
     r1 = store.commit(MODEL_A, RevisionOrigin(kind="agent_edit"))
 
-    build_path = tmp_path / ".cad-agent" / "history" / "builds" / f"{r1.id}.json"
-    build_path.parent.mkdir(parents=True, exist_ok=True)
-    build_path.write_text("garbage", encoding="utf-8")
+    log_path = tmp_path / "builds.jsonl"
+    log_path.write_text("garbage\n", encoding="utf-8")
 
     with pytest.raises(RevisionIntegrityError):
         store.build_for(r1.id)

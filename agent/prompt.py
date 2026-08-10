@@ -33,8 +33,7 @@ _OPERATIONAL_RULES = """\
   - ## Summary — one sentence
   - ## Key dimensions — confirmed values only
   - ## Design decisions — notable choices (e.g. "Box + fillet over chamfer")
-  - ## Limitations — unresolved issues, skipped operations, warnings
-- Final export is performed by the UI Finalize action; do not attempt it yourself."""
+  - ## Limitations — unresolved issues, skipped operations, warnings"""
 
 _BUILD123D_RULES = """\
 - When cad_build_and_verify fails, use its structured error code, phase, message,
@@ -47,43 +46,25 @@ _BUILD123D_RULES = """\
   playbook instead of guessing signatures.
 - Before RadiusArc, confirm radius >= half the endpoint chord distance.
 - After every fillet, chamfer, or boolean, discard any cached edge/face indices;
-  reselect targets by geometry type, position range, and measurable properties.
-- Use named feature markers to identify logically independent regions that users
-  may want to protect from later edits:
-
-  # cad-feature: base_plate start
-  base = Box(WIDTH, DEPTH, THICKNESS)
-  # cad-feature: base_plate end
-
-  Features must be non-overlapping, uniquely named (lowercase letters, digits,
-  underscores), and cover a self-contained block of code. Do not mark the entire
-  model as one feature — only independent, preservable subsections.
-- Protected parameters and features are enforced outside the prompt. When a write
-  is rejected due to constraint violations, the error will name the exact
-  protected items; change only unprotected code and retry."""
-
-_CONSTRAINT_CONTEXT = """\
-- Some parameters and source regions may be protected by user-owned pins. These
-  are listed in the active constraints below. You cannot change, rename, or
-  delete them. Write operations that violate a pin will be rejected automatically.
-- When a pin violation is reported, read the error to identify the specific
-  protected names and adjust your edit to preserve them.
-- Do not attempt to create, remove, or modify constraints. Only the user can
-  manage pins through the UI."""
+  reselect targets by geometry type, position range, and measurable properties."""
 
 _EXPERIENCE_MEMORY = """\
-- Use experience_search when a build, topology, or import problem may have a
-  known solution.
-- After verifying a new solution, store it with experience_add: describe
-  the problem briefly, the verified solution, and tag it (e.g. build123d,
-  geometry, fillet, import). This is your self-recovery database — the more you
-  record, the faster you recover in future sessions.
+- At the start of every CAD task, call experience_search with the user's request
+  as the query. A memory miss is normal; continue working regardless.
+- Use experience_search again whenever a build, topology, or import problem
+  recurs — past solutions may apply to a slightly different situation.
+- Before your final response on a task where a CAD build that previously failed
+  is now succeeded, call experience_add to record the recovered lesson. The
+  stored entry must be genuinely generalizable (not project-specific), and must
+  not duplicate an existing memory; check the search results first.
+- Each memory entry stores a short generalized problem, the verified solution,
+  tags (e.g. build123d, geometry, fillet, import), the build123d version, and the
+  source project name. Do not store model source, full diffs, secrets, private
+  user requests, or anything that contains identifying details.
 - Only store solutions that have been tested and confirmed working. Never store
   guesses, failed attempts, or unverified workarounds.
-- Keep entries short and generalized. Do not store full conversations, personal
-  data, model source code, or long tracebacks.
-- Before reusing a solution from another project, confirm its technical conditions
-  match the current situation."""
+- Before reusing a solution from another project, confirm its technical
+  conditions still match the current situation."""
 
 BUILD123D_RULES = _BUILD123D_RULES
 OPERATIONAL_RULES = _OPERATIONAL_RULES
@@ -104,10 +85,6 @@ You are a pragmatic local CAD assistant using build123d.
 <operational_rules>
 {_OPERATIONAL_RULES}
 </operational_rules>
-
-<constraint_rules>
-{_CONSTRAINT_CONTEXT}
-</constraint_rules>
 
 <experience_memory>
 {_EXPERIENCE_MEMORY}

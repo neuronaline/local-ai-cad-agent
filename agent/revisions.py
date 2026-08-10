@@ -29,6 +29,13 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _LIST_DEFAULT_LIMIT = 50
 _LIST_MAX_LIMIT = 200
 _MAX_ERROR_CHARS = 2000
+# Fixed retention policy per docs/AGGRESSIVE_CLEANUP.md: keep at most this many
+# revisions plus the last successful (last-known-good) revision.  Removing
+# this knob keeps history small enough to be useful without surfacing another
+# user-facing configuration option.
+_DEFAULT_RETENTION = 25
+_BUILDS_LOG_NAME = "builds.jsonl"
+_BUILDS_MAX_BYTES = 2 * 1024 * 1024  # 2 MB append-only log
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
@@ -159,7 +166,7 @@ def _sha256(data: bytes) -> str:
 class RevisionStore:
     """Owns all paths, validation, and atomic persistence for revision history."""
 
-    def __init__(self, project_dir: Path, retention_count: int = 0) -> None:
+    def __init__(self, project_dir: Path, retention_count: int = _DEFAULT_RETENTION) -> None:
         self.project_dir = project_dir.resolve()
         self.retention_count = retention_count
         # Per-instance lock — was a module-level RLock that serialized every
@@ -465,7 +472,7 @@ class RevisionStore:
     def record_build_success(
         self, revision_id: str, metrics: dict, preview: Path
     ) -> None:
-        """Record a successful build for a revision."""
+        """Record a successful build for a revision into builds.jsonl."""
         self._validate_revision_id(revision_id)
         revision = self.get(revision_id)
         self._verify_active_model(revision)
@@ -474,7 +481,7 @@ class RevisionStore:
             _sha256(preview.read_bytes()) if preview.is_file() else None
         )
 
-        self._write_build(
+        self._append_build(
             BuildRecord(
                 revision_id=revision_id,
                 model_sha256=revision.model_sha256,
@@ -487,14 +494,14 @@ class RevisionStore:
 
     @_synchronized
     def record_build_failure(self, revision_id: str, error: str) -> None:
-        """Record a failed build for a revision."""
+        """Record a failed build for a revision into builds.jsonl."""
         self._validate_revision_id(revision_id)
         revision = self.get(revision_id)
         self._verify_active_model(revision)
 
         bounded_error = (error or "CAD execution failed.")[:_MAX_ERROR_CHARS]
 
-        self._write_build(
+        self._append_build(
             BuildRecord(
                 revision_id=revision_id,
                 model_sha256=revision.model_sha256,
@@ -506,27 +513,91 @@ class RevisionStore:
 
     @_synchronized
     def build_for(self, revision_id: str) -> BuildRecord | None:
-        """Return the build record for a revision, or None if not built."""
+        """Return the latest build record for a revision, or None if not built.
+
+        Reads the append-only builds.jsonl log in reverse chronological order.
+        """
         self._validate_revision_id(revision_id)
-        data = self._read_json_safe(self._builds_dir / f"{revision_id}.json")
-        if data is None:
-            return None
-        try:
-            build = BuildRecord.from_dict(data)
-        except (KeyError, TypeError) as error:
-            raise RevisionIntegrityError(
-                f"Build record for {revision_id} is malformed."
-            ) from error
         revision = self.get(revision_id)
-        if build.revision_id != revision_id or build.model_sha256 != revision.model_sha256:
-            raise RevisionIntegrityError(
-                f"Build record for {revision_id} does not match its revision."
-            )
-        if build.status not in {"succeeded", "failed"}:
+        try:
+            log_path = self._builds_log_path()
+        except OSError:
+            return None
+        if not log_path.is_file():
+            return None
+        latest: BuildRecord | None = None
+        with log_path.open("r", encoding="utf-8") as log:
+            for line in log:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError as error:
+                    raise RevisionIntegrityError(
+                        f"Build log is malformed: {error}"
+                    ) from error
+                if not isinstance(item, dict):
+                    continue
+                if item.get("revision_id") != revision_id:
+                    continue
+                try:
+                    build = BuildRecord.from_dict(item)
+                except (KeyError, TypeError) as error:
+                    raise RevisionIntegrityError(
+                        f"Build record for {revision_id} is malformed."
+                    ) from error
+                if build.model_sha256 != revision.model_sha256:
+                    continue
+                if latest is None or build.attempted_at > latest.attempted_at:
+                    latest = build
+        if latest is not None and latest.status not in {"succeeded", "failed"}:
             raise RevisionIntegrityError(
                 f"Build record for {revision_id} has an invalid status."
             )
-        return build
+        return latest
+
+    def _append_build(self, build: BuildRecord) -> None:
+        """Append a build record to the per-project builds.jsonl log.
+
+        Truncates the oldest entries when the file exceeds the size cap so the
+        log stays bounded without per-record files.
+        """
+        log_path = self._builds_log_path()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(build.to_dict(), ensure_ascii=False)
+        with log_path.open("a", encoding="utf-8") as log:
+            log.write(payload + "\n")
+        self._trim_builds_log(log_path)
+
+    def _builds_log_path(self) -> Path:
+        return self.project_dir / _BUILDS_LOG_NAME
+
+    def _trim_builds_log(self, log_path: Path) -> None:
+        """Keep builds.jsonl under the size cap by dropping oldest lines."""
+        try:
+            size = log_path.stat().st_size
+        except OSError:
+            return
+        if size <= _BUILDS_MAX_BYTES:
+            return
+        try:
+            text = log_path.read_text(encoding="utf-8")
+        except OSError:
+            return
+        lines = [line for line in text.splitlines() if line]
+        while lines and (sum(len(line.encode("utf-8")) + 1 for line in lines) > _BUILDS_MAX_BYTES):
+            lines.pop(0)
+        with tempfile.NamedTemporaryFile(
+            mode="w", dir=log_path.parent, encoding="utf-8", delete=False
+        ) as temporary:
+            tmp_path = Path(temporary.name)
+            tmp_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+        tmp_path.replace(log_path)
+
+    def _write_build(self, build: BuildRecord) -> None:
+        """Backward-compat alias used by older callers and round-trip tests."""
+        self._append_build(build)
 
     @_synchronized
     def last_known_good(self) -> Revision | None:
@@ -538,27 +609,31 @@ class RevisionStore:
         return None
 
     @_synchronized
-    def prune(self, max_revisions: int) -> int:
+    def prune(self, max_revisions: int | None = None) -> int:
         """Remove old revisions exceeding `max_revisions`, preserving the
         last-known-good revision. Returns the number of revisions removed.
+
+        When `max_revisions` is None, uses the store's configured retention
+        count (default 25).  Set to 0 to disable pruning.
 
         Blob files are NOT garbage-collected — they may be shared by
         preserved revisions or restores.
         """
-        if max_revisions < 1:
+        target = max_revisions if max_revisions is not None else self.retention_count
+        if target < 1:
             return 0
 
         revisions = self._all_revisions()
-        if len(revisions) <= max_revisions:
+        if len(revisions) <= target:
             return 0
 
         lkg = self.last_known_good()
         lkg_id = lkg.id if lkg else None
 
         removed = 0
-        # Keep the `max_revisions` most recent, plus the LKG if not already
+        # Keep the `target` most recent, plus the LKG if not already
         # in that set (it may be older).
-        keep_ids: set[str] = {r.id for r in revisions[:max_revisions]}
+        keep_ids: set[str] = {r.id for r in revisions[:target]}
         if lkg_id is not None:
             keep_ids.add(lkg_id)
 
@@ -821,14 +896,6 @@ class RevisionStore:
                 "revision_id": revision.id,
                 "model_sha256": revision.model_sha256,
             },
-        )
-
-    def _write_build(self, build: BuildRecord) -> None:
-        self._validate_revision_id(build.revision_id)
-        if not _SHA256_RE.fullmatch(build.model_sha256):
-            raise RevisionIntegrityError("Build record has an invalid model digest.")
-        self._atomic_write_json(
-            self._builds_dir / f"{build.revision_id}.json", build.to_dict()
         )
 
     @staticmethod
