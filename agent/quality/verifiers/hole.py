@@ -96,7 +96,9 @@ def verify_hole(requirement: Requirement, shape: Any) -> ValidationResult:
             message="hole requirement has no diameter target.",
             created_at=_utc_now(),
         )
-    tolerance = float(requirement.tolerance or 0.1)
+    # Preserve an explicit ``tolerance=0`` (audit_077); ``requirement.tolerance``
+    # is already validated to be a finite, non-negative number by the model.
+    tolerance = float(requirement.tolerance)
     candidates = [face for face in _cylinder_faces(shape) if _is_hole_face(face)]
     observed_count = len(candidates)
     if observed_count == 0:

@@ -194,7 +194,9 @@ def verify_dimension(requirement: Requirement, shape: Any) -> ValidationResult:
             message=f"dimension requirement {requirement.id!r} has no target value.",
             created_at=_utc_now(),
         )
-    tolerance = float(requirement.tolerance or 0.05)
+    # Preserve an explicit ``tolerance=0`` (audit_077); ``requirement.tolerance``
+    # is already validated to be a finite, non-negative number by the model.
+    tolerance = float(requirement.tolerance)
     diff = observed_value - float(target)
     within = abs(diff) <= tolerance
     status = "passed" if within else "failed"
@@ -313,7 +315,9 @@ def verify_hole(requirement: Requirement, shape: Any) -> ValidationResult:
             message="hole requirement has no diameter target.",
             created_at=_utc_now(),
         )
-    tolerance = float(requirement.tolerance or 0.1)
+    # Preserve an explicit ``tolerance=0`` (audit_077); ``requirement.tolerance``
+    # is already validated to be a finite, non-negative number by the model.
+    tolerance = float(requirement.tolerance)
     candidates = [face for face in _cylinder_faces(shape) if _is_hole_face(face)]
     observed_count = len(candidates)
     if observed_count == 0:
@@ -397,16 +401,31 @@ VERIFIERS: dict[str, Callable[[Requirement, Any], ValidationResult]] = {
 }
 
 
+def _is_finite_non_negative(value: float) -> bool:
+    """Mirror of ``agent.quality.models._is_finite_non_negative`` (audit_077)."""
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(numeric) and numeric >= 0
+
+
 def _requirement_from_dict(data: dict[str, Any]) -> Requirement:
     selector = data.get("selector") or {}
     extras = data.get("extras") or {}
+    # Preserve an explicit ``tolerance=0`` (audit_077) instead of replacing it
+    # with the default; ``0 or 0.05`` would coerce zero to the default.
+    raw_tolerance = data.get("tolerance", 0.05)
+    tolerance = float(raw_tolerance) if isinstance(raw_tolerance, (int, float)) else 0.05
+    if not _is_finite_non_negative(tolerance):
+        tolerance = 0.05
     return Requirement(
         id=str(data.get("id") or ""),
         kind=str(data.get("kind") or "manual_review"),
         required=bool(data.get("required", True)),
         source_text=str(data.get("source_text") or ""),
         target=float(data["target"]) if isinstance(data.get("target"), (int, float)) else None,
-        tolerance=float(data.get("tolerance", 0.05) or 0.05),
+        tolerance=tolerance,
         units=str(data.get("units") or "mm"),
         selector=dict(selector) if isinstance(selector, dict) else {},
         extras=dict(extras) if isinstance(extras, dict) else {},

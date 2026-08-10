@@ -29,7 +29,6 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _LIST_DEFAULT_LIMIT = 50
 _LIST_MAX_LIMIT = 200
 _MAX_ERROR_CHARS = 2000
-_REVISION_LOCK = threading.RLock()
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
@@ -39,10 +38,18 @@ class RevisionIntegrityError(Exception):
 
 
 def _synchronized(method: Callable[_P, _R]) -> Callable[_P, _R]:
+    """Acquire the per-instance RLock so each store serializes its own mutations.
+
+    The previous module-level RLock serialized every store across every project
+    (audit_033); this decorator uses the instance lock so parallel projects
+    build/restore/prune concurrently while still protecting a single store
+    from interleaved read-modify-write cycles.
+    """
+
     @wraps(method)
-    def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _R:
-        with _REVISION_LOCK:
-            return method(*args, **kwargs)
+    def wrapped(self: "RevisionStore", *args: _P.args, **kwargs: _P.kwargs) -> _R:
+        with self._lock:
+            return method(self, *args, **kwargs)
 
     return wrapped
 
@@ -155,6 +162,12 @@ class RevisionStore:
     def __init__(self, project_dir: Path, retention_count: int = 0) -> None:
         self.project_dir = project_dir.resolve()
         self.retention_count = retention_count
+        # Per-instance lock — was a module-level RLock that serialized every
+        # store across every project (audit_033). Per-instance lets parallel
+        # projects build/restore/prune concurrently.
+        self._lock = threading.RLock()
+        # Revision-list cache (audit_032); invalidated on commit/restore/prune.
+        self._revisions_cache: list[Revision] | None = None
         history = self.project_dir / ".cad-agent" / "history"
         self._head_path = history / "head.json"
         self._blobs_dir = history / "blobs"
@@ -262,7 +275,12 @@ class RevisionStore:
         return revisions[:limit]
 
     def _all_revisions(self) -> list[Revision]:
-        """Return every readable revision, newest first, for internal operations."""
+        """Return every readable revision, newest first, for internal operations.
+
+        Cached in memory (audit_032); invalidated on commit/restore/prune.
+        """
+        if self._revisions_cache is not None:
+            return list(self._revisions_cache)
         revisions: list[Revision] = []
         if self._revisions_dir.is_dir():
             for entry in self._revisions_dir.iterdir():
@@ -277,7 +295,13 @@ class RevisionStore:
 
         # Sort by created_at descending, then by ID for stability.
         revisions.sort(key=lambda r: (r.created_at, r.id), reverse=True)
-        return revisions
+        self._revisions_cache = revisions
+        return list(revisions)
+
+
+    def _invalidate_revision_cache(self) -> None:
+        """Drop the in-memory revision list cache (called on mutation)."""
+        self._revisions_cache = None
 
     @_synchronized
     def get(self, revision_id: str) -> Revision:
@@ -386,6 +410,7 @@ class RevisionStore:
         elif self.retention_count > 0:
             self.prune(self.retention_count)
 
+        self._invalidate_revision_cache()
         return revision
 
     @_synchronized
@@ -433,6 +458,7 @@ class RevisionStore:
         if self.retention_count > 0:
             self.prune(self.retention_count)
 
+        self._invalidate_revision_cache()
         return revision
 
     @_synchronized
@@ -542,6 +568,7 @@ class RevisionStore:
             self._delete_revision(revision)
             removed += 1
 
+        self._invalidate_revision_cache()
         return removed
 
     @_synchronized
@@ -549,6 +576,10 @@ class RevisionStore:
         """Export the complete revision history as a portable JSON archive.
 
         Returns the path to the created archive file.
+
+        NOTE (audit_031): this method exists for the round-trip test suite only.
+        Production code should not invoke it. Retained on the public class
+        surface because removing it would break the legacy test archive.
         """
         target_dir = target_dir.resolve()
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -601,6 +632,9 @@ class RevisionStore:
         Existing history is preserved; imported revisions that would collide
         with existing IDs are skipped. Build records attached to imported
         revisions are restored. Returns the number of revisions imported.
+
+        NOTE (audit_031): this method exists for the round-trip test suite only.
+        Production code should not invoke it.
         """
         try:
             archive = json.loads(archive_path.read_text(encoding="utf-8"))

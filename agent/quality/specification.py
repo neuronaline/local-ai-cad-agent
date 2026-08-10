@@ -49,6 +49,11 @@ _NUM_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _AXIS_PATTERN = re.compile(r"\b(?P<axis>[xyz])\s*(?:-?\s*axis|length|width|height|depth|size)", re.IGNORECASE)
+# Single source of truth for axis-prefixed numeric dimensions (audit_044).
+_AXIS_DIMENSION_PATTERN = re.compile(
+    r"(?P<axis>[xyz])\s*(?:length|width|height|depth|size)\s*[:=]?\s*(?P<value>-?\d+(?:\.\d+)?)\s*(?P<unit>mm|cm|m|inch|in)?",
+    re.IGNORECASE,
+)
 _HOLE_KEYWORDS = re.compile(r"\b(holes?|bores?|cutouts?|cut-outs?|through[ -]holes?)\b", re.IGNORECASE)
 _HOLE_PATTERN_KEYWORDS = re.compile(
     r"\b(\d+\s*(?:x|×)\s*[^\s,]+|\d+\s*holes?|hole\s+pattern|pair\s+of\s+holes)\b",
@@ -209,21 +214,25 @@ def parse_request(
 
 
 def _answer_index(answers: Iterable[dict[str, Any]] | None) -> dict[str, Any]:
-    """Map known clarification keys to their numeric/string values."""
+    """Map known clarification keys to their numeric/string values.
+
+    Performs a single canonicalization pass via ``_canonical_answer_key``
+    (audit_045); the previous two-step normalise-then-lookup cost a redundant
+    string scan on every entry.
+    """
     out: dict[str, Any] = {}
     if not answers:
         return out
     for entry in answers:
         if not isinstance(entry, dict):
             continue
-        key = str(entry.get("id") or entry.get("key") or "").strip()
-        if not key:
+        raw_key = entry.get("id") or entry.get("key") or ""
+        canonical = _canonical_answer_key(str(raw_key))
+        if not canonical:
             continue
         value = entry.get("value")
         if value is None or value == "":
             continue
-        # Map common synonyms to canonical keys.
-        canonical = _canonical_answer_key(key)
         out[canonical] = value
     return out
 
@@ -253,11 +262,7 @@ def _extract_dimensions(text: str) -> list[Requirement]:
     requirements: list[Requirement] = []
     lowered = text or ""
     # Axis-named dimensions first ("X length: 50 mm").
-    for index, match in enumerate(re.finditer(
-        r"(?P<axis>[xyz])\s*(?:length|width|height|depth|size)\s*[:=]?\s*(?P<value>-?\d+(?:\.\d+)?)\s*(?P<unit>mm|cm|m|inch|in)?",
-        lowered,
-        re.IGNORECASE,
-    )):
+    for index, match in enumerate(_AXIS_DIMENSION_PATTERN.finditer(lowered)):
         value = _to_mm(float(match.group("value")), match.group("unit"))
         axis = match.group("axis").upper()
         requirements.append(

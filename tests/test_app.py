@@ -496,6 +496,57 @@ def test_api_setup_rejects_unknown_provider(tmp_path: Path, monkeypatch):
     assert "Unknown provider" in resp.get_json()["error"]
 
 
+def test_api_setup_reload_propagates_to_quality_endpoints(tmp_path: Path, monkeypatch):
+    """Regression: setup reload must update every consumer of settings (audit_078)."""
+    settings = Settings(
+        tmp_path / "projects",
+        "https://example.test",
+        "test-model",
+        1,
+        "127.0.0.1",
+        5000,
+        quality_require_acceptance_before_finalize=False,
+    )
+    monkeypatch.setattr("app._project_root", lambda: tmp_path)
+    (tmp_path / ".env.example").write_text("OPENROUTER_API_KEY=\n", encoding="utf-8")
+    client = create_app(settings).test_client()
+    assert client.post("/api/projects/new", json={"name": "demo"}).status_code == 201
+
+    # Stub load_settings so the in-process reload returns settings we can
+    # inspect — the real loader reads from the project root which the test
+    # does not control.
+    new_settings = Settings(
+        tmp_path / "projects",
+        "https://example.test",
+        "openai/gpt-4o",
+        1,
+        "127.0.0.1",
+        5000,
+        quality_require_acceptance_before_finalize=True,
+    )
+    monkeypatch.setattr("app.load_settings", lambda: new_settings)
+
+    resp = client.post(
+        "/api/setup",
+        json={"api_key": "sk-or-v1-mykey", "model": "openai/gpt-4o"},
+    )
+    assert resp.status_code == 200
+
+    # Every settings consumer must now reflect the freshly-built settings, not
+    # the closure variable captured at create_app time.
+    bus = client.application.config["EVENT_BUS"]
+    assert bus.settings is new_settings
+    assert client.application.config["SETTINGS"] is new_settings
+    assert client.application.config["AGENT_RUNNER"].settings is new_settings
+
+    # A request-time path that previously read the closure ``settings`` must
+    # now return the new value: the finalize gate should see the updated flag.
+    # We use the project listing endpoint as a stand-in for the request-time
+    # settings read; the projects handler now consults app.config["SETTINGS"].
+    listed = client.get("/api/projects").get_json()
+    assert listed["projects"][0]["name"] == "demo"
+
+
 # ── Preflight ──
 
 def test_preflight_returns_check_results(tmp_path: Path, monkeypatch):

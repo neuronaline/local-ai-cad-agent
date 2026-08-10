@@ -64,7 +64,19 @@ def _split_summary(summary: str) -> tuple[str, str | None]:
 
 
 def _parse_journey(project_dir: Path) -> dict[str, int | str]:
-    """Scan conversation.jsonl for CAD iteration counts and token usage."""
+    """Scan conversation.jsonl for CAD iteration counts and token usage.
+
+    If a pre-aggregated ``.journey.json`` is present, return it directly (audit_042).
+    The runner updates this file at each usage event so finalize is O(1).
+    """
+    cache_path = project_dir / ".journey.json"
+    if cache_path.is_file():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if isinstance(cached, dict):
+                return cached
+        except (OSError, json.JSONDecodeError):
+            pass
     log_path = project_dir / "conversation.jsonl"
     cad_runs = 0
     cad_failures = 0

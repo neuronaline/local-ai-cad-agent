@@ -11,6 +11,7 @@ Phase 2 adds :class:`DesignSpec` (parsed user requirement list) and
 
 from __future__ import annotations
 
+import math
 import re
 import uuid
 from dataclasses import dataclass, field
@@ -30,6 +31,15 @@ def new_id() -> str:
 
 def _as_str(value: Any, default: str = "") -> str:
     return str(value) if value is not None else default
+
+
+def _is_finite_non_negative(value: float) -> bool:
+    """Return True when ``value`` is a real, non-NaN, non-negative number (audit_077)."""
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(numeric) and numeric >= 0
 
 
 @dataclass(frozen=True)
@@ -393,13 +403,19 @@ class Requirement:
     def from_dict(cls, data: dict[str, Any]) -> Requirement:
         selector = data.get("selector")
         extras = data.get("extras")
+        # Preserve an explicit ``tolerance=0`` (audit_077) instead of replacing
+        # it with the default. ``0 or 0.05`` would coerce zero to the default.
+        raw_tolerance = data.get("tolerance", 0.05)
+        tolerance = float(raw_tolerance) if isinstance(raw_tolerance, (int, float)) else 0.05
+        if not _is_finite_non_negative(tolerance):
+            tolerance = 0.05
         return cls(
             id=_as_str(data.get("id")),
             kind=_as_str(data.get("kind"), "manual_review"),
             required=bool(data.get("required", True)),
             source_text=_as_str(data.get("source_text")),
             target=float(data["target"]) if isinstance(data.get("target"), (int, float)) else None,
-            tolerance=float(data.get("tolerance", 0.05) or 0.05),
+            tolerance=tolerance,
             units=_as_str(data.get("units"), "mm") or "mm",
             selector=dict(selector) if isinstance(selector, dict) else {},
             extras=dict(extras) if isinstance(extras, dict) else {},

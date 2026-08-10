@@ -590,3 +590,25 @@ def test_runner_evaluates_spec_artifact(tmp_path: Path):
     # At least the dimension checks pass and the hole check is found.
     assert "passed" in statuses
     assert (project_dir / ".cad_validation.json").is_file()
+
+
+def test_zero_tolerance_is_preserved_by_requirement_from_dict():
+    """Regression: ``tolerance=0`` must not be silently replaced by the default (audit_077)."""
+    from agent.quality.models import Requirement
+
+    raw = {
+        "id": "REQ-test",
+        "kind": "dimension",
+        "target": 10.0,
+        "tolerance": 0,
+        "units": "mm",
+    }
+    loaded = Requirement.from_dict(raw)
+    assert loaded.tolerance == 0.0
+
+    # Also confirm a negative or non-finite tolerance is rejected back to the
+    # safe default rather than propagated as NaN/garbage.
+    bad = dict(raw, tolerance=-1.0)
+    assert Requirement.from_dict(bad).tolerance == 0.05
+    nan_payload = dict(raw, tolerance=float("nan"))
+    assert Requirement.from_dict(nan_payload).tolerance == 0.05

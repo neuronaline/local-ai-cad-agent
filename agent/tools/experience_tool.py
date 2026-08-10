@@ -10,7 +10,15 @@ from typing import Any, ClassVar
 
 _MEMORY_DIR = ".agent-memory"
 _MEMORY_FILE = "past_issues.json"
-_LOCK = threading.RLock()
+_MEMORY_LOCKS: dict[Path, threading.RLock] = {}
+_MEMORY_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for_memory_file(path: Path) -> threading.RLock:
+    """Return the process-local lock shared by users of one memory file."""
+    path = path.resolve()
+    with _MEMORY_LOCKS_GUARD:
+        return _MEMORY_LOCKS.setdefault(path, threading.RLock())
 
 _MAX_FIELD_LENGTHS = {
     "problem": 500,
@@ -51,6 +59,9 @@ class ExperienceTool:
         self._project_name = project_name
         self._memory_dir = workspace_root / _MEMORY_DIR
         self._memory_file = self._memory_dir / _MEMORY_FILE
+        # The memory file is shared by every project in this workspace, so all
+        # instances using it must share one read-modify-write lock.
+        self._memory_lock = _lock_for_memory_file(self._memory_file)
 
     # ── public API ──────────────────────────────────────────────────────
 
@@ -102,7 +113,7 @@ class ExperienceTool:
         tags = self._normalize_tags(tags or [])
         problem = self._validate_field("problem", problem)
         solution = self._validate_field("solution", solution)
-        with _LOCK:
+        with self._memory_lock:
             records = self._read_unlocked()
             duplicate = self._find_duplicate(records, problem)
             now = _utc_now()
@@ -140,7 +151,7 @@ class ExperienceTool:
         """Correct an existing solution or its tags, bumping usage metadata."""
         if not isinstance(record_id, str) or not record_id.strip():
             raise ValueError("Record id is required.")
-        with _LOCK:
+        with self._memory_lock:
             records = self._read_unlocked()
             target = self._find_by_id(records, record_id)
             if target is None:
@@ -162,7 +173,9 @@ class ExperienceTool:
     # ── persistence ─────────────────────────────────────────────────────
 
     def _read(self) -> list[dict[str, Any]]:
-        with _LOCK:
+        # Reads still take the shared lock so the JSON file cannot be torn
+        # mid-write by ``_write`` (audit_034).
+        with self._memory_lock:
             return self._read_unlocked()
 
     def _read_unlocked(self) -> list[dict[str, Any]]:
@@ -192,7 +205,7 @@ class ExperienceTool:
         self._memory_dir.mkdir(parents=True, exist_ok=True)
         payload = {"version": 1, "issues": records}
         tmp_path = self._memory_file.with_suffix(self._memory_file.suffix + ".tmp")
-        with _LOCK:
+        with self._memory_lock:
             try:
                 tmp_path.write_text(
                     json.dumps(payload, ensure_ascii=False, indent=2) + "\n",

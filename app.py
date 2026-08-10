@@ -1,5 +1,6 @@
 """Local AI CAD Agent web server."""
 from __future__ import annotations
+import urllib.parse
 
 import hashlib
 import json
@@ -33,6 +34,7 @@ from werkzeug.exceptions import RequestEntityTooLarge
 
 from agent.constraints import ConstraintError, ConstraintStore, ModelConstraintValidator
 from agent.core import AgentRunner
+from agent.core import _history_lock_slot
 from agent.finalize import finalize_project
 from agent.images import store_images
 from agent.quality.errors import (
@@ -40,12 +42,14 @@ from agent.quality.errors import (
     DECISION_TYPES,
     ISSUE_SEVERITIES,
 )
+from agent.quality.models import Issue
 from agent.quality.store import (
     QualityError,
     QualityIntegrityError,
     QualityLimitError,
     QualityStore,
 )
+from agent.io import atomic_write_text
 from agent.revisions import RevisionIntegrityError, RevisionStore
 from agent.sandbox import _BWRAP, seccomp_filter_fd
 from agent.settings import Settings, load_settings
@@ -65,17 +69,35 @@ SSE_QUEUE_SIZE = 512
 class EventBus:
     """In-process fan-out for the single local browser client(s)."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, app: Flask | None = None) -> None:
         self.settings = settings
+        self.app = app
         self._subscribers: list[queue.Queue[dict[str, Any] | None]] = []
         self._lock = threading.Lock()
         self._history_lock = threading.Lock()
+
+    def _workspace_root(self) -> Path:
+        """Return the active workspace root, picking up post-setup reloads.
+
+        The bus is bound at app construction time but settings may be replaced
+        by ``/api/setup``; fall back to ``app.config`` whenever a Flask app is
+        attached so history events land in the correct project directory
+        (audit_078).
+        """
+        if self.app is not None:
+            try:
+                current = self.app.config.get("SETTINGS")
+                if current is not None:
+                    return current.workspace_root
+            except Exception:  # noqa: BLE001 - defensive: app teardown path
+                pass
+        return self.settings.workspace_root
 
     def publish(self, event_type: str, data: dict[str, Any]) -> None:
         if event_type in HISTORY_EVENT_TYPES:
             project = data.get("project")
             if isinstance(project, str) and project:
-                project_dir = self.settings.workspace_root / project
+                project_dir = self._workspace_root() / project
                 if project_dir.is_dir():
                     with self._history_lock:
                         _append_conversation(
@@ -273,12 +295,24 @@ def _project_locks(app: Flask, *project_names: str):
             lock.release()
 
 
+# Files whose mtimes actually drive the project-card "modified at" (audit_035).
+_PROJECT_MTIME_CANDIDATES = (
+    "model.py",
+    "conversation.jsonl",
+    "summary.md",
+    "report.md",
+    "preview.stl",
+    "render.png",
+)
+
+
 def _project_modified_at(project_dir: Path) -> str:
     modified = project_dir.stat().st_mtime
-    for path in project_dir.rglob("*"):
+    for name in _PROJECT_MTIME_CANDIDATES:
+        candidate = project_dir / name
         try:
-            if path.is_file():
-                modified = max(modified, path.stat().st_mtime)
+            if candidate.is_file():
+                modified = max(modified, candidate.stat().st_mtime)
         except OSError:
             continue
     return datetime.fromtimestamp(modified, tz=timezone.utc).isoformat()
@@ -313,27 +347,7 @@ def _save_env_api_key(env_path: Path, env_var: str, api_key: str) -> None:
             new_lines.append(line)
     if not found:
         new_lines.append(f"{env_var}={api_key}\n")
-    _atomic_write_text(env_path, "".join(new_lines))
-
-
-def _atomic_write_text(path: Path, content: str) -> None:
-    """Atomically replace a file: write a temp sibling, then rename over it."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent, text=True
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_name, path)
-    except BaseException:
-        try:
-            os.unlink(temp_name)
-        except OSError:
-            pass
-        raise
+    atomic_write_text(env_path, "".join(new_lines))
 
 
 def _save_config_setup(config_path: Path, provider: str, model: str) -> None:
@@ -364,7 +378,7 @@ def _save_config_setup(config_path: Path, provider: str, model: str) -> None:
         section = {}
         data[provider] = section
     section["model"] = model
-    _atomic_write_text(
+    atomic_write_text(
         config_path,
         yaml.dump(data, default_flow_style=False, allow_unicode=True),
     )
@@ -374,11 +388,15 @@ def create_app(settings: Settings | None = None) -> Flask:
     load_dotenv(Path(__file__).resolve().with_name(".env"))
     settings = settings or load_settings()
     settings.workspace_root.mkdir(parents=True, exist_ok=True)
-    bus = EventBus(settings)
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = 52 * 1024 * 1024
     app.config["SETTINGS"] = settings
+    bus = EventBus(settings, app)
     app.config["EVENT_BUS"] = bus
+    # Share the bus's history lock with the agent loop so the
+    # conversation.jsonl mirror written by _append_api_message serializes with
+    # the events the bus publishes (audit_078 follow-up).
+    _history_lock_slot[0] = bus._history_lock
     app.config["AGENT_RUNNER"] = AgentRunner(settings, bus.publish)
     app.config["PROJECT_LOCKS"]: dict[str, threading.Lock] = {}
     app.config["PROJECT_LOCKS_LOCK"] = threading.Lock()
@@ -402,19 +420,16 @@ def create_app(settings: Settings | None = None) -> Flask:
         return jsonify({"error": "The request is too large; upload at most five 10 MB images."}), 413
 
     def _hostname(header_value: str) -> str:
-        """Extract the bare hostname from a Host or Origin header."""
+        """Extract the bare hostname from a Host or Origin header.
+
+        Delegates to urllib.parse which handles IPv6 brackets, missing
+        schemes, and ports correctly (audit_036).
+        """
         if not header_value:
             return ""
-        # Strip scheme for Origin headers.
-        value = header_value.split("://")[-1]
-        # Strip port and path.
-        value = value.split("/")[0]
-        # Handle IPv6 brackets: [::1]:5000 → ::1
-        if value.startswith("["):
-            value = value.lstrip("[").split("]")[0]
-        else:
-            value = value.split(":")[0]
-        return value
+        # Add scheme if missing so urlparse returns the right hostname field.
+        raw = header_value if "://" in header_value else f"//{header_value}"
+        return urllib.parse.urlparse(raw).hostname or ""
 
     @app.before_request
     def validate_origin():
@@ -436,7 +451,7 @@ def create_app(settings: Settings | None = None) -> Flask:
         host_name = _hostname(host)
         origin_name = _hostname(origin)
 
-        bind_host = settings.host
+        bind_host = app.config["SETTINGS"].host
         _WILDCARD_BINDS = frozenset({"0.0.0.0", "::", ""})
         if bind_host in _WILDCARD_BINDS:
             # Wildcard bind — must be same-origin.
@@ -501,6 +516,7 @@ def create_app(settings: Settings | None = None) -> Flask:
         new_settings = load_settings()
         app.config["SETTINGS"] = new_settings
         app.config["AGENT_RUNNER"].settings = new_settings
+        app.config["EVENT_BUS"].settings = new_settings
         return jsonify({"ok": True})
 
     @app.get("/api/preflight")
@@ -526,8 +542,9 @@ def create_app(settings: Settings | None = None) -> Flask:
 
     @app.get("/api/projects")
     def list_projects():
+        workspace_root = app.config["SETTINGS"].workspace_root
         projects: list[dict[str, Any]] = []
-        for item in sorted(settings.workspace_root.iterdir()):
+        for item in sorted(workspace_root.iterdir()):
             if not item.is_dir() or not PROJECT_NAME_RE.fullmatch(item.name):
                 continue
             metadata = _read_project_metadata(item)
@@ -545,11 +562,12 @@ def create_app(settings: Settings | None = None) -> Flask:
         name = str(payload.get("name", "")).strip().lower().replace(" ", "-")
         if not PROJECT_NAME_RE.fullmatch(name):
             return jsonify({"error": "Use 1-63 lowercase letters, numbers, or hyphens."}), 400
-        project_dir = settings.workspace_root / name
+        workspace_root = app.config["SETTINGS"].workspace_root
+        project_dir = workspace_root / name
         with _project_lock(app, name):
             if project_dir.exists():
                 return jsonify({"error": "Project already exists."}), 409
-            with tempfile.TemporaryDirectory(prefix=".new-project-", dir=settings.workspace_root) as temporary:
+            with tempfile.TemporaryDirectory(prefix=".new-project-", dir=workspace_root) as temporary:
                 staging = Path(temporary)
                 (staging / "inputs").mkdir()
                 (staging / "output").mkdir()
@@ -565,29 +583,27 @@ def create_app(settings: Settings | None = None) -> Flask:
 
     @app.delete("/api/projects/<project_name>")
     def delete_project(project_name: str):
+        current_settings = app.config["SETTINGS"]
         try:
-            project_dir = _project_path(settings, project_name)
+            project_dir = _project_path(current_settings, project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         with _project_lock(app, project_name):
             try:
-                project_dir = _project_path(settings, project_name)
+                project_dir = _project_path(current_settings, project_name)
             except (ValueError, FileNotFoundError) as error:
                 return jsonify({"error": str(error)}), 404
             runner = app.config["AGENT_RUNNER"]
-            if (
-                (runner.is_running() and runner.active_project() == project_name)
-                or runner.is_awaiting_preview(project_name)
-                or runner.waiting_question(project_name)
-            ):
+            if runner.has_active_state_for(project_name):
                 return jsonify({"error": "Cannot delete a project with active agent state."}), 409
             shutil.rmtree(project_dir)
         return jsonify({"deleted": True})
 
     @app.put("/api/projects/<project_name>/rename")
     def rename_project(project_name: str):
+        current_settings = app.config["SETTINGS"]
         try:
-            project_dir = _project_path(settings, project_name)
+            project_dir = _project_path(current_settings, project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         payload = request.get_json(silent=True) or {}
@@ -596,20 +612,16 @@ def create_app(settings: Settings | None = None) -> Flask:
             return jsonify({"error": "Use 1-63 lowercase letters, numbers, or hyphens."}), 400
         if new_name == project_name:
             return jsonify({"project": project_name})
-        target = settings.workspace_root / new_name
+        target = current_settings.workspace_root / new_name
         with _project_locks(app, project_name, new_name):
             try:
-                project_dir = _project_path(settings, project_name)
+                project_dir = _project_path(current_settings, project_name)
             except (ValueError, FileNotFoundError) as error:
                 return jsonify({"error": str(error)}), 404
             if target.exists():
                 return jsonify({"error": "A project with that name already exists."}), 409
             runner = app.config["AGENT_RUNNER"]
-            if (
-                (runner.is_running() and runner.active_project() == project_name)
-                or runner.is_awaiting_preview(project_name)
-                or runner.waiting_question(project_name)
-            ):
+            if runner.has_active_state_for(project_name):
                 return jsonify({"error": "Cannot rename a project with active agent state."}), 409
             # Prepare all updated file contents before moving anything so a
             # mid-rename failure cannot leave project.json behind the rename.
@@ -674,7 +686,7 @@ def create_app(settings: Settings | None = None) -> Flask:
         if not message:
             return jsonify({"error": "Message is required."}), 400
         try:
-            project_dir = _project_path(settings, project_name)
+            project_dir = _project_path(app.config["SETTINGS"], project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         runner = app.config["AGENT_RUNNER"]
@@ -699,7 +711,7 @@ def create_app(settings: Settings | None = None) -> Flask:
             return jsonify({"error": "An agent task is already running."}), 409
         with _project_lock(app, project_name):
             try:
-                project_dir = _project_path(settings, project_name)
+                project_dir = _project_path(app.config["SETTINGS"], project_name)
                 image_paths = store_images(request.files.getlist("attachments"), project_dir)
             except FileNotFoundError as error:
                 return jsonify({"error": str(error)}), 404
@@ -754,12 +766,12 @@ def create_app(settings: Settings | None = None) -> Flask:
         if not raw_answer:
             return jsonify({"error": "Answer is required."}), 400
         try:
-            _project_path(settings, project_name)
+            _project_path(app.config["SETTINGS"], project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         with _project_lock(app, project_name):
             try:
-                _project_path(settings, project_name)
+                _project_path(app.config["SETTINGS"], project_name)
             except (ValueError, FileNotFoundError) as error:
                 return jsonify({"error": str(error)}), 404
             accepted = app.config["AGENT_RUNNER"].answer(project_name, raw_answer)
@@ -775,7 +787,7 @@ def create_app(settings: Settings | None = None) -> Flask:
         project_name = str((payload or {}).get("project", "")) or None
         if project_name:
             try:
-                _project_path(settings, project_name)
+                _project_path(app.config["SETTINGS"], project_name)
             except (ValueError, FileNotFoundError) as error:
                 return jsonify({"error": str(error)}), 404
         runner = app.config["AGENT_RUNNER"]
@@ -792,7 +804,7 @@ def create_app(settings: Settings | None = None) -> Flask:
     @app.get("/api/projects/<project_name>/state")
     def project_state(project_name: str):
         try:
-            _project_path(settings, project_name)
+            _project_path(app.config["SETTINGS"], project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         runner = app.config["AGENT_RUNNER"]
@@ -809,7 +821,8 @@ def create_app(settings: Settings | None = None) -> Flask:
     @app.get("/api/projects/<project_name>/history")
     def project_history(project_name: str):
         try:
-            project_dir = _project_path(settings, project_name)
+            current_settings = app.config["SETTINGS"]
+            project_dir = _project_path(current_settings, project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         log_path = project_dir / "conversation.jsonl"
@@ -825,7 +838,7 @@ def create_app(settings: Settings | None = None) -> Flask:
                     event = json.loads(line)
                     if not isinstance(event, dict):
                         continue
-                    if settings.show_info_messages or event.get("type") not in INFO_EVENT_TYPES:
+                    if current_settings.show_info_messages or event.get("type") not in INFO_EVENT_TYPES:
                         events.append(event)
                 except json.JSONDecodeError:
                     pass
@@ -835,7 +848,8 @@ def create_app(settings: Settings | None = None) -> Flask:
     def finalize(project_name: str):
         try:
             with _project_lock(app, project_name):
-                project_dir = _project_path(settings, project_name)
+                current_settings = app.config["SETTINGS"]
+                project_dir = _project_path(current_settings, project_name)
                 runner = app.config["AGENT_RUNNER"]
                 if (
                     runner.is_running()
@@ -845,7 +859,7 @@ def create_app(settings: Settings | None = None) -> Flask:
                     return jsonify({"error": "Stop or finish the active agent task before finalizing."}), 409
                 finalization_status = "accepted"
                 bypassed = False
-                if settings.quality_require_acceptance_before_finalize:
+                if current_settings.quality_require_acceptance_before_finalize:
                     body = request.get_json(silent=True) or {}
                     force_value = body.get("force")
                     force = force_value is True
@@ -946,7 +960,7 @@ def create_app(settings: Settings | None = None) -> Flask:
     @app.get("/api/projects/<project_name>/render")
     def project_render(project_name: str):
         try:
-            render_path = _project_path(settings, project_name) / "render.png"
+            render_path = _project_path(app.config["SETTINGS"], project_name) / "render.png"
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         if not render_path.is_file() or render_path.stat().st_size == 0:
@@ -956,7 +970,7 @@ def create_app(settings: Settings | None = None) -> Flask:
     @app.get("/api/projects/<project_name>/output/report")
     def project_report(project_name: str):
         try:
-            report_path = _project_path(settings, project_name) / "output" / "report.md"
+            report_path = _project_path(app.config["SETTINGS"], project_name) / "output" / "report.md"
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         if not report_path.is_file():
@@ -967,7 +981,7 @@ def create_app(settings: Settings | None = None) -> Flask:
     def project_finalize_meta(project_name: str):
         """Return ``.finalize_meta.json`` (or 404) for the active finalization."""
         try:
-            project_dir = _project_path(settings, project_name)
+            project_dir = _project_path(app.config["SETTINGS"], project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         meta_path = project_dir / "output" / ".finalize_meta.json"
@@ -982,7 +996,7 @@ def create_app(settings: Settings | None = None) -> Flask:
     @app.get("/api/projects/<project_name>/output/<path:filename>")
     def project_output_file(project_name: str, filename: str):
         try:
-            project_dir = _project_path(settings, project_name)
+            project_dir = _project_path(app.config["SETTINGS"], project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         allowed = {"model.step", "model.stl"}
@@ -997,7 +1011,7 @@ def create_app(settings: Settings | None = None) -> Flask:
     @app.get("/api/projects/<project_name>/preview")
     def preview(project_name: str):
         try:
-            preview_path = _project_path(settings, project_name) / "preview.stl"
+            preview_path = _project_path(app.config["SETTINGS"], project_name) / "preview.stl"
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         if not preview_path.is_file():
@@ -1009,7 +1023,7 @@ def create_app(settings: Settings | None = None) -> Flask:
     @app.get("/api/projects/<project_name>/preview/meta")
     def preview_meta(project_name: str):
         try:
-            project_dir = _project_path(settings, project_name)
+            project_dir = _project_path(app.config["SETTINGS"], project_name)
             preview_path = project_dir / "preview.stl"
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
@@ -1031,7 +1045,7 @@ def create_app(settings: Settings | None = None) -> Flask:
     @app.post("/api/projects/<project_name>/preview/displayed")
     def preview_displayed(project_name: str):
         try:
-            _project_path(settings, project_name)
+            _project_path(app.config["SETTINGS"], project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         payload = request.get_json(silent=True) or {}
@@ -1045,7 +1059,7 @@ def create_app(settings: Settings | None = None) -> Flask:
     @app.post("/api/projects/<project_name>/preview/failed")
     def preview_failed(project_name: str):
         try:
-            _project_path(settings, project_name)
+            _project_path(app.config["SETTINGS"], project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         payload = request.get_json(silent=True) or {}
@@ -1060,7 +1074,7 @@ def create_app(settings: Settings | None = None) -> Flask:
     @app.post("/api/projects/<project_name>/screenshot")
     def screenshot_capture(project_name: str):
         try:
-            _project_path(settings, project_name)
+            _project_path(app.config["SETTINGS"], project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         payload = request.get_json(silent=True) or {}
@@ -1133,7 +1147,7 @@ def create_app(settings: Settings | None = None) -> Flask:
     @app.get("/api/projects/<project_name>/revisions")
     def list_revisions(project_name: str):
         try:
-            project_dir = _project_path(settings, project_name)
+            project_dir = _project_path(app.config["SETTINGS"], project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         store = RevisionStore(project_dir)
@@ -1175,7 +1189,7 @@ def create_app(settings: Settings | None = None) -> Flask:
     @app.get("/api/projects/<project_name>/revisions/<revision_id>")
     def revision_detail(project_name: str, revision_id: str):
         try:
-            project_dir = _project_path(settings, project_name)
+            project_dir = _project_path(app.config["SETTINGS"], project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         store = RevisionStore(project_dir)
@@ -1202,7 +1216,7 @@ def create_app(settings: Settings | None = None) -> Flask:
     @app.get("/api/projects/<project_name>/revisions/<revision_id>/diff")
     def revision_diff(project_name: str, revision_id: str):
         try:
-            project_dir = _project_path(settings, project_name)
+            project_dir = _project_path(app.config["SETTINGS"], project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         store = RevisionStore(project_dir)
@@ -1248,24 +1262,21 @@ def create_app(settings: Settings | None = None) -> Flask:
     @app.post("/api/projects/<project_name>/revisions/<revision_id>/restore")
     def restore_revision(project_name: str, revision_id: str):
         try:
-            project_dir = _project_path(settings, project_name)
+            current_settings = app.config["SETTINGS"]
+            project_dir = _project_path(current_settings, project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         with _project_lock(app, project_name):
             try:
-                project_dir = _project_path(settings, project_name)
+                project_dir = _project_path(app.config["SETTINGS"], project_name)
             except (ValueError, FileNotFoundError) as error:
                 return jsonify({"error": str(error)}), 404
             runner = app.config["AGENT_RUNNER"]
-            if (
-                runner.is_running()
-                or runner.is_awaiting_preview(project_name)
-                or runner.waiting_question(project_name)
-            ):
+            if runner.has_active_state_for(project_name):
                 return jsonify({"error": "Cannot restore while the agent is active."}), 409
             store = RevisionStore(
                 project_dir,
-                retention_count=settings.revision_retention_count,
+                retention_count=current_settings.revision_retention_count,
             )
             try:
                 store.reconcile()
@@ -1327,7 +1338,7 @@ def create_app(settings: Settings | None = None) -> Flask:
     @app.get("/api/projects/<project_name>/constraints")
     def list_constraints(project_name: str):
         try:
-            project_dir = _project_path(settings, project_name)
+            project_dir = _project_path(app.config["SETTINGS"], project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         with _project_lock(app, project_name):
@@ -1350,7 +1361,7 @@ def create_app(settings: Settings | None = None) -> Flask:
     @app.post("/api/projects/<project_name>/constraints")
     def create_constraint(project_name: str):
         try:
-            project_dir = _project_path(settings, project_name)
+            project_dir = _project_path(app.config["SETTINGS"], project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         payload = request.get_json(silent=True) or {}
@@ -1362,14 +1373,10 @@ def create_app(settings: Settings | None = None) -> Flask:
             return jsonify({"error": "Constraint name is required."}), 400
         with _project_lock(app, project_name):
             runner = app.config["AGENT_RUNNER"]
-            if (
-                (runner.is_running() and runner.active_project() == project_name)
-                or runner.is_awaiting_preview(project_name)
-                or runner.waiting_question(project_name)
-            ):
+            if runner.has_active_state_for(project_name):
                 return jsonify({"error": "Cannot modify constraints while the agent is active."}), 409
             try:
-                project_dir = _project_path(settings, project_name)
+                project_dir = _project_path(app.config["SETTINGS"], project_name)
             except (ValueError, FileNotFoundError) as error:
                 return jsonify({"error": str(error)}), 404
             model_path = project_dir / "model.py"
@@ -1400,19 +1407,15 @@ def create_app(settings: Settings | None = None) -> Flask:
     @app.delete("/api/projects/<project_name>/constraints/<constraint_id>")
     def delete_constraint(project_name: str, constraint_id: str):
         try:
-            project_dir = _project_path(settings, project_name)
+            project_dir = _project_path(app.config["SETTINGS"], project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         with _project_lock(app, project_name):
             runner = app.config["AGENT_RUNNER"]
-            if (
-                (runner.is_running() and runner.active_project() == project_name)
-                or runner.is_awaiting_preview(project_name)
-                or runner.waiting_question(project_name)
-            ):
+            if runner.has_active_state_for(project_name):
                 return jsonify({"error": "Cannot modify constraints while the agent is active."}), 409
             try:
-                project_dir = _project_path(settings, project_name)
+                project_dir = _project_path(app.config["SETTINGS"], project_name)
             except (ValueError, FileNotFoundError) as error:
                 return jsonify({"error": str(error)}), 404
             store = ConstraintStore(project_dir)
@@ -1437,7 +1440,7 @@ def create_app(settings: Settings | None = None) -> Flask:
     @app.get("/api/projects/<project_name>/quality/runs")
     def quality_runs(project_name: str):
         try:
-            project_dir = _project_path(settings, project_name)
+            project_dir = _project_path(app.config["SETTINGS"], project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         try:
@@ -1467,7 +1470,7 @@ def create_app(settings: Settings | None = None) -> Flask:
         if not _valid_uuid(run_id):
             return jsonify({"error": "Invalid run id."}), 404
         try:
-            project_dir = _project_path(settings, project_name)
+            project_dir = _project_path(app.config["SETTINGS"], project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         store = QualityStore(project_dir)
@@ -1490,7 +1493,7 @@ def create_app(settings: Settings | None = None) -> Flask:
         if not _valid_uuid(run_id):
             return jsonify({"error": "Invalid run id."}), 404
         try:
-            project_dir = _project_path(settings, project_name)
+            project_dir = _project_path(app.config["SETTINGS"], project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         try:
@@ -1508,7 +1511,7 @@ def create_app(settings: Settings | None = None) -> Flask:
     def quality_latest_spec(project_name: str):
         """Return the most recent DesignSpec for the active run (read-only)."""
         try:
-            project_dir = _project_path(settings, project_name)
+            project_dir = _project_path(app.config["SETTINGS"], project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         store = QualityStore(project_dir)
@@ -1535,7 +1538,7 @@ def create_app(settings: Settings | None = None) -> Flask:
         if not _valid_uuid(attempt_id):
             return jsonify({"error": "Invalid attempt id."}), 404
         try:
-            project_dir = _project_path(settings, project_name)
+            project_dir = _project_path(app.config["SETTINGS"], project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         store = QualityStore(project_dir)
@@ -1552,37 +1555,35 @@ def create_app(settings: Settings | None = None) -> Flask:
         if not _valid_uuid(attempt_id):
             return jsonify({"error": "Invalid attempt id."}), 404
         try:
-            project_dir = _project_path(settings, project_name)
+            project_dir = _project_path(app.config["SETTINGS"], project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         store = QualityStore(project_dir)
-        try:
-            runs = store.list_runs(limit=500)
-        except (QualityError, QualityIntegrityError) as error:
-            return jsonify({"error": str(error)}), 400
-        for run in runs:
-            try:
-                attempt = store.get_attempt(run.run_id, attempt_id)
-            except QualityIntegrityError:
-                continue
-            return jsonify({"run": run.to_dict(), "attempt": attempt.to_dict()})
-        return jsonify({"error": "Attempt not found."}), 404
+        # Reuse the shared resolver and the in-memory attempt→run index
+        # (audit_019 + audit_018) to avoid walking every run on disk.
+        found, error_response = _resolve_quality_attempt(store, attempt_id)
+        if error_response is not None:
+            return error_response
+        run, attempt = found["run"], found["attempt"]
+        return jsonify({"run": run.to_dict(), "attempt": attempt.to_dict()})
 
     def _resolve_quality_attempt(
         store: QualityStore, attempt_id: str
     ) -> tuple[dict[str, Any] | None, Any]:
-        """Locate the run+attempt for an attempt id, or return an error response."""
+        """Locate the run+attempt for an attempt id, or return an error response.
+
+        Uses the in-memory attempt->run index so the lookup is O(1) instead of
+        scanning every run manifest on disk (audit_019 + audit_018).
+        """
         try:
-            runs = store.list_runs(limit=500)
-        except (QualityError, QualityIntegrityError) as error:
+            run_id = store._run_id_for_attempt(attempt_id)  # noqa: SLF001
+            run = store.get_run(run_id)
+            attempt = store.get_attempt(run_id, attempt_id)
+        except QualityIntegrityError:
+            return None, (jsonify({"error": "Attempt not found."}), 404)
+        except QualityError as error:
             return None, (jsonify({"error": str(error)}), 400)
-        for run in runs:
-            try:
-                attempt = store.get_attempt(run.run_id, attempt_id)
-            except QualityIntegrityError:
-                continue
-            return {"run": run, "attempt": attempt}, None
-        return None, (jsonify({"error": "Attempt not found."}), 404)
+        return {"run": run, "attempt": attempt}, None
 
     def _require_current_attempt(
         store: QualityStore, found: dict[str, Any], project_name: str
@@ -1590,7 +1591,7 @@ def create_app(settings: Settings | None = None) -> Flask:
         """Ensure the attempt targets the current head revision (delivery gate)."""
         try:
             with _project_lock(app, project_name):
-                revisions = RevisionStore(_project_path(settings, project_name))
+                revisions = RevisionStore(_project_path(app.config["SETTINGS"], project_name))
                 revisions.reconcile()
                 head = revisions.head()
         except (ValueError, RevisionIntegrityError) as error:
@@ -1609,7 +1610,7 @@ def create_app(settings: Settings | None = None) -> Flask:
         if not _valid_uuid(attempt_id):
             return jsonify({"error": "Invalid attempt id."}), 404
         try:
-            project_dir = _project_path(settings, project_name)
+            project_dir = _project_path(app.config["SETTINGS"], project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         store = QualityStore(project_dir)
@@ -1670,7 +1671,7 @@ def create_app(settings: Settings | None = None) -> Flask:
         if not _valid_uuid(attempt_id):
             return jsonify({"error": "Invalid attempt id."}), 404
         try:
-            project_dir = _project_path(settings, project_name)
+            project_dir = _project_path(app.config["SETTINGS"], project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         store = QualityStore(project_dir)
@@ -1703,8 +1704,8 @@ def create_app(settings: Settings | None = None) -> Flask:
         from agent.quality.models import new_id
 
         issue_id = new_id()
-        evidence: list[str] = []
         screenshot = body.get("screenshot")
+        png: bytes | None = None
         if isinstance(screenshot, str) and screenshot:
             try:
                 import base64
@@ -1714,15 +1715,11 @@ def create_app(settings: Settings | None = None) -> Flask:
                 return jsonify({"error": "screenshot must be a base64 PNG."}), 400
             if not png.startswith(b"\x89PNG\r\n\x1a\n"):
                 return jsonify({"error": "screenshot must be a PNG image."}), 400
-            try:
-                evidence.append(
-                    store.save_issue_evidence(
-                        found["run"].run_id, attempt_id, issue_id, png
-                    )
-                )
-            except QualityLimitError as error:
-                return jsonify({"error": str(error)}), 413
+        issue: Issue | None = None
+        evidence: list[str] = []
         try:
+            # Create the issue first so a screenshot/save failure cannot leave
+            # orphaned evidence pointing at a non-existent issue (audit_079).
             issue = store.create_issue(
                 found["run"].run_id,
                 attempt_id=attempt_id,
@@ -1731,9 +1728,19 @@ def create_app(settings: Settings | None = None) -> Flask:
                 severity=severity,
                 message=str(message),
                 requirement_ids=requirement_ids,
-                evidence=evidence,
+                evidence=(),
                 issue_id=issue_id,
             )
+            if png is not None:
+                evidence.append(
+                    store.save_issue_evidence(
+                        found["run"].run_id, attempt_id, issue_id, png
+                    )
+                )
+            if evidence:
+                issue = store.update_issue_evidence(
+                    found["run"].run_id, issue_id, tuple(evidence)
+                )
             # An explicit issue report marks the targeted revision rejected.
             store.record_decision(
                 found["run"].run_id,
@@ -1744,8 +1751,16 @@ def create_app(settings: Settings | None = None) -> Flask:
                 comment=str(message)[:2000],
                 camera=camera,
             )
-        except (QualityError, QualityIntegrityError, QualityLimitError) as error:
-            return jsonify({"error": str(error)}), 422
+        except (QualityError, QualityIntegrityError, QualityLimitError, RuntimeError, OSError) as error:
+            # Roll back any persisted state so a retry cannot duplicate work
+            # or leave a stale decision pointing at a missing issue (audit_079).
+            if issue is not None:
+                try:
+                    store.delete_issue(found["run"].run_id, issue.issue_id)
+                except Exception:  # noqa: BLE001 - best-effort rollback.
+                    pass
+            status = 413 if isinstance(error, QualityLimitError) else 422
+            return jsonify({"error": str(error)}), status
         bus.publish(
             "design_rejected",
             {
@@ -1761,7 +1776,7 @@ def create_app(settings: Settings | None = None) -> Flask:
     @app.get("/api/projects/<project_name>/quality/issues")
     def quality_issues(project_name: str):
         try:
-            project_dir = _project_path(settings, project_name)
+            project_dir = _project_path(app.config["SETTINGS"], project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         try:
@@ -1786,7 +1801,7 @@ def create_app(settings: Settings | None = None) -> Flask:
         if not _valid_uuid(issue_id):
             return jsonify({"error": "Invalid issue id."}), 404
         try:
-            project_dir = _project_path(settings, project_name)
+            project_dir = _project_path(app.config["SETTINGS"], project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         try:
@@ -1831,7 +1846,7 @@ def create_app(settings: Settings | None = None) -> Flask:
     @app.get("/api/projects/<project_name>/quality/metrics")
     def quality_metrics(project_name: str):
         try:
-            project_dir = _project_path(settings, project_name)
+            project_dir = _project_path(app.config["SETTINGS"], project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         store = QualityStore(project_dir)

@@ -71,7 +71,9 @@ def verify_dimension(requirement: Requirement, shape: Any) -> ValidationResult:
             message=f"dimension requirement {requirement.id!r} has no target value.",
             created_at=_utc_now(),
         )
-    tolerance = float(requirement.tolerance or 0.05)
+    # Preserve an explicit ``tolerance=0`` (audit_077); ``requirement.tolerance``
+    # is already validated to be a finite, non-negative number by the model.
+    tolerance = float(requirement.tolerance)
     diff = observed_value - float(target)
     within = abs(diff) <= tolerance
     status = "passed" if within else "failed"

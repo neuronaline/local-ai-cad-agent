@@ -151,6 +151,25 @@ def test_reporting_issue_rejects_revision_and_preserves_evidence(
     ).read_text(encoding="utf-8")
 
 
+def test_reporting_oversized_evidence_rolls_back_issue(scenario: QualityScenario, monkeypatch):
+    from agent.quality.store import QualityLimitError
+
+    def _too_large(*_args, **_kwargs):
+        raise QualityLimitError("Issue evidence exceeds the size bound.")
+
+    monkeypatch.setattr("app.QualityStore.save_issue_evidence", _too_large)
+    screenshot = base64.b64encode(b"\x89PNG\r\n\x1a\npayload").decode("ascii")
+
+    response = scenario.client.post(
+        f"/api/projects/demo/quality/attempts/{scenario.attempt_id}/issues",
+        json={"category": "other", "screenshot": screenshot},
+    )
+
+    assert response.status_code == 413
+    issue_dir = scenario.project_dir / ".cad-agent" / "quality" / "runs" / scenario.run_id / "issues"
+    assert list(issue_dir.glob("*.json")) == []
+
+
 def test_decision_requires_a_successful_current_preview(scenario: QualityScenario):
     store = QualityStore(scenario.project_dir)
     failed_run = store.start_run(project="demo")
@@ -311,3 +330,46 @@ def test_resolving_issue_updates_open_count_and_finalize_gate(tmp_path: Path, mo
         json={"decision": "accepted"},
     )
     assert scenario.client.post("/api/projects/demo/finalize").status_code == 200
+
+
+def test_reporting_issue_rolls_back_when_decision_step_fails(
+    tmp_path: Path, monkeypatch
+):
+    """Regression: a failing record_decision must not leave an orphan issue (audit_079)."""
+    import app as app_module
+
+    scenario = _scenario(tmp_path)
+    project_dir = scenario.project_dir
+    store = QualityStore(project_dir)
+
+    # Force the post-issue decision recording step to fail so the endpoint
+    # takes the rollback branch.
+    def _explode(*_args, **_kwargs):
+        raise RuntimeError("simulated decision failure")
+
+    monkeypatch.setattr(store, "record_decision", _explode)
+    monkeypatch.setattr(app_module.QualityStore, "record_decision", _explode)
+
+    response = scenario.client.post(
+        f"/api/projects/demo/quality/attempts/{scenario.attempt_id}/issues",
+        json={"category": "other", "severity": "blocking", "message": "broken"},
+    )
+
+    assert response.status_code == 422
+
+    # The rollback path must have removed the issue so a retry starts clean
+    # and no orphan decision/issue records are persisted.
+    remaining = list((project_dir / ".cad-agent" / "quality" / "runs" / scenario.run_id / "issues").glob("*.json"))
+    assert remaining == [], f"expected issue rollback, found: {[r.name for r in remaining]}"
+    decisions = list((project_dir / ".cad-agent" / "quality" / "runs" / scenario.run_id / "decisions").glob("*.json"))
+    assert decisions == [], f"expected no decisions recorded, found: {[r.name for r in decisions]}"
+
+    # A retry with the store restored must succeed and produce exactly one issue.
+    monkeypatch.undo()
+    retry = scenario.client.post(
+        f"/api/projects/demo/quality/attempts/{scenario.attempt_id}/issues",
+        json={"category": "other", "severity": "blocking", "message": "retry"},
+    )
+    assert retry.status_code == 201
+    issues_after_retry = list((project_dir / ".cad-agent" / "quality" / "runs" / scenario.run_id / "issues").glob("*.json"))
+    assert len(issues_after_retry) == 1

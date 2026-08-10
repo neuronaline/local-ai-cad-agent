@@ -275,3 +275,108 @@ def create_llm_client(settings: Settings):
 
         return OpenRouterClient(settings)
     raise ValueError(f"Unknown LLM provider: {provider!r}")
+
+
+# ---------------------------------------------------------------------------
+# Shared Chat Completions client — shared retry loop and state
+# ---------------------------------------------------------------------------
+
+
+class ChatCompletionsClient:
+    """Shared base for OpenAI-compatible Chat Completions clients.
+
+    Provider-specific logic (endpoint, headers, payload extras) is pushed into
+    the thin subclasses via ``_endpoint``, ``_build_headers``, and
+    ``_build_payload``. The retry loop, stream parsing, and image fallback
+    are fully shared here.
+    """
+
+    def __init__(self, settings: Settings, provider_label: str) -> None:
+        self.settings = settings
+        self.stop_event = None
+        self.session_id: str | None = None
+        self.last_usage: dict[str, Any] | None = None
+        self.stream_callback = None
+        self._provider_label = provider_label
+
+    def _endpoint(self) -> str:  # pragma: no cover — overridden by subclass
+        raise NotImplementedError
+
+    def _build_headers(self, api_key: str) -> dict[str, str]:  # pragma: no cover
+        raise NotImplementedError
+
+    def _build_payload(self, messages, tools):  # pragma: no cover
+        raise NotImplementedError
+
+    def _post(self, payload, headers):  # pragma: no cover
+        raise NotImplementedError
+
+    def _api_key(self) -> str:  # pragma: no cover
+        raise NotImplementedError
+
+    def sanitize_messages(self, messages):
+        return sanitize_messages(messages)
+
+    def _stream_response(self, response):
+        result = parse_chat_stream(
+            response,
+            provider_label=self._provider_label,
+            stop_event=self.stop_event,
+            stream_callback=self.stream_callback,
+        )
+        usage = result.get("usage") if isinstance(result, dict) else None
+        self.last_usage = usage if isinstance(usage, dict) else None
+        return result
+
+    def _try_image_fallback(self, payload, response):
+        messages_without_images, removed = without_images(payload["messages"])
+        if removed:
+            response.close()
+            payload["messages"] = messages_without_images
+        return removed
+
+    def chat(self, messages, tools=None):
+        self.last_usage = None
+        api_key = self._api_key()
+        if not api_key:
+            raise RuntimeError(f"{api_key_env(self._provider_label.lower())} is not configured.")
+        payload = self._build_payload(messages, tools)
+        headers = self._build_headers(api_key)
+
+        image_fallback_used = False
+        for attempt in range(3):
+            response: requests.Response | None = None
+            try:
+                response = self._post(payload, headers)
+            except Exception:
+                if attempt == 2:
+                    raise
+            else:
+                if response.status_code in {400, 404} and not image_fallback_used:
+                    if self._try_image_fallback(payload, response):
+                        image_fallback_used = True
+                        continue
+                    body_preview = ""
+                    try:
+                        body_preview = response.text[:500]
+                    except Exception:  # noqa: BLE001,S110
+                        pass
+                    if body_preview:
+                        raise RuntimeError(f"{self._provider_label} {response.status_code}: {body_preview}")
+                if response.status_code not in {408, 429} and response.status_code < 500:
+                    response.raise_for_status()
+                    if hasattr(response, "iter_lines"):
+                        return self._stream_response(response)
+                    body = response.json()
+                    self.last_usage = body.get("usage") if isinstance(body.get("usage"), dict) else None
+                    return body
+                if attempt == 2:
+                    response.raise_for_status()
+            finally:
+                close = getattr(response, "close", None)
+                if callable(close):
+                    close()
+            if attempt < 2:
+                delay = retry_delay(response, attempt)
+                sleep_with_cancel(delay, self.stop_event)
+        raise RuntimeError(f"{self._provider_label} retry loop ended unexpectedly.")

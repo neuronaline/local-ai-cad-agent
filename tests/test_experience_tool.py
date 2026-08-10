@@ -60,6 +60,12 @@ def test_duplicate_experience_merges_learning_across_projects(
     assert record["reuse_count"] == 1
 
 
+def test_projects_sharing_a_memory_file_share_a_lock(tool: ExperienceTool):
+    other_project = ExperienceTool(tool._workspace_root, "project-b")
+
+    assert other_project._memory_lock is tool._memory_lock
+
+
 def test_update_changes_existing_experience_and_tracks_reuse(
     tool: ExperienceTool,
 ):

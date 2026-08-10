@@ -496,6 +496,25 @@ def test_protocol_history_is_append_only_and_preserves_tool_call_content(
     )
 
 
+def test_legacy_history_migration_does_not_duplicate_conversation(tmp_path: Path):
+    project = tmp_path / "demo"
+    project.mkdir()
+    transcript = (
+        '{"role":"user","content":"Make a bracket"}\n'
+        '{"role":"assistant","content":"I will make it."}\n'
+    )
+    (project / "conversation.jsonl").write_text(transcript, encoding="utf-8")
+
+    history = AgentRunner._load_api_history(project)
+
+    assert history == [
+        {"role": "user", "content": "Make a bracket"},
+        {"role": "assistant", "content": "I will make it."},
+    ]
+    assert (project / "conversation.jsonl").read_text(encoding="utf-8") == transcript
+    assert (project / "api_messages.jsonl").read_text(encoding="utf-8").count("\n") == 2
+
+
 def test_constraint_changes_are_appended_without_mutating_system_prefix(
     tmp_path: Path, monkeypatch
 ):

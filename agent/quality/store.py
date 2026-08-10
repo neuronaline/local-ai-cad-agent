@@ -25,7 +25,7 @@ import json
 import os
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from agent.quality.errors import (
     ACCEPTED_DECISION_TYPES,
@@ -81,6 +81,12 @@ class QualityStore:
         self.project_dir = Path(project_dir).resolve()
         self.root = self.project_dir / ".cad-agent" / "quality"
         self._lock = _lock_for(self.project_dir)
+        # Per-revision → run_id index (lazy-built on first access).
+        self._revision_run_index: dict[str, str] | None = None
+        # Per-attempt → run_id index (lazy-built on first access).
+        self._attempt_run_index: dict[str, str] | None = None
+        # Metrics cache: (runs_dir_mtime, metrics_dict).
+        self._metrics_cache: tuple[float, dict[str, Any]] | None = None
 
     # ------------------------------------------------------------------ paths
     def _runs_dir(self) -> Path:
@@ -131,6 +137,46 @@ class QualityStore:
         if not isinstance(value, str) or len(value) != 32 or not value.isalnum():
             raise QualityIntegrityError(f"Invalid quality record id: {value!r}")
 
+    # ------------------------------------------------------------------ indexes
+    def _ensure_indexes(self) -> None:
+        """Build revision→run and attempt→run indexes (once per instance)."""
+        if self._revision_run_index is not None and self._attempt_run_index is not None:
+            return
+        rev_idx: dict[str, str] = {}
+        att_idx: dict[str, str] = {}
+        for run_id in self._all_run_ids():
+            attempts_dir = self._run_dir(run_id) / "attempts"
+            if attempts_dir.is_dir():
+                for att_file in attempts_dir.glob("*.json"):
+                    try:
+                        data = self._read_json_required(att_file)
+                        att_id = data.get("attempt_id", "")
+                        rev_id = data.get("revision_id")
+                        if att_id:
+                            att_idx[att_id] = run_id
+                        if isinstance(rev_id, str) and rev_id:
+                            rev_idx.setdefault(rev_id, run_id)
+                    except QualityIntegrityError:
+                        continue
+        self._revision_run_index = rev_idx
+        self._attempt_run_index = att_idx
+
+    def _revision_to_run(self, revision_id: str) -> str | None:
+        """O(1) lookup of the run id that owns a revision (via in-memory index)."""
+        if not revision_id:
+            return None
+        self._ensure_indexes()
+        assert self._revision_run_index is not None
+        return self._revision_run_index.get(revision_id)
+
+    def _attempt_to_run(self, attempt_id: str) -> str | None:
+        """O(1) lookup of the run id that owns an attempt (via in-memory index)."""
+        if not attempt_id:
+            return None
+        self._ensure_indexes()
+        assert self._attempt_run_index is not None
+        return self._attempt_run_index.get(attempt_id)
+
     # ------------------------------------------------------------------ writes
     def start_run(
         self,
@@ -161,6 +207,7 @@ class QualityStore:
                 )
             self._write_json_atomic(run_file, run.to_dict())
             self._append_event_locked(run.run_id, "run_started", {"run_id": run.run_id})
+            self._invalidate_caches()
         return run
 
     def complete_run(
@@ -256,6 +303,14 @@ class QualityStore:
                     "revision_id": attempt.revision_id,
                 },
             )
+            # Maintain in-memory indexes (audit_018).
+            self._ensure_indexes()
+            assert self._attempt_run_index is not None
+            self._attempt_run_index[attempt.attempt_id] = run_id
+            if revision_id is not None:
+                assert self._revision_run_index is not None
+                self._revision_run_index.setdefault(revision_id, run_id)
+            self._metrics_cache = None
         return attempt
 
     def complete_attempt(
@@ -305,18 +360,20 @@ class QualityStore:
             if metrics is not None:
                 artifacts_dir = self._artifacts_dir(run_id, attempt_id)
                 artifacts_dir.mkdir(parents=True, exist_ok=True)
-                payload = json.dumps(metrics, ensure_ascii=False, separators=(",", ":"))
-                if len(payload.encode("utf-8")) > ARTIFACT_COPY_MAX_BYTES:
+                payload_bytes = json.dumps(
+                    metrics, ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+                if len(payload_bytes) > ARTIFACT_COPY_MAX_BYTES:
                     raise QualityLimitError(
                         "Attempt metrics artifact exceeds the size bound."
                     )
-                digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+                digest = hashlib.sha256(payload_bytes).hexdigest()
                 artifact_path = artifacts_dir / "metrics.json"
-                self._write_bytes_atomic(artifact_path, payload.encode("utf-8"))
+                self._write_bytes_atomic(artifact_path, payload_bytes)
                 artifacts["metrics"] = {
                     "path": self._relative_posix(artifact_path),
                     "sha256": digest,
-                    "size": len(payload.encode("utf-8")),
+                    "size": len(payload_bytes),
                 }
                 data["metrics"] = metrics
             if artifacts:
@@ -334,7 +391,9 @@ class QualityStore:
                     else None,
                 },
             )
-            return Attempt.from_dict(self._read_json_required(attempt_file))
+            # Return the in-memory state we just wrote instead of re-reading
+            # the manifest (audit_021). The dataclass reflects the freshest fields.
+            return Attempt.from_dict(data)
 
     def append_event(self, run_id: str, event_type: str, data: dict[str, Any]) -> None:
         with self._lock:
@@ -374,6 +433,83 @@ class QualityStore:
                 continue
         ids.sort(key=lambda item: item[0], reverse=True)
         return [item[1] for item in ids]
+
+    # --- Unbounded record iterators (audit_080) ---------------------------------
+    # ``list_*`` methods cap at 500 for UI responsiveness; metrics aggregation
+    # needs every record on disk so projects above the cap are not silently
+    # undercounted. Each iterator reads its directory directly, skipping any
+    # malformed file the same way the bounded variants do.
+
+    def _iter_runs_all(self) -> Iterable[TaskRun]:
+        runs_dir = self._runs_dir()
+        if not runs_dir.is_dir():
+            return iter(())
+        ids = self._all_run_ids()
+        for run_id in ids:
+            try:
+                yield self.get_run(run_id)
+            except QualityIntegrityError:
+                continue
+
+    def _iter_attempts_all(self, run_id: str) -> Iterable[Attempt]:
+        try:
+            self._require_run(run_id)
+        except QualityIntegrityError:
+            return iter(())
+        attempts_dir = self._run_dir(run_id) / "attempts"
+        if not attempts_dir.is_dir():
+            return iter(())
+        results: list[Attempt] = []
+        with self._lock:
+            for attempt_file in sorted(attempts_dir.glob("*.json")):
+                try:
+                    results.append(
+                        Attempt.from_dict(self._read_json_required(attempt_file))
+                    )
+                except QualityIntegrityError:
+                    continue
+        return results
+
+    def _iter_decisions_all(self, run_id: str) -> Iterable[UserDecision]:
+        try:
+            self._require_run(run_id)
+        except QualityIntegrityError:
+            return iter(())
+        decision_dir = self._run_dir(run_id) / "decisions"
+        if not decision_dir.is_dir():
+            return iter(())
+        results: list[UserDecision] = []
+        with self._lock:
+            for decision_file in sorted(decision_dir.glob("*.json")):
+                try:
+                    results.append(
+                        UserDecision.from_dict(self._read_json_required(decision_file))
+                    )
+                except QualityIntegrityError:
+                    continue
+        # Sort newest first to mirror ``list_decisions`` so callers that read
+        # only the first hit per attempt see the most recent decision.
+        results.sort(key=lambda item: item.created_at, reverse=True)
+        return results
+
+    def _iter_issues_all(self, run_id: str) -> Iterable[Issue]:
+        try:
+            self._require_run(run_id)
+        except QualityIntegrityError:
+            return iter(())
+        issue_dir = self._run_dir(run_id) / "issues"
+        if not issue_dir.is_dir():
+            return iter(())
+        results: list[Issue] = []
+        with self._lock:
+            for issue_file in sorted(issue_dir.glob("*.json")):
+                try:
+                    results.append(
+                        Issue.from_dict(self._read_json_required(issue_file))
+                    )
+                except QualityIntegrityError:
+                    continue
+        return results
 
     def reconcile(self) -> int:
         """Mark runs left ``running`` by a dead process as ``interrupted``.
@@ -555,30 +691,33 @@ class QualityStore:
 
     def latest_decision_for_revision(self, revision_id: str) -> UserDecision | None:
         """Latest explicit decision across all runs for one revision (or None)."""
+        run_id = self._revision_to_run(revision_id)
+        if run_id is None:
+            return None
+        try:
+            decisions = self.list_decisions(run_id, limit=500)
+        except QualityIntegrityError:
+            return None
         latest: UserDecision | None = None
-        for run_id in self._all_run_ids():
-            try:
-                decisions = self.list_decisions(run_id, limit=500)
-            except QualityIntegrityError:
+        for decision in decisions:
+            if decision.revision_id != revision_id:
                 continue
-            for decision in decisions:
-                if decision.revision_id != revision_id:
-                    continue
-                if latest is None or decision.created_at > latest.created_at:
-                    latest = decision
+            if latest is None or decision.created_at > latest.created_at:
+                latest = decision
         return latest
 
     def decisions_for_revision(self, revision_id: str) -> list[UserDecision]:
-        decisions: list[UserDecision] = []
-        for run_id in self._all_run_ids():
-            try:
-                decisions.extend(
-                    decision
-                    for decision in self.list_decisions(run_id, limit=500)
-                    if decision.revision_id == revision_id
-                )
-            except QualityIntegrityError:
-                continue
+        run_id = self._revision_to_run(revision_id)
+        if run_id is None:
+            return []
+        try:
+            decisions = [
+                decision
+                for decision in self.list_decisions(run_id, limit=500)
+                if decision.revision_id == revision_id
+            ]
+        except QualityIntegrityError:
+            return []
         return sorted(decisions, key=lambda item: item.created_at)
 
     def create_issue(
@@ -665,15 +804,17 @@ class QualityStore:
 
     def has_successful_attempt_for_revision(self, revision_id: str) -> bool:
         """Return whether a revision has at least one successful CAD attempt."""
-        for run_id in self._all_run_ids():
-            try:
-                attempts = self.list_attempts(run_id, limit=500)
-            except QualityIntegrityError:
-                continue
-            for attempt in attempts:
-                if attempt.revision_id == revision_id and attempt.status == "succeeded":
-                    return True
-        return False
+        run_id = self._revision_to_run(revision_id)
+        if run_id is None:
+            return False
+        try:
+            attempts = self.list_attempts(run_id, limit=500)
+        except QualityIntegrityError:
+            return False
+        return any(
+            attempt.revision_id == revision_id and attempt.status == "succeeded"
+            for attempt in attempts
+        )
 
     def resolve_issue(
         self,
@@ -707,6 +848,36 @@ class QualityStore:
             )
             return Issue.from_dict(self._read_json_required(issue_file))
 
+    def delete_issue(self, run_id: str, issue_id: str) -> bool:
+        """Remove an issue and any persisted evidence, returning whether it existed.
+
+        Intended for rollback when a downstream step (decision, evidence save)
+        fails after the issue was created (audit_079). Resolved issues are
+        left alone to preserve the audit trail.
+        """
+        self._validate_id(issue_id)
+        removed = False
+        with self._lock:
+            issue_file = self._issue_file(run_id, issue_id)
+            if issue_file.exists():
+                try:
+                    data = self._read_json_required(issue_file)
+                except QualityIntegrityError:
+                    data = None
+                if not (isinstance(data, dict) and data.get("status") == "resolved"):
+                    issue_file.unlink()
+                    removed = True
+        if removed:
+            evidence_root = self.root / "runs" / run_id / "attempts"
+            if evidence_root.is_dir():
+                for artifact_dir in evidence_root.glob("*/artifacts/evidence"):
+                    evidence_file = artifact_dir / f"issue-{issue_id}.png"
+                    try:
+                        evidence_file.unlink()
+                    except FileNotFoundError:
+                        pass
+        return removed
+
     def save_issue_evidence(
         self,
         run_id: str,
@@ -725,6 +896,31 @@ class QualityStore:
             path = evidence_dir / f"issue-{issue_id}.png"
             self._write_bytes_atomic(path, png_bytes)
         return self._relative_posix(path)
+
+    def update_issue_evidence(
+        self,
+        run_id: str,
+        issue_id: str,
+        evidence: tuple[str, ...],
+    ) -> Issue:
+        """Replace the issue's evidence list, appending an event.
+
+        Used by the issue-report endpoint after the screenshot has been written
+        to disk so the JSON manifest stays in sync with the artifacts
+        directory (audit_079).
+        """
+        self._validate_id(issue_id)
+        with self._lock:
+            issue_file = self._issue_file(run_id, issue_id)
+            data = self._read_json_required(issue_file)
+            data["evidence"] = [str(item) for item in evidence]
+            self._write_json_atomic(issue_file, data)
+            self._append_event_locked(
+                run_id,
+                "issue_updated",
+                {"issue_id": issue_id, "evidence_count": len(evidence)},
+            )
+            return Issue.from_dict(self._read_json_required(issue_file))
 
     # -------------------------------------------------------------- specs & verifiers
 
@@ -785,20 +981,16 @@ class QualityStore:
         self,
         result: ValidationResult,
         *,
-        run_id: str | None = None,
+        run_id: str,
     ) -> ValidationResult:
         """Persist a :class:`ValidationResult` and index it for fast lookup.
 
-        ``run_id`` is optional but recommended: passing it avoids an O(runs)
-        disk scan to locate the attempt. When omitted the scan runs under the
-        store lock so concurrent readers cannot see a stale mapping.
+        ``run_id`` is required (audit_038) — the caller always has it on hand
+        when constructing the result, so a per-call disk scan was redundant.
         """
         with self._lock:
-            if run_id is None:
-                run_id = self._run_id_for_attempt(result.attempt_id)
-            else:
-                self._validate_id(run_id)
-                self._validate_id(result.attempt_id)
+            self._validate_id(run_id)
+            self._validate_id(result.attempt_id)
             self._require_run(run_id)
             validation_dir = self._validation_dir(run_id)
             validation_dir.mkdir(parents=True, exist_ok=True)
@@ -825,15 +1017,12 @@ class QualityStore:
         return result
 
     def _run_id_for_attempt(self, attempt_id: str) -> str:
-        """Locate the run id that owns an attempt by scanning disk manifests."""
+        """Locate the run id that owns an attempt via the in-memory index (audit_018)."""
         self._validate_id(attempt_id)
-        for run_id in self._all_run_ids():
-            try:
-                if (self._run_dir(run_id) / "attempts" / f"{attempt_id}.json").is_file():
-                    return run_id
-            except QualityIntegrityError:
-                continue
-        raise QualityIntegrityError(f"Unknown attempt id: {attempt_id!r}")
+        run_id = self._attempt_to_run(attempt_id)
+        if run_id is None:
+            raise QualityIntegrityError(f"Unknown attempt id: {attempt_id!r}")
+        return run_id
 
     def validations_for_attempt(self, attempt_id: str) -> list[ValidationResult]:
         """Return every validation result for one attempt, newest first."""
@@ -861,8 +1050,18 @@ class QualityStore:
         return results
 
     def get_metrics(self) -> dict[str, Any]:
-        """Aggregate observability metrics for the project."""
-        runs = self.list_runs(limit=500)
+        """Aggregate observability metrics for the project (mtime-cached).
+
+        Reads every record on disk rather than sampling the first ``limit=500``
+        of each list so projects that exceed the per-list cap are still
+        aggregated accurately (audit_080).
+        """
+        sentinel = self._runs_dir().stat().st_mtime if self._runs_dir().exists() else 0.0
+        if self._metrics_cache is not None:
+            cached_mtime, cached_metrics = self._metrics_cache
+            if cached_mtime == sentinel:
+                return cached_metrics
+        runs = list(self._iter_runs_all())
         attempts_total = 0
         attempts_succeeded = 0
         attempts_failed = 0
@@ -874,7 +1073,7 @@ class QualityStore:
         accepted_revisions: set[str] = set()
         latest_by_revision: dict[str, UserDecision] = {}
         for run in runs:
-            attempts = self.list_attempts(run.run_id, limit=500)
+            attempts = list(self._iter_attempts_all(run.run_id))
             attempts_total += len(attempts)
             for attempt in attempts:
                 if attempt.status == "succeeded":
@@ -883,7 +1082,7 @@ class QualityStore:
                     attempts_failed += 1
             attempts_by_id = {attempt.attempt_id: attempt for attempt in attempts}
             latest_by_attempt: dict[str, UserDecision] = {}
-            for decision in self.list_decisions(run.run_id, limit=500):
+            for decision in self._iter_decisions_all(run.run_id):
                 decisions[decision.decision] = decisions.get(decision.decision, 0) + 1
                 latest_by_attempt.setdefault(decision.attempt_id, decision)
                 current = latest_by_revision.get(decision.revision_id)
@@ -895,7 +1094,7 @@ class QualityStore:
                     decisions_on_succeeded += 1
                     if decision.decision == "rejected":
                         rejected_on_succeeded += 1
-            for issue in self.list_issues(run.run_id, limit=500):
+            for issue in self._iter_issues_all(run.run_id):
                 if issue.status == "open":
                     issues_open += 1
                 elif issue.status == "resolved":
@@ -905,7 +1104,7 @@ class QualityStore:
             for decision in latest_by_revision.values()
             if decision.decision in ACCEPTED_DECISION_TYPES
         }
-        return {
+        result = {
             "runs": len(runs),
             "attempts": {
                 "total": attempts_total,
@@ -923,8 +1122,16 @@ class QualityStore:
             "rejected_on_succeeded": rejected_on_succeeded,
             "decisions_on_succeeded": decisions_on_succeeded,
         }
+        self._metrics_cache = (sentinel, result)
+        return result
 
     # ---------------------------------------------------------------- helpers
+    def _invalidate_caches(self) -> None:
+        """Reset all in-memory caches after a mutation."""
+        self._revision_run_index = None
+        self._attempt_run_index = None
+        self._metrics_cache = None
+
     def _require_run(self, run_id: str) -> TaskRun:
         self._validate_id(run_id)
         return TaskRun.from_dict(self._read_json_required(self._run_file(run_id)))

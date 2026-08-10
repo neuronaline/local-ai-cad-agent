@@ -690,28 +690,61 @@ function addFinalizedCard(data) {
 
   const item = document.createElement('div');
   item.className = 'message finalized-card';
-  item.innerHTML = `
-    <div class="finalized-header">
-      <span class="finalized-check">✓</span>
-      <span class="finalized-title">Finalization Complete</span>
-    </div>
-    <div class="finalized-body">
-      <img class="finalized-render" src="/api/projects/${encodeURIComponent(currentProject)}/render?v=${Date.now()}"
-           alt="CAD render" loading="lazy"
-           onerror="this.style.display='none'">
-      <div class="finalized-metrics">
-        <div class="metric"><span>Solids</span><strong>${metrics.solid_count ?? '—'}</strong></div>
-        <div class="metric"><span>Volume</span><strong>${metrics.volume_mm3 != null ? `${metrics.volume_mm3} mm³` : '—'}</strong></div>
-        <div class="metric"><span>Dimensions</span><strong>${dimensionText}</strong></div>
-        <div class="metric"><span>Valid</span><strong>${metrics.is_valid ? 'Yes' : 'No'}</strong></div>
-      </div>
-      <div class="finalized-links">
-        <a class="button-link" href="/api/projects/${encodeURIComponent(currentProject)}/output/model.step" download>STEP</a>
-        <a class="button-link" href="/api/projects/${encodeURIComponent(currentProject)}/output/model.stl" download>STL</a>
-        <a class="button-link" href="/api/projects/${encodeURIComponent(currentProject)}/output/report" target="_blank">Report</a>
-      </div>
-    </div>
-  `;
+
+  const header = document.createElement('div');
+  header.className = 'finalized-header';
+  const check = document.createElement('span');
+  check.className = 'finalized-check';
+  check.textContent = '\u2713';
+  const title = document.createElement('span');
+  title.className = 'finalized-title';
+  title.textContent = 'Finalization Complete';
+  header.append(check, title);
+
+  const body = document.createElement('div');
+  body.className = 'finalized-body';
+
+  const render = document.createElement('img');
+  render.className = 'finalized-render';
+  render.src = `/api/projects/${encodeURIComponent(currentProject)}/render?v=${Date.now()}`;
+  render.alt = 'CAD render';
+  render.loading = 'lazy';
+  render.addEventListener('error', () => { render.style.display = 'none'; });
+
+  const metricsDiv = document.createElement('div');
+  metricsDiv.className = 'finalized-metrics';
+  const addMetric = (label, value) => {
+    const m = document.createElement('div');
+    m.className = 'metric';
+    const s = document.createElement('span');
+    s.textContent = label;
+    const v = document.createElement('strong');
+    v.textContent = String(value);
+    m.append(s, v);
+    metricsDiv.append(m);
+  };
+  addMetric('Solids', metrics.solid_count ?? '\u2014');
+  addMetric('Volume', metrics.volume_mm3 != null ? `${metrics.volume_mm3} mm\u00b3` : '\u2014');
+  addMetric('Dimensions', dimensionText);
+  addMetric('Valid', metrics.is_valid ? 'Yes' : 'No');
+
+  const links = document.createElement('div');
+  links.className = 'finalized-links';
+  const addLink = (text, href, isDownload) => {
+    const a = document.createElement('a');
+    a.className = 'button-link';
+    a.textContent = text;
+    a.href = href;
+    if (isDownload) a.download = '';
+    else a.target = '_blank';
+    links.append(a);
+  };
+  addLink('STEP', `/api/projects/${encodeURIComponent(currentProject)}/output/model.step`, true);
+  addLink('STL', `/api/projects/${encodeURIComponent(currentProject)}/output/model.stl`, true);
+  addLink('Report', `/api/projects/${encodeURIComponent(currentProject)}/output/report`, false);
+
+  body.append(render, metricsDiv, links);
+  item.append(header, body);
 
   if (data.report_text) {
     const reportSection = document.createElement('div');

@@ -172,3 +172,26 @@ def test_quality_api_exposes_recorded_failure(tmp_path: Path):
     assert payload["run"]["status"] == "failed"
     assert payload["attempts"][0]["error"]["code"] == "MODEL_MISSING"
     assert payload["events"][-1]["event_type"] == "run_completed"
+
+
+def test_get_metrics_caches_result_across_calls(tmp_path: Path, monkeypatch):
+    """Regression: ``get_metrics`` must populate its mtime cache (audit_076)."""
+    store = QualityStore(tmp_path)
+    first = store.get_metrics()
+    assert store._metrics_cache is not None
+    cached_mtime, cached_metrics = store._metrics_cache
+    assert cached_metrics == first
+
+    # A second call without disk changes must return the same dict identity
+    # (proving the cache, not re-aggregation, served the read).
+    calls = {"count": 0}
+    original_list_runs = store.list_runs
+
+    def _tracking_list_runs(*args, **kwargs):
+        calls["count"] += 1
+        return original_list_runs(*args, **kwargs)
+
+    monkeypatch.setattr(store, "list_runs", _tracking_list_runs)
+    second = store.get_metrics()
+    assert calls["count"] == 0
+    assert second is first

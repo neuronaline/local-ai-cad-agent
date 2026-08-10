@@ -60,9 +60,28 @@ class ProjectTools:
         self.cad.stop()
 
 
+# Module-level handle to the SSE EventBus history lock so the conversation
+# mirror in ``_append_api_message`` serializes with the events the bus
+# writes. Wired from ``app.create_app`` after the bus is built; falls back
+# to a private per-process lock so tests and offline callers stay safe.
+_history_lock_slot: list[threading.Lock] = [threading.Lock()]
+
+
+def _shared_history_lock() -> threading.Lock:
+    """Return the active history lock (configurable by the Flask app)."""
+    return _history_lock_slot[0]
+
+
 class AgentRunner:
+    # Per-project cache of the stripped/truncated API history (audit_041).
+    _api_history_cache: dict[str, list[dict]] = {}
+
     def __init__(
-        self, settings: Settings, publish: Callable[[str, dict], None]
+        self,
+        settings: Settings,
+        publish: Callable[[str, dict], None],
+        *,
+        history_lock: threading.Lock | None = None,
     ) -> None:
         self.settings = settings
         self.publish = publish
@@ -71,16 +90,34 @@ class AgentRunner:
         self._active_tools: ProjectTools | None = None
         self._active_project: str | None = None
         self._lock = threading.Lock()
+        # Shared with the SSE EventBus so the readable conversation.jsonl mirror
+        # serializes with the events it writes; falls back to a private lock
+        # when the runner is constructed without a Flask app.
+        self._history_lock: threading.Lock = history_lock or threading.Lock()
         self._waiting_questions: dict[str, dict[str, object]] = {}
         self._preview_attempts: dict[tuple[str, str], dict[str, str]] = {}
         self._pending_completions: dict[str, dict[str, str]] = {}
         # Active quality run bookkeeping so preview-time finalization can reach
-        # the run record after the agent thread has returned.
+        # the run record after the agent thread has returned. We only persist
+        # the run id; the QualityStore instance is rebuildable from project_dir.
         self._run_ids: dict[str, str] = {}
-        self._quality_stores: dict[str, QualityStore] = {}
+        self._project_dirs: dict[str, Path] = {}
 
     def is_running(self) -> bool:
         return bool(self._thread and self._thread.is_alive())
+
+    def has_active_state_for(self, project: str) -> bool:
+        """Return whether the runner has any in-flight activity for ``project``.
+
+        Covers running threads, awaiting-preview gates, and pending questions.
+        """
+        if self.is_running() and self.active_project() == project:
+            return True
+        if self.is_awaiting_preview(project):
+            return True
+        if self.waiting_question(project) is not None:
+            return True
+        return False
 
     def active_project(self) -> str | None:
         with self._lock:
@@ -297,7 +334,7 @@ class AgentRunner:
                 run_id = run.run_id
                 with self._lock:
                     self._run_ids[project] = run_id
-                    self._quality_stores[project] = quality
+                    self._project_dirs[project] = tools.project_dir
                 self.publish(
                     "quality_run_started",
                     {"project": project, "run_id": run_id},
@@ -319,7 +356,6 @@ class AgentRunner:
             client = create_llm_client(self.settings)
             client.stop_event = self._stop_event
             client.session_id = f"{self.settings.llm_provider}:{project}"
-            AgentRunner._current_provider = self.settings.llm_provider
             for _ in range(self.settings.agent_tool_call_limit):
                 if self._stop_event.is_set():
                     run_outcome = "stopped"
@@ -538,7 +574,7 @@ class AgentRunner:
                     "agent_error",
                     {
                         "project": project,
-                        "message": self._user_error_message(detail, err_type),
+                        "message": self._user_error_message(detail, err_type, provider=self.settings.llm_provider),
                     },
                 )
         finally:
@@ -668,7 +704,14 @@ class AgentRunner:
 
         Inline image payloads are stripped to placeholders and the history is
         truncated to MAX_API_HISTORY messages so old turns are not re-sent.
+
+        Result is cached in a class-level dict keyed by project_dir, invalidated
+        whenever :meth:`_append_api_message` is called (audit_041).
         """
+        cache_key = str(project_dir)
+        cached = cls._api_history_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
         history: list[dict] = []
         history_path = cls._api_history_path(project_dir)
         if history_path.exists():
@@ -698,16 +741,40 @@ class AgentRunner:
                     ):
                         history.append({"role": item["role"], "content": item["content"]})
             for item in history:
-                cls._append_api_message(project_dir, item)
+                with cls._api_history_path(project_dir).open("a", encoding="utf-8") as log:
+                    log.write(
+                        json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n"
+                    )
         history = [cls._strip_image_parts(item) for item in history]
-        return cls._truncate_history(history)
+        history = cls._truncate_history(history)
+        cls._api_history_cache[cache_key] = list(history)
+        return history
 
     @classmethod
     def _append_api_message(cls, project_dir: Path, message: dict) -> None:
+        """Append a message to both the protocol history and the conversation log.
+
+        Single sink for both writes (audit_040); also invalidates the in-memory
+        history cache (audit_041) so the next load re-reads the appended turn.
+        """
+        cls._api_history_cache.pop(str(project_dir), None)
         with cls._api_history_path(project_dir).open("a", encoding="utf-8") as log:
             log.write(
                 json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n"
             )
+        # Mirror to the readable conversation log so the SSE transcript stays
+        # in sync without a second call site. Acquire the same lock the SSE
+        # EventBus uses for its event writes so the two streams cannot
+        # interleave on the same project (audit_078 follow-up).
+        role = message.get("role", "assistant")
+        readable = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "role": role,
+            "content": message.get("content"),
+        }
+        with _shared_history_lock():
+            with (project_dir / "conversation.jsonl").open("a", encoding="utf-8") as log:
+                log.write(json.dumps(readable, ensure_ascii=False) + "\n")
 
     def _publish_usage(self, project: str, usage: dict | None) -> None:
         if not usage:
@@ -737,20 +804,9 @@ class AgentRunner:
         args: dict,
         call_id: str = "",
     ) -> tuple[object, bool]:
-        required_arguments = {
-            "file_read": ("filename",),
-            "file_write": ("filename", "content"),
-            "file_replace": ("filename", "old", "new"),
-            "file_regex_replace": ("filename", "pattern", "replacement"),
-            "terminal_run": ("arguments",),
-            "terminal_check": ("arguments",),
-            "experience_search": ("query",),
-            "experience_add": ("problem", "solution"),
-            "experience_update": ("id",),
-        }
-        missing = [key for key in required_arguments.get(name, ()) if key not in args]
-        if missing:
-            raise ValueError(f"Missing required argument(s): {', '.join(missing)}.")
+        # Tool argument validation now lives in each tool's execute()
+        # method (audit_028). The JSON schemas emitted to the model still
+        # declare the required keys for the LLM's benefit.
 
         if name == "cad_build_and_verify":
             payload = tools.cad.build_and_verify()
@@ -1197,13 +1253,13 @@ class AgentRunner:
                 return False
 
     @staticmethod
-    def _user_error_message(detail: str, err_type: str) -> str:
+    def _user_error_message(detail: str, err_type: str, *, provider: str = "openrouter") -> str:
         """Map technical error messages to user-friendly messages."""
         lower = detail.lower()
-        provider_name = provider_label(AgentRunner._current_provider)
+        provider_name = provider_label(provider)
         key_url = (
             "https://platform.openai.com/api-keys"
-            if AgentRunner._current_provider == "openai"
+            if provider == "openai"
             else "https://openrouter.ai/keys"
         )
 
@@ -1238,7 +1294,6 @@ class AgentRunner:
         # Fallback: return the original detail (it will be logged fully server-side).
         return detail
 
-    _current_provider: str = "openrouter"  # set by AgentRunner.start; defaults to Settings.llm_provider
 
     def _register_preview(self, project: str, project_dir: Path) -> str:
         preview_path = project_dir / "preview.stl"
@@ -1335,9 +1390,12 @@ class AgentRunner:
         """Mark the active run terminal and publish the completion event."""
         with self._lock:
             run_id = self._run_ids.get(project)
-            quality = self._quality_stores.get(project)
-        if run_id is None or quality is None:
+            project_dir = self._project_dirs.get(project)
+        if run_id is None or project_dir is None:
             return
+        # QualityStore is reconstructable from project_dir; rebuild lazily
+        # so a stop signal arriving after thread exit can still finalize.
+        quality = QualityStore(project_dir)
         try:
             run = quality.complete_run(run_id, status=status, error=error)
         except QualityError:
@@ -1349,7 +1407,7 @@ class AgentRunner:
             )
         with self._lock:
             self._run_ids.pop(project, None)
-            self._quality_stores.pop(project, None)
+            self._project_dirs.pop(project, None)
 
     @staticmethod
     def _build123d_version() -> str | None:
