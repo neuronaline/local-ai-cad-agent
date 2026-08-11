@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from agent.prompt import BUILD123D_PLAYBOOK, SYSTEM_PROMPT
+from agent.prompt import get_build123d_playbook, get_system_prompt
 from agent.settings import load_settings
 
 
@@ -66,21 +66,25 @@ def test_settings_rejects_unknown_provider(tmp_path):
 
 
 def test_build123d_playbook_is_injected_once_into_the_static_system_prompt():
-    assert BUILD123D_PLAYBOOK.startswith("# build123d CAD CLI Playbook")
-    assert "```markdown" not in BUILD123D_PLAYBOOK
-    assert SYSTEM_PROMPT.count("<build123d_cli_playbook>") == 1
-    assert BUILD123D_PLAYBOOK in SYSTEM_PROMPT
-    assert "cad_build_and_verify performs the build" in SYSTEM_PROMPT
-    assert "cad.run" not in SYSTEM_PROMPT
+    playbook = get_build123d_playbook()
+    system_prompt = get_system_prompt()
+    assert playbook.startswith("# build123d CAD CLI Playbook")
+    assert "```markdown" not in playbook
+    assert system_prompt.count("<build123d_cli_playbook>") == 1
+    assert playbook in system_prompt
+    assert "cad_build_and_verify performs the build" in system_prompt
+    assert "cad.run" not in system_prompt
 
 
 def test_build123d_playbook_has_versioned_curve_and_topology_guidance():
-    assert "`build123d` **0.11.1**" in BUILD123D_PLAYBOOK
-    assert "`Ellipse` creates a **complete filled 2D sketch**" in BUILD123D_PLAYBOOK
-    assert "EllipticalCenterArc" in BUILD123D_PLAYBOOK
-    assert "radius >= endpoint_distance / 2" in BUILD123D_PLAYBOOK
-    assert "There is no top-level `max_fillet` function" in BUILD123D_PLAYBOOK
-    assert "discard any cached edge/face indices" in SYSTEM_PROMPT
+    playbook = get_build123d_playbook()
+    system_prompt = get_system_prompt()
+    assert "`build123d` **0.11.1**" in playbook
+    assert "`Ellipse` creates a **complete filled 2D sketch**" in playbook
+    assert "EllipticalCenterArc" in playbook
+    assert "radius >= endpoint_distance / 2" in playbook
+    assert "There is no top-level `max_fillet` function" in playbook
+    assert "discard any cached edge/face indices" in system_prompt
 
 
 # ---------------------------------------------------------------------------

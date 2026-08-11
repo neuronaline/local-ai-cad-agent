@@ -80,7 +80,8 @@ if not preview.is_file() or preview.stat().st_size == 0:
 # Persist the bounded validation/evidence artifact (used by the API and tests;
 # never returned to the LLM).
 evidence_path = Path(".cad_validation.json")
-evidence_path.write_text(
+evidence_tmp = Path(".cad_validation.json.tmp")
+evidence_tmp.write_text(
     json.dumps(
         {
             "schema_version": 1,
@@ -91,6 +92,7 @@ evidence_path.write_text(
     ),
     encoding="utf-8",
 )
+evidence_tmp.replace(evidence_path)
 
 cache = {
     "model_sha256": hashlib.sha256(model_code.encode("utf-8")).hexdigest(),

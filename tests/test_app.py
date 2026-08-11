@@ -38,6 +38,8 @@ def test_chat_ignores_client_supplied_routing_preferences(tmp_path: Path, monkey
     response = client.post(
         "/api/chat",
         data={"project": "demo", "message": "make a bracket", "model": "invalid", "force_provider": "true"},
+        headers={"Origin": "http://localhost:5000"},
+        content_type="multipart/form-data",
     )
     assert response.status_code == 202
 
@@ -77,6 +79,45 @@ def test_same_origin_state_change_is_allowed(tmp_path: Path, monkeypatch):
         "/api/chat",
         json={"project": "demo", "message": "hi"},
         headers={"Origin": "http://localhost:5000", "Host": "localhost:5000"},
+    )
+    assert response.status_code == 202
+
+
+def test_cross_origin_form_post_without_origin_is_rejected(tmp_path: Path):
+    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    client = create_app(settings).test_client()
+    client.post("/api/projects/new", json={"name": "demo"})
+
+    # Form POST with a non-loopback Host and no Origin header must be rejected.
+    # Browsers do not send Origin on simple form POSTs so a malicious page on
+    # another origin could otherwise drive the local service; we require an
+    # Origin header for form-encoded mutating requests whose Host does not
+    # already establish same-origin.
+    response = client.post(
+        "/api/chat",
+        data={"project": "demo", "message": "hi"},
+        headers={"Host": "attacker.example.test"},
+        content_type="multipart/form-data",
+    )
+    assert response.status_code == 403
+    assert "Cross-origin" in response.get_json()["error"]
+
+
+def test_same_origin_form_post_without_origin_is_allowed(tmp_path: Path, monkeypatch):
+    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    app = create_app(settings)
+    client = app.test_client()
+    client.post("/api/projects/new", json={"name": "demo"})
+    monkeypatch.setattr(app.config["AGENT_RUNNER"], "start", lambda *_args, **_kwargs: True)
+
+    # curl-style form POST with a loopback Host and no Origin header must be
+    # allowed: the Host already establishes same-origin even though the
+    # browser-only Origin header is absent.
+    response = client.post(
+        "/api/chat",
+        data={"project": "demo", "message": "hi"},
+        headers={"Host": "localhost:5000"},
+        content_type="multipart/form-data",
     )
     assert response.status_code == 202
 
@@ -239,7 +280,12 @@ def test_chat_stores_normalized_image_attachment(tmp_path: Path):
     Image.new("RGB", (20, 10), "red").save(source, format="JPEG")
     source.seek(0)
 
-    response = client.post("/api/chat", data={"project": "demo", "message": "Use this sketch", "attachments": (source, "sketch.jpg")})
+    response = client.post(
+        "/api/chat",
+        data={"project": "demo", "message": "Use this sketch", "attachments": (source, "sketch.jpg")},
+        headers={"Origin": "http://localhost:5000"},
+        content_type="multipart/form-data",
+    )
 
     assert response.status_code == 202
     attachment = response.get_json()["attachments"][0]
@@ -262,6 +308,8 @@ def test_chat_rolls_back_earlier_images_when_later_attachment_is_invalid(tmp_pat
             "message": "Use these",
             "attachments": [(source, "valid.png"), (BytesIO(b"not an image"), "invalid.txt")],
         },
+        headers={"Origin": "http://localhost:5000"},
+        content_type="multipart/form-data",
     )
 
     assert response.status_code == 400

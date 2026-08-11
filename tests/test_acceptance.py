@@ -138,6 +138,8 @@ def test_mvp_acceptance_flow(tmp_path: Path, monkeypatch):
             "message": "Create a mounting bracket from this sketch.",
             "attachments": (sketch, "bracket.png"),
         },
+        headers={"Origin": "http://localhost:5000"},
+        content_type="multipart/form-data",
     )
     assert response.status_code == 202
     runner = app.config["AGENT_RUNNER"]

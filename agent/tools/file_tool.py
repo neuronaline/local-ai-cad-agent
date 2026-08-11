@@ -82,9 +82,13 @@ class ModelPreflight(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
-        # Check for blocked built-in calls.
+        # Check for blocked built-in calls. Direct calls (eval(...)) and
+        # attribute-access forms (builtins.eval(...), __builtins__["eval"](...))
+        # both reach the same dangerous function, so cover both shapes.
         if isinstance(node.func, ast.Name) and node.func.id in BLOCKED_CALLS:
             self.blocked_errors.append(f"Unsafe function blocked: {node.func.id}")
+        elif isinstance(node.func, ast.Attribute) and node.func.attr in BLOCKED_CALLS:
+            self.blocked_errors.append(f"Unsafe function blocked: {node.func.attr}")
         name = self._call_name(node)
         if name == "Ellipse":
             invalid = {"center", "start_angle", "end_angle"} & {

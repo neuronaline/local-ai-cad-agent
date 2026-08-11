@@ -96,23 +96,33 @@ class PromptCache:
 
     def __init__(self) -> None:
         self._content: str | None = None
+        self._playbook_content: str | None = None
         self._playbook_mtime: float | None = None
+        self._last_playbook: str | None = None
 
     def get(self) -> str:
+        playbook = self.get_playbook()
+        if self._content is not None and playbook == self._last_playbook:
+            return self._content
+        self._content = _BASE_PROMPT + _SUFFIX_FORMAT.format(playbook=playbook)
+        self._last_playbook = playbook
+        return self._content
+
+    def get_playbook(self) -> str:
+        """Return the playbook content, re-reading from disk when its mtime changes."""
         playbook_path = _PLAYBOOK_PATH
         try:
             stat = playbook_path.stat()
             mtime = stat.st_mtime
         except OSError:
             mtime = -1.0
-        if self._content is not None and self._playbook_mtime == mtime:
-            return self._content
-        playbook = (
+        if self._playbook_content is not None and self._playbook_mtime == mtime:
+            return self._playbook_content
+        self._playbook_content = (
             playbook_path.read_text(encoding="utf-8").strip() if mtime >= 0 else ""
         )
-        self._content = _BASE_PROMPT + _SUFFIX_FORMAT.format(playbook=playbook)
         self._playbook_mtime = mtime
-        return self._content
+        return self._playbook_content
 
     def hash(self) -> str:
         """Stable hash for cache-busting / session-reset detection."""
@@ -127,6 +137,6 @@ def get_system_prompt() -> str:
     return _PROMPT_CACHE.get()
 
 
-# Backward-compatible module-level variables for existing imports.
-SYSTEM_PROMPT = get_system_prompt()
-BUILD123D_PLAYBOOK = _PLAYBOOK_PATH.read_text(encoding="utf-8").strip()
+def get_build123d_playbook() -> str:
+    """Return the playbook content, re-reading from disk when it changes."""
+    return _PROMPT_CACHE.get_playbook()

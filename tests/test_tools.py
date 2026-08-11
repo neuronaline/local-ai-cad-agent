@@ -19,6 +19,14 @@ def test_file_tool_rejects_unsafe_model(tmp_path: Path):
     with pytest.raises(ValueError, match="Unsafe function blocked"):
         tool.write("model.py", "__import__('os').system('id')\n")
 
+    # Attribute-access forms of blocked builtins must be caught too
+    # (e.g. __builtins__.eval, builtins.exec). The sandbox is the real
+    # boundary; the AST check is the contract development relies on.
+    with pytest.raises(ValueError, match="Unsafe function blocked"):
+        tool.write("model.py", "__builtins__.eval('1+1')\n")
+    with pytest.raises(ValueError, match="Unsafe function blocked"):
+        tool.write("model.py", "builtins.exec('print(1)')\n")
+
 
 def test_file_tool_only_edits_allowlisted_files(tmp_path: Path):
     tool = FileTool(tmp_path)

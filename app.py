@@ -149,6 +149,43 @@ def _append_conversation(project_dir: Path, event: dict[str, Any]) -> None:
         log.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
+# Module-level lock guarding the idempotency cache dict. The cache is touched
+# by every chat request and modified out-of-band by cleanup, so unsynchronized
+# access can produce redundant eviction work or skipped targets under load.
+_IDEMPOTENCY_LOCK = threading.Lock()
+
+
+def _idempotency_check(app: Flask, key: str) -> bool:
+    """Return True if the key is already recorded as in-flight."""
+    if not key:
+        return False
+    with _IDEMPOTENCY_LOCK:
+        cache = app.config.setdefault("IDEMPOTENCY_CACHE", {})
+        return key in cache
+
+
+def _idempotency_record(app: Flask, key: str) -> None:
+    """Record the key as in-flight and evict the oldest half if oversized."""
+    if not key:
+        return
+    with _IDEMPOTENCY_LOCK:
+        cache = app.config.setdefault("IDEMPOTENCY_CACHE", {})
+        cache[key] = True
+        if len(cache) > 1000:
+            oldest_keys = list(cache.keys())[:-500]
+            for old_key in oldest_keys:
+                cache.pop(old_key, None)
+
+
+def _idempotency_forget(app: Flask, key: str) -> None:
+    """Drop a key so a retry can be accepted."""
+    if not key:
+        return
+    with _IDEMPOTENCY_LOCK:
+        cache = app.config.setdefault("IDEMPOTENCY_CACHE", {})
+        cache.pop(key, None)
+
+
 def _read_project_metadata(project_dir: Path) -> dict[str, Any]:
     metadata_path = project_dir / "project.json"
     if metadata_path.is_file():
@@ -308,11 +345,13 @@ def create_app(settings: Settings | None = None) -> Flask:
         falls back to a same-origin comparison between the Host and Origin
         headers, and the Host must resolve to a loopback address.
 
-        Requests that carry no Origin but resolve Host to the configured
-        bind address are still allowed so the Flask test client and same-
-        origin form submissions can reach the API; cross-origin browser
-        requests always include an Origin header on state-changing methods,
-        so they cannot exploit this fallback.
+        Form-encoded POSTs (application/x-www-form-urlencoded or
+        multipart/form-data) whose Host header does not resolve to a loopback
+        address are explicitly required to carry an Origin header. Browsers
+        do not send Origin on simple form POSTs to a localhost target, so the
+        absence of Origin on a form POST whose Host is non-local is treated
+        as a forgery attempt. JSON POSTs from the bundled client include
+        Origin and remain allowed.
         """
         if request.method in _ALLOWED_METHODS:
             return None
@@ -323,6 +362,13 @@ def create_app(settings: Settings | None = None) -> Flask:
         host_name = _hostname(host)
         origin_name = _hostname(origin)
 
+        content_type = (request.content_type or "").split(";", 1)[0].strip().lower()
+        is_form_post = request.method == "POST" and content_type in {
+            "application/x-www-form-urlencoded",
+            "multipart/form-data",
+            "text/plain",
+        }
+
         bind_host = settings.host
         if bind_host in _WILDCARD_BINDS:
             # Wildcard bind — must be same-origin on loopback.
@@ -332,15 +378,27 @@ def create_app(settings: Settings | None = None) -> Flask:
                 return jsonify({"error": "Cross-origin requests are not allowed."}), 403
             if origin_name and origin_name not in _LOCAL_BINDS:
                 return jsonify({"error": "Cross-origin requests are not allowed."}), 403
+            # Block form POSTs whose Host does not resolve to a loopback
+            # address. Browsers do not send Origin on simple form POSTs;
+            # when the Host is loopback the request is unambiguously
+            # same-origin and is allowed, including curl-style requests
+            # that omit Origin.
+            if is_form_post and host_name not in _LOCAL_BINDS:
+                return jsonify({"error": "Cross-origin requests are not allowed."}), 403
         else:
             allowed = {bind_host, "localhost", "127.0.0.1", "::1"}
             if host_name and host_name not in allowed:
                 return jsonify({"error": "Cross-origin requests are not allowed."}), 403
             if origin_name and origin_name not in allowed:
                 return jsonify({"error": "Cross-origin requests are not allowed."}), 403
-            # Same-origin form submissions and Flask test client send Host but
-            # no Origin; allow them when Host resolves to a local bind.
-            if not origin and not host_name:
+            # Block form POSTs without an Origin header when the Host is not
+            # local. Browsers do not send Origin on simple form POSTs so a
+            # malicious page on another origin could otherwise drive the
+            # local service; we require an Origin header for form-encoded
+            # mutating requests whose Host does not already establish
+            # same-origin. The Flask test client opt-in is handled by
+            # sending an Origin header.
+            if is_form_post and not origin and host_name not in _LOCAL_BINDS:
                 return jsonify({"error": "Cross-origin requests are not allowed."}), 403
         return None
 
@@ -488,8 +546,7 @@ def create_app(settings: Settings | None = None) -> Flask:
         if runner.waiting_question(project_name):
             return jsonify({"error": "Answer the pending question before sending another message."}), 409
         if idempotency_key:
-            cache = app.config.setdefault("IDEMPOTENCY_CACHE", {})
-            if idempotency_key in cache:
+            if _idempotency_check(app, idempotency_key):
                 if runner.is_running() or runner.is_awaiting_preview():
                     return jsonify(
                         {
@@ -498,7 +555,7 @@ def create_app(settings: Settings | None = None) -> Flask:
                             "error": "Your message is already being processed.",
                         }
                     ), 202
-                cache.pop(idempotency_key, None)
+                _idempotency_forget(app, idempotency_key)
         if runner.is_running() or runner.is_awaiting_preview():
             return jsonify({"error": "An agent task is already running."}), 409
         with _project_lock(app, project_name):
@@ -523,12 +580,7 @@ def create_app(settings: Settings | None = None) -> Flask:
                 image_path.unlink(missing_ok=True)
             return jsonify({"error": "Unable to start the agent task."}), 409
         if idempotency_key:
-            cache = app.config.setdefault("IDEMPOTENCY_CACHE", {})
-            cache[idempotency_key] = True
-            if len(cache) > 1000:
-                oldest_keys = list(cache.keys())[:-500]
-                for key in oldest_keys:
-                    cache.pop(key, None)
+            _idempotency_record(app, idempotency_key)
         return jsonify({"accepted": True, "attachments": [
             path.relative_to(project_dir).as_posix() for path in image_paths
         ]}), 202

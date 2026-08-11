@@ -114,7 +114,7 @@ class _RingBuffer:
         with self._lock:
             return b"".join(self._buf).decode("utf-8", errors="replace")
 
-_ALLOWED_CHECK_IMPORTS = {"build123d", "cadquery", "math", "numpy", "ocp_vscode"}
+_ALLOWED_CHECK_IMPORTS = {"build123d", "cadquery", "math", "numpy"}
 _BLOCKED_CHECK_NAMES = frozenset(
     {
         "__import__",

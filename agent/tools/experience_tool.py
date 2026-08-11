@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -204,17 +206,30 @@ class ExperienceTool:
     def _write(self, records: list[dict[str, Any]]) -> None:
         self._memory_dir.mkdir(parents=True, exist_ok=True)
         payload = {"version": 1, "issues": records}
-        tmp_path = self._memory_file.with_suffix(self._memory_file.suffix + ".tmp")
-        with self._memory_lock:
-            try:
-                tmp_path.write_text(
-                    json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-                    encoding="utf-8",
+        # Use a unique same-directory temp file per write so concurrent
+        # processes do not collide on a single fixed temp name. The shared
+        # lock still serializes in-process writers; cross-process callers
+        # need an external lock (this is a known limitation of the shared
+        # memory file).
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{self._memory_file.name}.",
+            suffix=".tmp",
+            dir=self._memory_dir,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
                 )
-                tmp_path.replace(self._memory_file)
-            except OSError as error:
-                tmp_path.unlink(missing_ok=True)
-                raise RuntimeError(f"Failed to write memory file: {error}") from error
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, self._memory_file)
+        except BaseException:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+            raise RuntimeError(f"Failed to write memory file")
 
     # ── search helpers ──────────────────────────────────────────────────
 

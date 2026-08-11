@@ -83,36 +83,35 @@ class CadTool:
                 timeout_seconds=120,
             )
             try:
-                try:
-                    with self._lock:
-                        self._process = subprocess.Popen(
-                            command,
-                            text=True,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            pass_fds=(seccomp_fd,),
-                            start_new_session=True,
-                        )
-                        process = self._process
-                finally:
-                    os.close(seccomp_fd)
+                with self._lock:
+                    self._process = subprocess.Popen(
+                        command,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        pass_fds=(seccomp_fd,),
+                        start_new_session=True,
+                    )
+                    process = self._process
                 try:
                     stdout, stderr = _stream_with_limit(process, timeout=120)
-                finally:
-                    with self._lock:
-                        self._process = None
-            except _TimedOut as error:
-                self._record_build_failure("CAD operation timed out after 120 seconds.")
-                raise RuntimeError(
-                    "CAD operation timed out after 120 seconds."
-                ) from error
+                except _TimedOut as error:
+                    self._record_build_failure("CAD operation timed out after 120 seconds.")
+                    raise RuntimeError(
+                        "CAD operation timed out after 120 seconds."
+                    ) from error
+                except RuntimeError as error:
+                    detail = f"CAD subprocess failed: {error}"
+                    self._record_build_failure(detail)
+                    raise RuntimeError(detail) from error
+                if process.returncode:
+                    detail = self._failure_detail(stderr or stdout)
+                    self._record_build_failure(detail)
+                    raise RuntimeError(f"CAD execution failed:\n{detail}")
             finally:
+                os.close(seccomp_fd)
                 with self._lock:
                     self._process = None
-            if process.returncode:
-                detail = self._failure_detail(stderr or stdout)
-                self._record_build_failure(detail)
-                raise RuntimeError(f"CAD execution failed:\n{detail}")
 
             metrics_path = workspace / ".cad_metrics.json"
             preview_path = workspace / "preview.stl"
