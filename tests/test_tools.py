@@ -34,6 +34,14 @@ def test_file_tool_supports_limited_regex_patches(tmp_path: Path):
     assert tool.read("summary.md") == "Width: 12 mm\n"
 
 
+def test_file_tool_regex_replace_rejects_pathological_pattern(tmp_path: Path):
+    """ReDoS-prone patterns must be killed by the safety timeout."""
+    tool = FileTool(tmp_path)
+    tool.write("summary.md", "a" * 30)
+    with pytest.raises(RuntimeError, match="safety timeout"):
+        tool.regex_replace("summary.md", "(a+)+b", "X")
+
+
 @pytest.mark.parametrize("keyword", ["center", "start_angle", "end_angle"])
 def test_model_preflight_rejects_ellipse_arc_keywords(tmp_path: Path, keyword: str):
     code = (

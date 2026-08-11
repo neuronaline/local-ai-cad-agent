@@ -12,7 +12,9 @@ SINGLE_CHOICE_TYPES = frozenset({"select", "multiselect"})
 def normalize_questions(args: dict) -> list[dict]:
     """Normalize the legacy flat question format into the list format."""
     questions = args.get("questions")
-    if isinstance(questions, list):
+    if "questions" in args:
+        if not isinstance(questions, list):
+            raise ValueError("'questions' must be a list.")
         return questions
     input_type = args.get("input_type", "text")
     options = args.get("options") if input_type in {"select", "multiselect"} else []

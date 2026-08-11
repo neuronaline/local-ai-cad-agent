@@ -278,12 +278,13 @@ class ExperienceTool:
     def _validate_field(self, field: str, value: str) -> str:
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"{field} cannot be empty.")
+        stripped = value.strip()
         limit = _MAX_FIELD_LENGTHS.get(field)
-        if limit is not None and len(value) > limit:
+        if limit is not None and len(stripped) > limit:
             raise ValueError(
-                f"{field} exceeds {limit} characters ({len(value)} provided)."
+                f"{field} exceeds {limit} characters ({len(stripped)} provided)."
             )
-        return value.strip()
+        return stripped
 
     def _normalize_tags(self, tags: list[str]) -> list[str]:
         if not isinstance(tags, list):

@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
@@ -32,6 +33,22 @@ RENDERER = _read_script("renderer.py")
 _MIN_DIMENSION_MM = 0.001
 _MAX_DIMENSION_MM = 1_000_000.0
 _MIN_VOLUME_MM3 = 0.0
+
+
+def _kill_process_group(process: subprocess.Popen[str], *, force: bool) -> None:
+    """Send a signal to the sandbox process group so descendant pythons exit.
+
+    The bubblewrap subprocess is launched with ``start_new_session=True`` and
+    in turn spawns a python interpreter inside its namespace. ``Popen.terminate``
+    only signals the direct child (bwrap); without killing the process group
+    the inner python keeps running and holding memory/file handles.
+    """
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
+    except ProcessLookupError:
+        pass
 
 
 class CadTool:
@@ -237,9 +254,11 @@ class CadTool:
 
     def stop(self) -> None:
         with self._lock:
-            if self._process and self._process.poll() is None:
-                self._process.terminate()
-                try:
-                    self._process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    self._process.kill()
+            process = self._process
+        if process is None:
+            return
+        _kill_process_group(process, force=False)
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(process, force=True)

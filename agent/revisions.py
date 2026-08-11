@@ -367,6 +367,7 @@ class RevisionStore:
             return False
         return _sha256(blob_path.read_bytes()) == revision.model_sha256
 
+    @_synchronized
     def has_manifest(self, revision_id: str) -> bool:
         """Return whether a revision manifest exists, without parsing it."""
         self._validate_revision_id(revision_id)
@@ -819,6 +820,7 @@ class RevisionStore:
         self._write_revision(revision)
         self._write_head(revision)
         self._maybe_import_build(revision)
+        self._invalidate_revision_cache()
         return revision
 
     def _maybe_import_build(self, revision: Revision) -> None:
@@ -865,6 +867,7 @@ class RevisionStore:
         self._write_blob_bytes(source.encode("utf-8"), model_digest)
         self._write_revision(revision)
         self._write_head(revision)
+        self._invalidate_revision_cache()
         return revision
 
     def _write_blob_bytes(self, source_bytes: bytes, sha256: str) -> None:

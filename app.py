@@ -43,6 +43,25 @@ PROJECT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 INFO_EVENT_TYPES = frozenset({"agent_status", "tool_status", "agent_usage", "agent_stopped"})
 HISTORY_EVENT_TYPES = INFO_EVENT_TYPES | {"agent_error"}
 SSE_QUEUE_SIZE = 512
+_WILDCARD_BINDS = frozenset({"0.0.0.0", "::", ""})
+_LOCAL_BINDS = frozenset({"localhost", "127.0.0.1", "::1"})
+_ALLOWED_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def _hostname(header_value: str) -> str:
+    """Extract the bare hostname from a Host or Origin header."""
+    if not header_value:
+        return ""
+    # Strip scheme for Origin headers.
+    value = header_value.split("://")[-1]
+    # Strip path.
+    value = value.split("/")[0]
+    # Handle IPv6 brackets: [::1]:5000 -> ::1
+    if value.startswith("["):
+        value = value.lstrip("[").split("]")[0]
+    else:
+        value = value.split(":")[0]
+    return value
 
 
 class EventBus:
@@ -150,7 +169,14 @@ def _write_project_metadata(project_dir: Path, metadata: dict[str, Any]) -> None
     ) as temporary:
         temporary_path = Path(temporary.name)
         json.dump(metadata, temporary, ensure_ascii=False, indent=2)
-    temporary_path.replace(target)
+    try:
+        temporary_path.replace(target)
+    except BaseException:
+        try:
+            temporary_path.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def _model_status(project_dir: Path) -> str:
@@ -270,6 +296,53 @@ def create_app(settings: Settings | None = None) -> Flask:
             "form-action 'self'",
         )
         return response
+
+    @app.before_request
+    def validate_origin():
+        """Reject cross-origin mutation requests when bound to localhost.
+
+        Safe methods (GET/HEAD/OPTIONS) are always allowed. For state-changing
+        methods the Origin / Host headers must match the configured bind
+        address so a malicious page on another origin cannot drive the local
+        service. When the bind address is a wildcard (0.0.0.0, ::) the check
+        falls back to a same-origin comparison between the Host and Origin
+        headers, and the Host must resolve to a loopback address.
+
+        Requests that carry no Origin but resolve Host to the configured
+        bind address are still allowed so the Flask test client and same-
+        origin form submissions can reach the API; cross-origin browser
+        requests always include an Origin header on state-changing methods,
+        so they cannot exploit this fallback.
+        """
+        if request.method in _ALLOWED_METHODS:
+            return None
+        origin = request.headers.get("Origin", "")
+        host = request.headers.get("Host", "")
+        if not origin and not host:
+            return None  # No headers to check (e.g., direct curl).
+        host_name = _hostname(host)
+        origin_name = _hostname(origin)
+
+        bind_host = settings.host
+        if bind_host in _WILDCARD_BINDS:
+            # Wildcard bind — must be same-origin on loopback.
+            if origin and host and origin_name and origin_name != host_name:
+                return jsonify({"error": "Cross-origin requests are not allowed."}), 403
+            if host_name not in _LOCAL_BINDS:
+                return jsonify({"error": "Cross-origin requests are not allowed."}), 403
+            if origin_name and origin_name not in _LOCAL_BINDS:
+                return jsonify({"error": "Cross-origin requests are not allowed."}), 403
+        else:
+            allowed = {bind_host, "localhost", "127.0.0.1", "::1"}
+            if host_name and host_name not in allowed:
+                return jsonify({"error": "Cross-origin requests are not allowed."}), 403
+            if origin_name and origin_name not in allowed:
+                return jsonify({"error": "Cross-origin requests are not allowed."}), 403
+            # Same-origin form submissions and Flask test client send Host but
+            # no Origin; allow them when Host resolves to a local bind.
+            if not origin and not host_name:
+                return jsonify({"error": "Cross-origin requests are not allowed."}), 403
+        return None
 
     @app.errorhandler(RequestEntityTooLarge)
     def upload_too_large(_error):

@@ -77,6 +77,12 @@ class QuestionValidator:
         if input_type == "select":
             options = question.get("options", [])
             return isinstance(options, list) and answer in options
+        if input_type == "multiselect":
+            options = question.get("options", [])
+            if not isinstance(options, list):
+                return False
+            selected = [value.strip() for value in answer.split(",") if value.strip()]
+            return bool(selected) and all(value in options for value in selected)
         if input_type == "number":
             return QuestionValidator._is_valid_number_with_unit(answer)
         return bool(answer.strip())
@@ -84,13 +90,7 @@ class QuestionValidator:
     @staticmethod
     def _validate_legacy(question: dict[str, object], answer: str) -> bool:
         """Validate against the deprecated flat question format."""
-        input_type = question.get("input_type", "text")
-        if input_type == "select":
-            options = question.get("options", [])
-            return isinstance(options, list) and answer in options
-        if input_type == "number":
-            return QuestionValidator._is_valid_number_with_unit(answer)
-        return bool(answer.strip())
+        return QuestionValidator._validate_single(question, answer)
 
     @staticmethod
     def _is_valid_number_with_unit(value: str) -> bool:

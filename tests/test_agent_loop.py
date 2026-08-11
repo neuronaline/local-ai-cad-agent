@@ -1,4 +1,6 @@
 import json
+import threading
+import time
 from pathlib import Path
 from typing import ClassVar
 
@@ -244,9 +246,118 @@ def test_answer_resumes_a_waiting_agent(tmp_path: Path, monkeypatch):
     assert runner.answer("demo", "6 mm")
     runner._thread.join(timeout=1)
     assert runner.waiting_question("demo") is None
-    assert '"content": "6 mm"' in (project_dir / "conversation.jsonl").read_text(
-        encoding="utf-8"
+    log_text = (project_dir / "conversation.jsonl").read_text(encoding="utf-8")
+    # The answer is persisted exactly once via the canonical history sink.
+    assert log_text.count('"role":"user","content":"6 mm"') == 1
+    assert '"content": "6 mm"' not in log_text
+
+
+def test_answer_persists_user_message_before_thread_starts(tmp_path: Path, monkeypatch):
+    """Regression: answer() must write the user message before starting the run.
+
+    Previously the new run thread was started first and the user message was
+    appended afterwards. The thread's _context() could read the log before
+    the append, miss the answer, and re-append it as a duplicate entry. The
+    fix persists the answer first (still under the runner lock) and only
+    then starts the thread.
+    """
+    import agent.core
+
+    project_root = tmp_path / "projects"
+    project_dir = project_root / "demo"
+    project_dir.mkdir(parents=True)
+    (project_dir / "conversation.jsonl").write_text("", encoding="utf-8")
+
+    # Block the new thread at the very start of _run so it cannot read the
+    # log until the main thread has had a chance to write.
+    proceed = threading.Event()
+    original_context = agent.core.AgentRunner._context
+
+    def blocked_context(self, project_dir, message, image_paths):
+        proceed.wait(timeout=5)
+        return original_context(self, project_dir, message, image_paths)
+
+    monkeypatch.setattr(agent.core.AgentRunner, "_context", blocked_context)
+
+    class _NoopClient:
+        def __init__(self, _settings):
+            self.stop_event = threading.Event()
+            self.session_id = ""
+            self.last_usage = None
+            self.stream_callback = lambda event: None
+
+        def chat(self, _messages, _tools):
+            return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+    monkeypatch.setattr(
+        agent.core, "create_llm_client", lambda _settings, _ignored=None: _NoopClient(_settings)
     )
+
+    runner = AgentRunner(
+        Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000),
+        lambda *_: None,
+    )
+    runner._waiting_questions["demo"] = {
+        "title": "",
+        "questions": [{"id": "q1", "question": "Size?", "input_type": "text"}],
+    }
+    assert runner.answer("demo", "6 mm")
+    # At this point the new thread is blocked in _context. The user message
+    # must already be on disk so the thread, when unblocked, reads it once.
+    log_text = (project_dir / "conversation.jsonl").read_text(encoding="utf-8")
+    assert log_text.count('"role":"user","content":"6 mm"') == 1
+
+    proceed.set()
+    runner._thread.join(timeout=2)
+    log_text = (project_dir / "conversation.jsonl").read_text(encoding="utf-8")
+    assert log_text.count('"role":"user","content":"6 mm"') == 1
+
+
+def test_answer_waits_for_previous_run_to_finish(tmp_path: Path, monkeypatch):
+    """answer() must block until a prior run's finally has cleared thread state."""
+    project_root = tmp_path / "projects"
+    project_dir = project_root / "demo"
+    project_dir.mkdir(parents=True)
+    (project_dir / "conversation.jsonl").write_text("", encoding="utf-8")
+
+    class _SlowClient:
+        def __init__(self, _settings):
+            self.stop_event = threading.Event()
+            self.session_id = ""
+            self.last_usage = None
+            self.stream_callback = lambda event: None
+
+        def chat(self, _messages, _tools):
+            # Block long enough that the previous run is still in flight when
+            # answer() is invoked. Returning a no-tool-call response lets the
+            # loop exit and the finally reset _thread/_run_complete.
+            time.sleep(0.5)
+            return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+    import agent.core
+
+    monkeypatch.setattr(agent.core, "create_llm_client", lambda _settings, _ignored=None: _SlowClient(_settings))
+    runner = AgentRunner(
+        Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000),
+        lambda *_: None,
+    )
+    # Start a run that will sleep in the LLM client.
+    assert runner.start("demo", "build something", [])
+    runner._waiting_questions["demo"] = {
+        "title": "",
+        "questions": [{"id": "q1", "question": "Size?", "input_type": "text"}],
+    }
+
+    # Calling answer() while the previous run is still alive must still
+    # complete successfully (it waits on _run_complete, not on is_alive()).
+    started = time.time()
+    assert runner.answer("demo", "6 mm")
+    elapsed = time.time() - started
+    assert elapsed >= 0.4, f"answer() returned too quickly ({elapsed:.2f}s); did it wait?"
+    # And after the run finishes, thread state is fully reset.
+    runner._thread.join(timeout=2)
+    assert runner._thread is None
+    assert runner._run_complete.is_set()
 
 
 def test_waiting_question_survives_runner_recreation_and_validates_answer(

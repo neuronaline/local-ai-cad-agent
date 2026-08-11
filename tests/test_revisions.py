@@ -248,6 +248,25 @@ def test_no_model_and_no_history_reconcile_returns_none(tmp_path: Path):
     assert store.head() is None
 
 
+def test_reconcile_invalidates_cached_revision_list_on_recovery(tmp_path: Path):
+    """audit_108: a recovery reconcile must drop the stale revision cache."""
+    store = RevisionStore(tmp_path)
+    initial = store.commit(MODEL_A, RevisionOrigin(kind="agent_edit"))
+
+    # Populate the cache via list(), then externally rewrite model.py.
+    cached_before = store.list()
+    assert len(cached_before) == 1
+    (tmp_path / "model.py").write_text(MODEL_B, encoding="utf-8")
+
+    recovery = store.reconcile()
+    assert recovery is not None
+    assert recovery.id != initial.id
+
+    # list() must observe the recovery revision, not the pre-reconcile snapshot.
+    after = store.list()
+    assert recovery.id in {r.id for r in after}
+    assert len(after) == 2
+
 # --------------------------------------------------------------------------- #
 #  Pagination
 # --------------------------------------------------------------------------- #

@@ -74,7 +74,10 @@ def _shared_history_lock() -> threading.Lock:
 class AgentRunner:
     """One-thread-per-task chat-completions driver with tool dispatch."""
 
-    # Per-project cache of the truncated conversation history.
+    # Per-project cache of the truncated conversation history. Bounded so
+    # project create/delete churn does not accumulate unbounded memory; entries
+    # for directories that no longer exist are evicted on access.
+    _HISTORY_CACHE_MAX = 32
     _history_cache: dict[str, list[dict]] = {}
 
     def __init__(
@@ -95,11 +98,24 @@ class AgentRunner:
         self._waiting_questions: dict[str, dict[str, object]] = {}
         self._preview_attempts: dict[tuple[str, str], dict[str, str]] = {}
         self._pending_completions: dict[str, dict[str, str]] = {}
+        # Set by the active _run() inside its finally clause so callers can
+        # observe completion reliably without polling thread.is_alive().
+        self._run_complete: threading.Event = threading.Event()
+        self._run_complete.set()
 
     # ------------------------------------------------------------------ state
 
     def is_running(self) -> bool:
-        return bool(self._thread and self._thread.is_alive())
+        with self._lock:
+            thread = self._thread
+            complete = self._run_complete.is_set()
+        # A run is considered active if either we know the thread is alive or
+        # the run-completion flag has not yet been raised by its finally. The
+        # completion flag is the authoritative signal; we still fall back to
+        # is_alive() for tests/synthetic runners that inject a thread object.
+        if thread is not None and thread.is_alive():
+            return True
+        return not complete
 
     def has_active_state_for(self, project: str) -> bool:
         if self.is_running() and self.active_project() == project:
@@ -192,9 +208,13 @@ class AgentRunner:
     def _start_locked(
         self, project: str, message: str, image_paths: list[Path]
     ) -> bool:
-        if (self._thread and self._thread.is_alive()) or self._pending_completions:
+        if (
+            (self._thread is not None and not self._run_complete.is_set())
+            or self._pending_completions
+        ):
             return False
         self._stop_event.clear()
+        self._run_complete.clear()
         self._active_project = project
         self._thread = threading.Thread(
             target=self._run, args=(project, message, image_paths), daemon=True
@@ -206,22 +226,31 @@ class AgentRunner:
         question = self.waiting_question(project)
         if not question or not self._validate_answer(question, answer):
             return False
+        # Wait for the previous run to fully finish (including its finally
+        # block) so we never observe a half-completed run while still accepting
+        # a follow-up message. _run_complete is set inside _run's finally and
+        # replaces a fragile is_alive() / fixed-timeout join. A defensive
+        # timeout guards against a runaway run that never reaches finally.
         with self._lock:
-            previous_thread = self._thread
-        if previous_thread and previous_thread.is_alive():
-            previous_thread.join(timeout=2)
+            previous_event = self._run_complete
+        previous_event.wait(timeout=10.0)
         project_dir = self.settings.workspace_root / project
         formatted = self._format_answer(question, answer)
         with self._lock:
-            if (self._thread and self._thread.is_alive()) or self._pending_completions:
+            if (
+                (self._thread is not None and not self._run_complete.is_set())
+                or self._pending_completions
+            ):
                 return False
-            self._log(project_dir, "user", formatted)
+            # Persist the user answer BEFORE starting the new thread so the
+            # thread's _context() reads it from the canonical log instead of
+            # racing against this append and re-writing a duplicate entry.
+            self._append_message(project_dir, {"role": "user", "content": formatted})
             if not self._start_locked(project, formatted, []):
                 return False
             self._waiting_questions.pop(project, None)
             (project_dir / ".agent_state.json").unlink(missing_ok=True)
             return True
-
     def stop(self, project: str | None = None) -> list[str]:
         """Stop agent work and clear pending state for one or all projects."""
         affected: list[str] = []
@@ -337,6 +366,8 @@ class AgentRunner:
                     },
                 )
                 messages.append(assistant_message)
+                # Persist every assistant turn (intermediate tool-call turns and
+                # final user-facing turns) as the single canonical history entry.
                 self._append_message(project_dir, assistant_message)
                 if not tool_calls:
                     content = assistant_message.get("content") or "Task completed."
@@ -465,6 +496,10 @@ class AgentRunner:
                 self._active_tools = None
                 if self._active_project == project:
                     self._active_project = None
+                # Mark this run finished and drop the thread reference so a
+                # subsequent start/answer() never observes a stale _thread.
+                self._thread = None
+                self._run_complete.set()
 
     # ------------------------------------------------------------------ context
 
@@ -519,7 +554,11 @@ class AgentRunner:
         cache_key = str(project_dir)
         cached = cls._history_cache.get(cache_key)
         if cached is not None:
-            return list(cached)
+            # Evict stale entries whose project directory has been removed.
+            if not project_dir.exists():
+                cls._history_cache.pop(cache_key, None)
+            else:
+                return list(cached)
         history: list[dict] = []
         log_path = project_dir / "conversation.jsonl"
         if log_path.exists():
@@ -536,6 +575,13 @@ class AgentRunner:
                     history.append(item)
         history = [cls._strip_image_parts(item) for item in history]
         history = cls._truncate_history(history)
+        # Bound the cache size with FIFO eviction to avoid unbounded growth
+        # from long-lived processes with many project create/delete cycles.
+        while len(cls._history_cache) >= cls._HISTORY_CACHE_MAX:
+            oldest = next(iter(cls._history_cache))
+            if oldest == cache_key:
+                break
+            cls._history_cache.pop(oldest, None)
         cls._history_cache[cache_key] = list(history)
         return history
 
@@ -909,11 +955,21 @@ class AgentRunner:
             )
 
     def _complete(self, project: str, message: str) -> None:
-        project_dir = self.settings.workspace_root / project
-        self._log(project_dir, "assistant", message)
-        self.publish("agent_message", {"project": project, "message": message})
+        """Persist the final assistant turn and publish it to subscribers.
 
-    # ------------------------------------------------------------------ helpers
+        The agent loop persists the assistant turn via ``_append_message``;
+        this method ensures the final user-facing response is recorded
+        even when the loop reaches ``_complete`` without persisting the
+        assistant message (e.g. the ``_await_preview`` path). The agent
+        loop and ``_complete`` together guarantee a single canonical entry.
+        """
+        project_dir = self.settings.workspace_root / project
+        history = self._load_history(project_dir)
+        if not history or history[-1] != {"role": "assistant", "content": message}:
+            self._append_message(
+                project_dir, {"role": "assistant", "content": message}
+            )
+        self.publish("agent_message", {"project": project, "message": message})
 
     @staticmethod
     def _validate_answer(question: dict[str, object], answer: str) -> bool:

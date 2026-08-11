@@ -42,6 +42,45 @@ def test_chat_ignores_client_supplied_routing_preferences(tmp_path: Path, monkey
     assert response.status_code == 202
 
 
+def test_cross_origin_mutation_is_rejected(tmp_path: Path):
+    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    client = create_app(settings).test_client()
+    client.post("/api/projects/new", json={"name": "demo"})
+
+    # Mismatched Origin (a malicious page driving the local service).
+    response = client.post(
+        "/api/chat",
+        json={"project": "demo", "message": "hi"},
+        headers={"Origin": "http://attacker.test"},
+    )
+    assert response.status_code == 403
+    assert "Cross-origin" in response.get_json()["error"]
+
+    # Cross-origin Host on a specific bind (still rejected even without Origin).
+    response = client.post(
+        "/api/chat",
+        json={"project": "demo", "message": "hi"},
+        headers={"Host": "evil.example.test"},
+    )
+    assert response.status_code == 403
+
+
+def test_same_origin_state_change_is_allowed(tmp_path: Path, monkeypatch):
+    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    app = create_app(settings)
+    client = app.test_client()
+    client.post("/api/projects/new", json={"name": "demo"})
+    monkeypatch.setattr(app.config["AGENT_RUNNER"], "start", lambda *_args, **_kwargs: True)
+
+    # Same-origin browser request (Origin matches Host) is allowed.
+    response = client.post(
+        "/api/chat",
+        json={"project": "demo", "message": "hi"},
+        headers={"Origin": "http://localhost:5000", "Host": "localhost:5000"},
+    )
+    assert response.status_code == 202
+
+
 def test_settings_routes_are_not_exposed(tmp_path: Path):
     settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
     client = create_app(settings).test_client()

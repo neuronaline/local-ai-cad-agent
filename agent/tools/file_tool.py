@@ -4,10 +4,15 @@ import ast
 import json
 import math
 import operator
+import os
 import re
+import signal
+import subprocess
+import sys
 from pathlib import Path
 from typing import ClassVar
 
+from agent.io import atomic_write_text
 from agent.revisions import RevisionOrigin, RevisionStore
 
 BLOCKED_IMPORTS = {
@@ -211,7 +216,13 @@ class FileTool:
         "type": "function",
         "function": {
             "name": "file",
-            "description": "Read or safely edit model.py or summary.md.",
+            "description": (
+                "Read or safely edit model.py or summary.md. The "
+                "regex_replace operation matches with re.DOTALL, so '.' in "
+                "the pattern also matches newline characters. Use explicit "
+                "anchors and non-greedy quantifiers when matching multi-line "
+                "blocks."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -278,7 +289,7 @@ class FileTool:
             return self._write_model(content, "write")
         # Non-model files: simple write without revision tracking.
         path = self._path(filename)
-        path.write_text(content, encoding="utf-8")
+        atomic_write_text(path, content)
         return f"Wrote {filename} ({len(content)} characters)."
 
     def _write_model(self, content: str, operation: str) -> str:
@@ -338,12 +349,7 @@ class FileTool:
         if not 1 <= count <= 20:
             raise ValueError("Regex replacement count must be between 1 and 20.")
         current = self.read(filename)
-        try:
-            updated, replacements = re.subn(
-                pattern, replacement, current, count=count, flags=re.DOTALL
-            )
-        except re.error as error:
-            raise ValueError(f"Invalid regex pattern: {error}") from error
+        updated, replacements = _safe_subn(pattern, replacement, current, count=count)
         if replacements == 0:
             raise ValueError("The regex did not match; file was not changed.")
         detail = ""
@@ -352,3 +358,60 @@ class FileTool:
         else:
             self.write(filename, updated)
         return f"Updated {filename} with {replacements} regex replacement(s).{detail}"
+
+
+_REGEX_TIMEOUT_SECONDS = 5.0
+# JSON envelope so the worker can return (text, replacements) without pickling.
+_REGEX_WORKER_CODE = (
+    "import json, re, sys\n"
+    "pattern, replacement, text, count = json.load(sys.stdin)\n"
+    "try:\n"
+    "    updated, replacements = re.subn(\n"
+    "        pattern, replacement, text, count=count, flags=re.DOTALL\n"
+    "    )\n"
+    "    json.dump({\"ok\": True, \"updated\": updated, \"replacements\": replacements}, sys.stdout)\n"
+    "except re.error as error:\n"
+    "    json.dump({\"ok\": False, \"error\": str(error)}, sys.stdout)\n"
+)
+
+
+def _safe_subn(pattern: str, replacement: str, text: str, *, count: int) -> tuple[str, int]:
+    """Apply re.subn with a wall-clock timeout enforced in a subprocess.
+
+    Python's :mod:`re` module has no native timeout, so a pathological pattern
+    (e.g. ``(a+)+b``) supplied by an untrusted caller can wedge the calling
+    thread with catastrophic backtracking. We run the substitution in a
+    short-lived child process and SIGKILL it if it overruns.
+    """
+    payload = json.dumps([pattern, replacement, text, count]).encode("utf-8")
+    with subprocess.Popen(
+        [sys.executable, "-c", _REGEX_WORKER_CODE],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    ) as worker:
+        try:
+            stdout, stderr = worker.communicate(payload, timeout=_REGEX_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(worker.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            worker.wait()
+            raise RuntimeError(
+                "Regex substitution exceeded the safety timeout "
+                f"({_REGEX_TIMEOUT_SECONDS:g}s); the pattern is likely "
+                "catastrophically backtracking."
+            ) from None
+    if worker.returncode != 0:
+        raise RuntimeError(
+            f"Regex worker failed: {(stderr or b'').decode('utf-8', errors='replace').strip() or 'unknown error'}"
+        )
+    try:
+        result = json.loads(stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"Regex worker returned malformed output: {error}") from error
+    if not result.get("ok"):
+        raise ValueError(f"Invalid regex pattern: {result.get('error', 'unknown error')}")
+    return result["updated"], int(result["replacements"])
