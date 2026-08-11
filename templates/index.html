@@ -95,11 +95,8 @@
       <div id="history-content" class="drawer-content"></div>
       <div id="model-content" class="drawer-content" hidden></div>
     </aside>
-    <script>
-      window.APP_CONFIG = {
-        projectName: {{ project_name | tojson }},
-        showInfoMessages: {{ show_info_messages | tojson }},
-      };
+    <script id="app-config" type="application/json">
+      {{ {'projectName': project_name, 'showInfoMessages': show_info_messages} | tojson }}
     </script>
     <script type="importmap">
       {

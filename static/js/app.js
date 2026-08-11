@@ -18,8 +18,9 @@ const activityList = document.querySelector('#activity-list');
 const attachmentPreview = document.querySelector('#attachment-preview');
 const modelActions = document.querySelector('#model-actions');
 const viewer = new CadViewer(document.querySelector('#viewer'), document.querySelector('#dimensions'));
-const showInfoMessages = window.APP_CONFIG?.showInfoMessages ?? true;
-const currentProject = window.APP_CONFIG?.projectName || '';
+const appConfig = JSON.parse(document.querySelector('#app-config')?.textContent || '{}');
+const showInfoMessages = appConfig.showInfoMessages ?? true;
+const currentProject = appConfig.projectName || '';
 
 let selectedFiles = [];
 let lastStreamedAgent = null;
