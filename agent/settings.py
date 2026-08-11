@@ -38,6 +38,7 @@ class Settings:
     show_info_messages: bool = True
     agent_tool_call_limit: int = 12
     revision_retention_count: int = 0  # 0 = unlimited, >0 = keep at most N revisions
+    agent_debug_log_tool_errors: bool = False
 
     @property
     def llm_model(self) -> str:
@@ -134,6 +135,9 @@ def load_settings(project_root: Path | None = None) -> Settings:
         show_info_messages=_strict_bool(ui.get("show_info_messages", True), "ui.show_info_messages"),
         agent_tool_call_limit=_positive_int(agent.get("tool_call_limit", 12), "agent.tool_call_limit"),
         revision_retention_count=_non_negative_int(agent.get("revision_retention_count", 0), "agent.revision_retention_count"),
+        agent_debug_log_tool_errors=_strict_bool(
+            agent.get("debug_log_tool_errors", False), "agent.debug_log_tool_errors"
+        ),
     )
 
 

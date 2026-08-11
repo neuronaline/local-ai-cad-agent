@@ -748,7 +748,6 @@ class AgentRunner:
         name = function.get("name") if isinstance(function, dict) else ""
         if not isinstance(name, str) or not name:
             name = "unknown_tool"
-        tool_succeeded = False
         preview_id = prev_preview_id
         waiting = False
         arguments: dict = {}
@@ -772,7 +771,6 @@ class AgentRunner:
                 tools, project, name, arguments, call_id
             )
             result = tool_success(name, raw_result)
-            tool_succeeded = True
             if self._is_model_mutation(name, arguments):
                 preview_id = None
                 cad_error = None
@@ -792,6 +790,7 @@ class AgentRunner:
             )
         except Exception as error:  # noqa: BLE001 - Tool errors are useful LLM context.
             result, waiting = tool_failure(name, error), False
+            self._debug_tool_error(project_dir, call_id, name, error, result)
             if self._is_cad_build(name, arguments):
                 cad_error = str(error)
                 cad_fix_required = True
@@ -970,6 +969,35 @@ class AgentRunner:
                 project_dir, {"role": "assistant", "content": message}
             )
         self.publish("agent_message", {"project": project, "message": message})
+
+    def _debug_tool_error(
+        self,
+        project_dir: Path,
+        call_id: str,
+        tool: str,
+        error: Exception,
+        result: str,
+    ) -> None:
+        """Append recoverable tool failures to a project-local debug log."""
+        if not self.settings.agent_debug_log_tool_errors:
+            return
+        try:
+            payload = json.loads(result)
+            error_detail = payload.get("error", {}) if isinstance(payload, dict) else {}
+            entry = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "call_id": call_id,
+                "tool": tool,
+                "error_type": type(error).__name__,
+                "message": str(error),
+                "classification": error_detail,
+            }
+            with _shared_history_lock():
+                with (project_dir / "debug-errors.jsonl").open("a", encoding="utf-8") as log:
+                    log.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except (OSError, TypeError, ValueError):
+            # Debug logging must not affect the agent's recovery path.
+            return
 
     @staticmethod
     def _validate_answer(question: dict[str, object], answer: str) -> bool:

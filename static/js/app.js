@@ -23,11 +23,9 @@ const showInfoMessages = appConfig.showInfoMessages ?? true;
 const currentProject = appConfig.projectName || '';
 
 let selectedFiles = [];
-let lastStreamedAgent = null;
 let previewProject = '';
 let loadedPreviewRevision = '';
 let previewLoadPromise = null;
-const agentStreams = new Map();
 const toolMessages = new Map();
 const activityItems = new Map();
 const ALLOWED_TAGS = new Set([
@@ -101,7 +99,6 @@ function addMessage(text, type = 'agent', options = {}) {
     `;
     feed.appendChild(item);
     renderAgentContent(item, text || '');
-    agentStreams.set('latest', { item, text: text || '' });
     return item;
   }
   item.textContent = text || '';
@@ -133,16 +130,33 @@ function updateActivitySummary() {
     return;
   }
   const running = items.filter(item => ['preparing', 'running', 'started', 'reviewing'].includes(item.status));
-  const failed = items.filter(item => item.status === 'error');
-  const completed = items.filter(item => item.status === 'completed').length;
+  const failed = items.filter(item => item.status === 'error' && !item.recovered);
+  const corrected = items.filter(item => item.recovered).length;
   const current = running.at(-1);
   activityTitle.textContent = current
     ? `${activityLabel(current.tool)} · ${activityLabel(current.status)}`
     : failed.length
       ? `${failed.length} failed ${failed.length === 1 ? 'task' : 'tasks'}`
-      : `${completed || items.length} ${completed === 1 ? 'task' : 'tasks'} completed`;
+      : `${items.length} ${items.length === 1 ? 'step' : 'steps'} completed${corrected ? ` · ${corrected} corrected` : ''}`;
   activityPanel.open = Boolean(current);
   activityPanel.hidden = false;
+}
+
+function markActivityRecovered() {
+  for (const item of activityItems.values()) {
+    const row = activityList.querySelector(`[data-call-id="${CSS.escape(item.callId)}"]`);
+    if (item.status === 'error') {
+      item.recovered = true;
+      if (row) row.hidden = true;
+    } else if (['preparing', 'running', 'started', 'reviewing', 'rendering'].includes(item.status)) {
+      item.status = 'completed';
+      if (row) {
+        row.dataset.status = 'completed';
+        row.querySelector('.activity-state').textContent = 'Completed';
+      }
+    }
+  }
+  updateActivitySummary();
 }
 
 function addToolMessage(data) {
@@ -163,6 +177,7 @@ function addToolMessage(data) {
     activityList.appendChild(row);
   }
   row.dataset.status = status;
+  row.hidden = Boolean(item.recovered);
   row.replaceChildren();
   const name = document.createElement('span');
   name.className = 'activity-name';
@@ -301,21 +316,23 @@ async function loadCurrentState() {
 async function loadHistory(projectName) {
   try {
     const data = await api(`/api/projects/${encodeURIComponent(projectName)}/history`);
-    agentStreams.clear();
     clearActivity();
-    lastStreamedAgent = null;
     feed.replaceChildren();
     questionArea.replaceChildren();
+    let hasSummary = false;
     for (const evt of data.events) {
       const role = evt.role || '';
       const content = evt.content || '';
       if (role === 'user') {
         addMessage(content, 'user');
       } else if (role === 'assistant' || role === 'agent') {
+        if (evt.tool_calls || !String(content).trim()) continue;
         addMessage(content, 'agent');
+        hasSummary = true;
       } else if (evt.type === 'agent_error') addMessage(evt.data?.message || content, 'error');
       else if (showInfoMessages) addInfoMessage(evt.type, evt.data);
     }
+    if (hasSummary) markActivityRecovered();
     if (!data.events.length) {
       const empty = document.createElement('div');
       empty.className = 'empty-state';
@@ -706,29 +723,18 @@ function connectStream() {
     },
     agent_stream_start: data => {
       if (data.project !== currentProject) return;
-      const item = addMessage('', 'agent', {streaming: true});
-      agentStreams.set(data.message_id, { item, text: '' });
+      // Intermediate model turns are represented by activity items only.
     },
-    agent_message_delta: data => {
-      if (data.project !== currentProject) return;
-      const entry = agentStreams.get(data.message_id);
-      if (!entry) return;
-      const delta = (data.content || data.text || '');
-      entry.text += delta;
-      renderAgentContent(entry.item, entry.text);
-    },
+    agent_message_delta: () => { /* Final summary is shown on agent_message. */ },
     agent_reasoning_delta: data => { /* hidden by policy */ },
     agent_tool_call_delta: data => { /* not surfaced */ },
     agent_stream_end: data => {
       if (data.project !== currentProject) return;
-      const entry = agentStreams.get(data.message_id);
-      if (entry) {
-        entry.item.querySelector('.message-state').textContent = '';
-        lastStreamedAgent = entry;
-      }
+      // Tool-call turns do not create chat cards.
     },
     agent_message: data => {
       if (data.project !== currentProject) return;
+      markActivityRecovered();
       addMessage(data.message || '', 'agent');
     },
     tool_status: data => {

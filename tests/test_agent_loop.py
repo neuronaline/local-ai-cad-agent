@@ -8,6 +8,7 @@ import pytest
 
 from agent.core import TOOL_SCHEMAS, AgentRunner, ProjectTools
 from agent.settings import Settings
+from agent.tool_results import failure as tool_failure
 
 
 class FakeOpenRouterClient:
@@ -758,3 +759,34 @@ def test_failed_build_clears_preview_and_returns_structured_error(tmp_path: Path
     assert payload["ok"] is False
     assert payload["error"]["code"] == "CAD_BUILD_FAILED"
     assert payload["error"]["phase"] == "build"
+
+
+def test_debug_error_log_records_recoverable_tool_failures(tmp_path: Path):
+    project_root = tmp_path / "projects"
+    project = project_root / "demo"
+    project.mkdir(parents=True)
+    settings = Settings(
+        project_root,
+        "https://example.test",
+        "test",
+        1,
+        "127.0.0.1",
+        5000,
+        agent_debug_log_tool_errors=True,
+    )
+    runner = AgentRunner(settings, lambda *_: None)
+    error = ValueError("Invalid Python: unexpected indent (line 12)")
+
+    runner._debug_tool_error(
+        project,
+        "write-1",
+        "file_write",
+        error,
+        tool_failure("file_write", error),
+    )
+
+    entries = (project / "debug-errors.jsonl").read_text(encoding="utf-8").splitlines()
+    record = json.loads(entries[0])
+    assert record["call_id"] == "write-1"
+    assert record["tool"] == "file_write"
+    assert record["classification"]["code"] == "VALIDATION_ERROR"

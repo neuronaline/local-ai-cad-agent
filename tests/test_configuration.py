@@ -40,6 +40,14 @@ def test_tool_call_limit_must_be_positive(tmp_path):
         load_settings(project_root=tmp_path)
 
 
+def test_debug_tool_error_log_setting(tmp_path):
+    _write_config(tmp_path, "agent:\n  debug_log_tool_errors: true\n")
+
+    settings = load_settings(project_root=tmp_path)
+
+    assert settings.agent_debug_log_tool_errors is True
+
+
 def test_settings_uses_openai_model_when_provider_is_openai(tmp_path):
     _write_config(
         tmp_path,
