@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import ClassVar
 
 INPUT_TYPES = frozenset({"text", "select", "number", "multiselect"})
 SINGLE_CHOICE_TYPES = frozenset({"select", "multiselect"})
@@ -29,36 +28,6 @@ def normalize_questions(args: dict) -> list[dict]:
 
 
 class QuestionTool:
-    __tool_schema__: ClassVar[dict[str, object]] = {
-        "type": "function",
-        "function": {
-            "name": "question",
-            "description": "Ask the user one or more clarifying questions, then stop and wait for their answers.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "title": {"type": "string", "description": "Optional heading displayed above the questions"},
-                    "questions": {
-                        "type": "array",
-                        "description": "One or more question fields to present to the user",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "id": {"type": "string", "description": "Short unique key for this question, e.g. 'material' or 'q1'"},
-                                "question": {"type": "string", "description": "The question text to show the user"},
-                                "input_type": {"type": "string", "enum": ["text", "select", "number", "multiselect"], "description": "How the user should answer (default: text)"},
-                                "options": {"type": "array", "items": {"type": "string"}, "description": "Choices for select or multiselect"},
-                                "required": {"type": "boolean", "description": "Whether an answer is mandatory (default: true)"},
-                            },
-                            "required": ["id", "question"],
-                        },
-                    },
-                },
-                "required": ["questions"],
-            },
-        },
-    }
-
     def __init__(self, publish: Callable[[str, dict], None]) -> None:
         self.publish = publish
 
@@ -125,7 +94,9 @@ class QuestionTool:
                         "id": q["id"].strip(),
                         "question": q["question"].strip(),
                         "input_type": q.get("input_type", "text"),
-                        "options": q.get("options", []) if q.get("input_type") in SINGLE_CHOICE_TYPES else [],
+                        "options": q.get("options", [])
+                        if q.get("input_type") in SINGLE_CHOICE_TYPES
+                        else [],
                         "required": q.get("required", True),
                     }
                     for q in questions

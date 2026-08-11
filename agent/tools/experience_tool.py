@@ -1,4 +1,5 @@
 """Shared past-issues memory — search, store, and reuse verified solutions."""
+
 from __future__ import annotations
 
 import json
@@ -8,7 +9,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any
 
 _MEMORY_DIR = ".agent-memory"
 _MEMORY_FILE = "past_issues.json"
@@ -21,6 +22,7 @@ def _lock_for_memory_file(path: Path) -> threading.RLock:
     path = path.resolve()
     with _MEMORY_LOCKS_GUARD:
         return _MEMORY_LOCKS.setdefault(path, threading.RLock())
+
 
 _MAX_FIELD_LENGTHS = {
     "problem": 500,
@@ -35,26 +37,6 @@ _MIN_WORD_LENGTH = 3
 
 class ExperienceTool:
     """Cross-project memory of encountered-and-verified problem/solution pairs."""
-
-    __tool_schema__: ClassVar[dict[str, Any]] = {
-        "type": "function",
-        "function": {
-            "name": "experience",
-            "description": "Search or store verified problem-solution pairs shared across projects.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "operation": {"type": "string", "enum": ["search", "add", "update"]},
-                    "query": {"type": "string", "description": "Space-separated search terms for problems, solutions, and tags"},
-                    "problem": {"type": "string", "description": "Short, generalized problem statement (max 500 chars)"},
-                    "solution": {"type": "string", "description": "Verified solution (max 2000 chars)"},
-                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Up to 10 lowercase tags"},
-                    "id": {"type": "string", "description": "Record id for update operation"},
-                },
-                "required": ["operation"],
-            },
-        },
-    }
 
     def __init__(self, workspace_root: Path, project_name: str) -> None:
         self._workspace_root = workspace_root
@@ -79,7 +61,9 @@ class ExperienceTool:
             problem = (args.get("problem") or "").strip()
             solution = (args.get("solution") or "").strip()
             if not problem or not solution:
-                return json.dumps({"error": "Both problem and solution are required."}), False
+                return json.dumps(
+                    {"error": "Both problem and solution are required."}
+                ), False
             result = self.add(problem, solution, args.get("tags"))
         elif operation == "update":
             if not args.get("id"):
@@ -110,7 +94,9 @@ class ExperienceTool:
         matches.sort(key=lambda item: item["_score"], reverse=True)
         return {"matches": matches[:_SEARCH_RESULT_LIMIT]}
 
-    def add(self, problem: str, solution: str, tags: list[str] | None = None) -> dict[str, Any]:
+    def add(
+        self, problem: str, solution: str, tags: list[str] | None = None
+    ) -> dict[str, Any]:
         """Store a verified problem and solution. Updates existing similar record."""
         tags = self._normalize_tags(tags or [])
         problem = self._validate_field("problem", problem)
@@ -218,18 +204,16 @@ class ExperienceTool:
         )
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(
-                    json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
-                )
+                handle.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temp_name, self._memory_file)
-        except BaseException:
+        except Exception as error:
             try:
                 os.unlink(temp_name)
             except OSError:
                 pass
-            raise RuntimeError(f"Failed to write memory file")
+            raise RuntimeError("Failed to write memory file") from error
 
     # ── search helpers ──────────────────────────────────────────────────
 
@@ -320,9 +304,7 @@ class ExperienceTool:
         return sorted(normalized)
 
     @staticmethod
-    def _merge_tags(
-        existing: list[str], incoming: list[str]
-    ) -> list[str]:
+    def _merge_tags(existing: list[str], incoming: list[str]) -> list[str]:
         seen = set(existing)
         for tag in incoming:
             seen.add(tag)

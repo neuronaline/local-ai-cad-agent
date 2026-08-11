@@ -7,7 +7,6 @@ import signal
 import subprocess
 import threading
 from pathlib import Path
-from typing import ClassVar
 
 from agent.sandbox import command as sandbox_command
 
@@ -114,6 +113,7 @@ class _RingBuffer:
         with self._lock:
             return b"".join(self._buf).decode("utf-8", errors="replace")
 
+
 _ALLOWED_CHECK_IMPORTS = {"build123d", "cadquery", "math", "numpy"}
 _BLOCKED_CHECK_NAMES = frozenset(
     {
@@ -164,21 +164,31 @@ def _validate_check_code(code: str) -> None:
         raise ValueError("check -c requires inline code.")
 
     def _import_allowed(module: str) -> bool:
-        return module.split(".")[0] in _ALLOWED_CHECK_IMPORTS or module.startswith("ocp_")
+        return module.split(".")[0] in _ALLOWED_CHECK_IMPORTS or module.startswith(
+            "ocp_"
+        )
 
     for index, statement in enumerate(statements):
         if isinstance(statement, (ast.Import, ast.ImportFrom)):
             for alias in statement.names:
-                module = alias.name if isinstance(statement, ast.Import) else statement.module
+                module = (
+                    alias.name
+                    if isinstance(statement, ast.Import)
+                    else statement.module
+                )
                 if not _import_allowed(module or ""):
                     raise ValueError(f"check -c import of '{module}' is not permitted.")
                 if alias.asname in _BLOCKED_CHECK_NAMES:
-                    raise ValueError(f"check -c does not allow the name '{alias.asname}'.")
+                    raise ValueError(
+                        f"check -c does not allow the name '{alias.asname}'."
+                    )
                 if (
                     isinstance(statement, ast.ImportFrom)
                     and alias.name in _BLOCKED_CHECK_NAMES
                 ):
-                    raise ValueError(f"check -c does not allow the name '{alias.name}'.")
+                    raise ValueError(
+                        f"check -c does not allow the name '{alias.name}'."
+                    )
             continue
         if index != len(statements) - 1:
             raise ValueError(
@@ -203,23 +213,6 @@ def _validate_check_code(code: str) -> None:
 class TerminalTool:
     """Runs only the current Python interpreter within a single workspace."""
 
-    __tool_schema__: ClassVar[dict[str, object]] = {
-        "type": "function",
-        "function": {
-            "name": "terminal",
-            "description": "Run a project-local Python script or a quick validation check.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "operation": {"type": "string", "enum": ["run", "check"]},
-                    "arguments": {"type": "array", "items": {"type": "string"}},
-                    "timeout_seconds": {"type": "integer"},
-                },
-                "required": ["arguments"],
-            },
-        },
-    }
-
     def __init__(self, project_dir: Path) -> None:
         self.project_dir = project_dir.resolve()
         self._process: subprocess.Popen[str] | None = None
@@ -234,7 +227,9 @@ class TerminalTool:
             result = self.run(args["arguments"], args.get("timeout_seconds", 30))
         return json.dumps(result), False
 
-    def check(self, arguments: list[str], timeout_seconds: int = 15) -> dict[str, object]:
+    def check(
+        self, arguments: list[str], timeout_seconds: int = 15
+    ) -> dict[str, object]:
         """Run a quick Python validation: -c '<safe_expr>' or -m pytest / pip list.
 
         Restricted to read-only, project-scoped operations. No file modification,
@@ -270,7 +265,9 @@ class TerminalTool:
             return self._run_command(["-m", module, *sub_args], timeout_seconds)
         raise ValueError("check supports only -c '<code>' or -m <module>.")
 
-    def _run_command(self, command: list[str], timeout_seconds: int) -> dict[str, object]:
+    def _run_command(
+        self, command: list[str], timeout_seconds: int
+    ) -> dict[str, object]:
         timeout = max(1, min(timeout_seconds, 120))
         command, seccomp_fd = sandbox_command(
             self.project_dir,
@@ -293,8 +290,6 @@ class TerminalTool:
             finally:
                 os.close(seccomp_fd)
             stdout, stderr = _stream_with_limit(process, timeout=timeout)
-        except _TimedOut:
-            raise  # The exception carries the partial output in its message.
         finally:
             with self._lock:
                 self._process = None
@@ -303,18 +298,29 @@ class TerminalTool:
                 f"Python command failed with exit code {process.returncode}.\n"
                 f"stdout:\n{stdout[-8000:]}\nstderr:\n{stderr[-8000:]}"
             )
-        return {"returncode": process.returncode, "stdout": stdout[-8000:], "stderr": stderr[-8000:], "actual_timeout_seconds": timeout}
+        return {
+            "returncode": process.returncode,
+            "stdout": stdout[-8000:],
+            "stderr": stderr[-8000:],
+            "actual_timeout_seconds": timeout,
+        }
 
     def run(self, arguments: list[str], timeout_seconds: int = 30) -> dict[str, object]:
         if not arguments or arguments[0] != "python":
             raise ValueError("Only Python commands are permitted.")
         if any(token in {"-c", "-m", "-i"} for token in arguments[1:]):
-            raise ValueError("Inline, module, and interactive Python commands are not permitted.")
+            raise ValueError(
+                "Inline, module, and interactive Python commands are not permitted."
+            )
         if len(arguments) != 2 or Path(arguments[1]).name != arguments[1]:
-            raise ValueError("Run a single Python script (no subdirectories) from the active project directory.")
+            raise ValueError(
+                "Run a single Python script (no subdirectories) from the active project directory."
+            )
         script = (self.project_dir / arguments[1]).resolve()
         if script.parent != self.project_dir or not script.is_file():
-            raise ValueError("Python script must exist in the active project directory.")
+            raise ValueError(
+                "Python script must exist in the active project directory."
+            )
         return self._run_command([script.name], timeout_seconds)
 
     def stop(self) -> None:

@@ -159,7 +159,7 @@ def test_info_messages_remain_stored_but_are_hidden_when_disabled(tmp_path: Path
     raw_history = (settings.workspace_root / "demo" / "conversation.jsonl").read_text(encoding="utf-8")
     assert history == []
     assert '"type": "agent_status"' in raw_history
-    assert b"showInfoMessages: false" in client.get("/project/demo").data
+    assert b'"showInfoMessages": false' in client.get("/project/demo").data
 
 
 def test_chat_requires_existing_project(tmp_path: Path):

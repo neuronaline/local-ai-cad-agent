@@ -5,12 +5,10 @@ import json
 import math
 import operator
 import os
-import re
 import signal
 import subprocess
 import sys
 from pathlib import Path
-from typing import ClassVar
 
 from agent.io import atomic_write_text
 from agent.revisions import RevisionOrigin, RevisionStore
@@ -50,13 +48,17 @@ class ModelPreflight(ast.NodeVisitor):
         names = [alias.name.split(".")[0] for alias in node.names]
         forbidden = set(names) & BLOCKED_IMPORTS
         if forbidden:
-            self.blocked_errors.append(f"Unsafe import blocked: {', '.join(sorted(forbidden))}")
+            self.blocked_errors.append(
+                f"Unsafe import blocked: {', '.join(sorted(forbidden))}"
+            )
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         names = [(node.module or "").split(".")[0]]
         forbidden = set(names) & BLOCKED_IMPORTS
         if forbidden:
-            self.blocked_errors.append(f"Unsafe import blocked: {', '.join(sorted(forbidden))}")
+            self.blocked_errors.append(
+                f"Unsafe import blocked: {', '.join(sorted(forbidden))}"
+            )
 
     def visit_Assign(self, node: ast.Assign) -> None:
         if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
@@ -67,7 +69,9 @@ class ModelPreflight(ast.NodeVisitor):
             points = self._line_points(node.value)
             if points is not None:
                 self.edge_points[name] = points
-            if self._topology_changed and self._contains_fixed_selector_index(node.value):
+            if self._topology_changed and self._contains_fixed_selector_index(
+                node.value
+            ):
                 self.warnings.append(
                     f"line {node.lineno}: fixed selector index used after a topology-changing "
                     "operation; reselect by geometry, position, radius, or adjacency"
@@ -154,7 +158,9 @@ class ModelPreflight(ast.NodeVisitor):
         value = self._number_or_tuple(node)
         return value if isinstance(value, float) else None
 
-    def _number_or_tuple(self, node: ast.AST | None) -> float | tuple[float, ...] | None:
+    def _number_or_tuple(
+        self, node: ast.AST | None
+    ) -> float | tuple[float, ...] | None:
         if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
             return float(node.value)
         if isinstance(node, ast.Name):
@@ -200,10 +206,7 @@ class ModelPreflight(ast.NodeVisitor):
             if not isinstance(child, ast.Subscript):
                 continue
             index = child.slice
-            if not (
-                isinstance(index, ast.Constant)
-                and isinstance(index.value, int)
-            ):
+            if not (isinstance(index, ast.Constant) and isinstance(index.value, int)):
                 continue
             calls = {
                 part.func.attr
@@ -216,34 +219,6 @@ class ModelPreflight(ast.NodeVisitor):
 
 
 class FileTool:
-    __tool_schema__: ClassVar[dict[str, object]] = {
-        "type": "function",
-        "function": {
-            "name": "file",
-            "description": (
-                "Read or safely edit model.py or summary.md. The "
-                "regex_replace operation matches with re.DOTALL, so '.' in "
-                "the pattern also matches newline characters. Use explicit "
-                "anchors and non-greedy quantifiers when matching multi-line "
-                "blocks."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "operation": {"type": "string", "enum": ["read", "write", "replace", "regex_replace"]},
-                    "filename": {"type": "string", "enum": ["model.py", "summary.md"]},
-                    "content": {"type": "string"},
-                    "old": {"type": "string"},
-                    "new": {"type": "string"},
-                    "pattern": {"type": "string"},
-                    "replacement": {"type": "string"},
-                    "count": {"type": "integer"},
-                },
-                "required": ["operation", "filename"],
-            },
-        },
-    }
-
     def __init__(
         self,
         project_dir: Path,
@@ -275,7 +250,9 @@ class FileTool:
         try:
             tree = ast.parse(code, filename="model.py")
         except SyntaxError as error:
-            raise ValueError(f"Invalid Python: {error.msg} (line {error.lineno})") from error
+            raise ValueError(
+                f"Invalid Python: {error.msg} (line {error.lineno})"
+            ) from error
         preflight = ModelPreflight()
         preflight.visit(tree)
         if preflight.blocked_errors:
@@ -307,7 +284,9 @@ class FileTool:
                 tool_call_id=self._tool_call_id,
             ),
         )
-        result = f"Wrote model.py ({len(content)} characters, revision {revision.id[:8]})."
+        result = (
+            f"Wrote model.py ({len(content)} characters, revision {revision.id[:8]})."
+        )
         if warnings:
             result += "\nPRE-FLIGHT WARNING: " + " | ".join(warnings)
         return result
@@ -335,13 +314,18 @@ class FileTool:
             result = self.replace(filename, args.get("old", ""), args.get("new", ""))
         elif operation == "regex_replace":
             result = self.regex_replace(
-                filename, args.get("pattern", ""), args.get("replacement", ""), args.get("count", 1)
+                filename,
+                args.get("pattern", ""),
+                args.get("replacement", ""),
+                args.get("count", 1),
             )
         else:
             raise ValueError("Unsupported file operation.")
         return json.dumps(result) if not isinstance(result, str) else result, False
 
-    def regex_replace(self, filename: str, pattern: str, replacement: str, count: int = 1) -> str:
+    def regex_replace(
+        self, filename: str, pattern: str, replacement: str, count: int = 1
+    ) -> str:
         if not pattern:
             raise ValueError("Regex pattern must not be empty.")
         # The length cap bounds catastrophic-backtracking risk: Python's re
@@ -373,13 +357,15 @@ _REGEX_WORKER_CODE = (
     "    updated, replacements = re.subn(\n"
     "        pattern, replacement, text, count=count, flags=re.DOTALL\n"
     "    )\n"
-    "    json.dump({\"ok\": True, \"updated\": updated, \"replacements\": replacements}, sys.stdout)\n"
+    '    json.dump({"ok": True, "updated": updated, "replacements": replacements}, sys.stdout)\n'
     "except re.error as error:\n"
-    "    json.dump({\"ok\": False, \"error\": str(error)}, sys.stdout)\n"
+    '    json.dump({"ok": False, "error": str(error)}, sys.stdout)\n'
 )
 
 
-def _safe_subn(pattern: str, replacement: str, text: str, *, count: int) -> tuple[str, int]:
+def _safe_subn(
+    pattern: str, replacement: str, text: str, *, count: int
+) -> tuple[str, int]:
     """Apply re.subn with a wall-clock timeout enforced in a subprocess.
 
     Python's :mod:`re` module has no native timeout, so a pathological pattern
@@ -415,7 +401,11 @@ def _safe_subn(pattern: str, replacement: str, text: str, *, count: int) -> tupl
     try:
         result = json.loads(stdout.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise RuntimeError(f"Regex worker returned malformed output: {error}") from error
+        raise RuntimeError(
+            f"Regex worker returned malformed output: {error}"
+        ) from error
     if not result.get("ok"):
-        raise ValueError(f"Invalid regex pattern: {result.get('error', 'unknown error')}")
+        raise ValueError(
+            f"Invalid regex pattern: {result.get('error', 'unknown error')}"
+        )
     return result["updated"], int(result["replacements"])

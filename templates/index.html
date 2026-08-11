@@ -27,9 +27,9 @@
             <span>Describe the part you want to build.</span>
             <div class="example-prompts">
               <span class="example-label">Examples</span>
-              <button type="button" class="example-prompt" data-prompt="Create a 60 × 30 × 4 mm mounting plate with four M3 holes.">60 × 30 × 4 mm mounting plate</button>
-              <button type="button" class="example-prompt" data-prompt="Create a wheel for a 6 mm D-shaped motor shaft.">Wheel for a 6 mm D shaft</button>
-              <button type="button" class="example-prompt" data-prompt="Create a 40 mm cube with a centered 20 mm circular hole.">40 mm cube with a centered hole</button>
+              <button type="button" class="example-prompt" data-prompt="Create a 60 × 30 × 4 mm mounting plate with four 3.2 mm through-holes. Place each hole center 5 mm from its two nearest edges.">Mounting plate with four holes</button>
+              <button type="button" class="example-prompt" data-prompt="Create a wheel 50 mm in diameter and 12 mm thick for a 6 mm D-shaped motor shaft. Use a 5.5 mm flat-to-round shaft profile.">Wheel for a 6 mm D shaft</button>
+              <button type="button" class="example-prompt" data-prompt="Create a 40 mm cube with a centered 20 mm diameter through-hole along the Z axis.">Cube with a centered through-hole</button>
             </div>
           </div>
         </div>
@@ -39,7 +39,7 @@
           <div id="activity-list" class="activity-list"></div>
         </details>
         <form id="chat-form" class="composer">
-          <textarea id="message" placeholder="Describe the part you want to create…" rows="2" required aria-label="Part description"></textarea>
+          <textarea id="message" placeholder="Describe the part, dimensions, fit, and required features…" rows="2" required aria-label="Part description"></textarea>
           <div id="attachment-preview" class="attachment-preview" aria-live="polite"></div>
           <div class="action-bar">
             <label id="dropzone" class="attach-button" for="attachments" title="Add reference images"><span aria-hidden="true">＋</span><span id="attachment-label">Attach</span><input id="attachments" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden></label>

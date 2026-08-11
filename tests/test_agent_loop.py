@@ -186,7 +186,11 @@ def test_agent_does_not_complete_without_a_new_drawing(tmp_path: Path, monkeypat
     project_dir.mkdir(parents=True)
     (project_dir / "conversation.jsonl").write_text("", encoding="utf-8")
     events = []
-    monkeypatch.setattr(agent.core, "create_llm_client", lambda _settings, _ignored=None: FakeOpenRouterClient(_settings))
+    monkeypatch.setattr(
+        agent.core,
+        "create_llm_client",
+        lambda _settings, _ignored=None: FakeOpenRouterClient(_settings),
+    )
     runner = AgentRunner(
         Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000),
         lambda kind, data: events.append((kind, data)),
@@ -209,7 +213,11 @@ def test_question_is_persisted_for_the_next_user_reply(tmp_path: Path, monkeypat
     project_dir = project_root / "demo"
     project_dir.mkdir(parents=True)
     (project_dir / "conversation.jsonl").write_text("", encoding="utf-8")
-    monkeypatch.setattr(agent.core, "create_llm_client", lambda _settings, _ignored=None: FakeQuestionClient(_settings))
+    monkeypatch.setattr(
+        agent.core,
+        "create_llm_client",
+        lambda _settings, _ignored=None: FakeQuestionClient(_settings),
+    )
     runner = AgentRunner(
         Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000),
         lambda *_: None,
@@ -233,7 +241,11 @@ def test_answer_resumes_a_waiting_agent(tmp_path: Path, monkeypatch):
     project_dir = project_root / "demo"
     project_dir.mkdir(parents=True)
     (project_dir / "conversation.jsonl").write_text("", encoding="utf-8")
-    monkeypatch.setattr(agent.core, "create_llm_client", lambda _settings, _ignored=None: FakeFinalClient(_settings))
+    monkeypatch.setattr(
+        agent.core,
+        "create_llm_client",
+        lambda _settings, _ignored=None: FakeFinalClient(_settings),
+    )
     runner = AgentRunner(
         Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000),
         lambda *_: None,
@@ -290,7 +302,9 @@ def test_answer_persists_user_message_before_thread_starts(tmp_path: Path, monke
             return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
 
     monkeypatch.setattr(
-        agent.core, "create_llm_client", lambda _settings, _ignored=None: _NoopClient(_settings)
+        agent.core,
+        "create_llm_client",
+        lambda _settings, _ignored=None: _NoopClient(_settings),
     )
 
     runner = AgentRunner(
@@ -336,7 +350,11 @@ def test_answer_waits_for_previous_run_to_finish(tmp_path: Path, monkeypatch):
 
     import agent.core
 
-    monkeypatch.setattr(agent.core, "create_llm_client", lambda _settings, _ignored=None: _SlowClient(_settings))
+    monkeypatch.setattr(
+        agent.core,
+        "create_llm_client",
+        lambda _settings, _ignored=None: _SlowClient(_settings),
+    )
     runner = AgentRunner(
         Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000),
         lambda *_: None,
@@ -353,7 +371,9 @@ def test_answer_waits_for_previous_run_to_finish(tmp_path: Path, monkeypatch):
     started = time.time()
     assert runner.answer("demo", "6 mm")
     elapsed = time.time() - started
-    assert elapsed >= 0.4, f"answer() returned too quickly ({elapsed:.2f}s); did it wait?"
+    assert elapsed >= 0.4, (
+        f"answer() returned too quickly ({elapsed:.2f}s); did it wait?"
+    )
     # And after the run finishes, thread state is fully reset.
     runner._thread.join(timeout=2)
     assert runner._thread is None
@@ -372,7 +392,11 @@ def test_waiting_question_survives_runner_recreation_and_validates_answer(
     settings = Settings(
         project_root, "https://example.test", "test", 1, "127.0.0.1", 5000
     )
-    monkeypatch.setattr(agent.core, "create_llm_client", lambda _settings, _ignored=None: FakeQuestionClient(_settings))
+    monkeypatch.setattr(
+        agent.core,
+        "create_llm_client",
+        lambda _settings, _ignored=None: FakeQuestionClient(_settings),
+    )
     AgentRunner(settings, lambda *_: None)._run("demo", "Make a bracket")
 
     recreated = AgentRunner(settings, lambda *_: None)
@@ -412,6 +436,29 @@ def test_agent_tool_schema_and_dispatch_forbid_export(tmp_path: Path):
         runner._execute(
             ProjectTools(project, lambda *_: None), "demo", "cad_export", {}
         )
+
+
+def test_tool_schemas_document_side_effects_and_reject_extra_arguments():
+    schemas = {schema["function"]["name"]: schema for schema in TOOL_SCHEMAS}
+
+    for schema in schemas.values():
+        assert schema["function"]["parameters"]["additionalProperties"] is False
+
+    write_description = schemas["file_write"]["function"]["description"]
+    build_description = schemas["cad_build_and_verify"]["function"]["description"]
+    terminal_arguments = schemas["terminal_run"]["function"]["parameters"][
+        "properties"
+    ]["arguments"]
+    question_parameters = schemas["question"]["function"]["parameters"]
+
+    assert "overwrites the whole file" in write_description
+    assert "do not repeat unless the source changes" in build_description
+    assert terminal_arguments["minItems"] == terminal_arguments["maxItems"] == 2
+    assert question_parameters["properties"]["questions"]["minItems"] == 1
+    assert (
+        question_parameters["properties"]["questions"]["items"]["additionalProperties"]
+        is False
+    )
 
 
 def test_successful_tool_result_uses_structured_envelope(tmp_path: Path):
@@ -524,7 +571,11 @@ def test_failed_cad_run_is_not_reported_as_completed(tmp_path: Path, monkeypatch
     project = project_root / "demo"
     project.mkdir(parents=True)
     (project / "conversation.jsonl").write_text("", encoding="utf-8")
-    monkeypatch.setattr(agent.core, "create_llm_client", lambda _settings, _ignored=None: FailedCadRecoveryClient(_settings))
+    monkeypatch.setattr(
+        agent.core,
+        "create_llm_client",
+        lambda _settings, _ignored=None: FailedCadRecoveryClient(_settings),
+    )
     events = []
     runner = AgentRunner(
         Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000),
@@ -549,7 +600,11 @@ def test_protocol_history_is_append_only_and_preserves_tool_call_content(
     project = project_root / "demo"
     project.mkdir(parents=True)
     (project / "conversation.jsonl").write_text("", encoding="utf-8")
-    monkeypatch.setattr(agent.core, "create_llm_client", lambda _settings, _ignored=None: FakeOpenRouterClient(_settings))
+    monkeypatch.setattr(
+        agent.core,
+        "create_llm_client",
+        lambda _settings, _ignored=None: FakeOpenRouterClient(_settings),
+    )
     runner = AgentRunner(
         Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000),
         lambda *_: None,
@@ -597,7 +652,11 @@ def test_configured_tool_call_limit_stops_the_agent_loop(tmp_path: Path, monkeyp
     project = project_root / "demo"
     project.mkdir(parents=True)
     (project / "conversation.jsonl").write_text("", encoding="utf-8")
-    monkeypatch.setattr(agent.core, "create_llm_client", lambda _settings, _ignored=None: FakeOpenRouterClient(_settings))
+    monkeypatch.setattr(
+        agent.core,
+        "create_llm_client",
+        lambda _settings, _ignored=None: FakeOpenRouterClient(_settings),
+    )
     events = []
     runner = AgentRunner(
         Settings(
@@ -628,7 +687,11 @@ def test_content_delta_is_published_before_stream_end(tmp_path: Path, monkeypatc
     project = project_root / "demo"
     project.mkdir(parents=True)
     (project / "conversation.jsonl").write_text("", encoding="utf-8")
-    monkeypatch.setattr(agent.core, "create_llm_client", lambda _settings, _ignored=None: LiveFinalClient(_settings))
+    monkeypatch.setattr(
+        agent.core,
+        "create_llm_client",
+        lambda _settings, _ignored=None: LiveFinalClient(_settings),
+    )
     events = []
     runner = AgentRunner(
         Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000),

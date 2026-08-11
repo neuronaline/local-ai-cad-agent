@@ -1,11 +1,11 @@
 """Tests for application configuration: settings, prompt, and dependencies."""
+
 from pathlib import Path
 
 import pytest
 
 from agent.prompt import get_build123d_playbook, get_system_prompt
 from agent.settings import load_settings
-
 
 # ---------------------------------------------------------------------------
 # Settings
@@ -34,7 +34,9 @@ def test_tool_call_limit_loading(tmp_path, body, expected):
 def test_tool_call_limit_must_be_positive(tmp_path):
     _write_config(tmp_path, "agent:\n  tool_call_limit: 0\n")
 
-    with pytest.raises(ValueError, match="agent.tool_call_limit must be a positive integer"):
+    with pytest.raises(
+        ValueError, match="agent.tool_call_limit must be a positive integer"
+    ):
         load_settings(project_root=tmp_path)
 
 
@@ -84,7 +86,18 @@ def test_build123d_playbook_has_versioned_curve_and_topology_guidance():
     assert "EllipticalCenterArc" in playbook
     assert "radius >= endpoint_distance / 2" in playbook
     assert "There is no top-level `max_fillet` function" in playbook
+    assert "Final exports are handled separately by the application" in playbook
+    assert "Değişiklik Özeti" not in playbook
     assert "discard any cached edge/face indices" in system_prompt
+
+
+def test_system_prompt_defines_a_verified_and_non_repetitive_workflow():
+    system_prompt = get_system_prompt()
+
+    assert "Do not claim success from source inspection alone" in system_prompt
+    assert "never rebuild unchanged source" in system_prompt
+    assert "Ask all blocking questions together" in system_prompt
+    assert "State any important assumption in the final reply" in system_prompt
 
 
 # ---------------------------------------------------------------------------

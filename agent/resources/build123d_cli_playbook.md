@@ -1,875 +1,1585 @@
-# build123d CAD CLI Playbook & AI Code Generation Guide
+# build123d 0.11.1 — CAD Agent Guide
 
-This guide provides complete instructions, API patterns, and code examples for generating parametric 3D CAD models using `build123d` **0.11.1** in Python for execution via a local CAD CLI.
+Use this guide when generating Python CAD models for the local CAD CLI.
 
-API source of truth:
-- [build123d 0.11.1 objects](https://build123d.readthedocs.io/en/latest/objects.html)
-- [build123d 0.11.1 operations](https://build123d.readthedocs.io/en/latest/operations.html)
-- [Topology selection and exploration](https://build123d.readthedocs.io/en/latest/topology_selection.html)
-- [Builder common API reference](https://build123d.readthedocs.io/en/latest/builder_api_reference.html)
-- [Tips, Best Practices and FAQ](https://build123d.readthedocs.io/en/latest/tips.html)
-- [GitHub releases](https://github.com/gumyr/build123d/releases)
+Target version: **build123d 0.11.1**
 
-Do **not** transfer constructor parameters from CadQuery, FreeCAD, OpenSCAD, or a
-different build123d object. If Python reports an unexpected keyword, stop guessing
-and use the exact object signature in this guide.
+The goal is not to use every build123d feature. The goal is to generate **simple, robust, parametric, and easy-to-repair CAD code**.
 
 ---
 
-## 1. Execution Contract
+# 1. Hard Execution Contract
 
-All Python model files (conventionally named `model.py`) generated for the CAD CLI must strictly adhere to the following contract:
+Every generated `model.py` must follow these rules.
 
-1. **Units**: All linear dimensions must be specified in **millimeters (mm)**. All angular dimensions must be specified in **degrees**.
-2. **Top-Level Output Variable**: The script **must** expose the final 3D shape (a `Solid`, `Compound`, or `Part`) as a top-level global variable named `result`.
-   - In Builder mode: `result = model.part`
-   - In Algebra mode: `result = final_shape`
-3. **Execution Flow**:
-   - The CLI executes `model.py` via standard Python interpreter invocation.
-   - The CLI inspects the global scope for `result`.
-   - The CLI evaluates `result` for manifold validity, calculates bounding box and volume properties, and exports STEP, STL, and preview renders.
-4. **No UI / Non-Blocking**: Scripts must not call blocking GUI viewers or interactives (such as `show()`, `show_all()`, or `ocp_vscode` viewers).
-5. **No External Dependencies Beyond Standard Library + `build123d`**: Imports must rely strictly on standard Python libraries and `build123d`. Do not import from `cadquery`, `ocp_vscode`, `cqparts`, or any other CAD framework.
+## Units
 
----
+* Linear dimensions: **millimeters**
+* Angles: **degrees**
 
-## 2. Safe Standard Imports, Syntax Conventions & Parameterized Models
+## Imports
 
-### Safe Imports
-Always start model scripts with:
+Use:
+
 ```python
 from build123d import *
 ```
 
-### Syntax Paradigms
-`build123d` supports two distinct programming paradigms:
+Standard-library imports such as `math` are allowed when needed.
 
-1. **Builder Mode (Stateful Context Managers — Preferred for complex parts)**:
-   Uses `with BuildPart() as model:`, `with BuildSketch():`, `with BuildLine():`. Objects instantiated inside a context are automatically added to or subtracted from the active context based on the `mode` parameter.
-   ```python
-   with BuildPart() as model:
-       Box(100, 50, 10)
-       Hole(radius=5)
-   result = model.part
-   ```
+Do not import other CAD frameworks or viewers.
 
-2. **Algebra Mode (Stateless / Functional — Preferred for simple CSG or concise scripts)**:
-   Uses explicit mathematical operators (`+`, `-`, `&`) and returns new geometric objects without managing global state contexts.
-   ```python
-   base = Box(100, 50, 10)
-   hole = Cylinder(radius=5, height=10)
-   result = base - hole
-   ```
-
-### Parameterized Model Conventions
-- Define all adjustable parameters at the very top of `model.py` as explicit, typed constants.
-- Group parameters logically (e.g., overall dimensions, feature sizes, tolerances).
-- Use clear descriptive names (e.g., `wall_thickness`, `bore_diameter`, `fillet_radius`).
+Forbidden examples:
 
 ```python
-# Parameters
-length: float = 120.0
-width: float = 80.0
-height: float = 25.0
-wall_thickness: float = 2.0
-corner_radius: float = 5.0
+import cadquery
+import FreeCAD
+from ocp_vscode import show
+```
 
-# Model Construction
+## Required output
+
+The final 3D model must be available as a top-level global variable named:
+
+```python
+result
+```
+
+Builder Mode:
+
+```python
+result = model.part
+```
+
+Algebra Mode:
+
+```python
+result = final_shape
+```
+
+`result` must contain the final usable 3D shape.
+
+## No viewers
+
+Never call:
+
+```python
+show()
+show_all()
+show_object()
+```
+
+The CLI handles preview and rendering.
+
+---
+
+# 2. Generation Policy
+
+## Default to Builder Mode
+
+For most agent-generated parts, prefer:
+
+```python
 with BuildPart() as model:
-    # ...
-    pass
+    ...
 
 result = model.part
 ```
 
+Builder Mode is especially convenient for:
+
+* holes
+* sketches
+* extrusion
+* feature placement
+* arrays
+* fillets and chamfers
+* incremental construction
+
+Use Algebra Mode when explicit CSG is significantly simpler.
+
+Example:
+
+```python
+outer = Box(50, 40, 10)
+cutter = Cylinder(5, 12)
+
+result = outer - cutter
+```
+
+Do not mix paradigms unnecessarily.
+
 ---
 
-## 3. Core Features & API Reference
+# 3. Choose the Simplest Modeling Strategy
 
-### 3.1 Primitives
+Use this priority order.
 
-#### 3D Primitives
-- `Box(length, width, height, align=(Align.CENTER, Align.CENTER, Align.CENTER))`
-- `Cylinder(radius, height, align=(Align.CENTER, Align.CENTER, Align.CENTER))`
-- `Sphere(radius, align=(Align.CENTER, Align.CENTER, Align.CENTER))`
-- `Cone(bottom_radius, top_radius, height, align=(Align.CENTER, Align.CENTER, Align.CENTER))`
-- `Torus(major_radius, minor_radius, align=(Align.CENTER, Align.CENTER, Align.CENTER))`
-- `Wedge(xsize, ysize, zsize, xmin, zmin, xmax, zmax)`
-- `ConvexPolyhedron(points)` — convex hull from an iterable of points (v0.11.0+)
+### 1. Primitives + booleans
 
-#### 2D Sketch Primitives
-- `Rectangle(width, height, align=(Align.CENTER, Align.CENTER))`
-- `RectangleRounded(width, height, radius, align=(Align.CENTER, Align.CENTER))`
-- `Circle(radius, align=(Align.CENTER, Align.CENTER))`
-- `Ellipse(x_radius, y_radius, rotation=0, align=(Align.CENTER, Align.CENTER), mode=Mode.ADD)`
-- `Polygon(pts, align=(Align.NONE, Align.NONE))` — **default changed in v0.11.0** from centered to none
-- `RegularPolygon(radius, side_count, major_radius=True, align=(Align.CENTER, Align.CENTER))`
-- `Trapezoid(width, height, left_side_angle, right_side_angle=None, ...)`
-- `Triangle(a=..., b=..., c=..., A=..., B=..., C=..., ...)` — define by 1 side + 2 other values
-- `SlotCenterToCenter(center_separation, height)`
-- `SlotOverall(width, height)`
-- `SlotCenterPoint(center, point, height)`
-- `SlotArc(arc, height)`
-- `Text(text, font_size, align=(Align.CENTER, Align.CENTER))`
+Best for:
 
-`Ellipse` creates a **complete filled 2D sketch**, not an elliptical line or partial
-arc. Its 0.11.1 signature is:
+* boxes
+* plates
+* mounts
+* cylindrical parts
+* basic enclosures
+
+Typical tools:
+
+```python
+Box
+Cylinder
+Hole
+GridLocations
+PolarLocations
+```
+
+### 2. Sketch + extrude
+
+Use when the part has a custom constant cross-section.
+
+Typical tools:
+
+```python
+BuildSketch
+Rectangle
+Circle
+Polyline
+make_face
+extrude
+```
+
+### 3. Revolve
+
+Use for rotationally symmetric parts:
+
+* bushings
+* pulleys
+* knobs
+* shafts
+* bottle-like bodies
+
+```python
+revolve(axis=Axis.Z)
+```
+
+### 4. Sweep
+
+Use for:
+
+* pipes
+* handles
+* tubes
+* curved bars
+
+Create:
+
+1. a path
+2. a cross-section
+3. `sweep()`
+
+### 5. Loft
+
+Use only when the cross-section must change along the part.
+
+Examples:
+
+* rectangle → circle duct
+* funnel
+* aerodynamic transition
+
+Do not use sweep, loft, splines, or constrained geometry when simple primitives can solve the problem.
+
+---
+
+# 4. Parameter Rules
+
+Put editable dimensions near the top.
+
+Prefer:
+
+```python
+length = 100.0
+width = 60.0
+height = 20.0
+
+wall_thickness = 2.5
+
+hole_diameter = 3.2
+hole_radius = hole_diameter / 2
+```
+
+Avoid burying important dimensions inside operations:
+
+```python
+Box(97.3, 42.8, 13.6)
+```
+
+Use descriptive names.
+
+Good:
+
+```python
+motor_width
+shaft_radius
+mount_hole_spacing
+wall_thickness
+```
+
+Bad:
+
+```python
+a
+b
+x1
+size2
+```
+
+Short names are acceptable only for trivial local calculations.
+
+---
+
+# 5. Coordinate and Alignment Rules
+
+build123d primitives are centered by default.
+
+For mechanical parts it is often easier to keep the bottom at `Z = 0`.
+
+Prefer:
+
+```python
+Box(
+    length,
+    width,
+    height,
+    align=(Align.CENTER, Align.CENTER, Align.MIN),
+)
+```
+
+or:
+
+```python
+Cylinder(
+    radius,
+    height,
+    align=(Align.CENTER, Align.CENTER, Align.MIN),
+)
+```
+
+This produces:
+
+```text
+Z = 0
+│
+├── bottom
+│
+│  part
+│
+└── top = height
+```
+
+Be explicit about alignment whenever later geometry depends on absolute coordinates.
+
+---
+
+# 6. Placement
+
+## Arbitrary positions
+
+```python
+with Locations((20, 10, 0)):
+    Cylinder(5, 10)
+```
+
+Multiple positions:
+
+```python
+with Locations(
+    (-20, 0, 0),
+    (20, 0, 0),
+):
+    Hole(3)
+```
+
+## Grid
+
+```python
+with GridLocations(
+    x_spacing=40,
+    y_spacing=30,
+    x_count=2,
+    y_count=2,
+):
+    Hole(2.5)
+```
+
+## Radial pattern
+
+```python
+with PolarLocations(radius=25, count=6):
+    Hole(2)
+```
+
+`PolarLocations` also rotates child geometry around the pattern.
+
+## Rotation
+
+3D objects can be rotated directly:
+
+```python
+Cylinder(
+    radius=3,
+    height=20,
+    rotation=(0, 90, 0),
+)
+```
+
+Use this for simple sideways cutters.
+
+For holes on an existing planar face, face-based placement is often clearer:
+
+```python
+target_face = model.faces().sort_by(Axis.X)[-1]
+
+with Locations(target_face):
+    Hole(radius=3)
+```
+
+---
+
+# 7. Booleans
+
+Builder Mode:
+
+```python
+Box(50, 40, 10)
+
+Cylinder(
+    5,
+    12,
+    mode=Mode.SUBTRACT,
+)
+```
+
+Important modes:
+
+```python
+Mode.ADD
+Mode.SUBTRACT
+Mode.INTERSECT
+Mode.REPLACE
+Mode.PRIVATE
+```
+
+Algebra Mode:
+
+```python
+result = shape_a + shape_b
+result = shape_a - shape_b
+result = shape_a & shape_b
+```
+
+## Boolean clearance
+
+Avoid cutters whose top and bottom faces exactly match the target's faces.
+
+Use a small clearance for manually created cutters:
+
+```python
+EPS = 0.1
+```
+
+Example:
+
+```python
+with Locations((0, 0, thickness / 2)):
+    Cylinder(
+        radius=5,
+        height=thickness + 2 * EPS,
+        mode=Mode.SUBTRACT,
+    )
+```
+
+Do not add arbitrary large clearances.
+
+Use the smallest simple clearance that guarantees overlap.
+
+---
+
+# 8. Holes
+
+Prefer built-in hole objects for normal fastener holes.
+
+## Through hole
+
+Inside `BuildPart`:
+
+```python
+Hole(radius=3)
+```
+
+With no `depth`, Builder Mode can determine a through-cut from the active part.
+
+## Counterbore
+
+```python
+CounterBoreHole(
+    radius=3,
+    counter_bore_radius=5.5,
+    counter_bore_depth=3,
+)
+```
+
+## Countersink
+
+```python
+CounterSinkHole(
+    radius=3,
+    counter_sink_radius=6,
+)
+```
+
+The build123d 0.11.1 default countersink angle is:
+
+```python
+82
+```
+
+If the mechanical design requires another angle, specify it explicitly:
+
+```python
+CounterSinkHole(
+    radius=3,
+    counter_sink_radius=6,
+    counter_sink_angle=90,
+)
+```
+
+For Algebra Mode, hole objects do not have an active part from which to determine automatic through-depth. Provide an appropriate depth.
+
+---
+
+# 9. Essential Object Reference
+
+Do not memorize or invent constructor arguments from another CAD library.
+
+Only use parameters that belong to the build123d 0.11.1 object.
+
+## Common 3D objects
+
+```python
+Box(length, width, height)
+Cylinder(radius, height)
+Sphere(radius)
+Cone(bottom_radius, top_radius, height)
+Torus(major_radius, minor_radius)
+```
+
+Optional common parameters include:
+
+```python
+rotation=
+align=
+mode=
+```
+
+## Common 2D objects
+
+```python
+Rectangle(width, height)
+RectangleRounded(width, height, radius)
+Circle(radius)
+Ellipse(x_radius, y_radius)
+Polygon(*points)
+RegularPolygon(radius, side_count)
+SlotCenterToCenter(center_separation, height)
+SlotOverall(width, height)
+```
+
+Important:
+
+`Polygon` defaults to:
+
+```python
+align=(Align.NONE, Align.NONE)
+```
+
+in build123d 0.11.x.
+
+## Basic curves
+
+Use inside `BuildLine`.
+
+```python
+Line(start, end)
+Polyline(*points, close=False)
+Spline(*points)
+```
+
+Circular arcs:
+
+```python
+RadiusArc(start_point, end_point, radius)
+TangentArc(start_point, end_point, tangent=...)
+ThreePointArc(point1, point2, point3)
+CenterArc(center, radius, start_angle, arc_size)
+```
+
+Elliptical arc:
+
+```python
+EllipticalCenterArc(
+    center,
+    x_radius,
+    y_radius,
+    start_angle=0,
+    arc_size=90,
+)
+```
+
+### Ellipse vs EllipticalCenterArc
+
+`Ellipse` creates a filled 2D sketch object:
 
 ```python
 Ellipse(
     x_radius,
     y_radius,
     rotation=0,
-    align=(Align.CENTER, Align.CENTER),
-    mode=Mode.ADD,
 )
 ```
 
-It does **not** accept `center`, `start_angle`, or `end_angle`. Position a sketch
-ellipse with a sketch placement context. To create a partial ellipse inside
-`BuildLine`, use `EllipticalCenterArc`.
+Do not generate:
 
-#### 1D Curve and Arc Objects
-
-Use these objects inside `BuildLine`:
-
-**Basic curves:**
-- `Line(start_point, end_point)` — or `Line((x1, y1), (x2, y2))`
-- `PolarLine(start, length, angle)` — line by polar coordinates
-- `Polyline(*points, close=False)` — chain of straight segments
-- `Spline(*points, tangents=None, tangent_scalars=None, periodic=False)`
-
-**Circular arcs:**
-- `RadiusArc(start_point, end_point, radius, short_sagitta=True)` — two points + radius
-- `TangentArc(pts, tangent, tangent_from_first=True)` — two points + tangent direction
-- `ThreePointArc(point1, point2, point3)` — three through-points
-- `CenterArc(center, radius, start_angle, arc_size)` — center + radius + angular span
-- `JernArc(start, tangent, radius, arc_size)` — start point/tangent + radius + span
-- `SagittaArc(start_point, end_point, sagitta)` — two points + arc height
-- `DoubleTangentArc(pnt, tangent, other, keep=Keep.TOP)` — point/tangent to other curve
-
-**Elliptical/conic arcs:**
-- `EllipticalCenterArc(center, x_radius, y_radius, start_angle=0, arc_size=90, rotation=0)`
-  - **Note**: `end_angle` is deprecated in v0.11.0; use `arc_size` instead.
-- `EllipticalStartArc(start_pnt, start_tangent, x_radius, y_radius, arc_size, ...)`
-- `ParabolicCenterArc(vertex, focal_length, start_angle=0, arc_size=90, rotation=0)` (v0.11.0+)
-- `HyperbolicCenterArc(center, x_radius, y_radius, start_angle=0, arc_size=90, rotation=0)` (v0.11.0+)
-
-**Advanced curves:**
-- `Bezier(cntl_pnts, weights=None)` — rational Bézier curve
-- `BSpline(control_points, knots, degree, weights=None, periodic=False)` — exact B-spline (v0.11.0+)
-- `BlendCurve(curve0, curve1, continuity=..., end_points=None, tangent_scalars=(1,1))` (v0.10.0+)
-- `FilletPolyline(pts, radius, close=False)` — polyline with rounded corners; `radius` can be a single float or an iterable (v0.11.0+ supports 0 radius)
-- `Helix(pitch, height, radius, center=(0,0,0), direction=(0,0,1), cone_angle=0, lefthand=False)`
-- `Airfoil(airfoil_code, n_points, finite_te=False)` — NACA 4-digit airfoil
-- `IntersectingLine(start, direction, other)` — line from point/direction to intersection
-
-**Constrained geometry (v0.11.0+):**
-- `ConstrainedArcs(*args, sagitta=Sagitta.BOTH, selector=None)` — arcs constrained by other geometric objects
-- `ConstrainedLines(*args, selector=None)` — lines constrained by other geometric objects
-
-Example quarter ellipse:
 ```python
-with BuildLine():
-    dome = EllipticalCenterArc(
-        center=(0, base_height),
-        x_radius=base_radius,
-        y_radius=dome_height,
-        start_angle=0,
-        arc_size=90,
-    )
+Ellipse(
+    center=...,
+    start_angle=...,
+    end_angle=...,
+)
 ```
 
-`Locations` does **not** position 1D objects in Builder mode. Define curve points in
-the local coordinates of the `BuildLine` plane, or place the `BuildLine` itself.
+For an elliptical curve or partial ellipse, use:
 
-For `RadiusArc`, let `d` be the straight-line distance between its endpoints:
+```python
+EllipticalCenterArc(...)
+```
+
+In build123d 0.11.1, the old `end_angle` argument still exists for compatibility but is deprecated.
+
+New generated code should use:
+
+```python
+arc_size=
+```
+
+not:
+
+```python
+end_angle=
+```
+
+---
+
+# 10. RadiusArc Geometry Rule
+
+For:
+
+```python
+RadiusArc(start, end, radius)
+```
+
+the radius must satisfy:
+
+```text
+radius >= straight-line distance(start, end) / 2
+```
+
+Example:
 
 ```python
 from math import dist
 
-minimum_radius = dist(start_point, end_point) / 2
-assert arc_radius >= minimum_radius
+start = (0, 0)
+end = (40, 20)
+radius = 30
+
+minimum_radius = dist(start, end) / 2
+
+if radius < minimum_radius:
+    raise ValueError("RadiusArc radius is too small")
 ```
 
-A smaller radius cannot geometrically connect the endpoints. Use
-`EllipticalCenterArc`, `TangentArc`, `ThreePointArc`, `SagittaArc`, `JernArc`, or a
-constrained `Spline` when the desired profile is defined by tangency or silhouette
-rather than a known circular radius.
+Do not repeatedly guess larger radii.
 
-### 3.2 Alignment
-Alignment specifies how geometric origins relate to object bounding boxes:
-- `Align.CENTER`: Origin centered along axis.
-- `Align.MIN`: Origin at minimum coordinate boundary along axis.
-- `Align.MAX`: Origin at maximum coordinate boundary along axis.
-- `Align.NONE`: No alignment offset (used as default for `Polygon` since v0.11.0).
+If the actual design requirement is smoothness or tangency, consider:
 
-Tuple format for 3D: `align=(Align.CENTER, Align.CENTER, Align.MIN)` (places the base of the solid at Z=0).
-A single `Align` value applies to all axes: `align=Align.MIN`.
-
-### 3.3 Transforms & Locations
-- `Locations((x, y, z))` or `with Locations((x, y, z)):` positions subsequent operations.
-- `GridLocations(x_spacing, y_spacing, x_count, y_count)` creates a 2D rectangular grid.
-- `PolarLocations(radius, count, start_angle=0, angular_range=360)` creates a radial array.
-- `HexLocations(radius, x_count, y_count)` creates a hexagonal grid.
-- `Pos(x, y, z)` creates a positional translation context.
-- `Rot(x, y, z)` creates a rotational orientation context (angles in degrees around X, Y, Z).
-
-### 3.4 Booleans
-- **Builder Mode**: Operations accept `mode=Mode.ADD` (default), `mode=Mode.SUBTRACT`, `mode=Mode.INTERSECT`, `mode=Mode.REPLACE`, or `mode=Mode.PRIVATE`.
-- **Algebra Mode**: Use standard Python operators:
-  - Union: `shape1 + shape2`
-  - Difference: `shape1 - shape2`
-  - Intersection: `shape1 & shape2`
-
-### 3.5 Holes
-- `Hole(radius, depth=None)`: Cuts a cylindrical hole. If `depth` is `None`, cuts entirely through the active part context.
-- `CounterBoreHole(radius, counter_bore_radius, counter_bore_depth, depth=None)`
-- `CounterSinkHole(radius, counter_sink_radius, depth=None, counter_sink_angle=82)`
-  - **Note**: The default `counter_sink_angle` is **82°** (countersink standard), not 90°.
-
-### 3.6 Sketches & Workplanes
-- Workplanes can be set using default planes (`Plane.XY`, `Plane.XZ`, `Plane.YZ`) or face planes (`Plane(face)`).
-- `with BuildSketch(Plane.XZ):` opens a 2D drawing plane.
-- Operations on sketches: `extrude(amount=10)`, `revolve(axis=Axis.Z, revolution_arc=360)`, `sweep(path=...)`, `loft()`.
-- `make_face()`: creates a filled face from the current pending edges in `BuildSketch`.
-- `make_hull()`: creates a convex hull face from edges.
-
-### 3.7 Fillets & Chamfers
-- `fillet(objects, radius)`: Rounds selected edges or vertices.
-- `chamfer(objects, length)`: Bevels selected edges or vertices. Supports `length2` and `angle` for asymmetric chamfers.
-- `full_round(edge, invert=False)`: Rounds off a face along an edge using Voronoi largest empty circle.
-
-### 3.8 Other Operations
-- `extrude(to_extrude, amount, dir=None, until=None, target=None, both=False, taper=0)`: Extrude a 2D sketch or face into 3D.
-- `revolve(profiles, axis=Axis.Z, revolution_arc=360)`: Revolve a 2D profile about an axis.
-- `sweep(sections, path)`: Sweep 1D/2D sections along a path.
-- `loft(sections, ruled=False)`: Loft between sections (Faces, Sketches, or Vertex endpoints).
-- `offset(objects, amount, openings=None, kind=Kind.ARC)`: Offset edges, faces, or solids.
-- `scale(objects, by, about=None)`: Scale objects uniformly or non-uniformly.
-- `mirror(objects, about=Plane.XZ)`: Mirror objects about a plane.
-- `split(objects, bisect_by=Plane.XZ, keep=Keep.TOP)`: Bisect objects with a plane.
-- `draft(faces, neutral_plane, angle)`: Apply draft angle to faces (v0.10.0+).
-- `thicken(to_thicken, amount)`: Create a solid from a face by thickening along normals.
-- `section(obj, section_by)`: Create 2D cross-sections from a 3D part.
-- `project(objects, workplane)`: Project points, edges, or faces onto a workplane.
-- `trace(lines, line_width=1)`: Convert edges/wires into faces by sweeping a perpendicular line.
-
-### 3.9 Topology Selection Methods
-Topology selection methods on shapes/parts/builder objects return a `ShapeList`:
-- `part.edges()`: Returns all edges.
-- `part.faces()`: Returns all faces.
-- `part.vertices()`: Returns all vertices.
-- `part.wires()`: Returns all wires.
-- `part.solids()`: Returns all solids.
-
-**Builder-specific selectors:**
-- `model.edges(Select.LAST)`: Edges from the last operation.
-- `model.edges(Select.NEW)`: Only completely new edges created in the last operation (edges not reused from either operand).
-- `model.faces(Select.LAST)`: Faces from the last operation.
-
-**Algebra mode new-edge detection:**
-- `new_edges(before_shape, after_shape, combined=part)`: Find edges new to the combined shape.
-
-**ShapeList operators:**
-- `.filter_by(Axis.Z)`: Filters edges/faces parallel/perpendicular to an axis.
-- `.filter_by(GeomType.CIRCLE)`: Filters by geometry type (CIRCLE, LINE, PLANE, etc.).
-- `.filter_by_position(Axis.Z, min_val, max_val)`: Filters by position range along axis.
-- `.filter_by(callable)`: Filter by lambda/property, e.g. `.filter_by(lambda e: e.length > 5)`.
-- `.sort_by(Axis.Z)`: Sorts by position along axis.
-- `.sort_by(SortBy.LENGTH)` or `.sort_by(SortBy.AREA)`: Sort by geometric property.
-- `.sort_by(callable)`: Sort by custom callable.
-- `.sort_by_distance(shape_or_vector)`: Sort by distance from a shape or point.
-- `.group_by(Axis.Z)`: Groups by position, returns `GroupBy` (list of ShapeLists).
-- `.group_by(callable_or_property)`: Groups by custom criteria.
-- `topo_distance_to(reference_shape)`: Callable key that measures graph distance through topology (v0.11.0+).
-
-**Fillet, chamfer, and boolean operations change BREP topology.** Never assume an index
-such as `[1]` still identifies the same physical edge after one of these operations.
-Reselect subsequent targets from the current part and constrain them with stable
-properties such as:
-
-- known Z/X/Y position or a narrow `filter_by_position` range;
-- `GeomType`, radius, length, or face normal;
-- adjacency to an already identified face (`topo_distance_to()`);
-- `Select.LAST` in a builder context when the last modified features are intended.
-
-Prefer:
 ```python
-junction_edges = (
-    model.edges()
-    .filter_by(GeomType.CIRCLE)
-    .filter_by_position(Axis.Z, junction_z - 0.01, junction_z + 0.01)
-    .filter_by(lambda edge: abs(edge.radius - body_radius) < 0.01)
-)
-if len(junction_edges) == 1:
-    fillet(junction_edges[0], radius=junction_fillet)
+TangentArc
+ThreePointArc
+SagittaArc
+Spline
+EllipticalCenterArc
 ```
-
-Avoid:
-```python
-fillet(model.edges().sort_by(Axis.Z)[0], radius=2)
-junction = model.edges().sort_by(Axis.Z)[1]  # topology has changed
-fillet(junction, radius=1.5)
-```
-
-For a 3D solid, the maximum feasible fillet radius can be probed with the shape method
-`model.part.max_fillet(target_edges)`. There is no top-level `max_fillet` function
-exported by build123d 0.11.1. This probe does not repair a wrong edge selector.
 
 ---
 
-## 4. 15 Practical, Copyable `model.py` Examples
+# 11. Sketch + Extrude
 
-### Example 1: Simple Box with Center Hole
+Canonical pattern:
+
 ```python
-from build123d import *
-
-# Parameters
-length = 80.0
-width = 50.0
-thickness = 10.0
-hole_radius = 8.0
-
 with BuildPart() as model:
-    Box(length, width, thickness)
-    Hole(radius=hole_radius)
+    with BuildSketch():
+        Rectangle(60, 40)
+
+    extrude(amount=10)
 
 result = model.part
 ```
 
-### Example 2: Flanged Bushing (Revolve)
+Custom profile:
+
 ```python
-from build123d import *
+with BuildPart() as model:
+    with BuildSketch():
+        with BuildLine():
+            Polyline(
+                (0, 0),
+                (50, 0),
+                (50, 10),
+                (10, 10),
+                (10, 40),
+                (0, 40),
+                close=True,
+            )
 
-# Parameters
-outer_radius = 20.0
-flange_radius = 30.0
-inner_radius = 12.0
-total_height = 40.0
-flange_height = 8.0
+        make_face()
 
+    extrude(amount=20)
+
+result = model.part
+```
+
+`make_face()` requires a valid closed planar boundary.
+
+---
+
+# 12. Revolve
+
+Canonical pattern:
+
+```python
 with BuildPart() as model:
     with BuildSketch(Plane.XZ):
         with BuildLine():
-            l1 = Line((inner_radius, 0), (flange_radius, 0))
-            l2 = Line(l1 @ 1, (flange_radius, flange_height))
-            l3 = Line(l2 @ 1, (outer_radius, flange_height))
-            l4 = Line(l3 @ 1, (outer_radius, total_height))
-            l5 = Line(l4 @ 1, (inner_radius, total_height))
-            l6 = Line(l5 @ 1, l1 @ 0)
+            Polyline(
+                (10, 0),
+                (20, 0),
+                (20, 30),
+                (10, 30),
+                close=True,
+            )
+
         make_face()
+
     revolve(axis=Axis.Z)
 
 result = model.part
 ```
 
-### Example 3: L-Shaped Mounting Bracket
-```python
-from build123d import *
+For a full revolve around `Axis.Z`, keep the profile on one side of the axis.
 
-# Parameters
-width = 40.0
-base_length = 50.0
-wall_height = 60.0
-thickness = 6.0
-hole_dia = 6.0
+Prefer:
 
-with BuildPart() as model:
-    with BuildSketch(Plane.XZ):
-        with BuildLine():
-            l1 = Line((0, 0), (base_length, 0))
-            l2 = Line(l1 @ 1, (base_length, thickness))
-            l3 = Line(l2 @ 1, (thickness, thickness))
-            l4 = Line(l3 @ 1, (thickness, wall_height))
-            l5 = Line(l4 @ 1, (0, wall_height))
-            l6 = Line(l5 @ 1, l1 @ 0)
-        make_face()
-    extrude(amount=width)
-
-    # Base hole
-    with Locations((base_length - 15, width / 2, 0)):
-        Hole(radius=hole_dia / 2)
-
-    # Wall hole
-    with Locations((0, width / 2, wall_height - 15)):
-        with Locations(Rot(0, 90, 0)):
-            Hole(radius=hole_dia / 2)
-
-result = model.part
+```text
+X > 0
 ```
 
-### Example 4: Stepped Shaft with Keyway & Chamfers
-```python
-from build123d import *
+for the whole material profile.
 
-# Parameters
-d1, h1 = 30.0, 40.0
-d2, h2 = 20.0, 50.0
-key_w, key_h, key_len = 6.0, 3.5, 30.0
-chamfer_size = 1.0
+Avoid profiles that cross the revolution axis unless the geometry specifically requires and supports it.
 
-with BuildPart() as model:
-    Cylinder(radius=d1 / 2, height=h1, align=(Align.CENTER, Align.CENTER, Align.MIN))
-    with Locations((0, 0, h1)):
-        Cylinder(radius=d2 / 2, height=h2, align=(Align.CENTER, Align.CENTER, Align.MIN))
+---
 
-    # Keyway cut
-    with Locations((0, d2 / 2 - key_h / 2, h1 + key_len / 2)):
-        Box(key_w, key_h, key_len, mode=Mode.SUBTRACT)
+# 13. Sweep
 
-    # Chamfer top and bottom outer edges
-    circular_edges = model.edges().filter_by(GeomType.CIRCLE)
-    top_edge = circular_edges.sort_by(Axis.Z)[-1]
-    bottom_edge = circular_edges.sort_by(Axis.Z)[0]
-    chamfer([top_edge, bottom_edge], length=chamfer_size)
+A sweep needs:
 
-result = model.part
+```text
+PATH + CROSS-SECTION
 ```
 
-### Example 5: Electronics Enclosure with Standoff Bosses
+The cross-section should start on the path and be oriented appropriately for that path.
+
+Canonical example:
+
 ```python
 from build123d import *
 
-# Parameters
-length, width, height = 100.0, 70.0, 35.0
-wall_thick = 2.5
-boss_rad = 4.5
-hole_rad = 1.5
+bar_radius = 5.0
+width = 100.0
+height = 50.0
+bend_radius = 15.0
 
 with BuildPart() as model:
-    Box(length, width, height, align=(Align.CENTER, Align.CENTER, Align.MIN))
+    with BuildLine(Plane.XZ) as path:
+        FilletPolyline(
+            (0, 0),
+            (0, height),
+            (width, height),
+            (width, 0),
+            radius=bend_radius,
+        )
 
-    # Internal Cavity
-    with Locations((0, 0, wall_thick)):
-        Box(length - 2 * wall_thick, width - 2 * wall_thick, height, mode=Mode.SUBTRACT)
-
-    # Corner Bosses
-    bx = (length / 2) - wall_thick - boss_rad
-    by = (width / 2) - wall_thick - boss_rad
-    with GridLocations(2 * bx, 2 * by, 2, 2):
-        Cylinder(radius=boss_rad, height=height - wall_thick, align=(Align.CENTER, Align.CENTER, Align.MIN))
-        Hole(radius=hole_rad, depth=height - wall_thick)
-
-result = model.part
-```
-
-### Example 6: Spoked Wheel / Pulley (Polar Pattern)
-```python
-from build123d import *
-
-# Parameters
-outer_radius = 50.0
-rim_thickness = 5.0
-hub_radius = 12.0
-bore_radius = 5.0
-height = 12.0
-spoke_count = 5
-spoke_width = 4.0
-
-with BuildPart() as model:
-    # Central Hub
-    Cylinder(radius=hub_radius, height=height)
-    Hole(radius=bore_radius)
-
-    # Outer Rim
-    Cylinder(radius=outer_radius, height=height)
-    Cylinder(radius=outer_radius - rim_thickness, height=height, mode=Mode.SUBTRACT)
-
-    # Radial Spokes
-    with PolarLocations(radius=(hub_radius + outer_radius - rim_thickness) / 2, count=spoke_count):
-        Box(outer_radius - rim_thickness - hub_radius, spoke_width, height)
-
-result = model.part
-```
-
-### Example 7: Grid Mounting Plate / Pegboard
-```python
-from build123d import *
-
-# Parameters
-plate_x, plate_y, thickness = 120.0, 80.0, 8.0
-hole_dia = 5.0
-spacing_x, spacing_y = 15.0, 15.0
-cols, rows = 6, 4
-
-with BuildPart() as model:
-    Box(plate_x, plate_y, thickness)
-
-    with GridLocations(spacing_x, spacing_y, cols, rows):
-        Hole(radius=hole_dia / 2)
-
-    # Vertical edge chamfers
-    vert_edges = model.edges().filter_by(Axis.Z)
-    chamfer(vert_edges, length=1.5)
-
-result = model.part
-```
-
-### Example 8: Pipe Elbow (Sweep along Path)
-```python
-from build123d import *
-
-# Parameters
-outer_radius = 15.0
-inner_radius = 12.0
-bend_radius = 40.0
-straight_len = 30.0
-
-with BuildPart() as model:
-    with BuildLine() as path:
-        l1 = Line((0, 0, 0), (0, straight_len, 0))
-        a1 = RadiusArc(l1 @ 1, (bend_radius, straight_len + bend_radius, 0), radius=bend_radius)
-        l2 = Line(a1 @ 1, (bend_radius + straight_len, straight_len + bend_radius, 0))
-
-    with BuildSketch(Plane.ZX) as profile:
-        Circle(outer_radius)
-        Circle(inner_radius, mode=Mode.SUBTRACT)
+    with BuildSketch(Plane.XY):
+        Circle(bar_radius)
 
     sweep(path=path.line)
 
 result = model.part
 ```
 
-### Example 9: Lofted Transition Duct (Rectangular to Circular)
+Do not randomly change sweep planes when the operation fails.
+
+First check:
+
+1. Is the path connected?
+2. Does the profile intersect the start of the path?
+3. Is the profile plane sensible relative to the starting direction?
+4. Is the profile self-intersecting?
+
+---
+
+# 14. Loft
+
+Canonical outer loft:
+
+```python
+with BuildPart() as model:
+    with BuildSketch(Plane.XY):
+        Rectangle(60, 40)
+
+    with BuildSketch(Plane.XY.offset(70)):
+        Circle(20)
+
+    loft()
+
+result = model.part
+```
+
+For a hollow transition, make the inner loft extend slightly beyond the outer loft.
+
 ```python
 from build123d import *
 
-# Parameters
-rect_w, rect_h = 60.0, 40.0
-circle_rad = 20.0
 height = 70.0
-wall_thick = 2.0
+rect_width = 60.0
+rect_height = 40.0
+circle_radius = 20.0
+wall = 2.0
+EPS = 0.1
 
 with BuildPart() as model:
-    # Outer loft
-    with BuildSketch(Plane.XY) as s1:
-        Rectangle(rect_w, rect_h)
-    with BuildSketch(Plane.XY.offset(height)) as s2:
-        Circle(circle_rad)
+    # Outer body
+    with BuildSketch(Plane.XY):
+        Rectangle(rect_width, rect_height)
+
+    with BuildSketch(Plane.XY.offset(height)):
+        Circle(circle_radius)
+
     loft()
 
-    # Inner cavity loft
-    with BuildSketch(Plane.XY) as s3:
-        Rectangle(rect_w - 2 * wall_thick, rect_h - 2 * wall_thick)
-    with BuildSketch(Plane.XY.offset(height)) as s4:
-        Circle(circle_rad - wall_thick)
+    # Inner cavity
+    with BuildSketch(Plane.XY.offset(-EPS)):
+        Rectangle(
+            rect_width - 2 * wall,
+            rect_height - 2 * wall,
+        )
+
+    with BuildSketch(Plane.XY.offset(height + EPS)):
+        Circle(circle_radius - wall)
+
     loft(mode=Mode.SUBTRACT)
 
 result = model.part
 ```
 
-### Example 10: Counterbored Mounting Plate
+---
+
+# 15. Fillets and Chamfers
+
+```python
+fillet(edges, radius=2)
+```
+
+```python
+chamfer(edges, length=1)
+```
+
+Do not treat fillets as required structural geometry.
+
+Add major geometry first.
+
+Then holes and cutouts.
+
+Then optional finishing operations.
+
+Recommended order:
+
+```text
+main body
+→ major features
+→ holes
+→ cutouts
+→ fillets/chamfers
+→ result
+```
+
+If a cosmetic fillet repeatedly breaks an otherwise correct model, remove the fillet instead of destroying the main geometry trying to preserve it.
+
+---
+
+# 16. Topology Selection
+
+Never rely on arbitrary topology indices such as:
+
+```python
+model.edges()[7]
+```
+
+Edge and face ordering can change after:
+
+* booleans
+* fillets
+* chamfers
+* intersections
+* feature edits
+
+Prefer geometric selectors.
+
+## By axis
+
+```python
+vertical_edges = model.edges().filter_by(Axis.Z)
+```
+
+## By geometry type
+
+```python
+circles = model.edges().filter_by(GeomType.CIRCLE)
+```
+
+## By position
+
+```python
+top_edges = model.edges().filter_by_position(
+    Axis.Z,
+    height - 0.01,
+    height + 0.01,
+)
+```
+
+## By property
+
+```python
+long_edges = model.edges().filter_by(
+    lambda edge: edge.length > 20
+)
+```
+
+## Sorting
+
+```python
+top_face = model.faces().sort_by(Axis.Z)[-1]
+```
+
+## Last operation
+
+Builder Mode supports selectors such as:
+
+```python
+model.edges(Select.LAST)
+model.edges(Select.NEW)
+model.faces(Select.LAST)
+```
+
+Use them only when the relationship to the immediately previous operation is clear.
+
+---
+
+# 17. Validate Selectors Instead of Silently Ignoring Errors
+
+Bad:
+
+```python
+edges = model.edges().filter_by(GeomType.CIRCLE)
+
+if edges:
+    fillet(edges[0], radius=2)
+```
+
+This can silently generate the wrong part.
+
+Better:
+
+```python
+edges = (
+    model.edges()
+    .filter_by(GeomType.CIRCLE)
+    .filter_by_position(
+        Axis.Z,
+        target_z - 0.01,
+        target_z + 0.01,
+    )
+)
+
+if len(edges) != 1:
+    raise ValueError(
+        f"Expected 1 target edge, found {len(edges)}"
+    )
+
+fillet(edges, radius=2)
+```
+
+For an AI CAD system, a clear failure is better than a silently incorrect model.
+
+---
+
+# 18. Canonical Examples
+
+## Example A — Mounting Plate
+
 ```python
 from build123d import *
 
-# Parameters
-length, width, thickness = 100.0, 60.0, 12.0
-hole_r = 3.5
-cb_r = 6.0
-cb_d = 4.0
+length = 100.0
+width = 60.0
+thickness = 6.0
+
+hole_diameter = 4.0
+hole_margin = 10.0
 
 with BuildPart() as model:
-    Box(length, width, thickness)
+    Box(
+        length,
+        width,
+        thickness,
+        align=(Align.CENTER, Align.CENTER, Align.MIN),
+    )
 
-    # Central Slot Cutout
+    with GridLocations(
+        length - 2 * hole_margin,
+        width - 2 * hole_margin,
+        2,
+        2,
+    ):
+        Hole(hole_diameter / 2)
+
+result = model.part
+```
+
+---
+
+## Example B — Open Electronics Enclosure
+
+```python
+from build123d import *
+
+length = 100.0
+width = 70.0
+height = 30.0
+
+wall = 2.5
+
+boss_radius = 4.5
+boss_height = 8.0
+boss_hole_radius = 1.6
+
+EPS = 0.1
+
+with BuildPart() as model:
+    Box(
+        length,
+        width,
+        height,
+        align=(Align.CENTER, Align.CENTER, Align.MIN),
+    )
+
+    top_face = model.faces().sort_by(Axis.Z)[-1]
+
+    offset(
+        amount=-wall,
+        openings=[top_face],
+    )
+
+    boss_x = length / 2 - wall - boss_radius - 2
+    boss_y = width / 2 - wall - boss_radius - 2
+
+    with Locations((0, 0, wall)):
+        with GridLocations(
+            2 * boss_x,
+            2 * boss_y,
+            2,
+            2,
+        ):
+            Cylinder(
+                boss_radius,
+                boss_height,
+                align=(Align.CENTER, Align.CENTER, Align.MIN),
+            )
+
+            Cylinder(
+                boss_hole_radius,
+                boss_height + EPS,
+                align=(Align.CENTER, Align.CENTER, Align.MIN),
+                mode=Mode.SUBTRACT,
+            )
+
+result = model.part
+```
+
+---
+
+## Example C — L Bracket
+
+```python
+from build123d import *
+
+base_length = 50.0
+width = 40.0
+wall_height = 60.0
+thickness = 6.0
+
+hole_radius = 3.0
+EPS = 0.1
+
+with BuildPart() as model:
+    # Horizontal base
+    Box(
+        base_length,
+        width,
+        thickness,
+        align=(Align.MIN, Align.CENTER, Align.MIN),
+    )
+
+    # Vertical wall
+    Box(
+        thickness,
+        width,
+        wall_height,
+        align=(Align.MIN, Align.CENTER, Align.MIN),
+    )
+
+    # Base mounting hole
+    with Locations(
+        (
+            base_length - 15,
+            0,
+            thickness / 2,
+        )
+    ):
+        Cylinder(
+            hole_radius,
+            thickness + 2 * EPS,
+            mode=Mode.SUBTRACT,
+        )
+
+    # Horizontal hole through vertical wall
+    with Locations(
+        (
+            thickness / 2,
+            0,
+            wall_height - 15,
+        )
+    ):
+        Cylinder(
+            hole_radius,
+            thickness + 2 * EPS,
+            rotation=(0, 90, 0),
+            mode=Mode.SUBTRACT,
+        )
+
+result = model.part
+```
+
+---
+
+## Example D — Revolved Bushing
+
+```python
+from build123d import *
+
+inner_radius = 8.0
+body_radius = 15.0
+flange_radius = 22.0
+
+body_height = 30.0
+flange_height = 5.0
+
+with BuildPart() as model:
+    with BuildSketch(Plane.XZ):
+        with BuildLine():
+            Polyline(
+                (inner_radius, 0),
+                (flange_radius, 0),
+                (flange_radius, flange_height),
+                (body_radius, flange_height),
+                (body_radius, body_height),
+                (inner_radius, body_height),
+                close=True,
+            )
+
+        make_face()
+
+    revolve(axis=Axis.Z)
+
+result = model.part
+```
+
+---
+
+## Example E — Spoked Wheel
+
+```python
+from build123d import *
+
+outer_radius = 50.0
+rim_thickness = 5.0
+
+hub_radius = 12.0
+bore_radius = 5.0
+
+height = 10.0
+
+spoke_count = 6
+spoke_width = 5.0
+
+with BuildPart() as model:
+    # Rim
     with BuildSketch():
-        SlotCenterToCenter(30, 15)
-    extrude(amount=-thickness, mode=Mode.SUBTRACT)
+        Circle(outer_radius)
+        Circle(
+            outer_radius - rim_thickness,
+            mode=Mode.SUBTRACT,
+        )
 
-    # Corner Counterbored Holes
-    with GridLocations(length - 20, width - 20, 2, 2):
-        CounterBoreHole(radius=hole_r, counter_bore_radius=cb_r, counter_bore_depth=cb_d)
+    extrude(amount=height)
 
-result = model.part
-```
+    # Hub
+    Cylinder(
+        hub_radius,
+        height,
+        align=(Align.CENTER, Align.CENTER, Align.MIN),
+    )
 
-### Example 11: Shaft Coupling with Keyway & Radial Set Screws
-```python
-from build123d import *
+    Hole(bore_radius)
 
-# Parameters
-outer_dia, inner_dia = 40.0, 15.0
-length = 50.0
-key_w, key_h = 5.0, 2.5
-setscrew_r = 2.5
+    # Spokes
+    spoke_length = (
+        outer_radius
+        - rim_thickness
+        - hub_radius
+    )
 
-with BuildPart() as model:
-    Cylinder(radius=outer_dia / 2, height=length)
-    Hole(radius=inner_dia / 2)
+    spoke_center_radius = (
+        hub_radius + outer_radius - rim_thickness
+    ) / 2
 
-    # Keyway slot
-    with Locations((0, inner_dia / 2 + key_h / 2, 0)):
-        Box(key_w, key_h, length, mode=Mode.SUBTRACT)
-
-    # Side set-screw hole
-    with Locations((0, 0, length / 4)):
-        with Locations(Rot(0, 90, 0)):
-            Hole(radius=setscrew_r, depth=outer_dia / 2)
-
-result = model.part
-```
-
-### Example 12: Hex Standoff / Bolt Blank
-```python
-from build123d import *
-
-# Parameters
-hex_flat_to_flat = 10.0
-hex_radius = hex_flat_to_flat / 1.73205
-length = 25.0
-hole_r = 2.0
-cs_r = 3.8
-cs_angle = 82  # standard countersink angle in build123d
-
-with BuildPart() as model:
-    with BuildSketch():
-        RegularPolygon(radius=hex_radius, side_count=6)
-    extrude(amount=length)
-
-    CounterSinkHole(radius=hole_r, counter_sink_radius=cs_r, counter_sink_angle=cs_angle)
+    with PolarLocations(
+        radius=spoke_center_radius,
+        count=spoke_count,
+    ):
+        Box(
+            spoke_length,
+            spoke_width,
+            height,
+            align=(
+                Align.CENTER,
+                Align.CENTER,
+                Align.MIN,
+            ),
+        )
 
 result = model.part
 ```
 
-### Example 13: Beveled Gear Blank / Cone Cutouts
+Important: create the rim as a ring before adding it to the full part.
+
+Do not create a solid disk and then subtract its center after the hub has already been added, because that subtraction can also remove the hub.
+
+---
+
+## Example F — Curved Handle
+
 ```python
 from build123d import *
 
-# Parameters
-r_bottom = 40.0
-r_top = 30.0
-height = 20.0
-bore_r = 8.0
-pocket_r = 20.0
-pocket_d = 5.0
+bar_radius = 6.0
+
+width = 100.0
+height = 45.0
+bend_radius = 15.0
 
 with BuildPart() as model:
-    Cone(bottom_radius=r_bottom, top_radius=r_top, height=height, align=(Align.CENTER, Align.CENTER, Align.MIN))
-    Hole(radius=bore_r)
+    with BuildLine(Plane.XZ) as path:
+        FilletPolyline(
+            (0, 0),
+            (0, height),
+            (width, height),
+            (width, 0),
+            radius=bend_radius,
+        )
 
-    # Recessed top pocket
-    with Locations((0, 0, height - pocket_d)):
-        Cylinder(radius=pocket_r, height=pocket_d + 1.0, align=(Align.CENTER, Align.CENTER, Align.MIN), mode=Mode.SUBTRACT)
+    with BuildSketch(Plane.XY):
+        Circle(bar_radius)
 
-    # Bolt circle on top face
-    with Locations((0, 0, height)):
-        with PolarLocations(radius=25, count=4):
-            Hole(radius=2.5, depth=10)
-
-result = model.part
-```
-
-### Example 14: Curved Grab Bar / Handle
-```python
-from build123d import *
-
-# Parameters
-bar_rad = 6.0
-handle_w = 100.0
-handle_h = 45.0
-bend_r = 15.0
-pad_rad = 12.0
-pad_thick = 5.0
-
-with BuildPart() as model:
-    # Curve path
-    with BuildLine() as path:
-        l1 = Line((0, 0, 0), (0, 0, handle_h - bend_r))
-        a1 = RadiusArc(l1 @ 1, (bend_r, 0, handle_h), radius=bend_r)
-        l2 = Line(a1 @ 1, (handle_w - bend_r, 0, handle_h))
-        a2 = RadiusArc(l2 @ 1, (handle_w, 0, handle_h - bend_r), radius=bend_r)
-        l3 = Line(a2 @ 1, (handle_w, 0, 0))
-
-    # Swept bar profile
-    with BuildSketch(Plane.ZX) as section:
-        Circle(bar_rad)
     sweep(path=path.line)
 
-    # Base mounting flange pads
-    with Locations((0, 0, pad_thick / 2), (handle_w, 0, pad_thick / 2)):
-        Cylinder(radius=pad_rad, height=pad_thick)
-        Hole(radius=3.0)
-
 result = model.part
 ```
 
-### Example 15: Parametric Heat Sink Fin Array
+---
+
+# 19. Common Failures and Repair Strategy
+
+## `result` missing
+
+Symptom:
+
+```text
+No result variable
+```
+
+Repair:
+
 ```python
-from build123d import *
-
-# Parameters
-base_x, base_y, base_z = 60.0, 60.0, 5.0
-fin_thick = 1.5
-fin_height = 25.0
-num_fins = 8
-
-with BuildPart() as model:
-    # Base plate
-    Box(base_x, base_y, base_z, align=(Align.CENTER, Align.CENTER, Align.MIN))
-
-    # Fin array
-    spacing = (base_x - fin_thick) / (num_fins - 1)
-    start_x = -base_x / 2 + fin_thick / 2
-
-    for i in range(num_fins):
-        x_pos = start_x + i * spacing
-        with Locations((x_pos, 0, base_z)):
-            Box(fin_thick, base_y, fin_height, align=(Align.CENTER, Align.CENTER, Align.MIN))
-
-    # Corner chamfers on base plate
-    vert_edges = model.edges().filter_by(Axis.Z)
-    chamfer(vert_edges, length=1.0)
-
 result = model.part
 ```
 
 ---
 
-## 5. Common Errors, Root Causes, and Concrete Repair Patterns
+## Unexpected keyword argument
 
-### 1. Missing `result` Global Variable
-- **Symptom**: CLI execution fails with `NameError` or reports no top-level `result` found.
-- **Cause**: Script built geometry in context manager but omitted `result = model.part`.
-- **Repair**: Always assign `result = model.part` (Builder Mode) or `result = final_shape` (Algebra Mode) at the bottom of the script.
+Example:
 
-### 2. Co-planar Surface Boolean Failures
-- **Symptom**: Artifacts, non-manifold geometry, or boolean subtraction failing to cut cleanly through faces.
-- **Cause**: Subtracting object faces lie exactly on the outer plane of the base shape (zero-thickness boundary condition).
-- **Repair**: Use `Hole()`, `CounterBoreHole()`, or `CounterSinkHole()` which handle through-cuts cleanly. If using `Cylinder` or `Box` for subtraction, extend their dimensions slightly (e.g., +1mm height) and offset them to fully clear the target faces.
+```text
+TypeError: ... got an unexpected keyword argument ...
+```
 
-### 3. Fillet / Chamfer Topology Failures
-- **Symptom**: `RuntimeError: BRep_API: command not done` during filleting or chamfering.
-- **Cause**: The target selector may identify the wrong edge after an earlier topology
-  change, or the requested radius may exceed the local width/adjacent faces.
-- **Repair order**:
-  1. Confirm the selector returns exactly the intended edge using position, geometry,
-     radius/length, and adjacency.
-  2. Rebuild the selector after every fillet, chamfer, or boolean.
-  3. Only then evaluate a smaller radius or `part.max_fillet(target_edges)`.
-  4. Prefer a tangent curve in the revolved/extruded source profile over a fragile
-     post-hoc fillet.
-  5. Remove an optional finishing operation rather than repeatedly guessing.
+Meaning:
 
-### 4. Revolve Profile Axis Intersection
-- **Symptom**: Revolve operation crashes or creates self-intersecting BREP geometry.
-- **Cause**: 2D sketch profile crosses or lies on both sides of the revolution axis (e.g., crossing X=0 when revolving around `Axis.Z`).
-- **Repair**: Ensure all 2D profile coordinates are strictly on one side of the axis (e.g., X > 0). Use `split(bisect_by=Plane.ZY)` if necessary to prune crossing geometry before calling `revolve()`.
+The generated code is using the wrong API signature.
 
-### 5. Indexing Empty Topology Selections
-- **Symptom**: `IndexError: list index out of range` when accessing `model.edges().filter_by(...)`.
-- **Cause**: Filter conditions are overly restrictive or wrong axis specified.
-- **Repair**: Inspect and validate filtering criteria. Filter step-by-step or check list length before indexing:
-  ```python
-  edges = model.edges().filter_by(Axis.Z)
-  if edges:
-      chamfer(edges, length=1.0)
-  ```
+Repair:
 
-### 6. Ellipse Used as an Elliptical Arc
-- **Symptom**: `Ellipse.__init__() got an unexpected keyword argument 'center'`,
-  `start_angle`, or `end_angle`.
-- **Cause**: `Ellipse` is a complete 2D sketch object. Its constructor has no center
-  or angular trimming parameters.
-- **Repair**: Use `EllipticalCenterArc` inside `BuildLine`. Do not try alternate
-  `Ellipse` keyword combinations.
-
-### 7. RadiusArc Cannot Reach Its Endpoint
-- **Symptom**: `ValueError: Arc radius is not large enough to reach the end point.`
-- **Cause**: `radius < distance(start_point, end_point) / 2`.
-- **Repair**: Calculate the minimum before constructing the arc. If tangency or an
-  exact outline is the real constraint, choose a tangent/elliptical/spline curve
-  instead of guessing a larger circle.
-
-### 8. Unexpected Keyword Arguments
-- **Symptom**: `TypeError: ... got an unexpected keyword argument ...`.
-- **Cause**: Wrong object class, wrong build123d version, deprecated parameter (e.g., `end_angle` instead of `arc_size`), or parameters copied from another CAD API.
-- **Repair**: Treat this as an API-contract failure. Check the 0.11.1 signature in
-  this guide and switch to the correct dimensional object; do not rename keywords
-  experimentally.
-
-### 9. Deprecated `end_angle` on `EllipticalCenterArc`
-- **Symptom**: Using `end_angle=90` with `EllipticalCenterArc` still works but triggers a deprecation warning in v0.11.0+.
-- **Cause**: The `end_angle` parameter was replaced by `arc_size` in v0.11.0.
-- **Repair**: Replace `end_angle=value` with `arc_size=value - start_angle` (or simply `arc_size=value` when `start_angle=0`).
-
-### 10. Stale Index After Topology Change
-- **Symptom**: Grotesque results or boolean errors when using `model.edges()[5]` after a previous fillet/chamfer/boolean.
-- **Cause**: BREP topology indices are not stable across operations that add/remove/split edges.
-- **Repair**: Use `Select.LAST` immediately after the feature, or reselect with geometric filters from the current `model` / `model.part` state.
+1. Stop guessing.
+2. Check build123d **0.11.1** documentation or tagged source.
+3. Use the exact parameter name.
+4. Do not copy CadQuery, FreeCAD, or OpenSCAD arguments.
 
 ---
 
-## 6. Decision Guide for CAD Modeling Strategies
+## RadiusArc cannot reach endpoint
 
-| Modeling Paradigm | Best Used For | Typical Operations |
-| :--- | :--- | :--- |
-| **Primitives + Booleans** | Rectangular or cylindrical CSG parts, simple enclosures, mounting plates | `Box`, `Cylinder`, `Hole`, `GridLocations`, `PolarLocations` |
-| **Sketch + Extrude** | Custom 2D profiles extruded into 3D prismatic shapes (brackets, structural profiles) | `BuildSketch`, `Polyline`, `Rectangle`, `Circle`, `extrude` |
-| **Revolve** | Axisymmetric parts (bushings, pulleys, shafts, turned fittings, bottle bodies) | `BuildSketch` on `Plane.XZ`, `revolve(axis=Axis.Z)` |
-| **Sweep** | Constant cross-section along complex 3D or curved paths (pipes, handles, wiring ducts) | `BuildLine` (path), `BuildSketch` (profile), `sweep()` |
-| **Loft** | Transitions between differing cross-sections across space (ducts, funnels, aerodynamic shapes) | Multiple `BuildSketch` contexts on offset planes, `loft()` |
-| **Draft** | Parts for casting or molding requiring taper on vertical sides (v0.10.0+) | `draft(faces, neutral_plane, angle)` |
+Example:
 
----
+```text
+Arc radius is not large enough to reach the end point
+```
 
-## 7. AI Pre-Flight Checklist
+Repair:
 
-Before emitting code for `model.py`, the AI generator must verify:
+```text
+radius >= endpoint distance / 2
+```
 
-- [ ] **Imports**: Standard wildcard import `from build123d import *` is present at the top.
-- [ ] **Parameters**: All geometric parameters are defined as explicit variables in millimeters or degrees at the top.
-- [ ] **Builder vs Algebra consistency**: The script uses a consistent paradigm (e.g., `with BuildPart() as model:` and assigns `result = model.part`).
-- [ ] **Top-Level Variable**: The global `result` variable is explicitly assigned at the end of the script.
-- [ ] **Boolean Clearance**: Subtracting shapes overlap target geometry cleanly without co-planar surface ambiguity.
-- [ ] **Revolve Constraints**: Profiles intended for revolution sit entirely on one side of the rotation axis.
-- [ ] **Topology Bounds**: Fillet and chamfer radii are smaller than adjacent edge lengths and face dimensions.
-- [ ] **Curve Dimensionality**: Partial curves use 1D `BuildLine` objects; full
-  filled primitives such as `Ellipse` remain in `BuildSketch`.
-- [ ] **RadiusArc Feasibility**: `radius >= endpoint_distance / 2`.
-- [ ] **Stable Selectors**: Every selector after a topology-changing operation is
-  rebuilt and constrained by geometry/position rather than an assumed list index.
-- [ ] **Versioned API**: Constructors match build123d 0.11.1 exactly (`arc_size`, not `end_angle`; `counter_sink_angle` defaults to 82°, etc.).
-- [ ] **No Visualizer Calls**: No blocking `show()`, `show_all()`, or visual GUI commands are present.
+If the desired geometry is really defined by tangency, change the curve type instead.
 
 ---
 
-## 8. Değişiklik Özeti
+## Fillet/chamfer failure
 
-### Düzeltilen Hatalar
-1. **`EllipticalCenterArc` parametresi**: `end_angle` → `arc_size` olarak güncellendi (v0.11.0'da deprecate edildi). İlgili örnek kod ve API imzası düzeltildi.
-2. **`CounterSinkHole` varsayılan açısı**: 90° → 82° olarak düzeltildi (resmi dokümantasyonla uyumlu).
-3. **`Polygon` varsayılan hizalama**: `(Align.CENTER, Align.CENTER)` → `(Align.NONE, Align.NONE)` olarak güncellendi (v0.11.0 değişikliği).
-4. **Dokümantasyon URL'leri**: `/en/stable/` → `/en/latest/` olarak güncellendi (build123d'ün güncel doküman yapısı).
+Possible causes:
 
-### Eklenen Yeni İçerik
-5. **1D eğri nesneleri**: `CenterArc`, `JernArc`, `SagittaArc`, `PolarLine`, `Bezier`, `BSpline`, `BlendCurve`, `FilletPolyline`, `Helix`, `Airfoil`, `IntersectingLine`, `ConstrainedArcs`, `ConstrainedLines`, `ParabolicCenterArc`, `HyperbolicCenterArc`, `DoubleTangentArc`, `EllipticalStartArc` eklendi.
-6. **2D çizim nesneleri**: `Trapezoid`, `Triangle`, `SlotCenterPoint`, `SlotArc` eklendi.
-7. **3D nesneler**: `ConvexPolyhedron` eklendi.
-8. **Operasyonlar**: `draft()`, `full_round()`, `make_hull()`, `trace()`, `project()`, `project_workplane()`, `section()`, `thicken()`, `make_brake_formed()` eklendi.
-9. **Topoloji seçimi**: `Select.NEW`, `Select.LAST`, `new_edges()`, `topo_distance_to()`, `filter_by_position()`, `sort_by_distance()`, `group_by()` operatörleri eklendi.
-10. **`RegularPolygon.major_radius`** parametresi belgelendi.
-11. **`HexLocations`** eklendi.
-12. **Hata kalıpları**: "Deprecated `end_angle`", "Stale Index After Topology Change" hataları eklendi.
-13. **Karar rehberi**: `Draft` modelleme stratejisi eklendi.
+* wrong edge selected
+* topology changed
+* radius too large
+* tiny or degenerate local geometry
 
-### İyileştirilen Bölümler
-14. **Alignment bölümü**: `Align.NONE` ve tekli `Align` kullanımı eklendi.
-15. **Boolean bölümü**: `Mode.REPLACE` ve `Mode.PRIVATE` modları eklendi.
-16. **Pre-flight checklist**: `counter_sink_angle` varsayılanı ve `arc_size` kontrol maddeleri güncellendi.
+Repair order:
+
+1. Re-select from the current part.
+2. Verify how many edges were selected.
+3. Verify position and geometry.
+4. Reduce radius only after the selector is known to be correct.
+5. Remove optional finishing geometry if necessary.
+
+Never repeatedly change radius while using an unverified selector.
 
 ---
 
-## 9. Kaynaklar
+## Wrong face or edge after boolean
 
-- [build123d resmi dokümantasyonu (latest)](https://build123d.readthedocs.io/en/latest/)
-- [build123d Objects API](https://build123d.readthedocs.io/en/latest/objects.html)
-- [build123d Operations API](https://build123d.readthedocs.io/en/latest/operations.html)
-- [build123d Topology Selection and Exploration](https://build123d.readthedocs.io/en/latest/topology_selection.html)
-- [build123d Builder Common API Reference](https://build123d.readthedocs.io/en/latest/builder_api_reference.html)
-- [build123d Tips, Best Practices and FAQ](https://build123d.readthedocs.io/en/latest/tips.html)
-- [build123d GitHub Repository](https://github.com/gumyr/build123d)
-- [build123d v0.11.1 Release Notes](https://github.com/gumyr/build123d/releases/tag/v0.11.1)
-- [build123d v0.11.0 Release Notes](https://github.com/gumyr/build123d/releases/tag/v0.11.0)
-- [build123d v0.10.0 Release Notes](https://github.com/gumyr/build123d/releases/tag/v0.10.0)
-- [build123d PyPI](https://pypi.org/project/build123d/)
+Cause:
+
+Topology indices changed.
+
+Bad:
+
+```python
+edge = model.edges()[4]
+```
+
+Repair:
+
+Use current geometry:
+
+```python
+edge = (
+    model.edges()
+    .filter_by(GeomType.CIRCLE)
+    .sort_by(Axis.Z)[-1]
+)
+```
+
+---
+
+## Boolean artifacts
+
+Cause:
+
+Cutters may only touch a surface instead of passing through it.
+
+Repair:
+
+Use:
+
+```python
+EPS = 0.1
+```
+
+and extend manual cutters beyond the target.
+
+Prefer `Hole`, `CounterBoreHole`, and `CounterSinkHole` where applicable.
+
+---
+
+## Revolve failure
+
+Check:
+
+* Is the profile closed?
+* Is it planar?
+* Does it unintentionally cross the rotation axis?
+* Is the rotation axis correct?
+
+Simplify the profile before trying alternative APIs.
+
+---
+
+## Sweep failure
+
+Check:
+
+* path continuity
+* profile validity
+* profile/path intersection
+* profile orientation
+* self-intersection on tight bends
+
+Do not immediately switch to a spline or another sweep mode.
+
+---
+
+## Empty selector
+
+Bad:
+
+```python
+edge = edges[0]
+```
+
+without validation.
+
+Use:
+
+```python
+if len(edges) != 1:
+    raise ValueError(
+        f"Expected 1 edge, found {len(edges)}"
+    )
+```
+
+The CAD CLI should receive a useful error instead of an unrelated `IndexError`.
+
+---
+
+# 20. Rules for AI Repair Attempts
+
+When previously generated CAD code fails:
+
+## First attempt
+
+Fix the specific reported problem only.
+
+Do not rewrite the entire model unless the modeling strategy itself is invalid.
+
+## Second attempt
+
+Simplify the failing feature.
+
+Example:
+
+```text
+complex fillet selector
+→ simpler geometric selector
+```
+
+or:
+
+```text
+fragile custom subtraction
+→ Hole()
+```
+
+## Third attempt
+
+Replace the local modeling technique.
+
+Example:
+
+```text
+RadiusArc
+→ TangentArc
+```
+
+or:
+
+```text
+multiple booleans
+→ one sketch + extrude
+```
+
+Preserve all unaffected dimensions and features.
+
+Never randomly alter dimensions just to make the kernel succeed.
+
+---
+
+# 21. Preferred Agent Behavior
+
+Prefer:
+
+```text
+simple
+explicit
+parametric
+geometrically obvious
+easy to verify
+easy to repair
+```
+
+Avoid:
+
+```text
+clever
+overly abstract
+deeply nested
+index-dependent
+unnecessarily advanced
+```
+
+When two methods produce the same shape, choose the simpler method.
+
+For example:
+
+```text
+simple rectangular hole
+→ Box cutter
+```
+
+not:
+
+```text
+Polyline
+→ make_face
+→ extrude
+→ transform
+→ subtract
+```
+
+unless the more complex construction is actually required.
+
+---
+
+# 22. API Version Rules
+
+Target **build123d 0.11.1**.
+
+Do not assume floating `latest` documentation exactly matches the installed stable version.
+
+When API behavior is uncertain:
+
+1. Prefer the build123d `v0.11.1` tagged source.
+2. Then use the 0.11.1 release documentation/release notes.
+3. Never infer constructor arguments from another CAD framework.
+
+Known 0.11.x compatibility details:
+
+```text
+Polygon default alignment:
+(Align.NONE, Align.NONE)
+```
+
+```text
+EllipticalCenterArc:
+prefer arc_size
+```
+
+```text
+end_angle:
+deprecated compatibility argument
+```
+
+```text
+CounterSinkHole default counter_sink_angle:
+82 degrees
+```
+
+---
+
+# 23. Final Pre-Flight Checklist
+
+Before returning `model.py`, verify:
+
+* [ ] `from build123d import *`
+* [ ] dimensions are in mm
+* [ ] angles are in degrees
+* [ ] important dimensions are parameters
+* [ ] final global `result` exists
+* [ ] no viewer calls exist
+* [ ] no external CAD framework is imported
+* [ ] alignments are explicit where coordinates depend on them
+* [ ] manual cutters pass fully through intended material
+* [ ] revolved profiles do not unintentionally cross their axis
+* [ ] sweep profile starts on the path
+* [ ] `RadiusArc` radius is geometrically possible
+* [ ] no fragile topology index such as `edges()[7]` is used
+* [ ] selectors after booleans/fillets/chamfers use current topology
+* [ ] selectors expected to return a fixed number are validated
+* [ ] optional fillets/chamfers do not compromise the main geometry
+* [ ] build123d 0.11.1 parameter names are used
+* [ ] `Ellipse` is not being used as an elliptical arc
+* [ ] new elliptical arc code uses `arc_size`, not deprecated `end_angle`
+* [ ] the modeling strategy is no more complex than necessary
+
+The final priority is:
+
+```text
+correct geometry
+> robust execution
+> simple code
+> cosmetic detail
+```
