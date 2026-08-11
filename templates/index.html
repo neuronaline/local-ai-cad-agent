@@ -7,38 +7,71 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='vendor/highlight/styles/github-dark.min.css') }}">
   </head>
-  <body>
+  <body data-mobile-view="chat">
+    <nav class="mobile-tabs" aria-label="Workspace">
+      <button type="button" data-mobile-view="chat" aria-pressed="true">Chat</button>
+      <button type="button" data-mobile-view="viewer" aria-pressed="false">Preview</button>
+    </nav>
     <main class="app-shell">
       <section class="chat-panel">
         <header class="panel-header">
-          <div class="brand"><a href="/" class="back-link" title="Back to projects">← Projects</a><h1>{{ project_name }}</h1><span id="connection-status" class="connection-status" title="Connecting…"></span></div>
+          <div class="brand">
+            <a href="/" class="back-link" title="Back to projects">← Projects</a>
+            <h1>{{ project_name }}</h1>
+            <span id="connection-status" class="connection-status" title="Connecting…"></span>
+          </div>
         </header>
         <div id="chat-feed" class="chat-feed" aria-live="polite">
           <div class="empty-state">
-            <strong>Project: {{ project_name }}</strong>
+            <strong>{{ project_name }}</strong>
             <span>Describe the part you want to build.</span>
             <div class="example-prompts">
-              <span class="example-label">Try an example:</span>
-              <button type="button" class="example-prompt" data-prompt="Create a 60 × 30 × 4 mm mounting plate with four M3 holes.">Create a 60 × 30 × 4 mm mounting plate with four M3 holes.</button>
-              <button type="button" class="example-prompt" data-prompt="Create a wheel for a 6 mm D-shaped motor shaft.">Create a wheel for a 6 mm D-shaped motor shaft.</button>
-              <button type="button" class="example-prompt" data-prompt="Create a 40 mm cube with a centered 20 mm circular hole.">Create a 40 mm cube with a centered 20 mm circular hole.</button>
+              <span class="example-label">Examples</span>
+              <button type="button" class="example-prompt" data-prompt="Create a 60 × 30 × 4 mm mounting plate with four M3 holes.">60 × 30 × 4 mm mounting plate</button>
+              <button type="button" class="example-prompt" data-prompt="Create a wheel for a 6 mm D-shaped motor shaft.">Wheel for a 6 mm D shaft</button>
+              <button type="button" class="example-prompt" data-prompt="Create a 40 mm cube with a centered 20 mm circular hole.">40 mm cube with a centered hole</button>
             </div>
           </div>
         </div>
         <div id="question-area"></div>
+        <details id="activity-panel" class="activity-panel" hidden>
+          <summary><span id="activity-title">Activity</span><span class="activity-chevron">⌄</span></summary>
+          <div id="activity-list" class="activity-list"></div>
+        </details>
         <form id="chat-form" class="composer">
-          <textarea id="message" placeholder="Describe the part you want to create…" rows="2" required></textarea>
+          <textarea id="message" placeholder="Describe the part you want to create…" rows="2" required aria-label="Part description"></textarea>
+          <div id="attachment-preview" class="attachment-preview" aria-live="polite"></div>
           <div class="action-bar">
             <label id="dropzone" class="attach-button" for="attachments" title="Add reference images"><span aria-hidden="true">＋</span><span id="attachment-label">Attach</span><input id="attachments" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden></label>
+            <span class="composer-hint">Enter sends · Shift+Enter adds a line</span>
             <button id="history-btn" type="button" class="quiet">History</button>
             <button id="stop" type="button" class="danger" hidden>Stop</button>
             <button type="submit">Send</button>
           </div>
         </form>
       </section>
+      <div id="panel-resizer" class="panel-resizer" role="separator" aria-orientation="vertical" aria-label="Resize panels"></div>
       <section class="viewer-panel">
-        <header class="viewer-toolbar"><div class="viewer-title"><h2>Preview</h2><span id="dimensions">No preview yet</span></div><div class="viewer-actions"><button id="toggle-wireframe" class="quiet">Wireframe</button><button id="toggle-grid" class="quiet">Grid</button><button id="reset-view" class="quiet">Reset</button></div></header>
-        <div id="viewer" class="viewer"><div id="viewer-empty" class="viewer-empty"><span class="preview-icon">◇</span><strong>No preview yet</strong></div></div>
+        <header class="viewer-toolbar">
+          <div class="viewer-title"><h2>Preview</h2><span id="dimensions">No preview yet</span></div>
+          <div class="viewer-actions" aria-label="Preview controls">
+            <div class="view-presets" role="group" aria-label="Standard views">
+              <button type="button" class="quiet icon-only active" data-view="iso" title="Isometric view" aria-label="Isometric view">◈</button>
+              <button type="button" class="quiet icon-only" data-view="front" title="Front view" aria-label="Front view">F</button>
+              <button type="button" class="quiet icon-only" data-view="top" title="Top view" aria-label="Top view">T</button>
+              <button type="button" class="quiet icon-only" data-view="right" title="Right view" aria-label="Right view">R</button>
+            </div>
+            <button id="toggle-wireframe" class="quiet" aria-pressed="false">Wireframe</button>
+            <button id="toggle-grid" class="quiet" aria-pressed="true">Grid</button>
+            <button id="reset-view" class="quiet">Fit</button>
+          </div>
+        </header>
+        <div id="viewer" class="viewer"><div id="viewer-empty" class="viewer-empty"><span class="preview-icon">◇</span><strong>No preview yet</strong><span>Inspect the model here once it is ready.</span></div></div>
+        <div id="model-actions" class="model-actions" hidden>
+          <span>Model ready for review</span>
+          <button id="approve-design" type="button">Finalize design</button>
+          <button id="continue-editing" type="button" class="quiet">Continue editing</button>
+        </div>
         <section class="render-section" id="render-section" hidden>
           <header class="render-header">
             <h3>Render</h3>

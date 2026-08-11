@@ -8,7 +8,7 @@ export class CadViewer {
     this.dimensions = dimensions;
     this.emptyState = container.querySelector('#viewer-empty');
     this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color('#111827');
+    this.scene.background = new THREE.Color('#0d1524');
     this.camera = new THREE.PerspectiveCamera(45, 1, 0.1, 10000);
     this.camera.position.set(120, 100, 120);
     this.renderer = new THREE.WebGLRenderer({antialias: true});
@@ -16,11 +16,13 @@ export class CadViewer {
     container.appendChild(this.renderer.domElement);
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.enableDamping = true;
+    this.controls.minDistance = 1;
+    this.controls.maxDistance = 50000;
     this.scene.add(new THREE.HemisphereLight(0xe9efff, 0x172033, 2.5));
     const light = new THREE.DirectionalLight(0xffffff, 3);
     light.position.set(80, 120, 100);
     this.scene.add(light);
-    this.gridHelper = new THREE.GridHelper(200, 20, '#334155', '#1e293b');
+    this.gridHelper = new THREE.GridHelper(200, 20, '#2b3c5c', '#18243a');
     this.scene.add(this.gridHelper);
     this.loader = new STLLoader();
     this.model = null;
@@ -94,7 +96,7 @@ export class CadViewer {
             this.cadDimensions = size;
             geometry.center();
             const material = new THREE.MeshStandardMaterial({
-              color: '#8ba8ff', metalness: 0.25, roughness: 0.45, wireframe: this.wireframe,
+              color: '#8ea8ff', metalness: 0.12, roughness: 0.56, wireframe: this.wireframe,
             });
             this.model = new THREE.Mesh(geometry, material);
             this.model.rotation.x = -Math.PI / 2;
@@ -140,6 +142,24 @@ export class CadViewer {
     this.controls.update();
     const dimensions = this.cadDimensions || size;
     this.dimensions.textContent = `${dimensions.x.toFixed(1)} × ${dimensions.y.toFixed(1)} × ${dimensions.z.toFixed(1)} mm`;
+  }
+
+  setView(view) {
+    if (!this.model) return;
+    const box = new THREE.Box3().setFromObject(this.model);
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+    const distance = Math.max(size.x, size.y, size.z, 1) * 2.2;
+    const directions = {
+      iso: new THREE.Vector3(1.4, 1.1, 1.4),
+      front: new THREE.Vector3(0, 0, 1),
+      top: new THREE.Vector3(0, 1, 0.001),
+      right: new THREE.Vector3(1, 0, 0),
+    };
+    const direction = directions[view] || directions.iso;
+    this.camera.position.copy(center).addScaledVector(direction.normalize(), distance);
+    this.controls.target.copy(center);
+    this.controls.update();
   }
 
   toggleWireframe() {

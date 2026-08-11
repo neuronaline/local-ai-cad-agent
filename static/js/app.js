@@ -12,6 +12,11 @@ const renderSection = document.querySelector('#render-section');
 const renderBody = document.querySelector('#render-body');
 const renderImage = document.querySelector('#render-image');
 const renderToggle = document.querySelector('#render-toggle');
+const activityPanel = document.querySelector('#activity-panel');
+const activityTitle = document.querySelector('#activity-title');
+const activityList = document.querySelector('#activity-list');
+const attachmentPreview = document.querySelector('#attachment-preview');
+const modelActions = document.querySelector('#model-actions');
 const viewer = new CadViewer(document.querySelector('#viewer'), document.querySelector('#dimensions'));
 const showInfoMessages = window.APP_CONFIG?.showInfoMessages ?? true;
 const currentProject = window.APP_CONFIG?.projectName || '';
@@ -22,8 +27,8 @@ let previewProject = '';
 let loadedPreviewRevision = '';
 let previewLoadPromise = null;
 const agentStreams = new Map();
-const streamedTools = new Map();
 const toolMessages = new Map();
+const activityItems = new Map();
 const ALLOWED_TAGS = new Set([
   'p', 'br', 'b', 'strong', 'i', 'em', 'u', 's', 'del',
   'code', 'pre', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
@@ -103,31 +108,76 @@ function addMessage(text, type = 'agent', options = {}) {
   return item;
 }
 
+const activityLabels = {
+  agent: 'Agent', cad: 'Building model', file: 'Updating files', screenshot: 'Visual verification',
+  usage: 'Usage', terminal: 'Checking', preparing: 'Preparing', running: 'Running',
+  reviewing: 'Reviewing', completed: 'Completed', error: 'Error', stopped: 'Stopped', started: 'Started',
+};
+
+function activityLabel(value) {
+  return activityLabels[value] || String(value || 'Activity').replace(/[_-]+/g, ' ');
+}
+
+function clearActivity() {
+  activityItems.clear();
+  toolMessages.clear();
+  activityList.replaceChildren();
+  activityPanel.hidden = true;
+}
+
+function updateActivitySummary() {
+  const items = [...activityItems.values()];
+  if (!items.length) {
+    activityPanel.hidden = true;
+    return;
+  }
+  const running = items.filter(item => ['preparing', 'running', 'started', 'reviewing'].includes(item.status));
+  const failed = items.filter(item => item.status === 'error');
+  const completed = items.filter(item => item.status === 'completed').length;
+  const current = running.at(-1);
+  activityTitle.textContent = current
+    ? `${activityLabel(current.tool)} · ${activityLabel(current.status)}`
+    : failed.length
+      ? `${failed.length} failed ${failed.length === 1 ? 'task' : 'tasks'}`
+      : `${completed || items.length} ${completed === 1 ? 'task' : 'tasks'} completed`;
+  activityPanel.open = Boolean(current);
+  activityPanel.hidden = false;
+}
+
 function addToolMessage(data) {
   const callId = data.call_id || crypto.randomUUID();
-  const existing = toolMessages.get(callId);
-  if (existing && (data.status === 'completed' || data.status === 'error')) {
-    existing.item.querySelector('.tool-state').textContent = data.status;
-    existing.item.querySelector('.tool-result').textContent = data.result || '';
-    existing.item.classList.add(`status-${data.status}`);
-    return existing.item;
+  const status = data.status || 'running';
+  const item = activityItems.get(callId) || {callId, tool: data.tool || 'agent'};
+  item.tool = data.tool || item.tool;
+  item.status = status;
+  item.result = data.result || item.result || '';
+  activityItems.set(callId, item);
+  toolMessages.set(callId, item);
+
+  let row = activityList.querySelector(`[data-call-id="${CSS.escape(callId)}"]`);
+  if (!row) {
+    row = document.createElement('div');
+    row.className = 'activity-item';
+    row.dataset.callId = callId;
+    activityList.appendChild(row);
   }
-  if (existing) {
-    existing.item.querySelector('.tool-state').textContent = data.status;
-    return existing.item;
+  row.dataset.status = status;
+  row.replaceChildren();
+  const name = document.createElement('span');
+  name.className = 'activity-name';
+  name.textContent = activityLabel(item.tool);
+  const state = document.createElement('span');
+  state.className = 'activity-state';
+  state.textContent = activityLabel(status);
+  row.append(name, state);
+  if (item.result) {
+    const detail = document.createElement('span');
+    detail.className = 'activity-detail';
+    detail.textContent = item.result.length > 180 ? `${item.result.slice(0, 177)}…` : item.result;
+    row.appendChild(detail);
   }
-  const item = document.createElement('div');
-  item.className = `message tool status-${data.status || 'running'}`;
-  item.innerHTML = `
-    <div class="tool-line">
-      <span class="tool-name">${(data.tool || 'agent')}</span>
-      <span class="tool-state">${data.status || 'running'}</span>
-    </div>
-    <div class="tool-result">${(data.result || '').replace(/</g, '<')}</div>
-  `;
-  feed.appendChild(item);
-  toolMessages.set(callId, { item });
-  return item;
+  updateActivitySummary();
+  return row;
 }
 
 function setThinking(active) {
@@ -136,7 +186,7 @@ function setThinking(active) {
     if (!document.querySelector('.thinking-indicator')) {
       const el = document.createElement('div');
       el.className = 'thinking-indicator';
-      el.textContent = 'Agent is thinking…';
+      el.innerHTML = '<span></span><span></span><span></span><span>Preparing model</span>';
       feed.appendChild(el);
     }
   } else {
@@ -182,6 +232,7 @@ async function loadCurrentPreview(previewId) {
         }
       }
       await refreshRender();
+      modelActions.hidden = false;
     } catch (error) {
       addMessage(`Preview failed: ${error.message}`, 'error');
     } finally {
@@ -250,8 +301,7 @@ async function loadHistory(projectName) {
   try {
     const data = await api(`/api/projects/${encodeURIComponent(projectName)}/history`);
     agentStreams.clear();
-    streamedTools.clear();
-    toolMessages.clear();
+    clearActivity();
     lastStreamedAgent = null;
     feed.replaceChildren();
     questionArea.replaceChildren();
@@ -320,6 +370,7 @@ chatForm.addEventListener('submit', async event => {
   btn.disabled = true;
   message.disabled = true;
   try {
+    clearActivity();
     addMessage(text, 'user');
     setThinking(true);
     message.value = '';
@@ -335,10 +386,14 @@ chatForm.addEventListener('submit', async event => {
       return;
     }
     if (response.attachments?.length) {
-      addMessage(`${response.attachments.length} reference image(s) uploaded.`, 'tool');
+      addToolMessage({
+        call_id: `attachments-${crypto.randomUUID()}`,
+        tool: 'Images',
+        status: 'completed',
+        result: `${response.attachments.length} reference image(s) uploaded.`,
+      });
     }
-    selectedFiles = [];
-    if (attachmentLabel) attachmentLabel.textContent = 'Attach';
+    clearAttachments();
   } catch (error) {
     addMessage(error.message, 'error');
     setThinking(false);
@@ -367,9 +422,7 @@ stopButton.addEventListener('click', async () => {
 
 attachments.addEventListener('change', () => {
   selectedFiles = Array.from(attachments.files || []);
-  attachmentLabel.textContent = selectedFiles.length
-    ? `${selectedFiles.length} file${selectedFiles.length === 1 ? '' : 's'}`
-    : 'Attach';
+  renderAttachmentPreview();
 });
 
 ['dragenter', 'dragover'].forEach(eventName => {
@@ -388,8 +441,44 @@ dropzone.addEventListener('drop', event => {
   const files = Array.from(event.dataTransfer?.files || []).filter(file => file.type.startsWith('image/'));
   if (!files.length) return;
   selectedFiles = [...selectedFiles, ...files];
-  attachmentLabel.textContent = `${selectedFiles.length} file${selectedFiles.length === 1 ? '' : 's'}`;
+  renderAttachmentPreview();
 });
+
+function clearAttachments() {
+  selectedFiles = [];
+  attachments.value = '';
+  if (attachmentLabel) attachmentLabel.textContent = 'Attach';
+  attachmentPreview.replaceChildren();
+}
+
+function renderAttachmentPreview() {
+  attachmentPreview.replaceChildren();
+  if (attachmentLabel) {
+    attachmentLabel.textContent = selectedFiles.length ? `Images (${selectedFiles.length})` : 'Attach';
+  }
+  selectedFiles.forEach((file, index) => {
+    const item = document.createElement('div');
+    item.className = 'attachment-item';
+    const image = document.createElement('img');
+    const url = URL.createObjectURL(file);
+    image.src = url;
+    image.alt = file.name;
+    image.addEventListener('load', () => URL.revokeObjectURL(url), {once: true});
+    const name = document.createElement('span');
+    name.textContent = file.name;
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'quiet icon-only';
+    remove.textContent = '×';
+    remove.title = `Remove ${file.name}`;
+    remove.addEventListener('click', () => {
+      selectedFiles.splice(index, 1);
+      renderAttachmentPreview();
+    });
+    item.append(image, name, remove);
+    attachmentPreview.appendChild(item);
+  });
+}
 
 renderToggle.addEventListener('click', () => {
   const expanded = renderToggle.getAttribute('aria-expanded') === 'true';
@@ -399,9 +488,54 @@ renderToggle.addEventListener('click', () => {
 });
 
 // Viewer toolbar
-document.querySelector('#toggle-wireframe')?.addEventListener('click', () => viewer.toggleWireframe());
-document.querySelector('#toggle-grid')?.addEventListener('click', () => viewer.toggleGrid());
+document.querySelector('#toggle-wireframe')?.addEventListener('click', event => {
+  event.currentTarget.setAttribute('aria-pressed', String(viewer.toggleWireframe()));
+});
+document.querySelector('#toggle-grid')?.addEventListener('click', event => {
+  event.currentTarget.setAttribute('aria-pressed', String(viewer.toggleGrid()));
+});
 document.querySelector('#reset-view')?.addEventListener('click', () => viewer.fit());
+document.querySelectorAll('[data-view]').forEach(button => {
+  button.addEventListener('click', () => {
+    viewer.setView(button.dataset.view);
+    document.querySelectorAll('[data-view]').forEach(item => item.classList.toggle('active', item === button));
+  });
+});
+
+document.querySelector('#approve-design')?.addEventListener('click', () => {
+  message.value = 'Finalize the design. Run the final verification and prepare the outputs.';
+  chatForm.dispatchEvent(new Event('submit'));
+});
+document.querySelector('#continue-editing')?.addEventListener('click', () => message.focus());
+
+document.querySelectorAll('[data-mobile-view]').forEach(button => {
+  button.addEventListener('click', () => {
+    document.body.dataset.mobileView = button.dataset.mobileView;
+    document.querySelectorAll('[data-mobile-view]').forEach(item => {
+      item.setAttribute('aria-pressed', String(item === button));
+    });
+  });
+});
+
+const resizer = document.querySelector('#panel-resizer');
+resizer?.addEventListener('pointerdown', event => {
+  event.preventDefault();
+  resizer.setPointerCapture(event.pointerId);
+  document.body.classList.add('is-resizing');
+  const onMove = moveEvent => {
+    const width = Math.min(Math.max(moveEvent.clientX, 360), window.innerWidth - 400);
+    document.documentElement.style.setProperty('--chat-width', `${width}px`);
+  };
+  const onEnd = () => {
+    document.body.classList.remove('is-resizing');
+    resizer.removeEventListener('pointermove', onMove);
+    resizer.removeEventListener('pointerup', onEnd);
+    resizer.removeEventListener('pointercancel', onEnd);
+  };
+  resizer.addEventListener('pointermove', onMove);
+  resizer.addEventListener('pointerup', onEnd);
+  resizer.addEventListener('pointercancel', onEnd);
+});
 
 // History drawer
 const historyDrawer = document.querySelector('#history-drawer');
@@ -557,6 +691,12 @@ function connectStream() {
   const handlers = {
     agent_status: data => {
       if (data.project !== currentProject) return;
+      addToolMessage({
+        call_id: `status-${data.timestamp || data.status || crypto.randomUUID()}`,
+        tool: 'agent',
+        status: data.status || 'running',
+        result: data.message,
+      });
       if (data.status === 'started' || data.status === 'reviewing') {
         setThinking(true);
       } else if (['stopped', 'failed', 'completed'].includes(data.status)) {
