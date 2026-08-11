@@ -84,8 +84,19 @@ class EventBus:
                 pass
         return self.settings.workspace_root
 
-    def publish(self, event_type: str, data: dict[str, Any]) -> None:
-        if event_type in HISTORY_EVENT_TYPES:
+    def publish(
+        self,
+        event_type: str,
+        data: dict[str, Any],
+        *,
+        transient: bool = False,
+    ) -> None:
+        # Transient events are delivered to live subscribers but never
+        # appended to the conversation log. Used for terminal status events
+        # (completed/failed) that exist solely to clear the UI's thinking
+        # indicator and must not displace the canonical assistant message
+        # that just preceded them.
+        if not transient and event_type in HISTORY_EVENT_TYPES:
             project = data.get("project")
             if isinstance(project, str) and project:
                 project_dir = self._workspace_root() / project

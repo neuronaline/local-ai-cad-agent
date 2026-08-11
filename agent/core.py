@@ -83,7 +83,7 @@ class AgentRunner:
     def __init__(
         self,
         settings: Settings,
-        publish: Callable[[str, dict], None],
+        publish: Callable[..., None],
         *,
         history_lock: threading.Lock | None = None,
     ) -> None:
@@ -118,12 +118,13 @@ class AgentRunner:
         return not complete
 
     def has_active_state_for(self, project: str) -> bool:
+        """Return whether the project has an agent run that must not be deleted."""
         if self.is_running() and self.active_project() == project:
             return True
         if self.is_awaiting_preview(project):
             return True
-        if self.waiting_question(project) is not None:
-            return True
+        # A persisted waiting question is recoverable UI state, not an active
+        # worker.  It must not prevent deleting the project.
         return False
 
     def active_project(self) -> str | None:
@@ -380,6 +381,7 @@ class AgentRunner:
                                     "message": f"Drawing was not created: {cad_error}",
                                 },
                             )
+                            self._publish_terminal_failure(project)
                         elif any_tool_used:
                             if not nudged_cad and (project_dir / "model.py").is_file():
                                 nudged_cad = True
@@ -400,6 +402,7 @@ class AgentRunner:
                                     "message": "Drawing was not created: the task did not produce a new CAD preview.",
                                 },
                             )
+                            self._publish_terminal_failure(project)
                         else:
                             # No tools were used at all — just a conversation; complete silently.
                             self._complete(project, content)
@@ -468,6 +471,7 @@ class AgentRunner:
                     ),
                 },
             )
+            self._publish_terminal_failure(project)
         except Exception as error:  # noqa: BLE001 - Surface all agent failures to the local UI.
             import traceback
 
@@ -491,6 +495,7 @@ class AgentRunner:
                         "message": self._user_error_message(detail, err_type, provider=self.settings.llm_provider),
                     },
                 )
+                self._publish_terminal_failure(project)
         finally:
             with self._lock:
                 self._active_tools = None
@@ -943,6 +948,7 @@ class AgentRunner:
             self._complete(project, completion)
         elif error_message:
             self.publish("agent_error", {"project": project, "message": error_message})
+            self._publish_terminal_failure(project)
         else:
             self.publish(
                 "agent_status",
@@ -952,6 +958,18 @@ class AgentRunner:
                     "message": "Waiting for the drawing to become visible...",
                 },
             )
+
+    def _publish_terminal_failure(self, project: str) -> None:
+        # Mirror _complete's success-side agent_status so the UI clears the
+        # thinking indicator on every error path. agent_status:stopped is
+        # already published for user-initiated stops. Marked transient so
+        # the conversation log stays clean (the agent_error event that just
+        # preceded this is the canonical terminal record).
+        self.publish(
+            "agent_status",
+            {"project": project, "status": "failed", "message": "Task failed."},
+            transient=True,
+        )
 
     def _complete(self, project: str, message: str) -> None:
         """Persist the final assistant turn and publish it to subscribers.
@@ -969,6 +987,20 @@ class AgentRunner:
                 project_dir, {"role": "assistant", "content": message}
             )
         self.publish("agent_message", {"project": project, "message": message})
+        # Terminal status so the UI clears the thinking indicator on success.
+        # The agent loop publishes agent_error on failure paths and
+        # agent_status:stopped on user-initiated stops, so this complements
+        # both without overriding them. Marked transient so the agent_message
+        # above remains the canonical terminal entry in the conversation log.
+        self.publish(
+            "agent_status",
+            {
+                "project": project,
+                "status": "completed",
+                "message": "Task completed.",
+            },
+            transient=True,
+        )
 
     def _debug_tool_error(
         self,

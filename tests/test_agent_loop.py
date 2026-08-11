@@ -194,7 +194,7 @@ def test_agent_does_not_complete_without_a_new_drawing(tmp_path: Path, monkeypat
     )
     runner = AgentRunner(
         Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000),
-        lambda kind, data: events.append((kind, data)),
+        lambda *args, **_: events.append((args[0], args[1])),
     )
 
     runner._run("demo", "Make a bracket")
@@ -221,7 +221,7 @@ def test_question_is_persisted_for_the_next_user_reply(tmp_path: Path, monkeypat
     )
     runner = AgentRunner(
         Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000),
-        lambda *_: None,
+        lambda *_, **__: None,
     )
 
     runner._run("demo", "Make a bracket")
@@ -249,7 +249,7 @@ def test_answer_resumes_a_waiting_agent(tmp_path: Path, monkeypatch):
     )
     runner = AgentRunner(
         Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000),
-        lambda *_: None,
+        lambda *_, **__: None,
     )
     runner._waiting_questions["demo"] = {
         "title": "",
@@ -310,7 +310,7 @@ def test_answer_persists_user_message_before_thread_starts(tmp_path: Path, monke
 
     runner = AgentRunner(
         Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000),
-        lambda *_: None,
+        lambda *_, **__: None,
     )
     runner._waiting_questions["demo"] = {
         "title": "",
@@ -358,7 +358,7 @@ def test_answer_waits_for_previous_run_to_finish(tmp_path: Path, monkeypatch):
     )
     runner = AgentRunner(
         Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000),
-        lambda *_: None,
+        lambda *_, **__: None,
     )
     # Start a run that will sleep in the LLM client.
     assert runner.start("demo", "build something", [])
@@ -398,9 +398,9 @@ def test_waiting_question_survives_runner_recreation_and_validates_answer(
         "create_llm_client",
         lambda _settings, _ignored=None: FakeQuestionClient(_settings),
     )
-    AgentRunner(settings, lambda *_: None)._run("demo", "Make a bracket")
+    AgentRunner(settings, lambda *_, **__: None)._run("demo", "Make a bracket")
 
-    recreated = AgentRunner(settings, lambda *_: None)
+    recreated = AgentRunner(settings, lambda *_, **__: None)
     question = recreated.waiting_question("demo")
     assert question is not None
     assert question["questions"][0]["input_type"] == "number"
@@ -431,11 +431,11 @@ def test_agent_tool_schema_and_dispatch_forbid_export(tmp_path: Path):
     project.mkdir()
     runner = AgentRunner(
         Settings(tmp_path, "https://example.test", "test", 1, "127.0.0.1", 5000),
-        lambda *_: None,
+        lambda *_, **__: None,
     )
     with pytest.raises(AttributeError):
         runner._execute(
-            ProjectTools(project, lambda *_: None), "demo", "cad_export", {}
+            ProjectTools(project, lambda *_, **__: None), "demo", "cad_export", {}
         )
 
 
@@ -468,7 +468,7 @@ def test_successful_tool_result_uses_structured_envelope(tmp_path: Path):
     (project / "summary.md").write_text("# Ready\n", encoding="utf-8")
     runner = AgentRunner(
         Settings(tmp_path, "https://example.test", "test", 1, "127.0.0.1", 5000),
-        lambda *_: None,
+        lambda *_, **__: None,
     )
     messages = []
     call = {
@@ -480,7 +480,7 @@ def test_successful_tool_result_uses_structured_envelope(tmp_path: Path):
     }
 
     runner._process_tool_call(
-        ProjectTools(project, lambda *_: None),
+        ProjectTools(project, lambda *_, **__: None),
         "demo",
         project,
         call,
@@ -499,7 +499,7 @@ def test_missing_tool_argument_returns_structured_validation_error(tmp_path: Pat
     project.mkdir()
     runner = AgentRunner(
         Settings(tmp_path, "https://example.test", "test", 1, "127.0.0.1", 5000),
-        lambda *_: None,
+        lambda *_, **__: None,
     )
     messages = []
     call = {
@@ -511,7 +511,7 @@ def test_missing_tool_argument_returns_structured_validation_error(tmp_path: Pat
     }
 
     runner._process_tool_call(
-        ProjectTools(project, lambda *_: None),
+        ProjectTools(project, lambda *_, **__: None),
         "demo",
         project,
         call,
@@ -532,12 +532,12 @@ def test_malformed_tool_call_returns_structured_error(tmp_path: Path):
     project.mkdir()
     runner = AgentRunner(
         Settings(tmp_path, "https://example.test", "test", 1, "127.0.0.1", 5000),
-        lambda *_: None,
+        lambda *_, **__: None,
     )
     messages = []
 
     runner._process_tool_call(
-        ProjectTools(project, lambda *_: None),
+        ProjectTools(project, lambda *_, **__: None),
         "demo",
         project,
         {"function": {}},
@@ -580,7 +580,7 @@ def test_failed_cad_run_is_not_reported_as_completed(tmp_path: Path, monkeypatch
     events = []
     runner = AgentRunner(
         Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000),
-        lambda kind, data: events.append((kind, data)),
+        lambda *args, **_: events.append((args[0], args[1])),
     )
 
     runner._run("demo", "Build a part")
@@ -608,7 +608,7 @@ def test_protocol_history_is_append_only_and_preserves_tool_call_content(
     )
     runner = AgentRunner(
         Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000),
-        lambda *_: None,
+        lambda *_, **__: None,
     )
 
     runner._run("demo", "Make a bracket")
@@ -669,7 +669,7 @@ def test_configured_tool_call_limit_stops_the_agent_loop(tmp_path: Path, monkeyp
             5000,
             agent_tool_call_limit=1,
         ),
-        lambda kind, data: events.append((kind, data)),
+        lambda *args, **_: events.append((args[0], args[1])),
     )
 
     runner._run("demo", "Make a bracket")
@@ -696,7 +696,7 @@ def test_content_delta_is_published_before_stream_end(tmp_path: Path, monkeypatc
     events = []
     runner = AgentRunner(
         Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000),
-        lambda kind, data: events.append((kind, data)),
+        lambda *args, **_: events.append((args[0], args[1])),
     )
 
     runner._run("demo", "Hello")
@@ -717,7 +717,7 @@ def test_model_edit_invalidates_registered_preview(tmp_path: Path):
     events = []
     runner = AgentRunner(
         Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000),
-        lambda kind, data: events.append((kind, data)),
+        lambda *args, **_: events.append((args[0], args[1])),
     )
     preview_id = runner._register_preview("demo", project)
 
@@ -725,7 +725,11 @@ def test_model_edit_invalidates_registered_preview(tmp_path: Path):
     runner._await_preview("demo", preview_id, "Done")
 
     assert not runner.is_awaiting_preview("demo")
-    assert events[-1][0] == "agent_error"
+    assert events[-1][0] == "agent_status"
+    assert events[-1][1]["status"] == "failed"
+    # The terminal agent_error event precedes the closing agent_status
+    # (the status event tells the UI to clear its thinking indicator).
+    assert any(kind == "agent_error" for kind, _data in events)
 
 
 def test_failed_build_clears_preview_and_returns_structured_error(tmp_path: Path):
@@ -733,13 +737,13 @@ def test_failed_build_clears_preview_and_returns_structured_error(tmp_path: Path
     project = project_root / "demo"
     project.mkdir(parents=True)
     (project / "conversation.jsonl").write_text("", encoding="utf-8")
-    tools = ProjectTools(project, lambda *_: None)
+    tools = ProjectTools(project, lambda *_, **__: None)
     tools.cad.build_and_verify = lambda: (_ for _ in ()).throw(
         RuntimeError("broken model")
     )
     runner = AgentRunner(
         Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000),
-        lambda *_: None,
+        lambda *_, **__: None,
     )
     messages = []
     run_call = {
@@ -774,7 +778,7 @@ def test_debug_error_log_records_recoverable_tool_failures(tmp_path: Path):
         5000,
         agent_debug_log_tool_errors=True,
     )
-    runner = AgentRunner(settings, lambda *_: None)
+    runner = AgentRunner(settings, lambda *_, **__: None)
     error = ValueError("Invalid Python: unexpected indent (line 12)")
 
     runner._debug_tool_error(

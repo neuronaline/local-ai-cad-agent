@@ -637,7 +637,13 @@ function showQuestion(question) {
   if (question.questions?.length) {
     question.questions.forEach((q, index) => {
       const id = q.id || `q-${index}`;
-      fields.push({ id, label: q.question || id, options: q.options || [], type: q.type || 'text' });
+      fields.push({
+        id,
+        label: q.question || id,
+        options: q.options || [],
+        type: q.input_type || q.type || 'text',
+        required: q.required !== false,
+      });
     });
   } else if (question.question) {
     fields.push({ id: 'answer', label: question.question, options: question.options || [], type: 'text' });
@@ -646,7 +652,7 @@ function showQuestion(question) {
     const label = document.createElement('label');
     label.textContent = field.label;
     let input;
-    if (field.options?.length) {
+    if (field.options?.length && field.type !== 'multiselect') {
       input = document.createElement('select');
       input.required = true;
       for (const opt of field.options) {
@@ -655,7 +661,19 @@ function showQuestion(question) {
         optionEl.textContent = opt.label || opt;
         input.appendChild(optionEl);
       }
-    } else if (field.type === 'multi_line') {
+    } else if (field.type === 'number') {
+      input = document.createElement('input');
+      input.type = 'number';
+    } else if (field.type === 'multiselect') {
+      input = document.createElement('select');
+      input.multiple = true;
+      for (const opt of field.options) {
+        const optionEl = document.createElement('option');
+        optionEl.value = opt;
+        optionEl.textContent = opt;
+        input.appendChild(optionEl);
+      }
+    } else if (field.type === 'textarea') {
       input = document.createElement('textarea');
       input.rows = 2;
     } else {
@@ -675,7 +693,11 @@ function showQuestion(question) {
     const answers = {};
     for (const field of fields) {
       const el = form.elements.namedItem(field.id);
-      if (el) answers[field.id] = el.value;
+      if (el) {
+        answers[field.id] = field.type === 'multiselect'
+          ? Array.from(el.selectedOptions).map(option => option.value)
+          : el.value;
+      }
     }
     submit.disabled = true;
     try {
@@ -721,6 +743,10 @@ function connectStream() {
         setThinking(false);
       }
     },
+    question: data => {
+      if (data.project !== currentProject) return;
+      showQuestion(data);
+    },
     agent_stream_start: data => {
       if (data.project !== currentProject) return;
       // Intermediate model turns are represented by activity items only.
@@ -736,6 +762,10 @@ function connectStream() {
       if (data.project !== currentProject) return;
       markActivityRecovered();
       addMessage(data.message || '', 'agent');
+      // Defensive: every terminal turn publishes agent_message, so the
+      // thinking indicator must clear here even if the matching
+      // agent_status event was missed (or never published for this path).
+      setThinking(false);
     },
     tool_status: data => {
       if (data.project !== currentProject) return;
@@ -764,6 +794,8 @@ function connectStream() {
       const data = JSON.parse(event.data);
       if (data.project !== currentProject) return;
       addMessage(data.message || 'Agent error.', 'error');
+      // Errors are terminal; ensure the thinking indicator clears.
+      setThinking(false);
     } catch {}
   });
   eventSource.addEventListener('agent_stopped', event => {

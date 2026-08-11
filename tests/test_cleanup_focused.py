@@ -247,7 +247,7 @@ class _ScriptedClient:
 def _make_runner(project_root: Path, scripted) -> tuple[AgentRunner, _ScriptedClient]:
     runner = AgentRunner(
         Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000),
-        lambda *_: None,
+        lambda *_, **__: None,
     )
     return runner, _ScriptedClient(scripted)
 

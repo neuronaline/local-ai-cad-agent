@@ -446,7 +446,10 @@ def test_rename_project(tmp_path: Path):
     assert response.status_code == 404
 
 
-def test_project_crud_rejects_persisted_waiting_question(tmp_path: Path):
+def test_project_crud_allows_persisted_waiting_question(tmp_path: Path):
+    # A persisted waiting question is recoverable UI state, not an active
+    # worker; the project directory can be deleted/renamed because the next
+    # load will simply find no agent state to resume.
     settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
     client = create_app(settings).test_client()
     for name in ("delete-me", "rename-me"):
@@ -462,10 +465,10 @@ def test_project_crud_rejects_persisted_waiting_question(tmp_path: Path):
             json.dumps(state), encoding="utf-8"
         )
 
-    assert client.delete("/api/projects/delete-me").status_code == 409
+    assert client.delete("/api/projects/delete-me").status_code == 200
     assert client.put(
         "/api/projects/rename-me/rename", json={"name": "renamed"}
-    ).status_code == 409
+    ).status_code == 200
 
 
 def test_project_modified_at_tracks_file_content_changes(tmp_path: Path):
