@@ -155,6 +155,37 @@ def _project_path(settings: Settings, project_name: str) -> Path:
     return path
 
 
+def _redact_history_event(event: dict[str, Any]) -> dict[str, Any]:
+    """Replace inline image data URLs in history responses with a placeholder.
+
+    The persisted ``conversation.jsonl`` stores the full base64 payload on
+    user-image attachments so the LLM can still consume it. Returning those
+    blobs through the History endpoint makes responses unnecessarily large
+    and exposes content the UI does not need; substitute a lightweight
+    ``[Reference image]`` marker instead.
+    """
+    if event.get("role") != "user":
+        return event
+    content = event.get("content")
+    if not isinstance(content, list):
+        return event
+    redacted = False
+    parts: list[Any] = []
+    image_index = 0
+    for part in content:
+        if isinstance(part, dict) and part.get("type") == "image_url":
+            redacted = True
+            image_index += 1
+            parts.append({"type": "text", "text": f"[Reference image {image_index}]"})
+        else:
+            parts.append(part)
+    if not redacted:
+        return event
+    cleaned = dict(event)
+    cleaned["content"] = parts
+    return cleaned
+
+
 def _append_conversation(project_dir: Path, event: dict[str, Any]) -> None:
     with (project_dir / "conversation.jsonl").open("a", encoding="utf-8") as log:
         log.write(json.dumps(event, ensure_ascii=False) + "\n")
@@ -679,7 +710,7 @@ def create_app(settings: Settings | None = None) -> Flask:
                     if not isinstance(event, dict):
                         continue
                     if current_settings.show_info_messages or event.get("type") not in INFO_EVENT_TYPES:
-                        events.append(event)
+                        events.append(_redact_history_event(event))
                 except json.JSONDecodeError:
                     pass
         return jsonify({"events": events})

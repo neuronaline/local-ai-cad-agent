@@ -85,9 +85,11 @@ function renderAgentContent(item, text) {
 }
 
 function addMessage(text, type = 'agent', options = {}) {
+  const target = options.target || feed;
   const item = document.createElement('div');
   item.className = `message ${type}`;
   item.dataset.raw = text;
+  if (options.messageId) item.dataset.messageId = options.messageId;
   if (type === 'agent') {
     item.innerHTML = `
       <div class="message-meta">
@@ -97,19 +99,39 @@ function addMessage(text, type = 'agent', options = {}) {
       </div>
       <div class="message-content"></div>
     `;
-    feed.appendChild(item);
+    target.appendChild(item);
     renderAgentContent(item, text || '');
     return item;
   }
   item.textContent = text || '';
-  feed.appendChild(item);
+  target.appendChild(item);
   return item;
 }
 
 const activityLabels = {
-  agent: 'Agent', cad: 'Building model', file: 'Updating files', screenshot: 'Visual verification',
-  usage: 'Usage', terminal: 'Checking', preparing: 'Preparing', running: 'Running',
-  reviewing: 'Reviewing', completed: 'Completed', error: 'Error', stopped: 'Stopped', started: 'Started',
+  // Tool schema names published by the backend (agent/tools/tool_schemas.py).
+  cad_build_and_verify: 'Building model',
+  file_write: 'Updating model',
+  file_replace: 'Updating model',
+  file_regex_replace: 'Updating model',
+  file_read: 'Reading model',
+  terminal_run: 'Checking model',
+  terminal_check: 'Checking model',
+  experience_search: 'Checking past solutions',
+  experience_add: 'Saving solution',
+  experience_update: 'Updating past solutions',
+  question: 'Requesting input',
+  // Status / pseudo-tool labels (kept for SSE events and info rows).
+  agent: 'Agent',
+  usage: 'Usage',
+  preparing: 'Preparing',
+  running: 'Running',
+  rendering: 'Rendering',
+  reviewing: 'Reviewing',
+  started: 'Started',
+  completed: 'Completed',
+  error: 'Error',
+  stopped: 'Stopped',
 };
 
 function activityLabel(value) {
@@ -130,25 +152,23 @@ function updateActivitySummary() {
     return;
   }
   const running = items.filter(item => ['preparing', 'running', 'started', 'reviewing'].includes(item.status));
-  const failed = items.filter(item => item.status === 'error' && !item.recovered);
-  const corrected = items.filter(item => item.recovered).length;
+  const failed = items.filter(item => item.status === 'error');
   const current = running.at(-1);
   activityTitle.textContent = current
     ? `${activityLabel(current.tool)} · ${activityLabel(current.status)}`
     : failed.length
       ? `${failed.length} failed ${failed.length === 1 ? 'task' : 'tasks'}`
-      : `${items.length} ${items.length === 1 ? 'step' : 'steps'} completed${corrected ? ` · ${corrected} corrected` : ''}`;
+      : `${items.length} ${items.length === 1 ? 'step' : 'steps'} completed`;
   activityPanel.open = Boolean(current);
   activityPanel.hidden = false;
 }
 
 function markActivityRecovered() {
+  // Final completion should clear any in-flight activity rows but must NOT
+  // hide failed rows — the failure was real and the user needs to see it.
   for (const item of activityItems.values()) {
     const row = activityList.querySelector(`[data-call-id="${CSS.escape(item.callId)}"]`);
-    if (item.status === 'error') {
-      item.recovered = true;
-      if (row) row.hidden = true;
-    } else if (['preparing', 'running', 'started', 'reviewing', 'rendering'].includes(item.status)) {
+    if (['preparing', 'running', 'started', 'reviewing', 'rendering'].includes(item.status)) {
       item.status = 'completed';
       if (row) {
         row.dataset.status = 'completed';
@@ -177,7 +197,7 @@ function addToolMessage(data) {
     activityList.appendChild(row);
   }
   row.dataset.status = status;
-  row.hidden = Boolean(item.recovered);
+  row.hidden = false;
   row.replaceChildren();
   const name = document.createElement('span');
   name.className = 'activity-name';
@@ -313,34 +333,73 @@ async function loadCurrentState() {
   }
 }
 
-async function loadHistory(projectName) {
+// Extract readable text from a History entry's `content` field. The
+// backend persists image attachments as structured parts (text + image_url),
+// and the History endpoint redacts the image data, leaving a
+// `[Reference image N]` text placeholder for each part.
+function normalizeHistoryContent(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  const lines = [];
+  let imageIndex = 0;
+  for (const part of content) {
+    if (!part || typeof part !== 'object') continue;
+    if (part.type === 'text' && typeof part.text === 'string') {
+      lines.push(part.text);
+    } else if (part.type === 'image_url') {
+      imageIndex += 1;
+      lines.push(`[Reference image ${imageIndex}]`);
+    }
+  }
+  return lines.join('\n');
+}
+
+async function loadHistory(projectName, options = {}) {
+  const target = options.target === 'drawer' ? historyContent : feed;
+  const intoDrawer = options.target === 'drawer';
   try {
     const data = await api(`/api/projects/${encodeURIComponent(projectName)}/history`);
-    clearActivity();
-    feed.replaceChildren();
-    questionArea.replaceChildren();
-    let hasSummary = false;
+    if (intoDrawer) {
+      // Drawer mode must NEVER mutate the main chat feed.
+      target.replaceChildren();
+    } else {
+      clearActivity();
+      target.replaceChildren();
+      questionArea.replaceChildren();
+    }
+    let renderedAny = false;
     for (const evt of data.events) {
       const role = evt.role || '';
-      const content = evt.content || '';
+      const raw = evt.content;
+      const text = role === 'user' ? normalizeHistoryContent(raw) : (raw || '');
       if (role === 'user') {
-        addMessage(content, 'user');
+        addMessage(text, 'user', {target});
+        renderedAny = true;
       } else if (role === 'assistant' || role === 'agent') {
-        if (evt.tool_calls || !String(content).trim()) continue;
-        addMessage(content, 'agent');
-        hasSummary = true;
-      } else if (evt.type === 'agent_error') addMessage(evt.data?.message || content, 'error');
-      else if (showInfoMessages) addInfoMessage(evt.type, evt.data);
+        if (evt.tool_calls || !String(text).trim()) continue;
+        addMessage(text, 'agent', {target});
+        renderedAny = true;
+      } else if (evt.type === 'agent_error') {
+        addMessage(evt.data?.message || text, 'error', {target});
+        renderedAny = true;
+      } else if (!intoDrawer && showInfoMessages) {
+        addInfoMessage(evt.type, evt.data);
+      }
     }
-    if (hasSummary) markActivityRecovered();
-    if (!data.events.length) {
-      const empty = document.createElement('div');
-      empty.className = 'empty-state';
-      empty.textContent = `Project "${projectName}" selected. Describe a part to begin.`;
-      feed.appendChild(empty);
+    if (!renderedAny && !intoDrawer) {
+      // Project with no conversation → restore the empty state from the
+      // template (preserves the project name and example prompts).
+      const emptyTpl = document.querySelector('#chat-empty');
+      if (emptyTpl) target.appendChild(emptyTpl.content.cloneNode(true));
+      else {
+        const empty = document.createElement('div');
+        empty.className = 'empty-state';
+        empty.textContent = `Project "${projectName}" selected. Describe a part to begin.`;
+        target.appendChild(empty);
+      }
     }
   } catch (error) {
-    addMessage(error.message, 'error');
+    addMessage(error.message, 'error', {target});
   }
 }
 
@@ -573,7 +632,7 @@ function setDrawerTab(active) {
 document.querySelector('#history-btn')?.addEventListener('click', () => {
   historyDrawer.hidden = false;
   setDrawerTab('history');
-  loadHistory(currentProject);
+  loadHistory(currentProject, {target: 'drawer'});
   loadModelPane();
 });
 document.querySelector('#history-close')?.addEventListener('click', () => {
@@ -717,6 +776,83 @@ function showQuestion(question) {
 
 // SSE event stream
 let eventSource = null;
+// Cards currently being filled from streaming deltas. Keyed by message_id so
+// multiple in-flight turns (rare in practice, but the API supports them) do
+// not collide. Cards are removed once agent_message finalizes them.
+const streamingMessages = new Map();
+// The streaming card that has not yet been finalized; used by agent_message
+// to update the canonical final text without duplicating the card.
+let pendingFinalCard = null;
+
+function startStreamingCard(messageId) {
+  if (!messageId || streamingMessages.has(messageId)) return streamingMessages.get(messageId);
+  const item = document.createElement('div');
+  item.className = 'message agent';
+  item.dataset.raw = '';
+  item.dataset.messageId = messageId;
+  item.innerHTML = `
+    <div class="message-meta">
+      <span class="agent-mark">AI</span>
+      <span class="message-author">Agent</span>
+      <span class="message-state">Responding</span>
+    </div>
+    <div class="message-content"></div>
+  `;
+  feed.appendChild(item);
+  streamingMessages.set(messageId, item);
+  pendingFinalCard = item;
+  return item;
+}
+
+function appendStreamingDelta(messageId, delta) {
+  if (!messageId || !delta) return;
+  let card = streamingMessages.get(messageId);
+  if (!card) card = startStreamingCard(messageId);
+  card.dataset.raw = (card.dataset.raw || '') + delta;
+  renderAgentContent(card, card.dataset.raw);
+}
+
+function finalizeStreamingCard(messageId, finalText) {
+  if (messageId) {
+    const card = streamingMessages.get(messageId);
+    if (card) {
+      renderAgentContent(card, finalText || '');
+      card.dataset.raw = finalText || '';
+      const state = card.querySelector('.message-state');
+      if (state) state.textContent = '';
+      streamingMessages.delete(messageId);
+      // Keep pendingFinalCard pointing at this card so the subsequent
+      // agent_message event can replace its content with the canonical
+      // final message without creating a duplicate card.
+      return card;
+    }
+  }
+  // No streaming card — happens when content arrived before stream_start
+  // (or the user reloaded mid-run). Create a new card with the canonical text.
+  const item = addMessage(finalText || '', 'agent');
+  pendingFinalCard = item;
+  return item;
+}
+
+function discardEmptyStreamingCard(messageId) {
+  if (!messageId) return;
+  const card = streamingMessages.get(messageId);
+  if (!card) return;
+  streamingMessages.delete(messageId);
+  if (pendingFinalCard === card) pendingFinalCard = null;
+  if (!card.dataset.raw) card.remove();
+}
+
+async function syncAfterStreamReset() {
+  // Re-fetch the canonical state so events missed during the gap are visible.
+  // Re-rendering the main feed replaces persisted content rather than
+  // appending, which prevents duplicate messages on reconnect.
+  if (!currentProject) return;
+  await loadHistory(currentProject);
+  await loadCurrentState();
+  await syncCurrentPreview();
+}
+
 function connectStream() {
   if (eventSource) eventSource.close();
   const status = document.querySelector('#connection-status');
@@ -749,19 +885,55 @@ function connectStream() {
     },
     agent_stream_start: data => {
       if (data.project !== currentProject) return;
-      // Intermediate model turns are represented by activity items only.
+      // Lazily allocate the streaming card on the first delta; this avoids
+      // creating an empty card when the model turn will be tool-only.
     },
-    agent_message_delta: () => { /* Final summary is shown on agent_message. */ },
+    agent_content_delta: data => {
+      if (data.project !== currentProject) return;
+      // Backend publishes agent_content_delta for content chunks. The delta
+      // payload may carry the chunk under `content` or `delta`; accept either.
+      const chunk = data.content ?? data.delta ?? '';
+      if (chunk) appendStreamingDelta(data.message_id, chunk);
+    },
     agent_reasoning_delta: data => { /* hidden by policy */ },
     agent_tool_call_delta: data => { /* not surfaced */ },
     agent_stream_end: data => {
       if (data.project !== currentProject) return;
-      // Tool-call turns do not create chat cards.
+      const messageId = data.message_id;
+      const finalText = data.message || '';
+      if (!finalText.trim()) {
+        // Tool-only turn — drop any empty placeholder card so the chat does
+        // not show empty assistant messages.
+        discardEmptyStreamingCard(messageId);
+        return;
+      }
+      finalizeStreamingCard(messageId, finalText);
     },
     agent_message: data => {
       if (data.project !== currentProject) return;
+      const finalText = data.message || '';
+      if (!finalText.trim()) {
+        // No user-visible content (e.g. transient terminal notification).
+        setThinking(false);
+        return;
+      }
+      // Prefer the active streaming card so the final message replaces the
+      // streamed text instead of appending a duplicate card. If there is no
+      // streaming card (e.g. the run completed via _await_preview without
+      // deltas, or events were missed over a reset), fall back to a new card.
+      if (pendingFinalCard) {
+        renderAgentContent(pendingFinalCard, finalText);
+        pendingFinalCard.dataset.raw = finalText;
+        const state = pendingFinalCard.querySelector('.message-state');
+        if (state) state.textContent = '';
+        for (const [key, value] of streamingMessages) {
+          if (value === pendingFinalCard) streamingMessages.delete(key);
+        }
+        pendingFinalCard = null;
+      } else {
+        addMessage(finalText, 'agent');
+      }
       markActivityRecovered();
-      addMessage(data.message || '', 'agent');
       // Defensive: every terminal turn publishes agent_message, so the
       // thinking indicator must clear here even if the matching
       // agent_status event was missed (or never published for this path).
@@ -805,11 +977,31 @@ function connectStream() {
       setThinking(false);
     } catch {}
   });
+  eventSource.addEventListener('stream_reset', () => {
+    // The backend disconnected an overflowed subscriber and signalled that
+    // some events were dropped. Re-fetch the canonical state so the UI
+    // converges to the persisted conversation, project state, and preview.
+    syncAfterStreamReset().catch(err => console.error('stream_reset sync failed', err));
+  });
 }
+
+// Populate the chat input with the text of an example-prompt button. Uses
+// event delegation so it works whether the empty-state is rendered inline
+// (initial page load) or re-cloned into the feed by loadHistory().
+document.addEventListener('click', event => {
+  const target = event.target.closest('.example-prompt');
+  if (!target) return;
+  message.value = target.dataset.prompt || message.value;
+  message.focus();
+});
 
 (async function init() {
   if (!currentProject) return;
   await loadCurrentState();
+  // Load the persisted conversation into the main feed so reopening a
+  // project immediately shows its history. The empty-state element is
+  // removed automatically once any displayable message is rendered.
+  await loadHistory(currentProject);
   await syncCurrentPreview();
   connectStream();
 })();

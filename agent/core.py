@@ -17,7 +17,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from agent.images import as_chat_image
-from agent.llm_base import create_llm_client, provider_label, sanitize_assistant_message
+from agent.llm_base import (
+    RequestCancelled,
+    create_llm_client,
+    provider_label,
+    sanitize_assistant_message,
+)
 from agent.prompt import get_system_prompt
 from agent.revisions import RevisionStore
 from agent.settings import Settings
@@ -472,6 +477,16 @@ class AgentRunner:
                 },
             )
             self._publish_terminal_failure(project)
+        except RequestCancelled:
+            # Stopping is an expected control-flow path, not an OpenRouter error.
+            self.publish(
+                "agent_status",
+                {
+                    "project": project,
+                    "status": "stopped",
+                    "message": "Task stopped.",
+                },
+            )
         except Exception as error:  # noqa: BLE001 - Surface all agent failures to the local UI.
             import traceback
 

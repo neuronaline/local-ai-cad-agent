@@ -22,6 +22,10 @@ from agent.settings import Settings
 PROVIDER_LABELS = {"openrouter": "OpenRouter", "openai": "OpenAI"}
 
 
+class RequestCancelled(RuntimeError):
+    """Raised when the local agent stops an in-flight LLM request."""
+
+
 def sanitize_assistant_message(message: dict[str, Any]) -> dict[str, Any]:
     """Copy a model response while retaining standard content and tool fields."""
     sanitized = deepcopy(message)
@@ -123,12 +127,12 @@ def post_with_cancel(
 
     worker = threading.Thread(target=request_worker, daemon=True)
     if stop_event and stop_event.is_set():
-        raise RuntimeError("LLM request cancelled.")
+        raise RequestCancelled("LLM request cancelled.")
     worker.start()
     while worker.is_alive():
         worker.join(timeout=0.1)
         if stop_event and stop_event.is_set():
-            raise RuntimeError("LLM request cancelled.")
+            raise RequestCancelled("LLM request cancelled.")
     result = results.get()
     if isinstance(result, BaseException):
         raise result
@@ -153,7 +157,7 @@ def parse_chat_stream(
     for raw_line in response.iter_lines():
         if stop_event and stop_event.is_set():
             response.close()
-            raise RuntimeError(f"{provider_label} request cancelled.")
+            raise RequestCancelled(f"{provider_label} request cancelled.")
         line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
         if not line or not line.startswith("data:"):
             continue
@@ -239,7 +243,7 @@ def sleep_with_cancel(delay: float, stop_event: threading.Event | None) -> None:
     if delay <= 0:
         return
     if stop_event and stop_event.wait(delay):
-        raise RuntimeError("LLM request cancelled.")
+        raise RequestCancelled("LLM request cancelled.")
     if not stop_event:
         time.sleep(delay)
 

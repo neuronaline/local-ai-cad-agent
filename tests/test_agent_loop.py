@@ -179,6 +179,44 @@ class LiveFinalClient:
         }
 
 
+class CancelledClient:
+    def __init__(self, _settings):
+        self.stop_event = None
+        self.session_id = None
+        self.stream_callback = None
+
+    def chat(self, _messages, _tools):
+        from agent.llm_base import RequestCancelled
+
+        raise RequestCancelled("OpenRouter request cancelled.")
+
+
+def test_agent_treats_cancelled_llm_request_as_a_stopped_task(tmp_path: Path, monkeypatch):
+    import agent.core
+
+    project_root = tmp_path / "projects"
+    project_dir = project_root / "demo"
+    project_dir.mkdir(parents=True)
+    (project_dir / "conversation.jsonl").write_text("", encoding="utf-8")
+    events = []
+    monkeypatch.setattr(
+        agent.core,
+        "create_llm_client",
+        lambda _settings, _ignored=None: CancelledClient(_settings),
+    )
+    runner = AgentRunner(
+        Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000),
+        lambda *args, **_: events.append((args[0], args[1])),
+    )
+
+    runner._run("demo", "Make a bracket")
+
+    assert ("agent_status", {
+        "project": "demo", "status": "stopped", "message": "Task stopped."
+    }) in events
+    assert not any(kind == "agent_error" for kind, _data in events)
+
+
 def test_agent_does_not_complete_without_a_new_drawing(tmp_path: Path, monkeypatch):
     import agent.core
 

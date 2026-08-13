@@ -21,7 +21,8 @@
             <span id="connection-status" class="connection-status" title="Connecting…"></span>
           </div>
         </header>
-        <div id="chat-feed" class="chat-feed" aria-live="polite">
+        <div id="chat-feed" class="chat-feed" aria-live="polite"></div>
+        <template id="chat-empty">
           <div class="empty-state">
             <strong>{{ project_name }}</strong>
             <span>Describe the part you want to build.</span>
@@ -32,7 +33,7 @@
               <button type="button" class="example-prompt" data-prompt="Create a 40 mm cube with a centered 20 mm diameter through-hole along the Z axis.">Cube with a centered through-hole</button>
             </div>
           </div>
-        </div>
+        </template>
         <div id="question-area"></div>
         <details id="activity-panel" class="activity-panel" hidden>
           <summary><span id="activity-title">Activity</span><span class="activity-chevron">⌄</span></summary>
