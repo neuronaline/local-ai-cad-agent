@@ -80,7 +80,7 @@ info "Python dependencies installed."
 # ── Configuration files ──
 if [ ! -f .env ]; then
     cp .env.example .env
-    info ".env created from .env.example. Add your OPENROUTER_API_KEY inside."
+    info ".env created from .env.example. Add the API key for your selected provider."
 else
     info ".env already exists — left unchanged."
 fi
@@ -99,14 +99,20 @@ echo -e "${GREEN}  Local AI CAD Agent installed successfully!${NC}"
 echo -e "${GREEN}============================================${NC}"
 echo ""
 echo "  Next steps:"
-echo "  1. Set your OpenRouter API key in .env:"
-echo "     OPENROUTER_API_KEY=sk-or-v1-..."
+echo "  1. Set the API key for the provider selected in config.yaml:"
+echo "     OPENROUTER_API_KEY=...  or  OPENAI_API_KEY=..."
 echo ""
 echo "  2. (Optional) Customize the model in config.yaml"
 echo ""
 echo "  3. Start the application:"
 echo "     ${GREEN}./run.sh${NC}"
 echo ""
-if [ ! -s .env ] || ! grep -qE '^[[:space:]]*OPENROUTER_API_KEY[[:space:]]*=[[:space:]]*[^[:space:]]' .env; then
-    warn "OPENROUTER_API_KEY is empty in .env. The setup page will guide you on first launch."
+LLM_PROVIDER="$("$VENV_PYTHON" -c 'from agent.settings import load_settings; print(load_settings().llm_provider)')"
+if [ "$LLM_PROVIDER" = "openai" ]; then
+    API_KEY_NAME="OPENAI_API_KEY"
+else
+    API_KEY_NAME="OPENROUTER_API_KEY"
+fi
+if [ ! -s .env ] || ! grep -qE "^[[:space:]]*${API_KEY_NAME}[[:space:]]*=[[:space:]]*[^[:space:]]" .env; then
+    warn "${API_KEY_NAME} is empty in .env. The setup page will guide you on first launch."
 fi

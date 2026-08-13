@@ -37,9 +37,9 @@ if [ ! -f .env ]; then
     warn ".env is missing. Creating from .env.example…"
     if [ -f .env.example ]; then
         cp .env.example .env
-        info ".env created. Set your OPENROUTER_API_KEY there."
+        info ".env created. Set the API key for your selected provider there."
     else
-        warn ".env.example not found. Create .env with OPENROUTER_API_KEY manually."
+        warn ".env.example not found. Create .env with the API key for your selected provider manually."
     fi
 fi
 
@@ -72,10 +72,16 @@ if ! "$PYTHON_BIN" -c 'import ctypes; ctypes.CDLL("libseccomp.so.2")' 2>/dev/nul
 fi
 
 # ── API key ──
-# Python loads .env via dotenv; this shell only checks that the file exists.
+# Python loads .env via dotenv; this shell only checks the selected provider's key.
+LLM_PROVIDER="$("$PYTHON_BIN" -c 'from agent.settings import load_settings; print(load_settings().llm_provider)')"
+if [ "$LLM_PROVIDER" = "openai" ]; then
+    API_KEY_NAME="OPENAI_API_KEY"
+else
+    API_KEY_NAME="OPENROUTER_API_KEY"
+fi
 if [ -f "$PROJECT_DIR/.env" ] \
-    && ! grep -qE '^[[:space:]]*OPENROUTER_API_KEY[[:space:]]*=[[:space:]]*[^[:space:]]' "$PROJECT_DIR/.env" 2>/dev/null; then
-    warn "OPENROUTER_API_KEY is not configured. The setup page will guide you on first launch."
+    && ! grep -qE "^[[:space:]]*${API_KEY_NAME}[[:space:]]*=[[:space:]]*[^[:space:]]" "$PROJECT_DIR/.env" 2>/dev/null; then
+    warn "${API_KEY_NAME} is not configured. The setup page will guide you on first launch."
 fi
 
 # ── Port check ──

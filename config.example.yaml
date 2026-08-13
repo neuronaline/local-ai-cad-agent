@@ -38,10 +38,3 @@ server:
 
 ui:
   show_info_messages: true
-
-# CAD quality observability. `enabled` is on by default; setting
-# `require_acceptance_before_finalize: true` gates Finalize behind an explicit
-# accept/reject decision from the UI.
-quality:
-  enabled: true
-  require_acceptance_before_finalize: false

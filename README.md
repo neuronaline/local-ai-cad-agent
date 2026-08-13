@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 
-A local-first web app that lets you **chat with an AI agent to create parametric CAD models**. Built with [build123d](https://github.com/gumyr/build123d) for solid modeling, [Three.js](https://threejs.org/) for in-browser preview, and [OpenRouter](https://openrouter.ai/) for LLM access — all sandboxed with Bubblewrap.
+A local-first web app that lets you **chat with an AI agent to create parametric CAD models**. Built with [build123d](https://github.com/gumyr/build123d) for solid modeling, [Three.js](https://threejs.org/) for in-browser preview, and either [OpenRouter](https://openrouter.ai/) or [OpenAI](https://platform.openai.com/) for LLM access — all sandboxed with Bubblewrap.
 
 > **⚠️ Status:** This project is in **early development** and is also a **hobby project**. It is currently best suited for **simple, non-complex mechanical parts**. It may not yet be a good fit for finely detailed, large, or intricate models.
 
@@ -38,7 +38,7 @@ git clone https://github.com/neuronaline/local-ai-cad-agent.git
 cd local-ai-cad-agent
 ./install.sh
 
-# Add the key for your selected LLM provider to .env, e.g.
+# Add the key for your selected LLM provider to .env, for example:
 # OPENROUTER_API_KEY=your-key
 
 # Run
@@ -92,8 +92,8 @@ local-ai-cad-agent/
 │   ├── index.html             # Chat + 3D viewer page
 │   └── projects.html          # Project management page
 ├── tests/                     # Unit, API, sandbox & real-CAD acceptance tests
+├── install.sh                 # Dependency and first-run setup
 ├── run.sh                     # Startup script
-├── gunicorn.conf.py           # Single-worker WSGI config
 ├── config.example.yaml        # Shareable defaults
 └── requirements.txt
 ```
@@ -108,12 +108,12 @@ per-user configuration file.
 |---|---|---|
 | `workspace_root` | `~/CAD-Agent-Projects` | Where project data lives |
 | `llm.provider` | `openrouter` | Active provider: `openrouter` or `openai` |
-| `agent.tool_call_limit` | `30` | Max tool rounds per task |
+| `agent.tool_call_limit` | `30` | Maximum tool rounds per task |
 | `agent.revision_retention_count` | `0` | Model revisions to retain (`0` keeps all) |
 | `agent.debug_log_tool_errors` | `false` | Write detailed recoverable tool failures to `<project>/debug-errors.jsonl` |
 | `openrouter.model` | `google/gemini-3.6-flash` | OpenRouter model slug |
 | `openrouter.timeout_seconds` | `60` | Request timeout for OpenRouter |
-| `openrouter.reasoning_effort` | `medium` | `minimal`, `low`, `medium`, or `high` |
+| `openrouter.reasoning_effort` | `medium` | `minimal`, `low`, `medium`, or `high` (when supported by the model) |
 | `openrouter.provider` | `google-vertex/global` | Preferred provider slug |
 | `openrouter.force_provider` | `true` | Disable provider fallbacks |
 | `openai.model` | `gpt-5.6-terra` | Direct OpenAI model slug |
@@ -165,7 +165,7 @@ To update a frontend library, choose an exact upstream release, download its bro
 
 - `.env` and `config.yaml` are **git-ignored** — never commit API keys
 - All generated code runs in a **Bubblewrap sandbox** with clean environment, blocked network syscalls, and `prlimit` resource caps
-- The app is **local-only** — do not expose it to the public internet
+- The app is intended for **local use**. Do not expose it to the public internet.
 - Sandbox assumes standard FHS layout (`/usr`, `/etc`, `/bin`, `/lib`); non-standard distros (NixOS, Guix, Fedora Silverblue) may need adjustments
 - The sandbox relies on unprivileged user namespaces. If Bubblewrap fails to
   start, check your distribution's user-namespace policy and Bubblewrap setup.

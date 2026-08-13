@@ -8,7 +8,3 @@ requests>=2.31,<3
 build123d==0.11.1
 numpy>=1.26,<3
 Pillow>=10.0,<13
-
-# Production server
-gevent>=24.2,<27
-gunicorn>=22.0,<27
