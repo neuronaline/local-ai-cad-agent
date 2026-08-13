@@ -78,7 +78,8 @@ def test_settings_rejects_unknown_provider(tmp_path):
 def test_build123d_playbook_is_injected_once_into_the_static_system_prompt():
     playbook = get_build123d_playbook()
     system_prompt = get_system_prompt()
-    assert playbook.startswith("# build123d CAD CLI Playbook")
+    assert playbook.startswith("# build123d")
+    assert "Target version" in playbook
     assert "```markdown" not in playbook
     assert system_prompt.count("<build123d_cli_playbook>") == 1
     assert playbook in system_prompt
@@ -89,12 +90,23 @@ def test_build123d_playbook_is_injected_once_into_the_static_system_prompt():
 def test_build123d_playbook_has_versioned_curve_and_topology_guidance():
     playbook = get_build123d_playbook()
     system_prompt = get_system_prompt()
-    assert "`build123d` **0.11.1**" in playbook
-    assert "`Ellipse` creates a **complete filled 2D sketch**" in playbook
+    # Version pinning surfaces both in the header and the explicit target line.
+    assert "build123d 0.11.1" in playbook
+    # Curve API: the playbook must document the Ellipse vs EllipticalCenterArc
+    # distinction so the agent picks the correct primitive for filled shapes
+    # vs true elliptical arcs.
+    assert "Ellipse" in playbook
     assert "EllipticalCenterArc" in playbook
-    assert "radius >= endpoint_distance / 2" in playbook
-    assert "There is no top-level `max_fillet` function" in playbook
-    assert "Final exports are handled separately by the application" in playbook
+    assert "creates a filled 2D sketch object" in playbook
+    # Topology freshness after booleans/chamfers/fillets — both prompt and
+    # playbook call this out so the agent discards stale selectors.
+    assert "fillets" in playbook
+    assert "selectors after booleans" in playbook
+    # The CLI owns rendering/export; the playbook must tell the agent not to
+    # export from inside model.py.
+    assert "The CLI handles preview and rendering" in playbook
+    # Locale-leak guard: the agent's prompt must not contain Turkish
+    # "Değişiklik Özeti" header fragments from upstream sources.
     assert "Değişiklik Özeti" not in playbook
     assert "discard any cached edge/face indices" in system_prompt
 

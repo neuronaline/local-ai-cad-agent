@@ -847,9 +847,7 @@ def create_app(settings: Settings | None = None) -> Flask:
             return jsonify({"error": str(error)}), 400
         except RevisionIntegrityError as error:
             return jsonify({"error": str(error)}), 422
-        next_before = None
-        if revisions and store.list(limit=1, before=revisions[-1].id):
-            next_before = revisions[-1].id
+        next_before = revisions[-1].id if len(revisions) == limit else None
         return jsonify({
             "revisions": [
                 _revision_summary(
@@ -901,8 +899,14 @@ def create_app(settings: Settings | None = None) -> Flask:
             revision = store.get(revision_id)
         except (ValueError, RevisionIntegrityError) as error:
             return jsonify({"error": str(error)}), 404
-        against_id = request.args.get("against") or revision.parent_id
-        if against_id is None:
+        # If ``?against=`` is explicitly provided (including empty string),
+        # treat it as the authoritative source. Otherwise fall back to the
+        # revision's parent_id (audit_183).
+        if "against" in request.args:
+            against_id = request.args.get("against")
+        else:
+            against_id = revision.parent_id
+        if against_id is None or against_id == "":
             return jsonify({"diff": "", "truncated": False, "against": None})
         try:
             against = store.get(against_id)
@@ -935,16 +939,12 @@ def create_app(settings: Settings | None = None) -> Flask:
 
     @app.post("/api/projects/<project_name>/revisions/<revision_id>/restore")
     def restore_revision(project_name: str, revision_id: str):
+        current_settings = app.config["SETTINGS"]
         try:
-            current_settings = app.config["SETTINGS"]
             project_dir = _project_path(current_settings, project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         with _project_lock(app, project_name):
-            try:
-                project_dir = _project_path(app.config["SETTINGS"], project_name)
-            except (ValueError, FileNotFoundError) as error:
-                return jsonify({"error": str(error)}), 404
             runner = app.config["AGENT_RUNNER"]
             if runner.has_active_state_for(project_name):
                 return jsonify({"error": "Cannot restore while the agent is active."}), 409

@@ -492,6 +492,58 @@ def test_prune_removes_old_revisions(tmp_path: Path):
     assert len(revisions) <= 3
 
 
+def test_prune_removes_build_records_from_log(tmp_path: Path):
+    """Pruning must also drop build records for the deleted revisions (audit_176)."""
+    store = RevisionStore(tmp_path, retention_count=2)
+    revisions = []
+    for i in range(4):
+        revision = store.commit(
+            f"# model v{i}\nresult = {i}\n", RevisionOrigin(kind="agent_edit")
+        )
+        store.record_build_success(revision.id, {"solid_count": 1}, tmp_path / "preview.stl")
+        revisions.append(revision)
+
+    store.prune(2)
+
+    # Read the log and make sure no record references a pruned revision.
+    log_path = tmp_path / "builds.jsonl"
+    assert log_path.is_file()
+    retained_ids = {r.id for r in store.list(limit=200)}
+    for line in log_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        item = json.loads(line)
+        assert item["revision_id"] in retained_ids
+
+
+def test_prune_preserves_active_head_outside_retention_window(tmp_path: Path):
+    """An old head.json must survive pruning (audit_178)."""
+    # Use a high retention so manual rewrites + prune still cover the case.
+    store = RevisionStore(tmp_path, retention_count=10)
+    r1 = store.commit(MODEL_A, RevisionOrigin(kind="agent_edit"))
+    store.commit(MODEL_B, RevisionOrigin(kind="agent_edit"))
+    r3 = store.commit(MODEL_C, RevisionOrigin(kind="agent_edit"))
+
+    # Force head.json back to the oldest revision (simulating an external rewrite).
+    head_path = tmp_path / ".cad-agent" / "history" / "head.json"
+    head_path.write_text(
+        json.dumps({
+            "schema_version": 1,
+            "revision_id": r1.id,
+            "model_sha256": r1.model_sha256,
+        }),
+        encoding="utf-8",
+    )
+
+    # Prune down to 2 — r3 and r2 are the newest, but r1 is the active head.
+    store.prune(2)
+
+    # r1 must still be present because it is the active head.
+    assert (tmp_path / ".cad-agent" / "history" / "revisions" / f"{r1.id}.json").is_file()
+    assert store.head() is not None
+    assert store.head().id == r1.id
+
+
 def test_prune_preserves_last_known_good(tmp_path: Path):
     store = RevisionStore(tmp_path, retention_count=2)
     r1 = store.commit(MODEL_A, RevisionOrigin(kind="agent_edit"))

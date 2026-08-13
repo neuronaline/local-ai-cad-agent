@@ -179,7 +179,6 @@ class RevisionStore:
         self._head_path = history / "head.json"
         self._blobs_dir = history / "blobs"
         self._revisions_dir = history / "revisions"
-        self._builds_dir = history / "builds"
 
     # ------------------------------------------------------------------ #
     #  Public API
@@ -208,15 +207,9 @@ class RevisionStore:
             return self._adopt_existing_model(model_digest)
 
         # Validate head pointer.
-        head_revision_id = head_data.get("revision_id")
-        head_digest = head_data.get("model_sha256")
-        if not (
-            isinstance(head_revision_id, str)
-            and _REVISION_ID_RE.fullmatch(head_revision_id)
-        ):
-            raise RevisionIntegrityError("head.json has an invalid revision ID.")
-        if not (isinstance(head_digest, str) and _SHA256_RE.fullmatch(head_digest)):
-            raise RevisionIntegrityError("head.json has an invalid model digest.")
+        head_data = self._read_and_validate_head()
+        head_revision_id = head_data["revision_id"]
+        head_digest = head_data["model_sha256"]
 
         # Validate head revision manifest exists and matches.
         head_revision = self.get(head_revision_id)
@@ -244,6 +237,22 @@ class RevisionStore:
     @_synchronized
     def head(self) -> Revision | None:
         """Return the active head revision, or None if no history exists."""
+        head_data = self._read_and_validate_head()
+        if head_data is None:
+            return None
+        head_revision_id = head_data["revision_id"]
+        head_digest = head_data["model_sha256"]
+        revision = self.get(head_revision_id)
+        if revision.model_sha256 != head_digest:
+            raise RevisionIntegrityError(
+                "head.json digest does not match the head revision manifest digest."
+            )
+        return revision
+
+    def _read_and_validate_head(self) -> dict | None:
+        """Read head.json, returning a validated ``{revision_id, model_sha256}``
+        dict or ``None`` when no head exists. Raises ``RevisionIntegrityError``
+        for malformed pointers (audit_181)."""
         head_data = self._read_json_safe(self._head_path)
         if head_data is None:
             return None
@@ -256,12 +265,7 @@ class RevisionStore:
         head_digest = head_data.get("model_sha256")
         if not isinstance(head_digest, str) or not _SHA256_RE.fullmatch(head_digest):
             raise RevisionIntegrityError("head.json has an invalid model digest.")
-        revision = self.get(head_revision_id)
-        if revision.model_sha256 != head_digest:
-            raise RevisionIntegrityError(
-                "head.json digest does not match the head revision manifest digest."
-            )
-        return revision
+        return {"revision_id": head_revision_id, "model_sha256": head_digest}
 
     @_synchronized
     def list(
@@ -285,6 +289,10 @@ class RevisionStore:
         """Return every readable revision, newest first, for internal operations.
 
         Cached in memory (audit_032); invalidated on commit/restore/prune.
+
+        Must be called while holding ``self._lock`` (audit_185). All public
+        callers wrap this in ``@_synchronized``; new callers must do the same
+        to avoid races with cache invalidation.
         """
         if self._revisions_cache is not None:
             return list(self._revisions_cache)
@@ -407,11 +415,18 @@ class RevisionStore:
             created_at=_utc_now(),
             origin=origin,
         )
+        # Write the manifest and update head.json *before* rewriting model.py
+        # so that the recoverable invariant on crash is "head always points at
+        # a revision whose manifest exists". If the process dies between the
+        # head.json write and model.py, reconcile() will detect the mismatch
+        # and create a recovery revision adopting the stale model.py content.
         self._write_revision(revision)
-
-        # Atomically replace model.py, then update head.
-        self._atomic_write_text(self.project_dir / "model.py", source)
         self._write_head(revision)
+
+        # Replace model.py last; any failure here leaves the revision history
+        # consistent (head points at a valid manifest) and reconcile() will
+        # rebuild the model.py difference on the next run.
+        self._atomic_write_text(self.project_dir / "model.py", source)
 
         if retention > 0:
             self.prune(retention)
@@ -459,9 +474,11 @@ class RevisionStore:
         # Manifest is unique even if the blob is shared.
         self._write_revision(revision)
 
-        # Atomically replace model.py, then update head.
-        self._atomic_write_text(self.project_dir / "model.py", source)
+        # Update head.json *before* rewriting model.py so that crash recovery
+        # leaves the history consistent (head points at a valid manifest).
         self._write_head(revision)
+
+        self._atomic_write_text(self.project_dir / "model.py", source)
 
         if self.retention_count > 0:
             self.prune(self.retention_count)
@@ -594,7 +611,11 @@ class RevisionStore:
         ) as temporary:
             tmp_path = Path(temporary.name)
             tmp_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
-        tmp_path.replace(log_path)
+        try:
+            tmp_path.replace(log_path)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
 
     def _write_build(self, build: BuildRecord) -> None:
         """Backward-compat alias used by older callers and round-trip tests."""
@@ -631,12 +652,21 @@ class RevisionStore:
         lkg = self.last_known_good()
         lkg_id = lkg.id if lkg else None
 
+        # The active head must always survive pruning — even if it sits
+        # outside the newest ``target`` window (e.g. an old head.json written
+        # by an external tool). Aborting here keeps prune atomic if head()
+        # fails after we've already inspected revisions.
+        head = self.head()
+        head_id = head.id if head is not None else None
+
         removed = 0
-        # Keep the `target` most recent, plus the LKG if not already
-        # in that set (it may be older).
+        # Keep the `target` most recent, plus the LKG and active head
+        # if any of them are outside the recent window.
         keep_ids: set[str] = {r.id for r in revisions[:target]}
         if lkg_id is not None:
             keep_ids.add(lkg_id)
+        if head_id is not None:
+            keep_ids.add(head_id)
 
         for revision in revisions:
             if revision.id in keep_ids:
@@ -748,7 +778,11 @@ class RevisionStore:
                 self._write_blob_bytes(blob_content.encode("utf-8"), model_sha256)
 
             # Write revision manifest.
-            self._write_revision(Revision.from_dict(revision_data))
+            try:
+                revision = Revision.from_dict(revision_data)
+            except (KeyError, TypeError):
+                continue  # Skip malformed revision entries.
+            self._write_revision(revision)
 
             # Write build record if present.
             build_data = revision_data.get("build")
@@ -794,8 +828,52 @@ class RevisionStore:
         """
         manifest = self._revisions_dir / f"{revision.id}.json"
         manifest.unlink(missing_ok=True)
-        build = self._builds_dir / f"{revision.id}.json"
-        build.unlink(missing_ok=True)
+        self._remove_build_records(revision.id)
+
+    def _remove_build_records(self, revision_id: str) -> None:
+        """Rewrite builds.jsonl, dropping every entry for ``revision_id``.
+
+        Build records live in a single append-only JSONL log; without this
+        filter, ``prune`` would leave orphaned build records that no future
+        ``build_for`` lookup can match (audit_176)."""
+        try:
+            log_path = self._builds_log_path()
+        except OSError:
+            return
+        if not log_path.is_file():
+            return
+        try:
+            raw = log_path.read_text(encoding="utf-8")
+        except OSError:
+            return
+        kept: list[str] = []
+        removed = False
+        for line in raw.splitlines(keepends=False):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                item = json.loads(stripped)
+            except json.JSONDecodeError:
+                kept.append(line)
+                continue
+            if isinstance(item, dict) and item.get("revision_id") == revision_id:
+                removed = True
+                continue
+            kept.append(line)
+        if not removed:
+            return
+        payload = "\n".join(kept) + ("\n" if kept else "")
+        with tempfile.NamedTemporaryFile(
+            mode="w", dir=log_path.parent, encoding="utf-8", delete=False
+        ) as temporary:
+            tmp_path = Path(temporary.name)
+            tmp_path.write_text(payload, encoding="utf-8")
+        try:
+            tmp_path.replace(log_path)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
 
     def _verify_active_model(self, revision: Revision) -> None:
         """Confirm the active model.py digest matches the revision."""
