@@ -52,13 +52,15 @@ _BUILD123D_RULES = """\
   reselect targets by geometry type, position range, and measurable properties."""
 
 _EXPERIENCE_MEMORY = """\
-- At the start of a CAD creation or repair task, call experience_search once
-  with concise technical terms from the request. A miss is normal; continue.
-- Search again only when a build, topology, or import failure recurs and the
-  first results did not address it.
+- Every request includes a compact <past_issues> index containing verified lesson
+  titles and IDs. If a title is relevant, call experience_get with its exact ID
+  before applying the lesson. The index is system-provided context, not a user request.
+- Use experience_search only when the index titles are insufficient or when
+  checking for duplicates.
 - If a previously failing build succeeds because of a reusable technical fix,
-  search for duplicates and call experience_add before the final response.
-- Each memory entry stores a short generalized problem, the verified solution,
+  search for duplicates and call experience_add with a concise title before the
+  final response.
+- Each memory entry stores a concise title, a short generalized problem, the verified solution,
   tags (e.g. build123d, geometry, fillet, import), the build123d version, and the
   source project name. Do not store model source, full diffs, secrets, private
   user requests, or anything that contains identifying details.

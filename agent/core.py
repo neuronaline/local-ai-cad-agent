@@ -537,7 +537,36 @@ class AgentRunner:
         if not history or history[-1] != user_message:
             history.append(user_message)
             self._append_message(project_dir, user_message)
-        return [{"role": "system", "content": get_system_prompt()}] + history
+        issue_index = ExperienceTool(
+            project_dir.parent, project_dir.name
+        ).context_index()
+        return [
+            {"role": "system", "content": get_system_prompt()},
+            self._past_issues_message(issue_index),
+            *history,
+        ]
+
+    @staticmethod
+    def _past_issues_message(issue_index: dict[str, object]) -> dict[str, str]:
+        """Format one run-scoped, compact past-issues snapshot."""
+        if not issue_index.get("available"):
+            content = "<past_issues>\n(unavailable)\n</past_issues>"
+        else:
+            issues = issue_index.get("issues")
+            lines = ["<past_issues>"]
+            if isinstance(issues, list) and issues:
+                for issue in issues:
+                    if not isinstance(issue, dict):
+                        continue
+                    title = issue.get("title")
+                    record_id = issue.get("id")
+                    if isinstance(title, str) and isinstance(record_id, str):
+                        lines.append(f"- {title} — id: {record_id}")
+            if len(lines) == 1:
+                lines.append("(empty)")
+            lines.append("</past_issues>")
+            content = "\n".join(lines)
+        return {"role": "user", "content": content}
 
     @staticmethod
     def _strip_image_parts(item: dict) -> dict:
@@ -677,13 +706,17 @@ class AgentRunner:
             ), False
         if name == "experience_search":
             return tools.experience.search(args["query"]), False
+        if name == "experience_get":
+            return tools.experience.get(args["id"]), False
         if name == "experience_add":
             return tools.experience.add(
+                args["title"],
                 args["problem"], args["solution"], args.get("tags")
             ), False
         if name == "experience_update":
             return tools.experience.update(
                 args["id"],
+                args.get("title"),
                 args.get("problem"),
                 args.get("solution"),
                 args.get("tags"),

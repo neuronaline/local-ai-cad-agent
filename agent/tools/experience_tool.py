@@ -25,6 +25,7 @@ def _lock_for_memory_file(path: Path) -> threading.RLock:
 
 
 _MAX_FIELD_LENGTHS = {
+    "title": 120,
     "problem": 500,
     "solution": 2000,
 }
@@ -57,19 +58,26 @@ class ExperienceTool:
             if not query:
                 return json.dumps({"error": "A search query is required."}), False
             result = self.search(query)
+        elif operation == "get":
+            record_id = (args.get("id") or "").strip()
+            if not record_id:
+                return json.dumps({"error": "Record id is required."}), False
+            result = self.get(record_id)
         elif operation == "add":
+            title = (args.get("title") or "").strip()
             problem = (args.get("problem") or "").strip()
             solution = (args.get("solution") or "").strip()
-            if not problem or not solution:
+            if not title or not problem or not solution:
                 return json.dumps(
-                    {"error": "Both problem and solution are required."}
+                    {"error": "Title, problem, and solution are required."}
                 ), False
-            result = self.add(problem, solution, args.get("tags"))
+            result = self.add(title, problem, solution, args.get("tags"))
         elif operation == "update":
             if not args.get("id"):
                 return json.dumps({"error": "Record id is required for update."}), False
             result = self.update(
                 args["id"],
+                args.get("title"),
                 args.get("problem"),
                 args.get("solution"),
                 args.get("tags"),
@@ -77,6 +85,21 @@ class ExperienceTool:
         else:
             raise ValueError("Unsupported experience operation.")
         return json.dumps(result), False
+
+    def context_index(self) -> dict[str, Any]:
+        """Return the compact, safe snapshot injected into an agent context."""
+        try:
+            records = self._read()
+        except RuntimeError:
+            # Memory is optional. A bad shared file must not block CAD work.
+            return {"available": False, "issues": []}
+        issues = []
+        for record in records:
+            record_id = record.get("id")
+            title = record.get("title")
+            if isinstance(record_id, str) and record_id and isinstance(title, str) and title:
+                issues.append({"id": record_id, "title": title})
+        return {"available": True, "issues": issues}
 
     def search(self, query: str) -> dict[str, Any]:
         """Return matching records for a case-insensitive word query."""
@@ -94,11 +117,21 @@ class ExperienceTool:
         matches.sort(key=lambda item: item["_score"], reverse=True)
         return {"matches": matches[:_SEARCH_RESULT_LIMIT]}
 
+    def get(self, record_id: str) -> dict[str, Any]:
+        """Return one verified lesson by its exact ID."""
+        if not isinstance(record_id, str) or not record_id.strip():
+            raise ValueError("Record id is required.")
+        target = self._find_by_id(self._read(), record_id.strip())
+        if target is None:
+            raise ValueError(f"No record found with id: {record_id}")
+        return dict(target)
+
     def add(
-        self, problem: str, solution: str, tags: list[str] | None = None
+        self, title: str, problem: str, solution: str, tags: list[str] | None = None
     ) -> dict[str, Any]:
         """Store a verified problem and solution. Updates existing similar record."""
         tags = self._normalize_tags(tags or [])
+        title = self._validate_title(title)
         problem = self._validate_field("problem", problem)
         solution = self._validate_field("solution", solution)
         with self._memory_lock:
@@ -106,6 +139,7 @@ class ExperienceTool:
             duplicate = self._find_duplicate(records, problem)
             now = _utc_now()
             if duplicate:
+                duplicate["title"] = title
                 duplicate["solution"] = solution
                 duplicate["tags"] = self._merge_tags(duplicate.get("tags", []), tags)
                 duplicate["last_seen_at"] = now
@@ -117,6 +151,7 @@ class ExperienceTool:
             new_id = uuid.uuid4().hex
             record = {
                 "id": new_id,
+                "title": title,
                 "problem": problem,
                 "solution": solution,
                 "tags": tags,
@@ -132,6 +167,7 @@ class ExperienceTool:
     def update(
         self,
         record_id: str,
+        title: str | None = None,
         problem: str | None = None,
         solution: str | None = None,
         tags: list[str] | None = None,
@@ -144,6 +180,8 @@ class ExperienceTool:
             target = self._find_by_id(records, record_id)
             if target is None:
                 raise ValueError(f"No record found with id: {record_id}")
+            if title is not None:
+                target["title"] = self._validate_title(title)
             if problem is not None:
                 target["problem"] = self._validate_field("problem", problem)
             if solution is not None:
@@ -191,7 +229,7 @@ class ExperienceTool:
 
     def _write(self, records: list[dict[str, Any]]) -> None:
         self._memory_dir.mkdir(parents=True, exist_ok=True)
-        payload = {"version": 1, "issues": records}
+        payload = {"version": 2, "issues": records}
         # Use a unique same-directory temp file per write so concurrent
         # processes do not collide on a single fixed temp name. The shared
         # lock still serializes in-process writers; cross-process callers
@@ -284,6 +322,11 @@ class ExperienceTool:
                 f"{field} exceeds {limit} characters ({len(stripped)} provided)."
             )
         return stripped
+
+    def _validate_title(self, value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("title cannot be empty.")
+        return self._validate_field("title", " ".join(value.split()))
 
     def _normalize_tags(self, tags: list[str]) -> list[str]:
         if not isinstance(tags, list):

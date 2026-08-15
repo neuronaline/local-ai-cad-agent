@@ -254,7 +254,7 @@ def test_activity_label_uses_intended_wording_for_every_tool():
         "var labels = {};\n"
         "for (const name of ['cad_build_and_verify', 'file_write', 'file_replace',\n"
         "                    'file_regex_replace', 'file_read', 'terminal_run',\n"
-        "                    'terminal_check', 'experience_search', 'experience_add',\n"
+        "                    'terminal_check', 'experience_search', 'experience_get', 'experience_add',\n"
         "                    'experience_update', 'question', 'agent', 'usage',\n"
         "                    'preparing', 'running', 'rendering', 'reviewing',\n"
         "                    'started', 'completed', 'error', 'stopped']) {\n"
@@ -274,6 +274,7 @@ def test_activity_label_uses_intended_wording_for_every_tool():
     assert labels["file_write"] == "Updating model"
     assert labels["terminal_run"] == labels["terminal_check"] == "Checking model"
     assert labels["experience_search"] == "Checking past solutions"
+    assert labels["experience_get"] == "Reading past solution"
     assert labels["question"] == "Requesting input"
 
 

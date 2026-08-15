@@ -457,6 +457,7 @@ def test_agent_tool_schema_and_dispatch_forbid_export(tmp_path: Path):
         "terminal_run",
         "terminal_check",
         "experience_search",
+        "experience_get",
         "experience_add",
         "experience_update",
     } <= names
@@ -654,16 +655,42 @@ def test_protocol_history_is_append_only_and_preserves_tool_call_content(
     messages = runner._context(project, "Add a chamfer", [])
 
     assert messages[0]["role"] == "system"
-    assert [message["role"] for message in messages[1:]] == [
+    assert [message["role"] for message in messages[2:]] == [
         "user",
         "assistant",
         "tool",
         "assistant",
         "user",
     ]
+    assert messages[1] == {
+        "role": "user",
+        "content": "<past_issues>\n(empty)\n</past_issues>",
+    }
     assert (
         (project / "conversation.jsonl").read_text(encoding="utf-8").startswith(initial)
     )
+
+
+def test_past_issue_index_is_a_run_scoped_snapshot(tmp_path: Path):
+    project = tmp_path / "demo"
+    project.mkdir()
+    runner = AgentRunner(
+        Settings(tmp_path, "https://example.test", "test", 1, "127.0.0.1", 5000),
+        lambda *_, **__: None,
+    )
+
+    messages = runner._context(project, "Make a bracket", [])
+    snapshot = messages[1]["content"]
+
+    ProjectTools(project, lambda *_, **__: None).experience.add(
+        "Fillet recovery",
+        "Fillet fails on sharp edges.",
+        "Apply a chamfer first.",
+    )
+
+    assert messages[1]["content"] == snapshot
+    next_messages = runner._context(project, "Add a fillet", [])
+    assert "Fillet recovery" in next_messages[1]["content"]
 
 
 def test_legacy_history_is_loaded_from_conversation_jsonl(tmp_path: Path):

@@ -389,6 +389,7 @@ def test_agent_records_recovered_build_failure(tmp_path: Path, monkeypatch):
                                     "name": "experience_add",
                                     "arguments": json.dumps(
                                         {
+                                            "title": "Minimal box recovery",
                                             "problem": "Build failed once",
                                             "solution": "Use minimal Box.",
                                             "tags": ["build123d"],
@@ -448,4 +449,4 @@ def test_experience_tool_rejects_oversized_problem():
     tool = ExperienceTool(Path("/tmp"), "demo")
     huge = "x" * 600
     with pytest.raises(ValueError):
-        tool.add(huge, "valid solution", tags=["x"])
+        tool.add("Valid title", huge, "valid solution", tags=["x"])

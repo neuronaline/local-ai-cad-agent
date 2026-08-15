@@ -118,6 +118,7 @@ const activityLabels = {
   terminal_run: 'Checking model',
   terminal_check: 'Checking model',
   experience_search: 'Checking past solutions',
+  experience_get: 'Reading past solution',
   experience_add: 'Saving solution',
   experience_update: 'Updating past solutions',
   question: 'Requesting input',

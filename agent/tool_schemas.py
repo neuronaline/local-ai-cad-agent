@@ -194,9 +194,27 @@ TOOL_SCHEMAS = [
         ["query"],
     ),
     _tool(
+        "experience_get",
+        "Read the complete verified lesson for a record ID from the past-issues context index or experience_search results.",
+        {
+            "id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Exact record ID from the past-issues context index or experience_search.",
+            }
+        },
+        ["id"],
+    ),
+    _tool(
         "experience_add",
         "Store a general, newly verified CAD problem-solution lesson after checking for duplicates. Never store source code, secrets, or identifying details.",
         {
+            "title": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 120,
+                "description": "Short, single-line technical title shown in the past-issues index.",
+            },
             "problem": {
                 "type": "string",
                 "minLength": 1,
@@ -211,7 +229,7 @@ TOOL_SCHEMAS = [
             },
             "tags": _TAGS,
         },
-        ["problem", "solution"],
+        ["title", "problem", "solution"],
     ),
     _tool(
         "experience_update",
@@ -220,7 +238,13 @@ TOOL_SCHEMAS = [
             "id": {
                 "type": "string",
                 "minLength": 1,
-                "description": "Record id returned by experience_search.",
+                "description": "Record ID from experience_search or the past-issues index.",
+            },
+            "title": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 120,
+                "description": "Corrected short technical title.",
             },
             "problem": {
                 "type": "string",
