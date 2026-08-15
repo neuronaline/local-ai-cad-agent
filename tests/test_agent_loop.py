@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import threading
 import time
@@ -88,6 +89,29 @@ class FakeFinalClient:
                 {"message": {"role": "assistant", "content": "Thanks, continuing."}}
             ]
         }
+
+
+def test_new_task_resets_review_cycle_count(tmp_path: Path, monkeypatch):
+    import agent.core
+
+    project_root = tmp_path / "projects"
+    project = project_root / "demo"
+    project.mkdir(parents=True)
+    (project / "conversation.jsonl").write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        agent.core,
+        "create_llm_client",
+        lambda _settings, _ignored=None: FakeFinalClient(_settings),
+    )
+    runner = AgentRunner(
+        Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000),
+        lambda *_args, **_kwargs: None,
+    )
+    runner._review_cycles["demo"] = 3
+
+    runner._run("demo", "Start a new task")
+
+    assert runner._review_cycles["demo"] == 0
 
 
 class FailedCadRecoveryClient:
@@ -859,3 +883,245 @@ def test_debug_error_log_records_recoverable_tool_failures(tmp_path: Path):
     assert record["call_id"] == "write-1"
     assert record["tool"] == "file_write"
     assert record["classification"]["code"] == "VALIDATION_ERROR"
+
+
+# --------------------------------------------------------------------------- #
+# Review gate integration
+# --------------------------------------------------------------------------- #
+
+
+class _FakeReviewClient:
+    """Returns a fixed verdict; counts how many times it was invoked."""
+
+    def __init__(self, verdict):
+        self._verdict = verdict
+        self.call_count = 0
+
+    def chat(self, messages, tools=None):
+        self.call_count += 1
+        return {"choices": [{"message": {"role": "assistant", "tool_calls": [{
+            "function": {"name": "submit_review", "arguments": json.dumps(self._verdict)}
+        }]}}]}
+
+
+def _seed_pass_build(project: Path) -> dict[str, object]:
+    """Pretend ``cad_build_and_verify`` produced a passing-ready manifest."""
+    project.mkdir(parents=True, exist_ok=True)
+    (project / "model.py").write_text("result = 1\n", encoding="utf-8")
+    (project / "preview.stl").write_bytes(b"solid demo\n")
+    (project / "conversation.jsonl").write_text("", encoding="utf-8")
+    review_root = project / ".cad-agent" / "reviews" / ("a" * 64)
+    review_root.mkdir(parents=True)
+    (review_root / "review-sheet.png").write_bytes(b"\x89PNG\r\n\x1a\n sheet")
+    return {
+        "metrics": {"solid_count": 1, "is_valid": True, "dimensions_mm": {"x": 1, "y": 1, "z": 1}},
+        "feature_summary": {"through_hole_count": 0},
+        "preview": "preview.stl",
+        "render": "render.png",
+        "review_manifest": {
+            "model_sha256": "a" * 64,
+            "preview_sha256": "b" * 64,
+            "views": [{"view_id": "x_positive"}, {"view_id": "isometric_positive"}],
+            "contact_sheet": {"path": "review-sheet.png", "image_sha256": "c" * 64},
+        },
+        "review": "a" * 64,
+    }
+
+
+def test_review_gate_passes_for_passing_verdict(tmp_path: Path, monkeypatch):
+    project = tmp_path / "projects" / "demo"
+    payload = _seed_pass_build(project)
+    settings = Settings(
+        tmp_path / "projects", "https://example.test", "test", 1, "127.0.0.1", 5000
+    )
+    runner = AgentRunner(settings, lambda *_, **__: None)
+    tools = ProjectTools(project, lambda *_, **__: None)
+    tools.cad.build_and_verify = lambda: payload
+
+    review_client = _FakeReviewClient(
+        {"status": "pass", "summary": "All good.", "findings": []}
+    )
+    monkeypatch.setattr(
+        "agent.cad_review._default_create_client", lambda _settings: review_client
+    )
+
+    messages: list[dict] = []
+    preview_id, error, fix_required, _waiting = runner._process_tool_call(
+        tools,
+        "demo",
+        project,
+        {"id": "run-1", "function": {"name": "cad_build_and_verify", "arguments": "{}"}},
+        False,
+        None,
+        None,
+        messages,
+    )
+
+    assert preview_id is not None, "passing review must register a preview"
+    assert error is None
+    assert fix_required is False
+    # The reviewer was invoked exactly once; the verdict it returned lets the
+    # gate forward the build without forcing a regenerate.
+    assert review_client.call_count == 1
+
+
+def test_review_gate_blocks_completion_on_blocking_finding(tmp_path: Path, monkeypatch):
+    project = tmp_path / "projects" / "demo"
+    payload = _seed_pass_build(project)
+    settings = Settings(
+        tmp_path / "projects", "https://example.test", "test", 1, "127.0.0.1", 5000
+    )
+    runner = AgentRunner(settings, lambda *_, **__: None)
+    tools = ProjectTools(project, lambda *_, **__: None)
+    tools.cad.build_and_verify = lambda: payload
+
+    review_client = _FakeReviewClient(
+        {
+            "status": "fail",
+            "summary": "Missing through hole.",
+            "findings": [
+                {
+                    "severity": "blocking",
+                    "category": "missing_feature",
+                    "view": "isometric_positive",
+                    "message": "Through hole is missing.",
+                }
+            ],
+        }
+    )
+    monkeypatch.setattr(
+        "agent.cad_review._default_create_client", lambda _settings: review_client
+    )
+
+    messages: list[dict] = []
+    preview_id, error, fix_required, _waiting = runner._process_tool_call(
+        tools,
+        "demo",
+        project,
+        {"id": "run-1", "function": {"name": "cad_build_and_verify", "arguments": "{}"}},
+        False,
+        None,
+        None,
+        messages,
+    )
+
+    assert preview_id is None, "blocking finding must invalidate the preview"
+    assert fix_required is True
+    assert error is not None and error != ""
+
+
+def test_review_gate_treats_inconclusive_as_blocking(tmp_path: Path, monkeypatch):
+    project = tmp_path / "projects" / "demo"
+    payload = _seed_pass_build(project)
+    settings = Settings(
+        tmp_path / "projects", "https://example.test", "test", 1, "127.0.0.1", 5000
+    )
+    runner = AgentRunner(settings, lambda *_, **__: None)
+    tools = ProjectTools(project, lambda *_, **__: None)
+    tools.cad.build_and_verify = lambda: payload
+
+    class InconclusiveClient:
+        def chat(self, messages, tools=None):
+            return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+    monkeypatch.setattr(
+        "agent.cad_review._default_create_client", lambda _settings: InconclusiveClient()
+    )
+
+    messages: list[dict] = []
+    preview_id, error, fix_required, _waiting = runner._process_tool_call(
+        tools,
+        "demo",
+        project,
+        {"id": "run-1", "function": {"name": "cad_build_and_verify", "arguments": "{}"}},
+        False,
+        None,
+        None,
+        messages,
+    )
+
+    assert preview_id is None
+    assert fix_required is True
+    assert error is not None
+
+
+def test_review_gate_respects_cycle_limit(tmp_path: Path, monkeypatch):
+    project = tmp_path / "projects" / "demo"
+    payload = _seed_pass_build(project)
+    settings = dataclasses.replace(
+        Settings(tmp_path / "projects", "https://example.test", "test", 1, "127.0.0.1", 5000),
+        review_max_cycles=1,
+    )
+    runner = AgentRunner(settings, lambda *_, **__: None)
+    tools = ProjectTools(project, lambda *_, **__: None)
+    tools.cad.build_and_verify = lambda: payload
+
+    review_client = _FakeReviewClient(
+        {
+            "status": "fail",
+            "summary": "Still wrong.",
+            "findings": [
+                {
+                    "severity": "blocking",
+                    "category": "geometry",
+                    "message": "Wrong shape.",
+                }
+            ],
+        }
+    )
+    monkeypatch.setattr(
+        "agent.cad_review._default_create_client", lambda _settings: review_client
+    )
+
+    messages: list[dict] = []
+    preview_id, error, _fix_required, _waiting = runner._process_tool_call(
+        tools,
+        "demo",
+        project,
+        {"id": "run-1", "function": {"name": "cad_build_and_verify", "arguments": "{}"}},
+        False,
+        None,
+        None,
+        messages,
+    )
+
+    assert preview_id is None
+    assert error is not None and error != ""
+    assert runner._review_cycles.get("demo") == 1
+
+
+def test_review_gate_disabled_skips_review_call(tmp_path: Path, monkeypatch):
+    project = tmp_path / "projects" / "demo"
+    payload = _seed_pass_build(project)
+    settings = dataclasses.replace(
+        Settings(tmp_path / "projects", "https://example.test", "test", 1, "127.0.0.1", 5000),
+        review_enabled=False,
+    )
+    runner = AgentRunner(settings, lambda *_, **__: None)
+    tools = ProjectTools(project, lambda *_, **__: None)
+    tools.cad.build_and_verify = lambda: payload
+
+    called = {"count": 0}
+
+    def fake_factory(_settings):
+        called["count"] += 1
+        raise AssertionError("review client should not be created when disabled")
+
+    monkeypatch.setattr("agent.cad_review._default_create_client", fake_factory)
+
+    messages: list[dict] = []
+    preview_id, error, fix_required, _waiting = runner._process_tool_call(
+        tools,
+        "demo",
+        project,
+        {"id": "run-1", "function": {"name": "cad_build_and_verify", "arguments": "{}"}},
+        False,
+        None,
+        None,
+        messages,
+    )
+
+    assert preview_id is not None
+    assert error is None
+    assert fix_required is False
+    assert called["count"] == 0

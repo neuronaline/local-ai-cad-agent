@@ -1,13 +1,39 @@
 from io import BytesIO
 from pathlib import Path
 
+import numpy as np
 import pytest
 from PIL import Image
 
+from agent.tools.cad_scripts.renderer import _BACKGROUND, _shade_pixels
 from agent.revisions import RevisionStore
 from agent.tools.cad_tool import CadTool
 from agent.tools.file_tool import FileTool
 from agent.tools.terminal_tool import TerminalTool
+
+
+def test_review_renderer_uses_correct_barycentric_coordinates():
+    vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=float)
+    triangles = np.array([[0, 1, 2]], dtype=np.int32)
+    screen_vertices = np.array([[100, 100], [200, 100], [150, 200]], dtype=float)
+    pixels = _shade_pixels(
+        vertices,
+        triangles,
+        screen_vertices,
+        np.array([0, 0, 0], dtype=float),
+        np.array([0, 0, 1], dtype=float),
+    )
+
+    assert not np.array_equal(pixels[150, 150], _BACKGROUND)
+
+
+def test_cad_tool_passes_review_settings_to_runner():
+    code = CadTool(
+        Path("/tmp/project"), review_render_workers=2, review_required_views=6
+    )._runner_code(render=True)
+
+    assert "_RENDER_WORKERS = 2" in code
+    assert "_REQUIRED_VIEWS = 6" in code
 
 
 def test_file_tool_rejects_unsafe_model(tmp_path: Path):
@@ -195,7 +221,13 @@ def test_cad_build_recording_is_best_effort(tmp_path: Path, monkeypatch):
     cad = CadTool(tmp_path)
     calls = []
     metrics = {"solid_count": 1, "is_valid": True}
-    wrapped = {"metrics": metrics}
+    wrapped = {
+        "metrics": metrics,
+        "feature_summary": {},
+        "review_manifest": None,
+        "review_views_dir": None,
+        "review_sheet_path": None,
+    }
     monkeypatch.setattr(
         cad,
         "_execute",
@@ -207,6 +239,7 @@ def test_cad_build_recording_is_best_effort(tmp_path: Path, monkeypatch):
     assert calls == [{"render": True}]
     assert result == {
         "metrics": metrics,
+        "feature_summary": {},
         "preview": "preview.stl",
         "render": "render.png",
     }

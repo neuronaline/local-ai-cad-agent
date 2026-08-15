@@ -38,3 +38,12 @@ server:
 
 ui:
   show_info_messages: true
+
+# Post-build review gate. When enabled, every successful cad_build_and_verify
+# must also pass a bounded multi-view visual review before the agent reports
+# completion. max_cycles caps the number of repair attempts per user task.
+review:
+  enabled: true
+  max_cycles: 3
+  render_workers: 4
+  required_views: 8

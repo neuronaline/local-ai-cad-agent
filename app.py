@@ -789,6 +789,84 @@ def create_app(settings: Settings | None = None) -> Flask:
         return jsonify({"failed": True})
 
     # ------------------------------------------------------------------ #
+    #  Multi-view review APIs (read-only views into .cad-agent/reviews/)
+    # ------------------------------------------------------------------ #
+
+    _REVIEW_MANIFEST_NAME = "manifest.json"
+    _REVIEW_RESULT_NAME = "result.json"
+    _REVIEW_VIEWS_SUBDIR = "views"
+    _REVIEW_SHEET_NAME = "review-sheet.png"
+
+    def _review_latest(project_dir: Path) -> Path | None:
+        """Return the most recently modified review directory, or ``None``."""
+        root = project_dir / ".cad-agent" / "reviews"
+        if not root.is_dir():
+            return None
+        candidates = [path for path in root.iterdir() if path.is_dir()]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda path: path.stat().st_mtime)
+
+    @app.get("/api/projects/<project_name>/review/manifest")
+    def review_manifest(project_name: str):
+        try:
+            project_dir = _project_path(app.config["SETTINGS"], project_name)
+        except (ValueError, FileNotFoundError) as error:
+            return jsonify({"error": str(error)}), 404
+        latest = _review_latest(project_dir)
+        if latest is None:
+            return jsonify({"error": "No review has been generated yet."}), 404
+        manifest_path = latest / _REVIEW_MANIFEST_NAME
+        if not manifest_path.is_file():
+            return jsonify({"error": "Review manifest is missing."}), 404
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return jsonify({"error": "Review manifest is corrupted."}), 500
+        result_path = latest / _REVIEW_RESULT_NAME
+        if result_path.is_file():
+            try:
+                payload = dict(payload)
+                payload["result"] = json.loads(result_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                pass
+        payload = dict(payload)
+        payload.setdefault("artifact_dir", latest.name)
+        return jsonify(payload)
+
+    @app.get("/api/projects/<project_name>/review/sheet")
+    def review_sheet(project_name: str):
+        try:
+            project_dir = _project_path(app.config["SETTINGS"], project_name)
+        except (ValueError, FileNotFoundError) as error:
+            return jsonify({"error": str(error)}), 404
+        latest = _review_latest(project_dir)
+        if latest is None:
+            return jsonify({"error": "No review has been generated yet."}), 404
+        sheet_path = latest / _REVIEW_SHEET_NAME
+        if not sheet_path.is_file() or sheet_path.stat().st_size == 0:
+            return jsonify({"error": "Review contact sheet is missing."}), 404
+        return send_file(sheet_path, mimetype="image/png", max_age=0)
+
+    @app.get("/api/projects/<project_name>/review/view/<view_id>")
+    def review_view(project_name: str, view_id: str):
+        try:
+            project_dir = _project_path(app.config["SETTINGS"], project_name)
+        except (ValueError, FileNotFoundError) as error:
+            return jsonify({"error": str(error)}), 404
+        # ``view_id`` is a filesystem identifier; restrict to the documented
+        # canonical names to avoid path traversal via the URL.
+        if not view_id or "/" in view_id or "\\" in view_id or view_id.startswith("."):
+            return jsonify({"error": "Unknown review view."}), 404
+        latest = _review_latest(project_dir)
+        if latest is None:
+            return jsonify({"error": "No review has been generated yet."}), 404
+        view_path = latest / _REVIEW_VIEWS_SUBDIR / f"{view_id}.png"
+        if not view_path.is_file() or view_path.stat().st_size == 0:
+            return jsonify({"error": "Unknown review view."}), 404
+        return send_file(view_path, mimetype="image/png", max_age=0)
+
+    # ------------------------------------------------------------------ #
     #  Revision history APIs
     # ------------------------------------------------------------------ #
 

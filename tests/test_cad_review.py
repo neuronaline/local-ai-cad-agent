@@ -1,0 +1,365 @@
+"""Tests for the structured multimodal reviewer."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from agent.cad_review import (
+    REVIEW_TOOL_SCHEMA,
+    Finding,
+    ReviewResult,
+    parse_review_response,
+    run_review,
+    write_review_result,
+)
+
+
+MODEL_SHA = "a" * 64
+PREVIEW_SHA = "b" * 64
+ALLOWED_VIEWS = ("x_positive", "x_negative", "y_positive", "isometric_positive")
+
+
+def _valid_arguments() -> dict[str, object]:
+    return {
+        "status": "pass",
+        "summary": "All checks passed.",
+        "findings": [
+            {
+                "severity": "minor",
+                "category": "geometry",
+                "view": "x_positive",
+                "message": "Slight chamfer missing on the top edge.",
+                "repair_hint": "Add a 0.5mm chamfer.",
+            }
+        ],
+    }
+
+
+def test_review_tool_schema_has_no_additional_properties():
+    schema = REVIEW_TOOL_SCHEMA["function"]["parameters"]
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == {"status", "summary", "findings"}
+
+
+def test_parse_review_response_handles_pass_with_minor_finding():
+    result = parse_review_response(
+        json.dumps(_valid_arguments()),
+        model_sha256=MODEL_SHA,
+        preview_sha256=PREVIEW_SHA,
+        allowed_view_ids=ALLOWED_VIEWS,
+    )
+    assert result.status == "pass"
+    assert result.summary  # summary is forwarded as-is
+    assert len(result.findings) == 1
+    assert result.findings[0].severity == "minor"
+    assert result.findings[0].view == "x_positive"
+
+
+def test_parse_review_response_reclassifies_pass_with_blocking_finding():
+    arguments = _valid_arguments()
+    arguments["status"] = "pass"
+    arguments["findings"] = [
+        {
+            "severity": "blocking",
+            "category": "missing_feature",
+            "view": "z_positive",
+            "message": "Through hole is missing.",
+            "repair_hint": "Subtract a cylinder.",
+        }
+    ]
+    result = parse_review_response(
+        json.dumps(arguments),
+        model_sha256=MODEL_SHA,
+        preview_sha256=PREVIEW_SHA,
+        allowed_view_ids=ALLOWED_VIEWS,
+    )
+    # Incoherent: pass with a blocking finding is treated as fail.
+    assert result.status == "fail"
+
+
+def test_parse_review_response_drops_unknown_severity():
+    arguments = _valid_arguments()
+    arguments["findings"] = [
+        {"severity": "catastrophic", "category": "geometry", "message": "Bad"},
+        {
+            "severity": "minor",
+            "category": "dimensions",
+            "message": "Too small.",
+        },
+    ]
+    result = parse_review_response(
+        json.dumps(arguments),
+        model_sha256=MODEL_SHA,
+        preview_sha256=PREVIEW_SHA,
+        allowed_view_ids=ALLOWED_VIEWS,
+    )
+    assert result.status == "pass"
+    assert len(result.findings) == 1
+    assert result.findings[0].severity == "minor"
+
+
+def test_parse_review_response_drops_unknown_view_id():
+    arguments = _valid_arguments()
+    arguments["findings"] = [
+        {
+            "severity": "major",
+            "category": "alignment",
+            "view": "does_not_exist",
+            "message": "Off-axis hole.",
+        }
+    ]
+    result = parse_review_response(
+        json.dumps(arguments),
+        model_sha256=MODEL_SHA,
+        preview_sha256=PREVIEW_SHA,
+        allowed_view_ids=ALLOWED_VIEWS,
+    )
+    assert result.findings[0].view is None
+
+
+def test_parse_review_response_truncates_oversized_strings():
+    arguments = _valid_arguments()
+    arguments["summary"] = "x" * 500
+    arguments["findings"] = [
+        {
+            "severity": "minor",
+            "category": "geometry",
+            "message": "m" * 1000,
+            "repair_hint": "h" * 1000,
+        }
+    ]
+    result = parse_review_response(
+        json.dumps(arguments),
+        model_sha256=MODEL_SHA,
+        preview_sha256=PREVIEW_SHA,
+        allowed_view_ids=ALLOWED_VIEWS,
+    )
+    assert len(result.summary) <= 160
+    assert len(result.findings[0].message) <= 240
+    assert len(result.findings[0].repair_hint) <= 240
+
+
+def test_parse_review_response_rejects_malformed_payload():
+    result = parse_review_response(
+        "not json",
+        model_sha256=MODEL_SHA,
+        preview_sha256=PREVIEW_SHA,
+        allowed_view_ids=ALLOWED_VIEWS,
+    )
+    assert result.status == "inconclusive"
+
+
+def test_parse_review_response_rejects_unknown_status():
+    arguments = _valid_arguments()
+    arguments["status"] = "approved"
+    result = parse_review_response(
+        json.dumps(arguments),
+        model_sha256=MODEL_SHA,
+        preview_sha256=PREVIEW_SHA,
+        allowed_view_ids=ALLOWED_VIEWS,
+    )
+    assert result.status == "inconclusive"
+
+
+def test_parse_review_response_caps_finding_count():
+    arguments = _valid_arguments()
+    arguments["findings"] = [
+        {"severity": "minor", "category": "geometry", "message": f"m{i}"}
+        for i in range(50)
+    ]
+    result = parse_review_response(
+        json.dumps(arguments),
+        model_sha256=MODEL_SHA,
+        preview_sha256=PREVIEW_SHA,
+        allowed_view_ids=ALLOWED_VIEWS,
+    )
+    assert len(result.findings) <= 12
+
+
+def test_write_review_result_round_trip(tmp_path: Path):
+    review_dir = tmp_path / "review"
+    review_dir.mkdir()
+    result = ReviewResult(
+        status="pass",
+        summary="All checks passed.",
+        findings=[
+            Finding(
+                severity="minor",
+                category="geometry",
+                message="Slight chamfer missing.",
+                view="x_positive",
+            )
+        ],
+        model_sha256=MODEL_SHA,
+        preview_sha256=PREVIEW_SHA,
+    )
+    path = write_review_result(review_dir, result)
+    assert path == review_dir / "result.json"
+    payload = json.loads(path.read_text())
+    assert payload["status"] == "pass"
+    assert payload["findings"][0]["category"] == "geometry"
+
+
+class _FakeClient:
+    def __init__(self, response: dict[str, object]) -> None:
+        self.response = response
+
+    def chat(self, messages, tools=None):
+        return self.response
+
+
+def test_run_review_returns_pass_for_valid_tool_call(tmp_path: Path):
+    sheet = tmp_path / "sheet.png"
+    sheet.write_bytes(b"\x89PNG\r\n\x1a\n fake-sheet")
+    manifest = {
+        "model_sha256": MODEL_SHA,
+        "preview_sha256": PREVIEW_SHA,
+        "views": [
+            {"view_id": "x_positive"},
+            {"view_id": "isometric_positive"},
+        ],
+        "contact_sheet": {"path": "review-sheet.png", "width": 512, "height": 512, "image_sha256": "x"},
+    }
+    sent_image_parts: list[int] = []
+
+    class _RecordingClient:
+        def chat(self, messages, tools=None):
+            image_parts = [
+                part
+                for message in messages
+                if isinstance(message.get("content"), list)
+                for part in message["content"]
+                if isinstance(part, dict) and part.get("type") == "image_url"
+            ]
+            sent_image_parts.append(len(image_parts))
+            return {"choices": [{"message": {"role": "assistant", "tool_calls": [{
+                "function": {
+                    "name": "submit_review",
+                    "arguments": json.dumps(_valid_arguments()),
+                }
+            }]}}]}
+
+    result = run_review(
+        settings=object(),
+        request_text="Build a 60x40 bracket.",
+        model_source="result = 1",
+        metrics={"solid_count": 1, "dimensions_mm": {"x": 60, "y": 40, "z": 8}},
+        feature_summary={"through_hole_count": 1},
+        review_manifest=manifest,
+        sheet_path=sheet,
+        create_client=lambda _settings: _RecordingClient(),
+    )
+    assert result.status == "pass"
+    # The review-specific path must include the contact sheet image so the
+    # reviewer has visual evidence; it must not silently retry without one.
+    assert sent_image_parts == [1]
+
+
+def test_run_review_returns_inconclusive_when_tool_call_missing(tmp_path: Path):
+    sheet = tmp_path / "sheet.png"
+    sheet.write_bytes(b"\x89PNG\r\n\x1a\n fake-sheet")
+    manifest = {
+        "model_sha256": MODEL_SHA,
+        "preview_sha256": PREVIEW_SHA,
+        "views": [{"view_id": "x_positive"}],
+        "contact_sheet": {"path": "review-sheet.png", "image_sha256": "x"},
+    }
+    client = _FakeClient({"choices": [{"message": {"role": "assistant", "content": "looks good"}}]})
+    create_client = lambda _settings: client
+    result = run_review(
+        settings=object(),
+        request_text="Build",
+        model_source="result = 1",
+        metrics={},
+        feature_summary={},
+        review_manifest=manifest,
+        sheet_path=sheet,
+        create_client=create_client,
+    )
+    assert result.status == "inconclusive"
+
+
+def test_run_review_returns_inconclusive_when_sheet_missing(tmp_path: Path):
+    manifest = {
+        "model_sha256": MODEL_SHA,
+        "preview_sha256": PREVIEW_SHA,
+        "views": [{"view_id": "x_positive"}],
+        "contact_sheet": {"path": "review-sheet.png"},
+    }
+    client = _FakeClient({"choices": [{"message": {"role": "assistant", "content": ""}}]})
+    result = run_review(
+        settings=object(),
+        request_text="Build",
+        model_source="",
+        metrics={},
+        feature_summary={},
+        review_manifest=manifest,
+        sheet_path=tmp_path / "missing.png",
+        create_client=lambda _settings: client,
+    )
+    assert result.status == "inconclusive"
+
+
+def test_run_review_propagates_llm_errors_as_inconclusive(tmp_path: Path):
+    sheet = tmp_path / "sheet.png"
+    sheet.write_bytes(b"\x89PNG\r\n\x1a\n fake-sheet")
+    manifest = {
+        "model_sha256": MODEL_SHA,
+        "preview_sha256": PREVIEW_SHA,
+        "views": [{"view_id": "x_positive"}],
+        "contact_sheet": {"path": "review-sheet.png", "image_sha256": "x"},
+    }
+
+    class FailingClient:
+        require_images = True
+
+        def chat(self, messages, tools=None):
+            raise RuntimeError("network down")
+
+    create_client = lambda _settings: FailingClient()
+    result = run_review(
+        settings=object(),
+        request_text="Build",
+        model_source="",
+        metrics={},
+        feature_summary={},
+        review_manifest=manifest,
+        sheet_path=sheet,
+        create_client=create_client,
+    )
+    assert result.status == "inconclusive"
+
+
+def test_run_review_uses_stop_event_when_provided(tmp_path: Path):
+    sheet = tmp_path / "sheet.png"
+    sheet.write_bytes(b"\x89PNG\r\n\x1a\n fake-sheet")
+    manifest = {
+        "model_sha256": MODEL_SHA,
+        "preview_sha256": PREVIEW_SHA,
+        "views": [{"view_id": "x_positive"}],
+        "contact_sheet": {"path": "review-sheet.png", "image_sha256": "x"},
+    }
+    stop_event = object()
+    captured: dict[str, object] = {}
+
+    class StopAwareClient:
+        def chat(self, messages, tools=None):
+            captured["stop_event"] = self.stop_event
+            return {"choices": [{"message": {"role": "assistant", "tool_calls": [{
+                "function": {"name": "submit_review", "arguments": json.dumps(_valid_arguments())}
+            }]}}]}
+
+    create_client = lambda _settings: StopAwareClient()
+    run_review(
+        settings=object(),
+        request_text="Build",
+        model_source="",
+        metrics={},
+        feature_summary={},
+        review_manifest=manifest,
+        sheet_path=sheet,
+        stop_event=stop_event,
+        create_client=create_client,
+    )
+    assert captured["stop_event"] is stop_event

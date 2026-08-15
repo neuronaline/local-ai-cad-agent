@@ -12,6 +12,10 @@ const renderSection = document.querySelector('#render-section');
 const renderBody = document.querySelector('#render-body');
 const renderImage = document.querySelector('#render-image');
 const renderToggle = document.querySelector('#render-toggle');
+const reviewSection = document.querySelector('#review-section');
+const reviewStatus = document.querySelector('#review-status');
+const reviewSummary = document.querySelector('#review-summary');
+const reviewGallery = document.querySelector('#review-gallery');
 const activityPanel = document.querySelector('#activity-panel');
 const activityTitle = document.querySelector('#activity-title');
 const activityList = document.querySelector('#activity-list');
@@ -128,6 +132,7 @@ const activityLabels = {
   preparing: 'Preparing',
   running: 'Running',
   rendering: 'Rendering',
+  rendering_views: 'Rendering review views',
   reviewing: 'Reviewing',
   started: 'Started',
   completed: 'Completed',
@@ -152,7 +157,7 @@ function updateActivitySummary() {
     activityPanel.hidden = true;
     return;
   }
-  const running = items.filter(item => ['preparing', 'running', 'started', 'reviewing'].includes(item.status));
+  const running = items.filter(item => ['preparing', 'running', 'started', 'reviewing', 'rendering_views'].includes(item.status));
   const failed = items.filter(item => item.status === 'error');
   const current = running.at(-1);
   activityTitle.textContent = current
@@ -169,7 +174,7 @@ function markActivityRecovered() {
   // hide failed rows — the failure was real and the user needs to see it.
   for (const item of activityItems.values()) {
     const row = activityList.querySelector(`[data-call-id="${CSS.escape(item.callId)}"]`);
-    if (['preparing', 'running', 'started', 'reviewing', 'rendering'].includes(item.status)) {
+    if (['preparing', 'running', 'started', 'reviewing', 'rendering', 'rendering_views'].includes(item.status)) {
       item.status = 'completed';
       if (row) {
         row.dataset.status = 'completed';
@@ -270,6 +275,7 @@ async function loadCurrentPreview(previewId) {
       }
       await refreshRender();
       modelActions.hidden = false;
+      loadReviewGallery();
     } catch (error) {
       addMessage(`Preview failed: ${error.message}`, 'error');
     } finally {
@@ -296,6 +302,61 @@ async function refreshRender() {
   }
 }
 
+async function loadReviewGallery() {
+  if (!currentProject) return;
+  try {
+    const manifest = await api(`/api/projects/${encodeURIComponent(currentProject)}/review/manifest?ts=${Date.now()}`);
+    if (!manifest || !Array.isArray(manifest.views)) {
+      reviewSection.hidden = true;
+      return;
+    }
+    reviewSection.hidden = false;
+    const result = manifest.result && typeof manifest.result === 'object' ? manifest.result : null;
+    const status = result && typeof result.status === 'string' ? result.status : 'pending';
+    const summary = result && typeof result.summary === 'string' ? result.summary : '';
+    const findings = result && Array.isArray(result.findings) ? result.findings : [];
+    reviewStatus.textContent = summary || statusLabel(status);
+    reviewStatus.dataset.state = status;
+    reviewSummary.replaceChildren();
+    if (findings.length) {
+      reviewSummary.hidden = false;
+      for (const finding of findings) {
+        const line = document.createElement('div');
+        line.className = 'finding';
+        const severity = finding && typeof finding.severity === 'string' ? finding.severity : 'minor';
+        const message = finding && typeof finding.message === 'string' ? finding.message : '';
+        line.dataset.severity = severity;
+        line.textContent = message;
+        reviewSummary.appendChild(line);
+      }
+    } else {
+      reviewSummary.hidden = true;
+    }
+    reviewGallery.replaceChildren();
+    for (const view of manifest.views) {
+      if (!view || typeof view.view_id !== 'string') continue;
+      const figure = document.createElement('figure');
+      const img = document.createElement('img');
+      img.src = `/api/projects/${encodeURIComponent(currentProject)}/review/view/${encodeURIComponent(view.view_id)}?ts=${Date.now()}`;
+      img.alt = view.label || view.view_id;
+      img.loading = 'lazy';
+      const caption = document.createElement('figcaption');
+      caption.textContent = view.label || view.view_id;
+      figure.append(img, caption);
+      reviewGallery.appendChild(figure);
+    }
+  } catch {
+    reviewSection.hidden = true;
+  }
+}
+
+function statusLabel(status) {
+  if (status === 'pass') return 'Pass';
+  if (status === 'fail') return 'Fail';
+  if (status === 'inconclusive') return 'Inconclusive';
+  return 'Pending';
+}
+
 async function syncCurrentPreview() {
   if (!currentProject || previewLoadPromise) return;
   try {
@@ -305,6 +366,7 @@ async function syncCurrentPreview() {
       && (previewProject !== currentProject || loadedPreviewRevision !== meta.revision)
     ) {
       await loadCurrentPreview();
+      loadReviewGallery();
     }
   } catch {
     // SSE is the primary path; polling is only a reconnect fallback.

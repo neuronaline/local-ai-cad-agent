@@ -154,6 +154,23 @@ input, select, textarea { border: 1px solid var(--line); border-radius: 6px; bac
 .render-body { padding: .5rem .7rem .7rem; }
 .render-body img { display: block; width: min(320px, 100%); max-height: 220px; margin: auto; border: 1px solid var(--line); border-radius: 6px; object-fit: contain; }
 
+/* Multi-view review gallery */
+.review-section { border-top: 1px solid var(--line); background: var(--surface); }
+.review-status { font-size: .7rem; color: #b7c7e5; padding: .1rem .45rem; border-radius: 999px; background: #0b1322; border: 1px solid var(--line); }
+.review-status[data-state="pass"] { color: #b6f3c4; border-color: #285e3a; background: #0f2419; }
+.review-status[data-state="fail"] { color: #f3b6b6; border-color: #6a2828; background: #2b1010; }
+.review-status[data-state="inconclusive"] { color: #f3dfb6; border-color: #6a5328; background: #2b1d0e; }
+.review-summary { padding: .35rem .7rem .55rem; font-size: .72rem; color: #b7c7e5; }
+.review-summary .finding { margin: .15rem 0; }
+.review-summary .finding[data-severity="blocking"] { color: #f3b6b6; }
+.review-summary .finding[data-severity="major"] { color: #f3cdb6; }
+.review-summary .finding[data-severity="minor"] { color: #c9d6ef; }
+.review-gallery { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .35rem; padding: .25rem .7rem .7rem; }
+.review-gallery a { display: block; }
+.review-gallery img { display: block; width: 100%; aspect-ratio: 1 / 1; border: 1px solid var(--line); border-radius: 6px; object-fit: cover; background: #06080d; }
+.review-gallery figure { margin: 0; }
+.review-gallery figcaption { font-size: .65rem; text-align: center; color: #95a8c8; padding-top: .15rem; }
+
 /* History */
 .history-drawer { position: fixed; top: 0; right: 0; z-index: 20; display: flex; width: min(400px, 94vw); height: 100dvh; flex-direction: column; border-left: 1px solid var(--line); background: var(--surface); box-shadow: -16px 0 40px #03071280; }
 .drawer-header, .drawer-tabs { display: flex; align-items: center; padding: .55rem .7rem; border-bottom: 1px solid var(--line); }

@@ -34,6 +34,15 @@ _MIN_DIMENSION_MM = 0.001
 _MAX_DIMENSION_MM = 1_000_000.0
 _MIN_VOLUME_MM3 = 0.0
 
+# Review artifacts live under <project>/.cad-agent/reviews/<model_sha256>/.
+# A new manifest only invalidates the previous review when ``preview_sha256``
+# changes; same (model_sha256, preview_sha256) hits the on-disk cache.
+_REVIEWS_ROOT = ".cad-agent/reviews"
+_REVIEW_MANIFEST_NAME = "manifest.json"
+_REVIEW_RESULT_NAME = "result.json"
+_REVIEW_VIEWS_DIR = "views"
+_REVIEW_SHEET_NAME = "review-sheet.png"
+
 
 def _kill_process_group(process: subprocess.Popen[str], *, force: bool) -> None:
     """Send a signal to the sandbox process group so descendant pythons exit.
@@ -51,18 +60,114 @@ def _kill_process_group(process: subprocess.Popen[str], *, force: bool) -> None:
         pass
 
 
+def _project_name(project_dir: Path) -> str:
+    """Return the workspace-relative project name used by SSE payloads."""
+    try:
+        return project_dir.resolve().name
+    except OSError:
+        return project_dir.name
+
+
 class CadTool:
     def __init__(
         self,
         project_dir: Path,
         publish: Any = None,
         revisions: RevisionStore | None = None,
+        review_render_workers: int = 4,
+        review_required_views: int = 8,
     ) -> None:
         self.project_dir = project_dir.resolve()
         self._publish = publish
         self._revisions = revisions or RevisionStore(project_dir)
+        self._review_render_workers = max(1, int(review_render_workers))
+        self._review_required_views = max(1, int(review_required_views))
         self._process: subprocess.Popen[str] | None = None
         self._lock = threading.Lock()
+
+    # ------------------------------------------------------------------ review
+
+    def _reviews_root(self) -> Path:
+        return self.project_dir / ".cad-agent" / "reviews"
+
+    def _review_dir(self, model_sha256: str) -> Path:
+        return self._reviews_root() / model_sha256
+
+    def latest_review_dir(self) -> Path | None:
+        """Return the most recently modified review directory, if any."""
+        root = self._reviews_root()
+        if not root.is_dir():
+            return None
+        candidates = [path for path in root.iterdir() if path.is_dir()]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda path: path.stat().st_mtime)
+
+    def review_manifest_path(self) -> Path | None:
+        """Return the manifest path inside the latest review directory."""
+        latest = self.latest_review_dir()
+        if latest is None:
+            return None
+        manifest = latest / _REVIEW_MANIFEST_NAME
+        return manifest if manifest.is_file() else None
+
+    def review_result_path(self) -> Path | None:
+        latest = self.latest_review_dir()
+        if latest is None:
+            return None
+        result = latest / _REVIEW_RESULT_NAME
+        return result if result.is_file() else None
+
+    def review_view_path(self, view_id: str) -> Path | None:
+        latest = self.latest_review_dir()
+        if latest is None:
+            return None
+        target = latest / _REVIEW_VIEWS_DIR / f"{view_id}.png"
+        return target if target.is_file() else None
+
+    def review_sheet_path(self) -> Path | None:
+        latest = self.latest_review_dir()
+        if latest is None:
+            return None
+        target = latest / _REVIEW_SHEET_NAME
+        return target if target.is_file() else None
+
+    def _publish_status(self, status: str, message: str) -> None:
+        """Emit an ``agent_status`` SSE event for the active project.
+
+        Used to surface the multi-view rendering phase so the UI activity
+        drawer can label the step (``rendering_views``). The publish callback
+        is optional so tests that instantiate ``CadTool`` without a publish
+        function keep working.
+        """
+        publish = self._publish
+        if not callable(publish):
+            return
+        try:
+            publish(
+                "agent_status",
+                {
+                    "project": _project_name(self.project_dir),
+                    "status": status,
+                    "message": message,
+                },
+            )
+        except Exception:  # noqa: BLE001, S110 - status events must never fail the build.
+            pass
+
+    # ------------------------------------------------------------------ build
+
+    def _runner_code(self, render: bool) -> str:
+        if render:
+            prelude = (
+                "_RENDER_VIEWS = True\n"
+                "_WRITE_ISOMETRIC = True\n"
+                f"_RENDER_WORKERS = {self._review_render_workers}\n"
+                f"_REQUIRED_VIEWS = {self._review_required_views}\n"
+            )
+        else:
+            prelude = "_RENDER_VIEWS = False\n_WRITE_ISOMETRIC = False\n"
+        return prelude + RENDERER + "\n" + RUNNER
 
     def _execute(self, render: bool = False) -> dict[str, Any]:
         model_path = self.project_dir / "model.py"
@@ -70,7 +175,14 @@ class CadTool:
             raise ValueError("model.py does not exist yet.")
         model_code = model_path.read_text(encoding="utf-8")
         FileTool.validate_model(model_code)
-        code = RUNNER + (RENDERER if render else "")
+        # renderer.py is concatenated ahead of runner.py so the renderer's
+        # definitions (VIEWS, render_views, build_contact_sheet, ...) are
+        # visible to the runner's module-level main block. The runner reads
+        # the ``_RENDER_VIEWS`` flag to decide whether to rasterise every
+        # canonical view (always required by ``build_and_verify``, skipped
+        # by the cheaper metrics-only ``run`` path); ``_WRITE_ISOMETRIC``
+        # gates the legacy single ``render.png`` artifact.
+        code = self._runner_code(render)
 
         with tempfile.TemporaryDirectory(prefix="cad-agent-") as temporary:
             workspace = Path(temporary)
@@ -96,7 +208,9 @@ class CadTool:
                 try:
                     stdout, stderr = _stream_with_limit(process, timeout=120)
                 except _TimedOut as error:
-                    self._record_build_failure("CAD operation timed out after 120 seconds.")
+                    self._record_build_failure(
+                        "CAD operation timed out after 120 seconds."
+                    )
                     raise RuntimeError(
                         "CAD operation timed out after 120 seconds."
                     ) from error
@@ -116,7 +230,9 @@ class CadTool:
             metrics_path = workspace / ".cad_metrics.json"
             preview_path = workspace / "preview.stl"
             if not metrics_path.is_file() or not preview_path.is_file():
-                error_msg = "CAD execution did not produce preview and geometry metrics."
+                error_msg = (
+                    "CAD execution did not produce preview and geometry metrics."
+                )
                 self._record_build_failure(error_msg)
                 raise RuntimeError(error_msg)
             cached = json.loads(metrics_path.read_text(encoding="utf-8"))
@@ -129,6 +245,7 @@ class CadTool:
             metrics = cached["metrics"]
             self._enforce_basic_geometry(metrics)
             self._atomic_copy(preview_path, self.project_dir / "preview.stl")
+            review_manifest = cached.get("review_manifest") if render else None
             if render:
                 render_path = workspace / "render.png"
                 if not render_path.is_file() or render_path.stat().st_size == 0:
@@ -138,7 +255,60 @@ class CadTool:
                 self._atomic_copy(render_path, self.project_dir / "render.png")
             self._atomic_copy(metrics_path, self.project_dir / ".cad_metrics.json")
             self._record_build_success(metrics)
-            return {"metrics": metrics}
+            # The temp ``workspace`` is cleaned up when this ``with`` block exits,
+            # so copy the multi-view review artifacts into a stable staging
+            # location under ``project_dir`` before returning. ``promote_review``
+            # reads from ``staging_views_dir``/``staging_sheet_path`` and
+            # verifies each view's SHA against the manifest entry.
+            staging_views_dir: str | None = None
+            staging_sheet_path: str | None = None
+            if render:
+                # Surface the multi-view rasterisation phase so the UI can
+                # label the activity drawer ("rendering_views"). The event is
+                # only published when render=True because the cheap
+                # ``CadTool.run`` path skips view rendering entirely.
+                self._publish_status(
+                    "rendering_views",
+                    "Rendering review views…",
+                )
+                staging_views_dir, staging_sheet_path = self._stage_review_artifacts(
+                    workspace
+                )
+            return {
+                "metrics": metrics,
+                "feature_summary": cached.get("feature_summary") or {},
+                "review_manifest": review_manifest,
+                "review_views_dir": staging_views_dir,
+                "review_sheet_path": staging_sheet_path,
+            }
+
+    def _stage_review_artifacts(
+        self, workspace: Path
+    ) -> tuple[str, str]:
+        """Copy multi-view review artifacts out of the bubblewrap workspace.
+
+        Returns the project-relative paths to the staged ``views/`` directory
+        and the contact sheet PNG. Both paths live under
+        ``project_dir/.review-staging/`` and survive the temp workspace
+        teardown so ``promote_review`` can verify and promote them. The
+        staging directory is recreated atomically each run; stale views from
+        previous renders do not bleed into the new manifest.
+        """
+        staging_root = self.project_dir / ".review-staging"
+        source_views = workspace / ".review-views"
+        source_sheet = workspace / ".review-sheet.png"
+        if not source_views.is_dir():
+            raise RuntimeError("Review views directory was not produced by the sandbox.")
+        if not source_sheet.is_file() or source_sheet.stat().st_size == 0:
+            raise RuntimeError("Review contact sheet was not produced by the sandbox.")
+        if staging_root.exists():
+            shutil.rmtree(staging_root, ignore_errors=True)
+        staging_root.mkdir(parents=True, exist_ok=True)
+        views_target = staging_root / "views"
+        shutil.copytree(source_views, views_target)
+        sheet_target = staging_root / "review-sheet.png"
+        shutil.copyfile(source_sheet, sheet_target)
+        return str(views_target), str(sheet_target)
 
     def _enforce_basic_geometry(self, metrics: dict[str, Any]) -> None:
         """Apply the basic geometry checks the runner pre-validates.
@@ -205,6 +375,172 @@ class CadTool:
         finally:
             temporary_path.unlink(missing_ok=True)
 
+    # ------------------------------------------------------------------ review promotion
+
+    def promote_review(
+        self,
+        review_manifest: dict[str, Any],
+        *,
+        sandbox_views_dir: str,
+        sandbox_sheet_path: str,
+    ) -> dict[str, Any]:
+        """Copy the multi-view review artifacts from the sandbox into the project.
+
+        Returns the persisted manifest payload so the caller can publish the
+        review event without re-reading ``.cad-agent/reviews/.../manifest.json``.
+        Raises ``RuntimeError`` if any required view is missing or its hash
+        does not match the manifest entry; partial output is treated as a
+        build failure by the calling agent.
+        """
+        if not isinstance(review_manifest, dict):
+            raise RuntimeError("Review manifest is missing or malformed.")
+        model_sha256 = review_manifest.get("model_sha256")
+        preview_sha256 = review_manifest.get("preview_sha256")
+        if not (isinstance(model_sha256, str) and isinstance(preview_sha256, str)):
+            raise RuntimeError("Review manifest is missing model/preview hashes.")
+        views = review_manifest.get("views")
+        contact_sheet = review_manifest.get("contact_sheet")
+        if not isinstance(views, list) or not isinstance(contact_sheet, dict):
+            raise RuntimeError("Review manifest is missing views or contact sheet.")
+
+        views_dir = Path(sandbox_views_dir)
+        sheet_path = Path(sandbox_sheet_path)
+        if not views_dir.is_dir():
+            raise RuntimeError("Review views directory was not produced by the sandbox.")
+        if not sheet_path.is_file() or sheet_path.stat().st_size == 0:
+            raise RuntimeError("Review contact sheet was not produced by the sandbox.")
+
+        review_dir = self._review_dir(model_sha256)
+        cache_hit = self._review_is_fresh(
+            review_dir, preview_sha256, contact_sheet.get("image_sha256")
+        )
+        if cache_hit:
+            return self._read_review_manifest(review_dir) or review_manifest
+
+        staging = review_dir.with_suffix(review_dir.suffix + ".tmp")
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+        staging.mkdir(parents=True, exist_ok=True)
+        views_target = staging / _REVIEW_VIEWS_DIR
+        views_target.mkdir(exist_ok=True)
+        try:
+            for entry in views:
+                view_id = entry.get("view_id")
+                expected_sha = entry.get("image_sha256")
+                expected_size = int(entry.get("image_bytes") or 0)
+                if not (isinstance(view_id, str) and isinstance(expected_sha, str)):
+                    raise RuntimeError("Review view entry is missing identifiers.")
+                source = views_dir / f"{view_id}.png"
+                if not source.is_file() or source.stat().st_size == 0:
+                    raise RuntimeError(
+                        f"Review view {view_id} was not produced by the sandbox."
+                    )
+                destination = views_target / f"{view_id}.png"
+                shutil.copyfile(source, destination)
+                if destination.stat().st_size != expected_size:
+                    raise RuntimeError(
+                        f"Review view {view_id} size mismatch."
+                    )
+                actual_sha = hashlib.sha256(destination.read_bytes()).hexdigest()
+                if actual_sha != expected_sha:
+                    raise RuntimeError(
+                        f"Review view {view_id} hash mismatch: "
+                        f"expected {expected_sha[:12]}, got {actual_sha[:12]}."
+                    )
+            sheet_target = staging / _REVIEW_SHEET_NAME
+            shutil.copyfile(sheet_path, sheet_target)
+            actual_sheet_sha = hashlib.sha256(sheet_target.read_bytes()).hexdigest()
+            expected_sheet_sha = contact_sheet.get("image_sha256")
+            if (
+                expected_sheet_sha
+                and actual_sheet_sha != expected_sheet_sha
+            ):
+                raise RuntimeError("Review contact sheet hash mismatch.")
+
+            persisted_manifest = dict(review_manifest)
+            persisted_manifest["artifact_dir"] = review_dir.name
+            persisted_manifest["preview_sha256"] = preview_sha256
+            (staging / _REVIEW_MANIFEST_NAME).write_text(
+                json.dumps(persisted_manifest, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.replace(staging, review_dir)
+        finally:
+            if staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+        return self._read_review_manifest(review_dir) or persisted_manifest
+
+    @staticmethod
+    def _read_review_manifest(review_dir: Path) -> dict[str, Any] | None:
+        manifest_path = review_dir / _REVIEW_MANIFEST_NAME
+        if not manifest_path.is_file():
+            return None
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    @classmethod
+    def _review_is_fresh(
+        cls,
+        review_dir: Path,
+        preview_sha256: str,
+        sheet_sha: object,
+    ) -> bool:
+        if not review_dir.is_dir():
+            return False
+        manifest = cls._read_review_manifest(review_dir)
+        if manifest is None:
+            return False
+        if manifest.get("preview_sha256") != preview_sha256:
+            return False
+        if sheet_sha and manifest.get("contact_sheet", {}).get("image_sha256") != sheet_sha:
+            return False
+        views_target = review_dir / _REVIEW_VIEWS_DIR
+        for entry in manifest.get("views", []) or []:
+            view_id = entry.get("view_id")
+            expected_sha = entry.get("image_sha256")
+            if not (isinstance(view_id, str) and isinstance(expected_sha, str)):
+                return False
+            destination = views_target / f"{view_id}.png"
+            if not destination.is_file():
+                return False
+            actual_sha = hashlib.sha256(destination.read_bytes()).hexdigest()
+            if actual_sha != expected_sha:
+                return False
+        return True
+
+    def write_review_result(self, result: dict[str, Any]) -> Path:
+        """Persist the structured multimodal reviewer result.
+
+        A fresh result overwrites any existing ``result.json`` so the UI
+        always surfaces the latest verdict for the active review.
+        """
+        latest = self.latest_review_dir()
+        if latest is None:
+            raise RuntimeError("No review directory is available to record a result.")
+        target = latest / _REVIEW_RESULT_NAME
+        payload = dict(result)
+        payload.setdefault("written_at", _utc_now())
+        CadTool._atomic_copy_bytes(
+            json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"), target
+        )
+        return target
+
+    @staticmethod
+    def _atomic_copy_bytes(data: bytes, target: Path) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            dir=target.parent, delete=False
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(data)
+        try:
+            temporary_path.replace(target)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+
     @staticmethod
     def _failure_detail(output: str) -> str:
         """Extract the most relevant traceback frames and the final error message."""
@@ -242,14 +578,36 @@ class CadTool:
         return dict(payload.get("metrics") or {})
 
     def build_and_verify(self) -> dict[str, Any]:
-        """Build once, validate metrics, and produce both preview and render."""
+        """Build once, validate metrics, and produce preview + multi-view review."""
         payload = self._execute(render=True)
         metrics = payload.get("metrics") if isinstance(payload, dict) else None
-        return {
+        review_manifest = payload.get("review_manifest")
+        review_path: str | None = None
+        if review_manifest:
+            try:
+                promoted = self.promote_review(
+                    review_manifest,
+                    sandbox_views_dir=payload.get("review_views_dir") or "",
+                    sandbox_sheet_path=payload.get("review_sheet_path") or "",
+                )
+                review_path = promoted.get("artifact_dir")
+            except RuntimeError:
+                # Promotion failures are surfaced to the agent by raising; the
+                # caller (AgentRunner) maps them to a CAD_BUILD_FAILED result.
+                raise
+        result: dict[str, Any] = {
             "metrics": metrics,
             "preview": "preview.stl",
             "render": "render.png",
+            "feature_summary": payload.get("feature_summary") or {},
         }
+        if review_path:
+            result["review"] = review_path
+        if review_manifest:
+            # Surface the manifest so the agent loop can drive the structured
+            # reviewer without re-reading ``.cad-agent/reviews/``.
+            result["review_manifest"] = review_manifest
+        return result
 
     def stop(self) -> None:
         with self._lock:
@@ -261,3 +619,9 @@ class CadTool:
             process.wait(timeout=2)
         except subprocess.TimeoutExpired:
             _kill_process_group(process, force=True)
+
+
+def _utc_now() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()

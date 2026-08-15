@@ -19,6 +19,7 @@ A local-first web app that lets you **chat with an AI agent to create parametric
 - **Reference images** — Upload up to 5 images (10 MB each) to guide the agent
 - **Sandboxed execution** — All generated code runs in a Bubblewrap container with blocked network and resource limits
 - **Verified builds** — Each model is built, checked for a valid solid, and rendered before the agent reports completion
+- **Multi-view visual review** — A bounded structured reviewer inspects eight orthogonal and isometric views and only confirms builds whose geometry, dimensions, and features match the request
 - **Project management** — Create, rename, and switch between multiple CAD projects with persisted conversation history
 - **Model history** — Inspect source diffs, track successful builds, and restore any retained `model.py` revision
 - **Reusable experience memory** — The agent records verified, non-sensitive CAD fixes for reuse across projects in the same workspace
@@ -121,6 +122,10 @@ per-user configuration file.
 | `openai.reasoning_effort` | *(empty)* | Optional reasoning setting for compatible OpenAI models |
 | `server.host` / `server.port` | `127.0.0.1` / `5000` | Bind address |
 | `ui.show_info_messages` | `true` | Show tool-status info messages in chat |
+| `review.enabled` | `true` | Gate completion on a passing structured visual review |
+| `review.max_cycles` | `3` | Maximum repair attempts the agent may try per user task |
+| `review.render_workers` | `4` | Worker processes used to rasterise the canonical views |
+| `review.required_views` | `8` | Views that must be produced and hashed successfully per build |
 
 `reasoning_effort` must be one of `minimal`, `low`, `medium`, or `high` when it
 is set. YAML booleans must be unquoted (`true` / `false`).
@@ -134,6 +139,7 @@ Each project is stored below `workspace_root`. Its important files are:
 | `model.py` | Active build123d source; its top-level `result` is the final shape |
 | `summary.md` | Agent-maintained design summary after a verified build |
 | `preview.stl` / `render.png` | Latest generated browser preview assets |
+| `.cad-agent/reviews/<model_sha>/` | Per-revision multi-view review artifacts (`manifest.json`, `views/*.png`, `review-sheet.png`, `result.json`) |
 | `conversation.jsonl` | Persisted chat and tool-event history |
 | `.cad-agent/history/` | Revision manifests, source blobs, and build records |
 | `inputs/` | Normalized reference-image uploads |

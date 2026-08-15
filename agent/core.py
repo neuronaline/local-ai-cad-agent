@@ -23,6 +23,7 @@ from agent.llm_base import (
     provider_label,
     sanitize_assistant_message,
 )
+from agent.cad_review import ReviewResult, run_review, write_review_result
 from agent.prompt import get_system_prompt
 from agent.revisions import RevisionStore
 from agent.settings import Settings
@@ -55,7 +56,13 @@ class ProjectTools:
         self.revisions.reconcile()
         self.file = FileTool(project_dir, self.revisions)
         self.terminal = TerminalTool(project_dir)
-        self.cad = CadTool(project_dir, publish, self.revisions)
+        self.cad = CadTool(
+            project_dir,
+            publish,
+            self.revisions,
+            review_render_workers=(settings.review_render_workers if settings else 4),
+            review_required_views=(settings.review_required_views if settings else 8),
+        )
         self.question = QuestionTool(publish)
         # Experience tool lives at workspace scope, so we need the workspace root.
         # project_dir is <workspace>/<project>; parent yields the workspace.
@@ -103,6 +110,11 @@ class AgentRunner:
         self._waiting_questions: dict[str, dict[str, object]] = {}
         self._preview_attempts: dict[tuple[str, str], dict[str, str]] = {}
         self._pending_completions: dict[str, dict[str, str]] = {}
+        # Per-project latest review verdict keyed by (model_sha256, preview_sha256)
+        # so a stale review cannot complete a task that has been edited since.
+        self._latest_review: dict[str, dict[str, object]] = {}
+        # Per-project count of post-build review attempts in the current task.
+        self._review_cycles: dict[str, int] = {}
         # Set by the active _run() inside its finally clause so callers can
         # observe completion reliably without polling thread.is_alive().
         self._run_complete: threading.Event = threading.Event()
@@ -311,6 +323,8 @@ class AgentRunner:
             },
         )
         project_dir = self.settings.workspace_root / project
+        with self._lock:
+            self._review_cycles[project] = 0
         tools = ProjectTools(project_dir, self.publish, self.settings)
         with self._lock:
             self._active_tools = tools
@@ -831,8 +845,50 @@ class AgentRunner:
                 self.publish("revision_updated", {"project": project})
             if self._is_cad_build(name, arguments):
                 preview_id = self._register_preview(project, project_dir)
-                cad_error = None
-                cad_fix_required = False
+                review_payload = self._run_post_build_review(
+                    project, project_dir, raw_result
+                )
+                review_status = review_payload.get("status")
+                if review_status == "limit_reached":
+                    # Cycle limit hit: surface the unresolved findings, but
+                    # leave the preview registered so the UI can show what was
+                    # last reviewed. The caller (``_run``) blocks completion
+                    # by clearing ``preview_id`` after the loop.
+                    self.publish(
+                        "agent_error",
+                        {
+                            "project": project,
+                            "message": (
+                                "Review could not pass within the cycle limit: "
+                                + str(review_payload.get("summary") or "")
+                            ),
+                        },
+                    )
+                    with self._lock:
+                        self._pending_completions.pop(project, None)
+                    preview_id = None
+                    cad_error = (
+                        f"Review limit reached: {review_payload.get('summary') or 'unresolved findings'}"
+                    )
+                    cad_fix_required = False
+                elif review_status in {"fail", "inconclusive"}:
+                    # Force the generator to repair model.py and rebuild. The
+                    # preview is invalidated; the UI must wait for the next
+                    # passing review before it can display the part.
+                    blocking = bool(review_payload.get("blocking"))
+                    findings = review_payload.get("findings") or []
+                    cad_fix_required = True
+                    preview_id = None
+                    findings_text = "; ".join(
+                        str(entry.get("message") or "")
+                        for entry in findings
+                        if isinstance(entry, dict)
+                    )
+                    cad_error = (
+                        f"{'Blocking' if blocking else 'Review'} finding: "
+                        f"{review_payload.get('summary') or 'reviewer rejected the build'}"
+                        + (f" — {findings_text}" if findings_text else "")
+                    )
                 self.publish(
                     "preview_updated",
                     {"project": project, "preview_id": preview_id},
@@ -936,6 +992,156 @@ class AgentRunner:
                 "status": "loading",
             }
         return preview_id
+
+    # ------------------------------------------------------------------ review gate
+
+    def _run_post_build_review(
+        self,
+        project: str,
+        project_dir: Path,
+        raw_result: dict[str, object],
+    ) -> dict[str, object]:
+        """Run the structured multimodal review after a successful build.
+
+        Returns a small payload (``status``, ``summary``, ``blocking``) that
+        ``_process_tool_call`` uses to decide whether completion is allowed
+        and whether the generator must be asked for a repair. Per-task cycle
+        count is incremented here; when it reaches the configured maximum,
+        the run short-circuits and the unresolved findings are reported
+        instead of looping further.
+        """
+        manifest = raw_result.get("review_manifest") if isinstance(raw_result, dict) else None
+        artifact_dir = raw_result.get("review") if isinstance(raw_result, dict) else None
+        if not self.settings.review_enabled or not isinstance(manifest, dict):
+            return {"status": "skipped", "summary": "", "blocking": False}
+        model_sha = str(manifest.get("model_sha256") or "")
+        preview_sha = str(manifest.get("preview_sha256") or "")
+        sheet_path: Path | None = None
+        if isinstance(artifact_dir, str) and artifact_dir:
+            sheet_path = project_dir / ".cad-agent" / "reviews" / artifact_dir / "review-sheet.png"
+        if sheet_path is None or not sheet_path.is_file():
+            sheet_path = project_dir / ".cad-agent" / "reviews" / model_sha / "review-sheet.png"
+        model_source = ""
+        model_path = project_dir / "model.py"
+        if model_path.is_file():
+            try:
+                model_source = model_path.read_text(encoding="utf-8")
+            except OSError:
+                model_source = ""
+        request_text = self._user_request_text(project_dir)
+        self.publish(
+            "agent_status",
+            {"project": project, "status": "reviewing", "message": "Reviewing the build…"},
+        )
+        try:
+            review: ReviewResult = run_review(
+                settings=self.settings,
+                request_text=request_text,
+                model_source=model_source,
+                metrics=raw_result.get("metrics") or {},
+                feature_summary=raw_result.get("feature_summary") or {},
+                review_manifest=manifest,
+                sheet_path=sheet_path,
+                stop_event=self._stop_event,
+            )
+        except Exception as exc:
+            review = ReviewResult(
+                status="inconclusive",
+                summary=f"Review raised {type(exc).__name__}.",
+                model_sha256=model_sha,
+                preview_sha256=preview_sha,
+            )
+        review_sheet_dir = project_dir / ".cad-agent" / "reviews" / model_sha
+        review_sheet_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            write_review_result(review_sheet_dir, review)
+        except OSError:
+            pass
+        with self._lock:
+            self._latest_review[project] = {
+                "status": review.status,
+                "summary": review.summary,
+                "findings": [finding.as_dict() for finding in review.findings],
+                "model_sha256": model_sha,
+                "preview_sha256": preview_sha,
+            }
+            self._review_cycles[project] = self._review_cycles.get(project, 0) + 1
+        self.publish(
+            "review_updated",
+            {"project": project, "status": review.status, "summary": review.summary},
+        )
+        if review.status == "pass":
+            self.publish(
+                "agent_status",
+                {"project": project, "status": "review_passed", "message": review.summary},
+            )
+            return {
+                "status": "pass",
+                "summary": review.summary,
+                "blocking": False,
+                "findings": [finding.as_dict() for finding in review.findings],
+            }
+        # ``fail`` and ``inconclusive`` both block completion. ``inconclusive``
+        # is treated as the documented "never pass without visual evidence".
+        blocking = review.status == "fail" and review.is_blocking
+        self.publish(
+            "agent_status",
+            {
+                "project": project,
+                "status": "review_failed",
+                "message": review.summary,
+            },
+        )
+        max_cycles = max(1, self.settings.review_max_cycles)
+        if self._review_cycles.get(project, 0) >= max_cycles:
+            return {
+                "status": "limit_reached",
+                "summary": review.summary,
+                "blocking": blocking,
+                "findings": [finding.as_dict() for finding in review.findings],
+            }
+        return {
+            "status": review.status,
+            "summary": review.summary,
+            "blocking": blocking,
+            "findings": [finding.as_dict() for finding in review.findings],
+        }
+
+    def _user_request_text(self, project_dir: Path) -> str:
+        """Return the latest user request from ``conversation.jsonl`` for review context."""
+        history_path = project_dir / "conversation.jsonl"
+        if not history_path.is_file():
+            return ""
+        try:
+            with history_path.open("r", encoding="utf-8") as log:
+                lines = log.readlines()
+        except OSError:
+            return ""
+        for raw in reversed(lines):
+            try:
+                entry = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(entry, dict) or entry.get("role") != "user":
+                continue
+            content = entry.get("content")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                fragments: list[str] = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
+                        fragments.append(part["text"])
+                if fragments:
+                    return "\n".join(fragments)
+        return ""
+
+    def latest_review(self, project: str) -> dict[str, object] | None:
+        with self._lock:
+            entry = self._latest_review.get(project)
+        if not entry:
+            return None
+        return dict(entry)
 
     def _preview_matches(self, project: str, attempt: dict[str, str]) -> bool:
         preview_path = self.settings.workspace_root / project / "preview.stl"

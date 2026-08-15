@@ -764,3 +764,145 @@ def test_revision_list_reports_corrupt_history(tmp_path: Path):
 
     assert response.status_code == 422
     assert "filename is invalid" in response.get_json()["error"]
+
+
+# ---------------------------------------------------------------------------
+# Multi-view review endpoints
+# ---------------------------------------------------------------------------
+
+
+def _seed_review(project_dir: Path, *, model_sha: str, view_count: int = 2) -> None:
+    """Write a fake ``.cad-agent/reviews/<sha>/`` directory the endpoints can serve."""
+    review_root = project_dir / ".cad-agent" / "reviews" / model_sha
+    views_dir = review_root / "views"
+    views_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "model_sha256": model_sha,
+        "preview_sha256": "deadbeef" * 8,
+        "view_count": view_count,
+        "workers": 1,
+        "duration_seconds": 0.4,
+        "tessellated_triangles": 12,
+        "contact_sheet": {
+            "path": "review-sheet.png",
+            "image_sha256": "f" * 64,
+            "image_bytes": 4,
+            "width": 512,
+            "height": 512,
+        },
+        "views": [
+            {
+                "view_id": f"view_{i}",
+                "label": f"View {i}",
+                "path": f"views/view_{i}.png",
+                "image_sha256": "0" * 63 + str(i + 1),
+                "image_bytes": 4,
+                "width": 64,
+                "height": 64,
+                "render_status": "rendered",
+            }
+            for i in range(view_count)
+        ],
+    }
+    (review_root / "manifest.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+    (review_root / "review-sheet.png").write_bytes(b"\x89PNG\r\n\x1a\n stub-sheet")
+    for entry in payload["views"]:
+        (views_dir / f"{entry['view_id']}.png").write_bytes(
+            b"\x89PNG\r\n\x1a\n stub-view-" + entry["view_id"].encode()
+        )
+
+
+def test_review_endpoints_404_when_no_review_exists(tmp_path: Path):
+    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    client = create_app(settings).test_client()
+    client.post("/api/projects/new", json={"name": "demo"})
+
+    assert client.get("/api/projects/demo/review/manifest").status_code == 404
+    assert client.get("/api/projects/demo/review/sheet").status_code == 404
+    assert client.get("/api/projects/demo/review/view/x_positive").status_code == 404
+
+
+def test_review_manifest_returns_persisted_payload(tmp_path: Path):
+    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    client = create_app(settings).test_client()
+    client.post("/api/projects/new", json={"name": "demo"})
+    project_dir = settings.workspace_root / "demo"
+    model_sha = "a" * 64
+    _seed_review(project_dir, model_sha=model_sha, view_count=3)
+
+    response = client.get("/api/projects/demo/review/manifest")
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["model_sha256"] == model_sha
+    assert body["artifact_dir"] == model_sha
+    assert len(body["views"]) == 3
+    assert body["view_count"] == 3
+
+
+def test_review_sheet_and_view_serve_png_payloads(tmp_path: Path):
+    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    client = create_app(settings).test_client()
+    client.post("/api/projects/new", json={"name": "demo"})
+    project_dir = settings.workspace_root / "demo"
+    model_sha = "b" * 64
+    _seed_review(project_dir, model_sha=model_sha, view_count=2)
+
+    sheet = client.get("/api/projects/demo/review/sheet")
+    assert sheet.status_code == 200
+    assert sheet.mimetype == "image/png"
+    # The endpoint returns the exact sheet bytes that were promoted into
+    # ``.cad-agent/reviews/<sha>/review-sheet.png``.
+    project_dir = settings.workspace_root / "demo"
+    seeded_sheet = (project_dir / ".cad-agent" / "reviews" / ("b" * 64) / "review-sheet.png").read_bytes()
+    assert sheet.data == seeded_sheet
+
+    seeded_view = (project_dir / ".cad-agent" / "reviews" / ("b" * 64) / "views" / "view_0.png").read_bytes()
+    view = client.get("/api/projects/demo/review/view/view_0")
+    assert view.status_code == 200
+    assert view.mimetype == "image/png"
+    assert view.data == seeded_view
+
+    missing = client.get("/api/projects/demo/review/view/view_does_not_exist")
+    assert missing.status_code == 404
+
+
+def test_review_view_rejects_path_traversal(tmp_path: Path):
+    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    client = create_app(settings).test_client()
+    client.post("/api/projects/new", json={"name": "demo"})
+    project_dir = settings.workspace_root / "demo"
+    _seed_review(project_dir, model_sha="c" * 64)
+
+    assert client.get("/api/projects/demo/review/view/..").status_code == 404
+    assert client.get("/api/projects/demo/review/view/.hidden").status_code == 404
+    assert client.get("/api/projects/demo/review/view/..%2Fetc%2Fpasswd").status_code == 404
+
+
+def test_review_manifest_includes_result_when_present(tmp_path: Path):
+    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    client = create_app(settings).test_client()
+    client.post("/api/projects/new", json={"name": "demo"})
+    project_dir = settings.workspace_root / "demo"
+    model_sha = "d" * 64
+    _seed_review(project_dir, model_sha=model_sha)
+    review_dir = project_dir / ".cad-agent" / "reviews" / model_sha
+    (review_dir / "result.json").write_text(
+        json.dumps(
+            {
+                "status": "pass",
+                "summary": "All checks passed",
+                "findings": [
+                    {"severity": "minor", "message": "ok"}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    response = client.get("/api/projects/demo/review/manifest")
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["result"]["status"] == "pass"
+    assert body["result"]["findings"][0]["severity"] == "minor"

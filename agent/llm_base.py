@@ -301,6 +301,7 @@ class ChatCompletionsClient:
         self.session_id: str | None = None
         self.last_usage: dict[str, Any] | None = None
         self.stream_callback = None
+        self.require_images = False
         self._provider_label = provider_label
 
     def _endpoint(self) -> str:  # pragma: no cover — overridden by subclass
@@ -357,6 +358,16 @@ class ChatCompletionsClient:
                     raise
             else:
                 if response.status_code in {400, 404} and not image_fallback_used:
+                    # Review calls require images: a refusal that traces back
+                    # to ``image_url`` parts is treated as an inconclusive
+                    # review and surfaces to the caller instead of retrying
+                    # the request without its visual evidence.
+                    if self.require_images:
+                        response.close()
+                        raise RuntimeError(
+                            "Review model rejected image inputs; cannot "
+                            "complete review without visual evidence."
+                        )
                     if self._try_image_fallback(payload, response):
                         image_fallback_used = True
                         continue

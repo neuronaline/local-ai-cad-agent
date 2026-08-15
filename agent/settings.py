@@ -39,6 +39,11 @@ class Settings:
     agent_tool_call_limit: int = 12
     revision_retention_count: int = 0  # 0 = unlimited, >0 = keep at most N revisions
     agent_debug_log_tool_errors: bool = False
+    # ── Post-build review gate ──
+    review_enabled: bool = True
+    review_max_cycles: int = 3
+    review_render_workers: int = 4
+    review_required_views: int = 8
 
     @property
     def llm_model(self) -> str:
@@ -98,6 +103,7 @@ def load_settings(project_root: Path | None = None) -> Settings:
     server = config.get("server", {})
     ui = config.get("ui", {})
     agent = config.get("agent", {})
+    review = config.get("review", {})
 
     # llm.provider selects which adapter AgentRunner should use. Settings
     # for the inactive provider are still loaded so users can switch without
@@ -137,6 +143,14 @@ def load_settings(project_root: Path | None = None) -> Settings:
         revision_retention_count=_non_negative_int(agent.get("revision_retention_count", 0), "agent.revision_retention_count"),
         agent_debug_log_tool_errors=_strict_bool(
             agent.get("debug_log_tool_errors", False), "agent.debug_log_tool_errors"
+        ),
+        review_enabled=_strict_bool(review.get("enabled", True), "review.enabled"),
+        review_max_cycles=_positive_int(review.get("max_cycles", 3), "review.max_cycles"),
+        review_render_workers=_positive_int(
+            review.get("render_workers", 4), "review.render_workers"
+        ),
+        review_required_views=_positive_int(
+            review.get("required_views", 8), "review.required_views"
         ),
     )
 
