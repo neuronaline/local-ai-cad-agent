@@ -93,17 +93,136 @@ def test_update_changes_existing_experience_and_tracks_reuse(
     assert record["reuse_count"] == 1
 
 
-def test_invalid_memory_inputs_are_rejected(tool: ExperienceTool):
-    invalid_calls = (
-        lambda: tool.search(""),
-        lambda: tool.add("", "problem", "solution"),
-        lambda: tool.add("title", "problem", ""),
-        lambda: tool.update("missing-id", solution="new solution"),
+@pytest.mark.parametrize(
+    "invocation",
+    [
+        pytest.param(lambda t: t.search(""), id="search-empty"),
+        pytest.param(lambda t: t.search("   \t\n "), id="search-whitespace"),
+        pytest.param(lambda t: t.add("", "problem", "solution"), id="add-blank-title"),
+        pytest.param(lambda t: t.add("title", "problem", "  "), id="add-blank-solution"),
+        pytest.param(lambda t: t.add("\n\t ", "problem", "solution"), id="add-whitespace-title"),
+        pytest.param(lambda t: t.update("missing-id", solution="new solution"), id="update-missing-id"),
+        pytest.param(lambda t: t.update("   ", solution="x"), id="update-blank-id"),
+        pytest.param(lambda t: t.get(""), id="get-blank-id"),
+        pytest.param(lambda t: t.get("ghost"), id="get-missing-id"),
+    ],
+)
+def test_invalid_memory_inputs_are_rejected(tool: ExperienceTool, invocation):
+    """Boundary: empty/whitespace/missing inputs across search/add/update/get
+    must raise ``ValueError`` so a malformed agent tool call fails fast."""
+    with pytest.raises(ValueError):
+        invocation(tool)
+
+
+@pytest.mark.parametrize(
+    ("title", "problem", "solution", "match"),
+    [
+        pytest.param(
+            "x" * 121,
+            "p",
+            "s",
+            "title exceeds 120 characters",
+            id="oversized-title",
+        ),
+        pytest.param(
+            "t",
+            "x" * 501,
+            "s",
+            "problem exceeds 500 characters",
+            id="oversized-problem",
+        ),
+        pytest.param(
+            "t",
+            "p",
+            "x" * 2001,
+            "solution exceeds 2000 characters",
+            id="oversized-solution",
+        ),
+    ],
+)
+def test_add_rejects_oversized_fields(
+    tool: ExperienceTool, title: str, problem: str, solution: str, match: str
+):
+    """Field-length caps are the contract that keeps the database queryable."""
+    with pytest.raises(ValueError, match=match):
+        tool.add(title, problem, solution)
+
+
+def test_add_accepts_unicode_and_special_characters(tool: ExperienceTool):
+    """Unicode, quotes, and embedded newlines must round-trip through the
+    tool without being mangled or rejected."""
+    title = "Edge 'fillet' \"bug\" — ünïcödé & <script>alert(1)</script>"
+    problem = "Multi\nline\nproblem with\ttabs and \"quotes\""
+    solution = "Apply a 0.5 mm chamfer; see docs/notes.md (line 12) — ✓"
+
+    created = tool.add(title, problem, solution)
+    record = tool.get(created["id"])
+
+    # Title collapses whitespace via " ".join(value.split()) but preserves
+    # the unicode/special-char content. The other fields round-trip verbatim.
+    assert "ünïcödé" in record["title"]
+    assert "<script>" in record["title"]
+    assert record["problem"] == problem
+    assert record["solution"] == solution
+
+
+def test_add_rejects_too_many_tags(tool: ExperienceTool):
+    """More than ``_MAX_TAGS`` unique tags must be rejected with a clear error."""
+    too_many = [f"tag{i}" for i in range(11)]  # one over the 10-tag cap
+
+    with pytest.raises(ValueError, match="Maximum 10 unique tags"):
+        tool.add("Title", "Problem", "Solution", tags=too_many)
+
+
+def test_add_rejects_oversized_tag(tool: ExperienceTool):
+    """A single tag longer than ``_MAX_TAG_LENGTH`` must be rejected so
+    queries do not return pathologically large strings."""
+    oversized_tag = "a" * 51  # one over the 50-char cap
+
+    with pytest.raises(ValueError, match="exceeds 50 characters"):
+        tool.add("Title", "Problem", "Solution", tags=[oversized_tag])
+
+
+@pytest.mark.parametrize(
+    "bad_tags",
+    [
+        pytest.param("not-a-list", id="string-instead-of-list"),
+        pytest.param(42, id="integer-instead-of-list"),
+        pytest.param({"tag": "value"}, id="dict-instead-of-list"),
+        pytest.param((1, 2), id="tuple-instead-of-list"),
+    ],
+)
+def test_add_rejects_non_list_tags(tool: ExperienceTool, bad_tags):
+    """Tags must be a list — passing any non-list, non-None value must raise
+    ``ValueError`` rather than silently coerce. ``None`` is allowed (it
+    means 'no tags') by ``add``."""
+    with pytest.raises(ValueError, match="tags must be an array"):
+        tool.add("Title", "Problem", "Solution", tags=bad_tags)
+
+
+def test_add_accepts_none_tags(tool: ExperienceTool):
+    """``None`` tags must be accepted (it is documented as 'no tags')."""
+    created = tool.add("Title", "Problem", "Solution", tags=None)
+
+    assert created["id"]
+    assert tool.get(created["id"])["tags"] == []
+
+
+def test_search_handles_unicode_content_in_problem_or_solution(tool: ExperienceTool):
+    """Search must be case-insensitive over the indexed fields (problem +
+    solution) and handle unicode content without errors."""
+    # Arrange: the indexed fields carry unicode.
+    tool.add(
+        "Unicode chamfer recovery",
+        "Chamfer fails on ünïcödé edge geometry",
+        "Apply a smaller chamfer; verify with ✓",
     )
 
-    for call in invalid_calls:
-        with pytest.raises(ValueError):
-            call()
+    # Act: a unicode-lowercase query matches the unicode content.
+    result = tool.search("ünïcödé")
+
+    # Assert: the case-insensitive search surfaces the record.
+    assert result["matches"], "case-insensitive unicode query must match"
 
 
 def test_malformed_memory_is_never_overwritten(tool: ExperienceTool):

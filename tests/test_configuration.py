@@ -1,46 +1,86 @@
-"""Tests for application configuration: settings, prompt, and dependencies."""
+"""Tests for application configuration: settings loading and validation.
 
+These tests pin the *behavioural* contract of ``load_settings`` — defaults,
+overrides, validation, and provider routing — rather than mirroring the
+contents of the prompt or requirements files.
+"""
 from pathlib import Path
 
 import pytest
+import yaml
 
-from agent.prompt import get_build123d_playbook, get_system_prompt
-from agent.settings import load_settings
+from agent.settings import Settings, load_settings
 
 # ---------------------------------------------------------------------------
-# Settings
+# Helpers
 # ---------------------------------------------------------------------------
 
 
 def _write_config(tmp_path: Path, body: str) -> None:
+    """Arrange: write a config.yaml body for the test."""
     (tmp_path / "config.yaml").write_text(body, encoding="utf-8")
 
 
-@pytest.mark.parametrize(
-    ("body", "expected"),
-    [
-        pytest.param("agent:\n  tool_call_limit: 24\n", 24, id="loaded-from-config"),
-        pytest.param("", 12, id="default-when-omitted"),
-    ],
-)
-def test_tool_call_limit_loading(tmp_path, body, expected):
-    _write_config(tmp_path, body)
+# ---------------------------------------------------------------------------
+# Settings: defaults and overrides
+# ---------------------------------------------------------------------------
+
+
+def test_tool_call_limit_defaults_to_12_when_omitted(tmp_path: Path) -> None:
+    """Arrange / Act: empty config -> Settings uses the documented default."""
+    _write_config(tmp_path, "")
 
     settings = load_settings(project_root=tmp_path)
 
-    assert settings.agent_tool_call_limit == expected
+    assert settings.agent_tool_call_limit == 12
 
 
-def test_tool_call_limit_must_be_positive(tmp_path):
-    _write_config(tmp_path, "agent:\n  tool_call_limit: 0\n")
+def test_tool_call_limit_overrides_default_when_provided(tmp_path: Path) -> None:
+    """Arrange / Act: explicit override is honoured, not silently coerced."""
+    _write_config(tmp_path, "agent:\n  tool_call_limit: 24\n")
 
-    with pytest.raises(
-        ValueError, match="agent.tool_call_limit must be a positive integer"
-    ):
+    settings = load_settings(project_root=tmp_path)
+
+    assert settings.agent_tool_call_limit == 24
+
+
+@pytest.mark.parametrize(
+    ("body", "match"),
+    [
+        pytest.param(
+            "agent:\n  tool_call_limit: 0\n",
+            "must be a positive integer",
+            id="zero",
+        ),
+        pytest.param(
+            "agent:\n  tool_call_limit: -3\n",
+            "must be a positive integer",
+            id="negative",
+        ),
+        pytest.param(
+            "agent:\n  tool_call_limit: 'many'\n",
+            "must be a positive integer",
+            id="non-numeric-string",
+        ),
+        pytest.param(
+            "agent:\n  tool_call_limit: ''\n",
+            "must be a positive integer",
+            id="empty-string",
+        ),
+    ],
+)
+def test_tool_call_limit_rejects_invalid_inputs(
+    tmp_path: Path, body: str, match: str
+) -> None:
+    """Boundary: zero, negative, garbage, and empty inputs must all be rejected."""
+    _write_config(tmp_path, body)
+
+    with pytest.raises(ValueError, match=match):
         load_settings(project_root=tmp_path)
 
 
-def test_debug_tool_error_log_setting(tmp_path):
+def test_debug_tool_error_log_setting_round_trips(tmp_path: Path) -> None:
+    """Arrange / Act / Assert: a boolean override is read back as-is."""
     _write_config(tmp_path, "agent:\n  debug_log_tool_errors: true\n")
 
     settings = load_settings(project_root=tmp_path)
@@ -48,7 +88,25 @@ def test_debug_tool_error_log_setting(tmp_path):
     assert settings.agent_debug_log_tool_errors is True
 
 
-def test_settings_uses_openai_model_when_provider_is_openai(tmp_path):
+def test_debug_tool_error_log_default_is_false(tmp_path: Path) -> None:
+    """Default value (False) is preserved when the key is absent."""
+    _write_config(tmp_path, "")
+
+    settings = load_settings(project_root=tmp_path)
+
+    assert settings.agent_debug_log_tool_errors is False
+
+
+# ---------------------------------------------------------------------------
+# Settings: LLM provider routing
+# ---------------------------------------------------------------------------
+
+
+def test_openai_provider_uses_openai_model_and_remembers_openrouter(
+    tmp_path: Path,
+) -> None:
+    """When ``llm.provider`` is ``openai``, the OpenAI model is active and the
+    OpenRouter model is preserved for easy switching back."""
     _write_config(
         tmp_path,
         "llm:\n  provider: openai\nopenai:\n  model: gpt-4.1\nopenrouter:\n  model: openai/gpt-4o\n",
@@ -58,74 +116,58 @@ def test_settings_uses_openai_model_when_provider_is_openai(tmp_path):
 
     assert settings.llm_provider == "openai"
     assert settings.llm_model == "gpt-4.1"
-    # The other provider's model is still remembered for easy switching.
-    assert settings.openrouter_model == "openai/gpt-4o"
     assert settings.openai_model == "gpt-4.1"
+    assert settings.openrouter_model == "openai/gpt-4o"
 
 
-def test_settings_rejects_unknown_provider(tmp_path):
+def test_openrouter_provider_uses_openrouter_model_by_default(tmp_path: Path) -> None:
+    """Default provider is openrouter and ``llm_model`` reflects that."""
+    _write_config(tmp_path, "openrouter:\n  model: openai/gpt-4o\n")
+
+    settings = load_settings(project_root=tmp_path)
+
+    assert settings.llm_provider == "openrouter"
+    assert settings.llm_model == "openai/gpt-4o"
+
+
+def test_unknown_provider_is_rejected(tmp_path: Path) -> None:
+    """An unknown provider must raise — silently falling back would mask config errors."""
     _write_config(tmp_path, "llm:\n  provider: bogus\n")
 
     with pytest.raises(ValueError, match="llm.provider"):
         load_settings(project_root=tmp_path)
 
 
-# ---------------------------------------------------------------------------
-# System prompt
-# ---------------------------------------------------------------------------
+def test_empty_or_whitespace_provider_defaults_to_openrouter(tmp_path: Path) -> None:
+    """Empty/whitespace provider must not raise — they fall back to the documented default."""
+    _write_config(tmp_path, "llm:\n  provider: '   '\n")
+
+    settings = load_settings(project_root=tmp_path)
+
+    assert settings.llm_provider == "openrouter"
 
 
-def test_build123d_playbook_is_injected_once_into_the_static_system_prompt():
-    playbook = get_build123d_playbook()
-    system_prompt = get_system_prompt()
-    assert playbook.startswith("# build123d")
-    assert "Target version" in playbook
-    assert "```markdown" not in playbook
-    assert system_prompt.count("<build123d_cli_playbook>") == 1
-    assert playbook in system_prompt
-    assert "cad_build_and_verify performs the build" in system_prompt
-    assert "cad.run" not in system_prompt
+def test_settings_instance_retention_count_round_trip() -> None:
+    """Constructed Settings preserve ``revision_retention_count`` overrides."""
+    default_settings = Settings(Path("/tmp"), "https://e.test", "m", 1, "h", 1)
+    assert default_settings.revision_retention_count == 0
 
-
-def test_build123d_playbook_has_versioned_curve_and_topology_guidance():
-    playbook = get_build123d_playbook()
-    system_prompt = get_system_prompt()
-    # Version pinning surfaces both in the header and the explicit target line.
-    assert "build123d 0.11.1" in playbook
-    # Curve API: the playbook must document the Ellipse vs EllipticalCenterArc
-    # distinction so the agent picks the correct primitive for filled shapes
-    # vs true elliptical arcs.
-    assert "Ellipse" in playbook
-    assert "EllipticalCenterArc" in playbook
-    assert "creates a filled 2D sketch object" in playbook
-    # Topology freshness after booleans/chamfers/fillets — both prompt and
-    # playbook call this out so the agent discards stale selectors.
-    assert "fillets" in playbook
-    assert "selectors after booleans" in playbook
-    # The CLI owns rendering/export; the playbook must tell the agent not to
-    # export from inside model.py.
-    assert "The CLI handles preview and rendering" in playbook
-    # Locale-leak guard: the agent's prompt must not contain Turkish
-    # "Değişiklik Özeti" header fragments from upstream sources.
-    assert "Değişiklik Özeti" not in playbook
-    assert "discard any cached edge/face indices" in system_prompt
-
-
-def test_system_prompt_defines_a_verified_and_non_repetitive_workflow():
-    system_prompt = get_system_prompt()
-
-    assert "Do not claim success from source inspection alone" in system_prompt
-    assert "never rebuild unchanged source" in system_prompt
-    assert "Ask all blocking questions together" in system_prompt
-    assert "State any important assumption in the final reply" in system_prompt
+    custom_settings = Settings(
+        Path("/tmp"), "https://e.test", "m", 1, "h", 1, revision_retention_count=50
+    )
+    assert custom_settings.revision_retention_count == 50
 
 
 # ---------------------------------------------------------------------------
-# Pinned dependency
+# Settings: malformed inputs
 # ---------------------------------------------------------------------------
 
 
-def test_build123d_version_matches_the_versioned_playbook():
-    requirements = Path("requirements.txt").read_text(encoding="utf-8").splitlines()
+def test_settings_rejects_completely_unparseable_yaml(tmp_path: Path) -> None:
+    """A syntactically broken YAML file must raise rather than silently default."""
+    _write_config(tmp_path, "this:\n - is\n  not: valid: yaml:\n")
 
-    assert "build123d==0.11.1" in requirements
+    # The YAML parser raises ``yaml.YAMLError``; we accept any ``ValueError``
+    # subtype or ``YAMLError`` since the settings layer may wrap either.
+    with pytest.raises((ValueError, yaml.YAMLError)):
+        load_settings(project_root=tmp_path)

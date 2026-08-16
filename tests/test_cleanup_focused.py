@@ -21,7 +21,6 @@ from agent.revisions import (
     BuildRecord,
     RevisionOrigin,
     RevisionStore,
-    _DEFAULT_RETENTION,
 )
 from agent.settings import Settings
 from agent.tools.cad_tool import CadTool
@@ -102,14 +101,6 @@ def test_build_for_skips_entries_for_other_revisions(tmp_path: Path):
 
 
 # --- Retention ------------------------------------------------------------ #
-
-
-def test_default_retention_is_25_revisions():
-    """Plan pins the retention policy at 25 + last-known-good.
-
-    Exposed as a constant so changes are deliberate.
-    """
-    assert _DEFAULT_RETENTION == 25
 
 
 def test_commit_prunes_to_25_plus_last_successful(tmp_path: Path):

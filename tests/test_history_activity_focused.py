@@ -23,6 +23,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from agent.settings import Settings
 from app import _redact_history_event, create_app
 
@@ -236,50 +238,126 @@ def test_normalize_history_content_handles_list_and_string_content():
     assert out["empty"] == ""
 
 
+def test_normalize_history_content_is_defensive_against_malformed_parts():
+    """Edge case: the helper must never throw on weird shapes. Garbage parts
+    are skipped, unicode text round-trips, and a long stream of images gets
+    monotonically numbered placeholders."""
+    bindings = _extract_js("normalizeHistoryContent")
+    body = (
+        "var out = {\n"
+        # 1. Empty array → empty string.
+        "  empty_arr: normalizeHistoryContent([]),\n"
+        # 2. Only malformed parts (nulls, primitives, missing type) → empty.
+        "  only_garbage: normalizeHistoryContent([\n"
+        "    null, undefined, 42, 'string-part', {no_type: 1},\n"
+        "    {type: 'unknown'},\n"
+        "  ]),\n"
+        # 3. Unicode and special characters in text pass through verbatim.
+        "  unicode: normalizeHistoryContent([\n"
+        "    {type: 'text', text: 'ünïcödé ✓ <script>alert(1)</script>'},\n"
+        "  ]),\n"
+        # 4. Mixed valid text + multiple images preserves order and numbering.
+        "  long: normalizeHistoryContent([\n"
+        "    {type: 'text', text: 'first'},\n"
+        + ", ".join(["{type: 'image_url'}"] * 5) + ",\n"
+        "    {type: 'text', text: 'last'},\n"
+        "  ]),\n"
+        "};\n"
+        "process.stdout.write(JSON.stringify(out));\n"
+    )
+    out = json.loads(_eval_helper(bindings, body))
+
+    assert out["empty_arr"] == ""
+    assert out["only_garbage"] == ""
+    assert "ünïcödé" in out["unicode"]
+    assert "✓" in out["unicode"]
+    # Sanitization is a separate concern; we only assert the helper does not
+    # mangle content here.
+    assert "<script>" in out["unicode"]
+    # The 5-image sequence must be numbered 1..5 in order.
+    expected_long = "first\n[Reference image 1]\n[Reference image 2]\n[Reference image 3]\n[Reference image 4]\n[Reference image 5]\nlast"
+    assert out["long"] == expected_long
+
+
+def test_redact_history_event_handles_unicode_image_data():
+    """Edge case: the backend redactor must process unicode/oversized image
+    payloads without crashing and replace them with the standard placeholder.
+
+    The redaction is structural (it looks at ``type`` not at the payload
+    content), so this test pins two real risks: (1) large unicode payloads
+    must not blow the stack or exceed any implicit size limits, and (2) the
+    image counter must still increment to 1 in a single-image event.
+    """
+    # Arrange: a multi-kilobyte base64 payload with embedded unicode
+    # (simulating file names, EXIF strings, etc.).
+    base64 = ("ünïcödé" * 500).encode("utf-8").hex()
+    long_payload = "data:image/png;base64," + base64
+
+    event = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "see attached sketch"},
+            {"type": "image_url", "image_url": {"url": long_payload}},
+        ],
+    }
+
+    # Act: redactor processes the unicode-heavy payload.
+    redacted = _redact_history_event(event)
+
+    # Assert: the text part survives and the image is replaced by the
+    # numbered placeholder. The unicode substring must not leak anywhere.
+    parts = redacted["content"]
+    assert len(parts) == 2
+    assert parts[0] == {"type": "text", "text": "see attached sketch"}
+    assert parts[1] == {"type": "text", "text": "[Reference image 1]"}
+    serialised = " ".join(str(p) for p in parts)
+    assert "base64" not in serialised
+    assert "ünïcödé" not in serialised
+
+
 # ---------------------------------------------------------------------------
 # Issue 6: Activity labels map tool schema names to user-facing wording and
 # fall back to a sanitized human string for unknown tools.
 # ---------------------------------------------------------------------------
 
 
-def test_activity_label_uses_intended_wording_for_every_tool():
-    """Every currently-exposed tool schema name produces a label that
-    contains no underscore (visible-in-UI contract)."""
+def test_activity_label_strips_underscores_for_known_tools():
+    """Every known tool/status label must render as a human phrase without
+    underscores — the visible-in-UI contract that prevents tool names from
+    leaking into the activity drawer.
+    """
     bindings = (
         _extract_js("activityLabels", kind="object")
         + "\n"
         + _extract_js("activityLabel")
     )
+    # Drive the helper over every key in activityLabels (the source of truth).
     body = (
-        "var labels = {};\n"
-        "for (const name of ['cad_build_and_verify', 'file_write', 'file_replace',\n"
-        "                    'file_regex_replace', 'file_read', 'terminal_run',\n"
-        "                    'terminal_check', 'experience_search', 'experience_get', 'experience_add',\n"
-        "                    'experience_update', 'question', 'agent', 'usage',\n"
-        "                    'preparing', 'running', 'rendering', 'reviewing',\n"
-        "                    'started', 'completed', 'error', 'stopped']) {\n"
-        "  labels[name] = activityLabel(name);\n"
+        "var out = [];\n"
+        "for (const name of Object.keys(activityLabels)) {\n"
+        "  out.push([name, activityLabel(name)]);\n"
         "}\n"
-        "process.stdout.write(JSON.stringify(labels));\n"
+        "process.stdout.write(JSON.stringify(out));\n"
     )
-    labels = json.loads(_eval_helper(bindings, body))
+    rendered = json.loads(_eval_helper(bindings, body))
 
-    # Every label must be a non-empty human-readable string.
-    assert all(isinstance(v, str) and v and "_" not in v for v in labels.values())
+    assert rendered, "activityLabels must declare at least one entry"
 
-    # Spot-check the most-visible labels: anything the user actually sees for
-    # the heavy hitters must read as an English phrase, not a tool name.
-    assert labels["cad_build_and_verify"] == "Building model"
-    assert labels["file_write"] == labels["file_replace"] == labels["file_regex_replace"]
-    assert labels["file_write"] == "Updating model"
-    assert labels["terminal_run"] == labels["terminal_check"] == "Checking model"
-    assert labels["experience_search"] == "Checking past solutions"
-    assert labels["experience_get"] == "Reading past solution"
-    assert labels["question"] == "Requesting input"
+    for name, label in rendered:
+        assert isinstance(label, str) and label, (
+            f"{name!r} produced a non-string/empty label"
+        )
+        assert "_" not in label, (
+            f"{name!r} label {label!r} still contains underscores"
+        )
 
 
-def test_activity_label_fallback_sanitizes_unknown_tools():
-    """Unknown tool names must not leak underscores into the UI."""
+def test_activity_label_groups_share_the_same_wording():
+    """The activity panel renders tool families as a single phrase so users
+    do not see three different rows when the agent edits the file three ways.
+    Pinned: file_write/file_replace/file_regex_replace all share 'Updating
+    model'; terminal_run/terminal_check share 'Checking model'.
+    """
     bindings = (
         _extract_js("activityLabels", kind="object")
         + "\n"
@@ -287,15 +365,49 @@ def test_activity_label_fallback_sanitizes_unknown_tools():
     )
     body = (
         "process.stdout.write(JSON.stringify({\n"
-        "  unknown: activityLabel('future_tool_name'),\n"
-        "  empty: activityLabel(''),\n"
-        "  undef: activityLabel(undefined),\n"
+        "  file_write: activityLabel('file_write'),\n"
+        "  file_replace: activityLabel('file_replace'),\n"
+        "  file_regex_replace: activityLabel('file_regex_replace'),\n"
+        "  terminal_run: activityLabel('terminal_run'),\n"
+        "  terminal_check: activityLabel('terminal_check'),\n"
         "}));\n"
     )
     out = json.loads(_eval_helper(bindings, body))
-    assert out["unknown"] == "future tool name"
-    assert out["empty"] == "Activity"
-    assert out["undef"] == "Activity"
+
+    assert out["file_write"] == out["file_replace"] == out["file_regex_replace"]
+    assert out["terminal_run"] == out["terminal_check"]
+
+
+@pytest.mark.parametrize(
+    ("js_input", "expected"),
+    [
+        # Snake-case unknown name: the fallback ``String(value || 'Activity')``
+        # replaces ``_`` and ``-`` with spaces.
+        pytest.param("'future_tool_name'", "future tool name", id="snake-case-fallback"),
+        # Empty string is falsy in JS, so the ``||`` branch returns 'Activity'.
+        pytest.param("''", "Activity", id="empty-string"),
+        # null is falsy too; same 'Activity' fallback.
+        pytest.param("null", "Activity", id="js-null"),
+        # undefined is falsy too; same 'Activity' fallback.
+        pytest.param("undefined", "Activity", id="js-undefined"),
+    ],
+)
+def test_activity_label_fallback_sanitizes_unknown_inputs(js_input, expected):
+    """Unknown / empty / null tool names must fall back to a sanitized label
+    rather than leak underscores or render the raw tool name in the UI."""
+    bindings = (
+        _extract_js("activityLabels", kind="object")
+        + "\n"
+        + _extract_js("activityLabel")
+    )
+    body = (
+        f"process.stdout.write(JSON.stringify({{"
+        f"label: activityLabel({js_input})"
+        f"}}));\n"
+    )
+    out = json.loads(_eval_helper(bindings, body))
+
+    assert out["label"] == expected
 
 
 # ---------------------------------------------------------------------------

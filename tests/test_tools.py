@@ -27,13 +27,60 @@ def test_review_renderer_uses_correct_barycentric_coordinates():
     assert not np.array_equal(pixels[150, 150], _BACKGROUND)
 
 
-def test_cad_tool_passes_review_settings_to_runner():
-    code = CadTool(
-        Path("/tmp/project"), review_render_workers=2, review_required_views=6
-    )._runner_code(render=True)
+def test_cad_tool_runner_code_reflects_review_settings():
+    """Review knobs propagate to the generated runner script. Clamping to 1
+    prevents a zero/negative worker or view count from producing an invalid
+    subprocess invocation."""
+    # Arrange: zero / negative values must be clamped to 1 (the documented
+    # minimum for both workers and required views).
+    tool_zero = CadTool(Path("/tmp/project"), review_render_workers=0, review_required_views=0)
+    code_zero = tool_zero._runner_code(render=True)
+    assert "_RENDER_WORKERS = 1" in code_zero
+    assert "_REQUIRED_VIEWS = 1" in code_zero
 
-    assert "_RENDER_WORKERS = 2" in code
-    assert "_REQUIRED_VIEWS = 6" in code
+    # Arrange / Act: positive overrides land in the generated code verbatim.
+    tool_custom = CadTool(
+        Path("/tmp/project"), review_render_workers=2, review_required_views=6
+    )
+    code_custom = tool_custom._runner_code(render=True)
+    assert "_RENDER_WORKERS = 2" in code_custom
+    assert "_REQUIRED_VIEWS = 6" in code_custom
+
+    # Act / Assert: render=False must disable the review-rendering block so the
+    # subprocess never spawns review workers, regardless of the configured
+    # worker/view counts.
+    tool_no_render = CadTool(Path("/tmp/project"))
+    code_no_render = tool_no_render._runner_code(render=False)
+    assert "_RENDER_VIEWS = False" in code_no_render
+    assert "_RENDER_WORKERS = " not in code_no_render
+    assert "_REQUIRED_VIEWS = " not in code_no_render
+
+
+@pytest.mark.parametrize(
+    ("workers", "views", "expected_workers", "expected_views"),
+    [
+        pytest.param(0, 0, 1, 1, id="zero-zero-clamps-to-one"),
+        pytest.param(-1, -2, 1, 1, id="negative-values-clamps-to-one"),
+        pytest.param(1, 1, 1, 1, id="minimum-one-is-unchanged"),
+        pytest.param(8, 16, 8, 16, id="typical-values-pass-through"),
+        pytest.param("3", "5", 3, 5, id="string-numbers-are-coerced"),
+    ],
+)
+def test_cad_tool_review_settings_are_normalized(
+    workers, views, expected_workers, expected_views
+):
+    """Boundary: input clamping/normalization at construction time is the
+    contract that keeps the generated runner script valid."""
+    tool = CadTool(
+        Path("/tmp/project"),
+        review_render_workers=workers,
+        review_required_views=views,
+    )
+
+    code = tool._runner_code(render=True)
+
+    assert f"_RENDER_WORKERS = {expected_workers}" in code
+    assert f"_REQUIRED_VIEWS = {expected_views}" in code
 
 
 def test_file_tool_rejects_unsafe_model(tmp_path: Path):

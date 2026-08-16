@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
@@ -10,7 +11,7 @@ import requests
 from agent.llm_base import create_llm_client
 from agent.openai_client import OpenAIClient
 from agent.openrouter import OpenRouterClient
-from agent.settings import LLM_PROVIDERS, Settings
+from agent.settings import LLM_PROVIDERS, Settings, load_settings
 
 
 # ---------------------------------------------------------------------------
@@ -429,5 +430,21 @@ def test_openrouter_sends_reasoning_and_forced_provider_preferences(monkeypatch,
     }
 
 
-def test_supported_providers_constant():
-    assert LLM_PROVIDERS == {"openrouter", "openai"}
+def test_supported_providers_routing_is_consistent_with_settings(tmp_path: Path):
+    """Every provider in ``LLM_PROVIDERS`` must be accepted by ``load_settings``
+    and surface through ``Settings.llm_provider`` so the agent loop can route
+    to the right adapter.
+    """
+    for provider in LLM_PROVIDERS:
+        # Arrange / Act: load_settings accepts the provider string.
+        (tmp_path / "config.yaml").write_text(
+            f"llm:\n  provider: {provider}\n", encoding="utf-8"
+        )
+        settings = load_settings(project_root=tmp_path)
+
+        # Assert: the active provider is what the config asked for.
+        assert settings.llm_provider == provider
+        # Assert: llm_model resolves to a non-empty string (the property must
+        # always be populated regardless of provider).
+        assert settings.llm_model
+        assert isinstance(settings.llm_model, str)

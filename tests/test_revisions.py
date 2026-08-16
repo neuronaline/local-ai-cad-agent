@@ -637,16 +637,7 @@ def test_import_handles_malformed_archive(tmp_path: Path):
 
 
 # --------------------------------------------------------------------------- #
-#  Settings retention count
+#  Settings retention count (covered in test_configuration.py for the
+#  constructor contract; the retention behaviour is exercised in
+#  test_prune_* tests below).
 # --------------------------------------------------------------------------- #
-
-def test_settings_revision_retention_count_defaults_to_zero():
-    from agent.settings import Settings
-    s = Settings(Path("/tmp"), "https://e.test", "m", 1, "h", 1)
-    assert s.revision_retention_count == 0
-
-
-def test_settings_revision_retention_count_can_be_set():
-    from agent.settings import Settings
-    s = Settings(Path("/tmp"), "https://e.test", "m", 1, "h", 1, revision_retention_count=50)
-    assert s.revision_retention_count == 50
