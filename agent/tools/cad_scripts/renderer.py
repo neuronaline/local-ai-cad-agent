@@ -31,7 +31,7 @@ from collections.abc import Iterable, Sequence
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 # ``shape`` is injected by runner.py when this module is concatenated and run.
 # The renderer is also exercised as a standalone module in tests, where the
@@ -46,6 +46,7 @@ shape = globals().get("shape")  # type: ignore[name-defined]
 _WIDTH = 512
 _HEIGHT = 512
 _MARGIN = 36.0
+_SHEET_LABEL_HEIGHT = 28
 _DEFAULT_VIEW_COUNT = 8
 _BACKGROUND = np.array([23, 25, 29], dtype=np.uint8)
 _BASE_COLOR = np.array([141.0, 170.0, 255.0])
@@ -440,30 +441,47 @@ def render_iso(vertices: np.ndarray, triangles: np.ndarray, output_path: Path) -
 
 
 def build_contact_sheet(view_dir: Path, output_path: Path) -> dict[str, object]:
-    """Compose a 4x2 contact sheet from the rendered view PNGs.
+    """Compose a labelled, canonically ordered contact sheet.
 
-    Returns a small manifest describing the sheet so the reviewer knows the
-    hash it should match against the per-view hashes.
+    Labels and ``view_order`` let the reviewer reliably associate an observed
+    issue with the matching manifest ``view_id`` instead of relying on the
+    filesystem's alphabetical order.
     """
     view_dir = Path(view_dir)
-    sheet_paths = sorted(view_dir.glob("*.png"))
-    if not sheet_paths:
+    paths_by_id = {path.stem: path for path in view_dir.glob("*.png")}
+    ordered_views = [
+        (spec, paths_by_id[spec.view_id])
+        for spec in VIEWS
+        if spec.view_id in paths_by_id
+    ]
+    if not ordered_views:
         raise RuntimeError("No rendered views available for the contact sheet.")
     columns = 4
-    rows = max(1, math.ceil(len(sheet_paths) / columns))
+    rows = max(1, math.ceil(len(ordered_views) / columns))
     sheet = Image.new(
         "RGB",
-        (_WIDTH * columns, _HEIGHT * rows),
+        (_WIDTH * columns, (_HEIGHT + _SHEET_LABEL_HEIGHT) * rows),
         tuple(_BACKGROUND.tolist()),
     )
-    for index, path in enumerate(sheet_paths):
+    draw = ImageDraw.Draw(sheet)
+    for index, (spec, path) in enumerate(ordered_views):
+        x = (index % columns) * _WIDTH
+        y = (index // columns) * (_HEIGHT + _SHEET_LABEL_HEIGHT)
         with Image.open(path) as source:
-            sheet.paste(source, ((index % columns) * _WIDTH, (index // columns) * _HEIGHT))
+            sheet.paste(source, (x, y))
+        draw.text(
+            (x + 8, y + _HEIGHT + 6),
+            f"{spec.label} ({spec.view_id})",
+            fill=(210, 220, 240),
+        )
     sheet.save(output_path, "PNG", optimize=True)
     return {
         "path": "review-sheet.png",
         "width": sheet.size[0],
         "height": sheet.size[1],
+        "tile_width": _WIDTH,
+        "tile_height": _HEIGHT,
+        "view_order": [spec.view_id for spec, _path in ordered_views],
         "image_sha256": hashlib.sha256(output_path.read_bytes()).hexdigest(),
         "image_bytes": output_path.stat().st_size,
     }

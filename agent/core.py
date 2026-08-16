@@ -1021,6 +1021,7 @@ class AgentRunner:
             sheet_path = project_dir / ".cad-agent" / "reviews" / artifact_dir / "review-sheet.png"
         if sheet_path is None or not sheet_path.is_file():
             sheet_path = project_dir / ".cad-agent" / "reviews" / model_sha / "review-sheet.png"
+        single_render_path = project_dir / "render.png"
         model_source = ""
         model_path = project_dir / "model.py"
         if model_path.is_file():
@@ -1042,6 +1043,7 @@ class AgentRunner:
                 feature_summary=raw_result.get("feature_summary") or {},
                 review_manifest=manifest,
                 sheet_path=sheet_path,
+                single_render_path=single_render_path,
                 stop_event=self._stop_event,
             )
         except Exception as exc:

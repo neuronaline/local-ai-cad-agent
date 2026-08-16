@@ -19,7 +19,7 @@ A local-first web app that lets you **chat with an AI agent to create parametric
 - **Reference images** — Upload up to 5 images (10 MB each) to guide the agent
 - **Sandboxed execution** — All generated code runs in a Bubblewrap container with blocked network and resource limits
 - **Verified builds** — Each model is built, checked for a valid solid, and rendered before the agent reports completion
-- **Multi-view visual review** — A bounded structured reviewer inspects eight orthogonal and isometric views and only confirms builds whose geometry, dimensions, and features match the request
+- **Visual review** — A bounded structured reviewer cross-checks a single isometric render against eight labelled orthogonal and isometric views before confirming geometry, dimensions, and features
 - **Project management** — Create, rename, and switch between multiple CAD projects with persisted conversation history
 - **Model history** — Inspect source diffs, track successful builds, and restore any retained `model.py` revision
 - **Reusable experience memory** — The agent records verified, non-sensitive CAD fixes for reuse across projects in the same workspace

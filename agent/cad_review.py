@@ -1,8 +1,9 @@
 """Structured multimodal review of a CAD build.
 
-The reviewer receives the active user request, the rendered contact sheet, the
-feature summary, and the latest ``model.py`` source. It must respond via the
-structured ``submit_review`` tool so we never have to parse free-form JSON.
+The reviewer receives the active user request, a single isometric render, the
+multi-view contact sheet, the feature summary, and the latest ``model.py``
+source. It must respond via the structured ``submit_review`` tool so we never
+have to parse free-form JSON.
 
 The contract:
 
@@ -19,10 +20,12 @@ persisted; only the bounded review result is written to the project tree.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from collections.abc import Iterable
+from typing import Any
 
 from agent.images import as_chat_image
 
@@ -307,6 +310,25 @@ def _inconclusive(reason: str, model_sha: str, preview_sha: str) -> ReviewResult
     )
 
 
+def _verify_image_artifact(
+    path: Path,
+    artifact: Any,
+    label: str,
+) -> str | None:
+    """Return an evidence error, or ``None`` when a hashed image is usable."""
+    if not path.is_file() or path.stat().st_size == 0:
+        return f"Review {label} is missing or empty."
+    if not isinstance(artifact, dict):
+        return f"Review manifest is missing {label} metadata."
+    expected_sha = artifact.get("image_sha256")
+    if not isinstance(expected_sha, str) or len(expected_sha) != 64:
+        return f"Review manifest has no valid {label} hash."
+    actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    if actual_sha != expected_sha:
+        return f"Review {label} hash does not match the manifest."
+    return None
+
+
 def run_review(
     *,
     settings: Any,
@@ -316,6 +338,7 @@ def run_review(
     feature_summary: dict[str, Any],
     review_manifest: dict[str, Any],
     sheet_path: Path,
+    single_render_path: Path,
     stop_event: Any = None,
     stop_instruction: str | None = None,
     create_client: Any = None,
@@ -335,10 +358,16 @@ def run_review(
         for entry in views:
             if isinstance(entry, dict) and isinstance(entry.get("view_id"), str):
                 view_ids.append(entry["view_id"])
-    if not sheet_path.is_file() or sheet_path.stat().st_size == 0:
-        return _inconclusive(
-            "Review contact sheet is missing or empty.", model_sha, preview_sha
-        )
+    sheet_error = _verify_image_artifact(
+        sheet_path, review_manifest.get("contact_sheet"), "contact sheet"
+    )
+    if sheet_error:
+        return _inconclusive(sheet_error, model_sha, preview_sha)
+    render_error = _verify_image_artifact(
+        single_render_path, review_manifest.get("single_render"), "single render"
+    )
+    if render_error:
+        return _inconclusive(render_error, model_sha, preview_sha)
     if not view_ids:
         return _inconclusive(
             "Review manifest has no rendered views.", model_sha, preview_sha
@@ -361,6 +390,15 @@ def run_review(
             "role": "user",
             "content": [
                 {"type": "text", "text": prompt},
+                {
+                    "type": "text",
+                    "text": "Visual evidence 1 of 2: single isometric render.",
+                },
+                as_chat_image(single_render_path),
+                {
+                    "type": "text",
+                    "text": "Visual evidence 2 of 2: multi-view contact sheet.",
+                },
                 as_chat_image(sheet_path),
             ],
         }
@@ -401,6 +439,7 @@ def _build_prompt(
         if isinstance(entry, dict)
     ]
     contact = review_manifest.get("contact_sheet") or {}
+    view_order = contact.get("view_order") if isinstance(contact, dict) else None
     sections = [
         "You are reviewing a CAD build against the user's request.",
         "",
@@ -424,6 +463,14 @@ def _build_prompt(
             f"size: {contact.get('width', '?')}×{contact.get('height', '?')}\n"
             f"image_sha256: {contact.get('image_sha256', '?')}"
         ),
+        "The contact-sheet tiles are labelled and ordered left-to-right, top-to-bottom: "
+        + (", ".join(view_order) if isinstance(view_order, list) else "see tile labels"),
+        "",
+        "## Single isometric render",
+        (
+            f"path: {review_manifest.get('single_render', {}).get('path', 'render.png')}\n"
+            f"image_sha256: {review_manifest.get('single_render', {}).get('image_sha256', '?')}"
+        ),
         "",
         "## Model source",
         "```python",
@@ -433,7 +480,9 @@ def _build_prompt(
         "## Verdict policy",
         (
             "- ``status: pass`` only when every visible feature in the sheet "
-            "matches the request and no blocking finding is reported.\n"
+            "and the single render matches the request and no blocking finding is reported.\n"
+            "- Cross-check the single render against the multi-view sheet; use the "
+            "labelled contact-sheet tile when assigning a finding's ``view``.\n"
             "- ``status: fail`` when at least one blocking finding is reported.\n"
             "- ``status: inconclusive`` when visual evidence is missing or "
             "ambiguous.\n"

@@ -449,8 +449,16 @@ class CadTool:
             raise RuntimeError("Review manifest is missing model/preview hashes.")
         views = review_manifest.get("views")
         contact_sheet = review_manifest.get("contact_sheet")
-        if not isinstance(views, list) or not isinstance(contact_sheet, dict):
-            raise RuntimeError("Review manifest is missing views or contact sheet.")
+        single_render = review_manifest.get("single_render")
+        if (
+            not isinstance(views, list)
+            or not isinstance(contact_sheet, dict)
+            or not isinstance(single_render, dict)
+        ):
+            raise RuntimeError("Review manifest is missing visual evidence metadata.")
+        single_render_sha = single_render.get("image_sha256")
+        if not isinstance(single_render_sha, str) or len(single_render_sha) != 64:
+            raise RuntimeError("Review manifest has no valid single render hash.")
 
         views_dir = Path(sandbox_views_dir)
         sheet_path = Path(sandbox_sheet_path)
@@ -513,7 +521,18 @@ class CadTool:
                 json.dumps(persisted_manifest, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-            os.replace(staging, review_dir)
+            backup = review_dir.with_suffix(review_dir.suffix + ".previous")
+            if backup.exists():
+                shutil.rmtree(backup, ignore_errors=True)
+            if review_dir.exists():
+                os.replace(review_dir, backup)
+            try:
+                os.replace(staging, review_dir)
+            except OSError:
+                if backup.exists() and not review_dir.exists():
+                    os.replace(backup, review_dir)
+                raise
+            shutil.rmtree(backup, ignore_errors=True)
         finally:
             if staging.exists():
                 shutil.rmtree(staging, ignore_errors=True)
@@ -545,6 +564,12 @@ class CadTool:
         if manifest.get("preview_sha256") != preview_sha256:
             return False
         if sheet_sha and manifest.get("contact_sheet", {}).get("image_sha256") != sheet_sha:
+            return False
+        single_render = manifest.get("single_render")
+        if not isinstance(single_render, dict):
+            return False
+        single_render_sha = single_render.get("image_sha256")
+        if not isinstance(single_render_sha, str) or len(single_render_sha) != 64:
             return False
         views_target = review_dir / _REVIEW_VIEWS_DIR
         for entry in manifest.get("views", []) or []:

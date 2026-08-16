@@ -1,4 +1,5 @@
 import dataclasses
+import hashlib
 import json
 import threading
 import time
@@ -909,10 +910,13 @@ def _seed_pass_build(project: Path) -> dict[str, object]:
     project.mkdir(parents=True, exist_ok=True)
     (project / "model.py").write_text("result = 1\n", encoding="utf-8")
     (project / "preview.stl").write_bytes(b"solid demo\n")
+    render_bytes = b"\x89PNG\r\n\x1a\n render"
+    (project / "render.png").write_bytes(render_bytes)
     (project / "conversation.jsonl").write_text("", encoding="utf-8")
     review_root = project / ".cad-agent" / "reviews" / ("a" * 64)
     review_root.mkdir(parents=True)
-    (review_root / "review-sheet.png").write_bytes(b"\x89PNG\r\n\x1a\n sheet")
+    sheet_bytes = b"\x89PNG\r\n\x1a\n sheet"
+    (review_root / "review-sheet.png").write_bytes(sheet_bytes)
     return {
         "metrics": {"solid_count": 1, "is_valid": True, "dimensions_mm": {"x": 1, "y": 1, "z": 1}},
         "feature_summary": {"through_hole_count": 0},
@@ -922,7 +926,14 @@ def _seed_pass_build(project: Path) -> dict[str, object]:
             "model_sha256": "a" * 64,
             "preview_sha256": "b" * 64,
             "views": [{"view_id": "x_positive"}, {"view_id": "isometric_positive"}],
-            "contact_sheet": {"path": "review-sheet.png", "image_sha256": "c" * 64},
+            "contact_sheet": {
+                "path": "review-sheet.png",
+                "image_sha256": hashlib.sha256(sheet_bytes).hexdigest(),
+            },
+            "single_render": {
+                "path": "render.png",
+                "image_sha256": hashlib.sha256(render_bytes).hexdigest(),
+            },
         },
         "review": "a" * 64,
     }

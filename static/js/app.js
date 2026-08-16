@@ -30,6 +30,9 @@ let selectedFiles = [];
 let previewProject = '';
 let loadedPreviewRevision = '';
 let previewLoadPromise = null;
+let renderImageUrl = '';
+let renderLoadSequence = 0;
+let reviewLoadSequence = 0;
 const toolMessages = new Map();
 const activityItems = new Map();
 const ALLOWED_TAGS = new Set([
@@ -287,25 +290,42 @@ async function loadCurrentPreview(previewId) {
 
 async function refreshRender() {
   if (!currentProject) return;
+  const sequence = ++renderLoadSequence;
   try {
     const res = await fetch(`/api/projects/${encodeURIComponent(currentProject)}/render?ts=${Date.now()}`);
+    if (sequence !== renderLoadSequence) return;
     if (!res.ok) {
+      clearRenderImage();
       renderSection.hidden = true;
       return;
     }
     const blob = await res.blob();
+    if (sequence !== renderLoadSequence) return;
     const url = URL.createObjectURL(blob);
+    const previousUrl = renderImageUrl;
+    renderImageUrl = url;
     renderImage.src = url;
+    if (previousUrl) URL.revokeObjectURL(previousUrl);
     renderSection.hidden = false;
   } catch {
+    if (sequence !== renderLoadSequence) return;
+    clearRenderImage();
     renderSection.hidden = true;
   }
 }
 
+function clearRenderImage() {
+  if (renderImageUrl) URL.revokeObjectURL(renderImageUrl);
+  renderImageUrl = '';
+  renderImage.removeAttribute('src');
+}
+
 async function loadReviewGallery() {
   if (!currentProject) return;
+  const sequence = ++reviewLoadSequence;
   try {
     const manifest = await api(`/api/projects/${encodeURIComponent(currentProject)}/review/manifest?ts=${Date.now()}`);
+    if (sequence !== reviewLoadSequence) return;
     if (!manifest || !Array.isArray(manifest.views)) {
       reviewSection.hidden = true;
       return;
@@ -346,6 +366,7 @@ async function loadReviewGallery() {
       reviewGallery.appendChild(figure);
     }
   } catch {
+    if (sequence !== reviewLoadSequence) return;
     reviewSection.hidden = true;
   }
 }

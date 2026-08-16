@@ -266,6 +266,7 @@ def _run_model(model_code: str) -> dict[str, object]:
     should_render = "_RENDER_VIEWS" not in globals() or bool(_RENDER_VIEWS)
     review_manifest_payload: dict[str, object]
     sheet_info_payload: dict[str, object]
+    single_render_payload: dict[str, object] = {}
     should_write_iso = "_WRITE_ISOMETRIC" in globals() and bool(_WRITE_ISOMETRIC)
     if should_write_iso:
         # Backward-compatible single isometric PNG (render.png). The renderer
@@ -273,6 +274,14 @@ def _run_model(model_code: str) -> dict[str, object]:
         # cached vertices/triangles are local to ``render_views``.
         iso_vertices, iso_triangles = _tessellate(shape)
         _write_isometric_artifact(iso_vertices, iso_triangles)
+        render_path = Path("render.png")
+        single_render_payload = {
+            "path": "render.png",
+            "width": _WIDTH,
+            "height": _HEIGHT,
+            "image_sha256": hashlib.sha256(render_path.read_bytes()).hexdigest(),
+            "image_bytes": render_path.stat().st_size,
+        }
     if should_render:
         # Clear any stale review outputs from a previous partial run so the
         # new render doesn't pick up leftover PNGs (build_contact_sheet
@@ -322,6 +331,7 @@ def _run_model(model_code: str) -> dict[str, object]:
             "view_count": review_manifest["view_count"],
             "views": review_manifest["views"],
             "contact_sheet": sheet_info_payload,
+            "single_render": single_render_payload,
         }
     else:
         review_manifest_payload = {}

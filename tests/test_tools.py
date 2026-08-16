@@ -6,7 +6,14 @@ import pytest
 from PIL import Image
 
 from agent.revisions import RevisionStore
-from agent.tools.cad_scripts.renderer import _BACKGROUND, _shade_pixels
+from agent.tools.cad_scripts.renderer import (
+    _BACKGROUND,
+    _HEIGHT,
+    _SHEET_LABEL_HEIGHT,
+    _WIDTH,
+    _shade_pixels,
+    build_contact_sheet,
+)
 from agent.tools.cad_tool import CadTool
 from agent.tools.file_tool import FileTool
 from agent.tools.question_tool import normalize_questions
@@ -29,6 +36,24 @@ def test_review_renderer_uses_correct_barycentric_coordinates():
     )
 
     assert not np.array_equal(pixels[150, 150], _BACKGROUND)
+
+
+def test_contact_sheet_uses_canonical_order_and_labels(tmp_path: Path):
+    views = tmp_path / "views"
+    views.mkdir()
+    Image.new("RGB", (_WIDTH, _HEIGHT), (255, 0, 0)).save(views / "x_positive.png")
+    Image.new("RGB", (_WIDTH, _HEIGHT), (0, 0, 255)).save(
+        views / "isometric_positive.png"
+    )
+
+    sheet_path = tmp_path / "review-sheet.png"
+    manifest = build_contact_sheet(views, sheet_path)
+
+    with Image.open(sheet_path) as sheet:
+        assert sheet.size == (_WIDTH * 4, _HEIGHT + _SHEET_LABEL_HEIGHT)
+        assert sheet.getpixel((10, 10)) == (255, 0, 0)
+        assert sheet.getpixel((_WIDTH + 10, 10)) == (0, 0, 255)
+    assert manifest["view_order"] == ["x_positive", "isometric_positive"]
 
 
 def test_cad_tool_runner_code_reflects_review_settings():

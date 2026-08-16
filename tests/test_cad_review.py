@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -18,6 +19,17 @@ from agent.cad_review import (
 MODEL_SHA = "a" * 64
 PREVIEW_SHA = "b" * 64
 ALLOWED_VIEWS = ("x_positive", "x_negative", "y_positive", "isometric_positive")
+IMAGE_BYTES = b"\x89PNG\r\n\x1a\n fake-image"
+
+
+def _write_image(path: Path) -> dict[str, object]:
+    path.write_bytes(IMAGE_BYTES)
+    return {
+        "path": path.name,
+        "width": 512,
+        "height": 512,
+        "image_sha256": hashlib.sha256(IMAGE_BYTES).hexdigest(),
+    }
 
 
 def _valid_arguments() -> dict[str, object]:
@@ -211,7 +223,9 @@ class _FakeClient:
 
 def test_run_review_returns_pass_for_valid_tool_call(tmp_path: Path):
     sheet = tmp_path / "sheet.png"
-    sheet.write_bytes(b"\x89PNG\r\n\x1a\n fake-sheet")
+    render = tmp_path / "render.png"
+    sheet_info = _write_image(sheet)
+    render_info = _write_image(render)
     manifest = {
         "model_sha256": MODEL_SHA,
         "preview_sha256": PREVIEW_SHA,
@@ -219,9 +233,11 @@ def test_run_review_returns_pass_for_valid_tool_call(tmp_path: Path):
             {"view_id": "x_positive"},
             {"view_id": "isometric_positive"},
         ],
-        "contact_sheet": {"path": "review-sheet.png", "width": 512, "height": 512, "image_sha256": "x"},
+        "contact_sheet": sheet_info,
+        "single_render": render_info,
     }
     sent_image_parts: list[int] = []
+    evidence_labels: list[list[str]] = []
 
     class _RecordingClient:
         def chat(self, messages, tools=None):
@@ -233,6 +249,14 @@ def test_run_review_returns_pass_for_valid_tool_call(tmp_path: Path):
                 if isinstance(part, dict) and part.get("type") == "image_url"
             ]
             sent_image_parts.append(len(image_parts))
+            evidence_labels.append(
+                [
+                    part["text"]
+                    for part in messages[0]["content"]
+                    if part.get("type") == "text"
+                    and part.get("text", "").startswith("Visual evidence")
+                ]
+            )
             return {"choices": [{"message": {"role": "assistant", "tool_calls": [{
                 "function": {
                     "name": "submit_review",
@@ -248,22 +272,30 @@ def test_run_review_returns_pass_for_valid_tool_call(tmp_path: Path):
         feature_summary={"through_hole_count": 1},
         review_manifest=manifest,
         sheet_path=sheet,
+        single_render_path=render,
         create_client=lambda _settings: _RecordingClient(),
     )
     assert result.status == "pass"
-    # The review-specific path must include the contact sheet image so the
-    # reviewer has visual evidence; it must not silently retry without one.
-    assert sent_image_parts == [1]
+    # The reviewer receives independently-rendered isometric and multi-view
+    # evidence; it must not silently retry without either image.
+    assert sent_image_parts == [2]
+    assert evidence_labels == [[
+        "Visual evidence 1 of 2: single isometric render.",
+        "Visual evidence 2 of 2: multi-view contact sheet.",
+    ]]
 
 
 def test_run_review_returns_inconclusive_when_tool_call_missing(tmp_path: Path):
     sheet = tmp_path / "sheet.png"
-    sheet.write_bytes(b"\x89PNG\r\n\x1a\n fake-sheet")
+    render = tmp_path / "render.png"
+    sheet_info = _write_image(sheet)
+    render_info = _write_image(render)
     manifest = {
         "model_sha256": MODEL_SHA,
         "preview_sha256": PREVIEW_SHA,
         "views": [{"view_id": "x_positive"}],
-        "contact_sheet": {"path": "review-sheet.png", "image_sha256": "x"},
+        "contact_sheet": sheet_info,
+        "single_render": render_info,
     }
     client = _FakeClient({"choices": [{"message": {"role": "assistant", "content": "looks good"}}]})
     create_client = lambda _settings: client
@@ -275,17 +307,21 @@ def test_run_review_returns_inconclusive_when_tool_call_missing(tmp_path: Path):
         feature_summary={},
         review_manifest=manifest,
         sheet_path=sheet,
+        single_render_path=render,
         create_client=create_client,
     )
     assert result.status == "inconclusive"
 
 
 def test_run_review_returns_inconclusive_when_sheet_missing(tmp_path: Path):
+    render = tmp_path / "render.png"
+    render_info = _write_image(render)
     manifest = {
         "model_sha256": MODEL_SHA,
         "preview_sha256": PREVIEW_SHA,
         "views": [{"view_id": "x_positive"}],
-        "contact_sheet": {"path": "review-sheet.png"},
+        "contact_sheet": {"path": "review-sheet.png", "image_sha256": "a" * 64},
+        "single_render": render_info,
     }
     client = _FakeClient({"choices": [{"message": {"role": "assistant", "content": ""}}]})
     result = run_review(
@@ -296,19 +332,53 @@ def test_run_review_returns_inconclusive_when_sheet_missing(tmp_path: Path):
         feature_summary={},
         review_manifest=manifest,
         sheet_path=tmp_path / "missing.png",
+        single_render_path=render,
         create_client=lambda _settings: client,
     )
     assert result.status == "inconclusive"
 
 
-def test_run_review_propagates_llm_errors_as_inconclusive(tmp_path: Path):
+def test_run_review_requires_a_matching_single_render(tmp_path: Path):
     sheet = tmp_path / "sheet.png"
-    sheet.write_bytes(b"\x89PNG\r\n\x1a\n fake-sheet")
+    sheet_info = _write_image(sheet)
     manifest = {
         "model_sha256": MODEL_SHA,
         "preview_sha256": PREVIEW_SHA,
         "views": [{"view_id": "x_positive"}],
-        "contact_sheet": {"path": "review-sheet.png", "image_sha256": "x"},
+        "contact_sheet": sheet_info,
+        "single_render": {
+            "path": "render.png",
+            "image_sha256": "a" * 64,
+        },
+    }
+    client = _FakeClient({})
+
+    result = run_review(
+        settings=object(),
+        request_text="Build",
+        model_source="",
+        metrics={},
+        feature_summary={},
+        review_manifest=manifest,
+        sheet_path=sheet,
+        single_render_path=tmp_path / "missing-render.png",
+        create_client=lambda _settings: client,
+    )
+
+    assert result.status == "inconclusive"
+
+
+def test_run_review_propagates_llm_errors_as_inconclusive(tmp_path: Path):
+    sheet = tmp_path / "sheet.png"
+    render = tmp_path / "render.png"
+    sheet_info = _write_image(sheet)
+    render_info = _write_image(render)
+    manifest = {
+        "model_sha256": MODEL_SHA,
+        "preview_sha256": PREVIEW_SHA,
+        "views": [{"view_id": "x_positive"}],
+        "contact_sheet": sheet_info,
+        "single_render": render_info,
     }
 
     class FailingClient:
@@ -326,6 +396,7 @@ def test_run_review_propagates_llm_errors_as_inconclusive(tmp_path: Path):
         feature_summary={},
         review_manifest=manifest,
         sheet_path=sheet,
+        single_render_path=render,
         create_client=create_client,
     )
     assert result.status == "inconclusive"
@@ -333,12 +404,15 @@ def test_run_review_propagates_llm_errors_as_inconclusive(tmp_path: Path):
 
 def test_run_review_uses_stop_event_when_provided(tmp_path: Path):
     sheet = tmp_path / "sheet.png"
-    sheet.write_bytes(b"\x89PNG\r\n\x1a\n fake-sheet")
+    render = tmp_path / "render.png"
+    sheet_info = _write_image(sheet)
+    render_info = _write_image(render)
     manifest = {
         "model_sha256": MODEL_SHA,
         "preview_sha256": PREVIEW_SHA,
         "views": [{"view_id": "x_positive"}],
-        "contact_sheet": {"path": "review-sheet.png", "image_sha256": "x"},
+        "contact_sheet": sheet_info,
+        "single_render": render_info,
     }
     stop_event = object()
     captured: dict[str, object] = {}
@@ -359,6 +433,7 @@ def test_run_review_uses_stop_event_when_provided(tmp_path: Path):
         feature_summary={},
         review_manifest=manifest,
         sheet_path=sheet,
+        single_render_path=render,
         stop_event=stop_event,
         create_client=create_client,
     )
