@@ -115,28 +115,49 @@ class _RingBuffer:
 
 
 _ALLOWED_CHECK_IMPORTS = {"build123d", "cadquery", "math", "numpy"}
+# Blocked identifiers: any AST Name or Attribute attr matching this set is
+# rejected. The terminal_check AST walker also bans chained accesses through
+# ``__builtins__``, ``__class__``, ``__bases__``, ``__mro__``, ``__subclasses__``,
+# ``__globals__``, ``globals``, ``locals``, and ``vars`` so the validator cannot
+# be tricked into evaluating ``getattr``/``__builtins__['eval']`` style escapes.
 _BLOCKED_CHECK_NAMES = frozenset(
     {
         "__import__",
+        "__build_class__",
+        "__builtins__",
+        "__class__",
+        "__bases__",
+        "__mro__",
+        "__subclasses__",
+        "__globals__",
+        "__dict__",
         "breakpoint",
+        "builtins",
         "compile",
         "eval",
         "exec",
+        "getattr",
+        "globals",
         "input",
+        "locals",
         "open",
         "os",
         "pathlib",
+        "setattr",
         "shutil",
         "socket",
         "subprocess",
         "sys",
+        "vars",
     }
 )
+# Function names that may be called directly. Any other call — including calls
+# whose target is an ``Attribute`` (``builtins.eval``) or a ``Subscript``
+# (``__builtins__['eval']``) — is rejected.
 _ALLOWED_CHECK_CALLS = frozenset(
     {
         "callable",
         "dir",
-        "getattr",
         "hasattr",
         "help",
         "isinstance",
@@ -148,12 +169,131 @@ _ALLOWED_CHECK_CALLS = frozenset(
     }
 )
 
+# Root attributes whose lookup is always banned because they unlock any builtin.
+_BANNED_ATTRIBUTE_ROOTS = frozenset(
+    {
+        "__builtins__",
+        "__class__",
+        "__bases__",
+        "__mro__",
+        "__subclasses__",
+        "__globals__",
+        "__dict__",
+        "builtins",
+        "globals",
+        "locals",
+        "vars",
+    }
+)
+
+
+def _check_root_identifier(node: ast.AST) -> str | None:
+    """Return the leftmost root identifier of an Attribute/Subscript chain.
+
+    ``__builtins__['eval']`` -> ``__builtins__``. ``(1).__class__.__mro__[1]``
+    -> ``__class__``. ``a.b`` -> ``a``.
+    """
+    while True:
+        if isinstance(node, ast.Attribute):
+            node = node.value
+            continue
+        if isinstance(node, ast.Subscript):
+            node = node.value
+            continue
+        if isinstance(node, ast.Name):
+            return node.id
+        return None
+
+
+def _subscript_constant(node: ast.Subscript) -> str | None:
+    """If the Subscript's slice is a string/numeric Constant, return its string form."""
+    slice_node = node.slice
+    if isinstance(slice_node, ast.Constant) and isinstance(slice_node.value, str):
+        return slice_node.value
+    return None
+
+
+class _CheckASTValidator(ast.NodeVisitor):
+    """Walk the snippet AST and reject any path that could escape the sandbox.
+
+    The validator mirrors the seccomp filter's intent: even with the bubblewrap
+    namespace in place, Python builtins like ``eval``, ``open``, ``__import__``,
+    and ``getattr`` are pure-Python functions the kernel does not see, so the
+    only real barrier is an AST-level allowlist. We track four conditions:
+
+    1. The final statement must be a single direct call to an allowed function
+       (``print``, ``type``, ``len``, ...). Indirect targets (``getattr``,
+       ``__builtins__['eval']``, ``(1).__class__``) are rejected.
+    2. Any ``ast.Name`` whose id matches the blocked set is rejected.
+    3. Any ``ast.Attribute`` whose attr matches the blocked set, or whose root
+       identifier is a banned introspection root (``__builtins__``, ``globals``,
+       ...) is rejected.
+    4. Any ``ast.Subscript`` whose root identifier is banned, or whose slice is
+       a string constant naming a blocked function (``__builtins__['eval']``) is
+       rejected.
+    """
+
+    def __init__(self) -> None:
+        self._errors: list[str] = []
+
+    def fail(self, message: str) -> None:
+        if message not in self._errors:
+            self._errors.append(message)
+
+    @property
+    def errors(self) -> list[str]:
+        return self._errors
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if node.id in _BLOCKED_CHECK_NAMES:
+            self.fail(f"check -c does not allow the name '{node.id}'.")
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if node.attr in _BLOCKED_CHECK_NAMES:
+            self.fail(f"check -c does not allow the name '{node.attr}'.")
+        root = _check_root_identifier(node)
+        if root in _BANNED_ATTRIBUTE_ROOTS:
+            self.fail(
+                f"check -c does not allow accessing '{root}' attributes."
+            )
+        self.generic_visit(node)
+
+    def visit_Subscript(self, node: ast.Subscript) -> None:
+        slice_value = _subscript_constant(node)
+        if slice_value and slice_value in _BLOCKED_CHECK_NAMES:
+            self.fail(
+                f"check -c does not allow the name '{slice_value}'."
+            )
+        root = _check_root_identifier(node)
+        if root in _BANNED_ATTRIBUTE_ROOTS:
+            self.fail(
+                f"check -c does not allow subscripting '{root}'."
+            )
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        # Only direct ``Name`` calls are allowed at the top level. Indirect
+        # call targets like ``getattr(__builtins__, 'eval')`` or
+        # ``__builtins__['eval']`` are rejected because we cannot prove which
+        # function they will resolve to without executing the code. Nested
+        # calls used as *arguments* (e.g. ``math.sqrt(4)`` inside
+        # ``print(math.sqrt(4))``) are inspected by the visitor walk but the
+        # restrictive top-level check is enforced separately against the
+        # final statement only.
+        self.generic_visit(node)
+
 
 def _validate_check_code(code: str) -> None:
     """Reject check -c snippets that could execute arbitrary code.
 
     Allows only imports from a strict module allowlist followed by a single
-    trailing call to a read-only inspection function.
+    trailing call to a read-only inspection function. The validator walks the
+    full AST and bans any ``Attribute``/``Subscript`` chain that could resolve
+    to a blocked builtin (``eval``, ``exec``, ``open``, ``__import__``, ...),
+    including computed-name chains (``__builtins__['eval']``,
+    ``getattr(__builtins__, 'open')``) and MRO introspection
+    (``().__class__.__bases__``).
     """
     try:
         tree = ast.parse(code, mode="exec")
@@ -168,6 +308,7 @@ def _validate_check_code(code: str) -> None:
             "ocp_"
         )
 
+    final_statement: ast.stmt | None = None
     for index, statement in enumerate(statements):
         if isinstance(statement, (ast.Import, ast.ImportFrom)):
             for alias in statement.names:
@@ -197,17 +338,36 @@ def _validate_check_code(code: str) -> None:
         if not (
             isinstance(statement, ast.Expr)
             and isinstance(statement.value, ast.Call)
-            and isinstance(statement.value.func, ast.Name)
-            and statement.value.func.id in _ALLOWED_CHECK_CALLS
         ):
             raise ValueError(
                 "check -c final statement must call one of: "
                 + ", ".join(sorted(_ALLOWED_CHECK_CALLS))
                 + "."
             )
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Name) and node.id in _BLOCKED_CHECK_NAMES:
-            raise ValueError(f"check -c does not allow the name '{node.id}'.")
+        final_statement = statement
+
+    validator = _CheckASTValidator()
+    validator.visit(tree)
+    if validator.errors:
+        raise ValueError(validator.errors[0])
+    # ``getattr`` was removed from the allow-list because its only safe use in
+    # a sandbox-only check was reaching blocked builtins, which the AST walker
+    # now bans. The second final-statement check below preserves the original
+    # "direct ``Name`` call to an allowed function" contract: the in-loop check
+    # only verifies the statement is an ``Expr`` wrapping a ``Call``, but the
+    # ``func.id in _ALLOWED_CHECK_CALLS`` membership is enforced here.
+    if final_statement is not None:
+        call = final_statement.value  # type: ignore[attr-defined]
+        if not (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id in _ALLOWED_CHECK_CALLS
+        ):
+            raise ValueError(
+                "check -c final statement must call one of: "
+                + ", ".join(sorted(_ALLOWED_CHECK_CALLS))
+                + "."
+            )
 
 
 class TerminalTool:
@@ -275,6 +435,7 @@ class TerminalTool:
             writable=False,
             timeout_seconds=timeout,
         )
+        process: subprocess.Popen[str] | None = None
         try:
             try:
                 with self._lock:
@@ -293,6 +454,23 @@ class TerminalTool:
         finally:
             with self._lock:
                 self._process = None
+            # If ``_stream_with_limit`` raised (timeout, memory-limit overflow,
+            # or any other exception), ``process`` is still alive and would
+            # otherwise be leaked: the outer reference on ``self._process`` has
+            # already been cleared, so ``stop()`` becomes a no-op for this
+            # child. Force-kill the whole process group so the bubblewrap
+            # namespace and any spawned python interpreter exit cleanly.
+            if process is not None:
+                _terminate(process, force=True)
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+        # ``_stream_with_limit`` only runs once ``Popen`` has captured a
+        # process reference, so reaching this point means ``process`` is
+        # populated. ``Popen`` failures propagate through the inner ``try``
+        # above and surface as ``OSError``/``FileNotFoundError`` with their
+        # original detail, which is more informative than a generic fallback.
         if process.returncode:
             raise RuntimeError(
                 f"Python command failed with exit code {process.returncode}.\n"

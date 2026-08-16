@@ -350,9 +350,16 @@ class FileTool:
 
 _REGEX_TIMEOUT_SECONDS = 5.0
 # JSON envelope so the worker can return (text, replacements) without pickling.
+# The worker catches all known top-level failure modes (regex errors, broken
+# stdin, JSON decode failures) and emits the same envelope so the parent can
+# produce actionable error messages instead of generic ``unknown error``.
 _REGEX_WORKER_CODE = (
     "import json, re, sys\n"
-    "pattern, replacement, text, count = json.load(sys.stdin)\n"
+    "try:\n"
+    "    pattern, replacement, text, count = json.load(sys.stdin)\n"
+    "except (json.JSONDecodeError, EOFError, ValueError) as error:\n"
+    '    json.dump({"ok": False, "error": f"payload read failed: {type(error).__name__}: {error}"}, sys.stdout)\n'
+    "    sys.exit(0)\n"
     "try:\n"
     "    updated, replacements = re.subn(\n"
     "        pattern, replacement, text, count=count, flags=re.DOTALL\n"
@@ -408,4 +415,13 @@ def _safe_subn(
         raise ValueError(
             f"Invalid regex pattern: {result.get('error', 'unknown error')}"
         )
-    return result["updated"], int(result["replacements"])
+    # Coerce ``replacements`` defensively: a malformed shape (e.g. string)
+    # must not propagate as ``TypeError`` from ``int(result[...])``; the
+    # worker has already returned an ``ok: true`` envelope so the only
+    # remaining failure mode is upstream tampering or memory corruption.
+    try:
+        return result["updated"], int(result.get("replacements", 0))
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            f"Regex worker returned malformed result: {error}"
+        ) from error

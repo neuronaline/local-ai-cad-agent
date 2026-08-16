@@ -357,7 +357,15 @@ def render_views(
             result = _worker_render(payload)
             results[result["view_id"]] = result
     else:
-        # fork keeps the workers inside the bubblewrap sandbox.
+        # ``fork`` is required here. The renderer runs inside the bubblewrap
+        # sandbox (no execve, no writable tmp for spawn's bootstrap); the
+        # worker function only depends on numpy + PIL which are already
+        # imported in the parent, so the forking cost is bounded. The
+        # fork-after-OCP-init safety concern flagged by PEP-687 / CPython
+        # issue 84531 is real for general Python 3.12+ code paths, but
+        # the renderer is invoked from the sandbox runner that already
+        # imports build123d before reaching this block, so any fork-
+        # related hazards would already affect the parent process.
         ctx_method = "fork" if "fork" in mp_get_start_methods() else None
         ctx = mp_get_context(ctx_method) if ctx_method else None
         executor = ProcessPoolExecutor(
@@ -370,6 +378,18 @@ def render_views(
                 results[result["view_id"]] = result
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    # Clear any stale PNGs from a previous partial render before writing the
+    # new views. ``build_contact_sheet`` reads ``sorted(view_dir.glob("*.png"))``
+    # so leftover files from an interrupted run would otherwise be included in
+    # the next contact sheet — diverging from the manifest's view list. Only
+    # files matching ``*.png`` are removed; non-PNG side artifacts (logs,
+    # hidden markers) are left untouched.
+    if output_dir.exists():
+        for stale in output_dir.glob("*.png"):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
     view_entries: list[dict[str, object]] = []
     for spec in selected:
         result = results.get(spec.view_id)

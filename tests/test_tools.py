@@ -5,11 +5,15 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from agent.tools.cad_scripts.renderer import _BACKGROUND, _shade_pixels
 from agent.revisions import RevisionStore
+from agent.tools.cad_scripts.renderer import _BACKGROUND, _shade_pixels
 from agent.tools.cad_tool import CadTool
 from agent.tools.file_tool import FileTool
-from agent.tools.terminal_tool import TerminalTool
+from agent.tools.question_tool import normalize_questions
+from agent.tools.terminal_tool import (
+    TerminalTool,
+    _validate_check_code,
+)
 
 
 def test_review_renderer_uses_correct_barycentric_coordinates():
@@ -412,3 +416,112 @@ def test_file_summary_write_does_not_create_revision(tmp_path: Path):
 
     store = RevisionStore(tmp_path)
     assert store.head() is None  # No model.py revision created.
+
+
+# --------------------------------------------------------------------------- #
+#  TerminalTool check -c AST validator regression tests
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "snippet",
+    [
+        # Pre-existing banned identifiers.
+        "eval('1+1')",
+        "exec('print(1)')",
+        "open('/etc/passwd')",
+        "__import__('os')",
+        "compile('x', 'y', 'exec')",
+        "input('prompt')",
+        "breakpoint()",
+        "globals()",
+        "locals()",
+        "vars()",
+        # getattr was in the old allowlist and is now blocked.
+        "getattr(__builtins__, 'eval')('1')",
+        # Subscript bypass: __builtins__['eval'].
+        "__builtins__['eval']('1')",
+        # MRO introspection chains that previously slipped past the walker.
+        "().__class__.__bases__[0].__subclasses__()",
+        "().__class__.__mro__[1].__subclasses__()",
+        # Attribute access into a banned root identifier.
+        "builtins.eval('1')",
+        "builtins.open('/etc/passwd')",
+        # Blocked module references.
+        "import os\nos.system('id')",
+        "from sys import stdin",
+    ],
+)
+def test_validate_check_code_rejects_sandbox_escape_vectors(snippet: str):
+    """Every snippet below must fail ``_validate_check_code``.
+
+    These are the canonical sandbox-escape vectors the AST walker was
+    hardened against. Regression coverage here ensures that re-introducing
+    ``getattr`` to the allowlist (or removing any other guard) is caught by
+    CI rather than discovered in production.
+    """
+    with pytest.raises(ValueError):
+        _validate_check_code(snippet)
+
+
+@pytest.mark.parametrize(
+    "snippet",
+    [
+        "print(2 + 2)",
+        "print(type(1))",
+        "print(len('abc'))",
+        "print(repr('x'))",
+        "from math import sqrt\nprint(sqrt(4))",
+        "import numpy as np\nprint(np.zeros(1))",
+    ],
+)
+def test_validate_check_code_accepts_read_only_inspection(snippet: str):
+    """Read-only inspection snippets must pass without raising."""
+    _validate_check_code(snippet)
+
+
+def test_validate_check_code_rejects_final_statement_not_in_allowlist():
+    """The trailing statement must be a direct ``Name`` call, not an ``Attribute``.
+
+    ``list.append(x, 1)`` is a single-statement ``Attribute`` call whose root
+    (``list``) and attr (``append``) are both outside the AST-walker's
+    blocked sets, so the walker is silent. The final-statement allowlist
+    check then rejects it because the call target is not a direct ``Name``.
+    """
+    with pytest.raises(ValueError, match="final statement must call one of"):
+        _validate_check_code("list.append(x, 1)")
+
+
+# --------------------------------------------------------------------------- #
+#  QuestionTool.normalize_questions regression tests
+# --------------------------------------------------------------------------- #
+
+
+def test_normalize_questions_legacy_format_rejects_missing_text():
+    """The legacy flat format must surface a friendly ValueError for empty
+    question text rather than letting the underlying KeyError / ``None`` slip
+    through to the SSE consumer."""
+    with pytest.raises(ValueError, match="'question' missing or empty"):
+        normalize_questions({"input_type": "text"})
+
+
+def test_normalize_questions_legacy_format_rejects_non_string_text():
+    with pytest.raises(ValueError, match="'question' missing or empty"):
+        normalize_questions({"question": 123, "input_type": "text"})
+
+
+def test_normalize_questions_legacy_format_rejects_whitespace_only_text():
+    with pytest.raises(ValueError, match="'question' missing or empty"):
+        normalize_questions({"question": "   ", "input_type": "text"})
+
+
+def test_normalize_questions_legacy_format_accepts_well_formed_text():
+    result = normalize_questions({"question": "Choose width", "input_type": "number"})
+    assert result == [
+        {
+            "id": "q1",
+            "question": "Choose width",
+            "input_type": "number",
+            "options": [],
+        }
+    ]

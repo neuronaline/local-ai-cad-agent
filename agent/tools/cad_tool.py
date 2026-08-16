@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import math
 import os
 import shutil
 import signal
@@ -84,6 +86,10 @@ class CadTool:
         self._review_required_views = max(1, int(review_required_views))
         self._process: subprocess.Popen[str] | None = None
         self._lock = threading.Lock()
+        # Counter surfaced by ``_publish_status`` so operators can detect when
+        # the SSE event bus is dropping ``agent_status`` events without
+        # scraping the host log.
+        self._status_publish_failures = 0
 
     # ------------------------------------------------------------------ review
 
@@ -152,8 +158,25 @@ class CadTool:
                     "message": message,
                 },
             )
-        except Exception:  # noqa: BLE001, S110 - status events must never fail the build.
-            pass
+        except Exception as error:  # noqa: BLE001 - status events must never fail the build.
+            # Status events are advisory: a publish failure (queue full,
+            # serialiser bug, network blip on the SSE consumer) must not abort
+            # the CAD build. But the failure used to be silently swallowed,
+            # leaving operators with no signal when the activity panel froze.
+            # Log it so the failure is observable in the host log, and bump an
+            # in-process counter so long-running sessions can surface it.
+            self._status_publish_failures += 1
+            logging.getLogger(__name__).warning(
+                "agent_status publish failed (status=%s, project=%s, "
+                "total_failures=%d): %s",
+                status,
+                _project_name(self.project_dir),
+                self._status_publish_failures,
+                error,
+                exc_info=logging.getLogger(__name__).isEnabledFor(
+                    logging.DEBUG
+                ),
+            )
 
     # ------------------------------------------------------------------ build
 
@@ -194,6 +217,7 @@ class CadTool:
                 writable=True,
                 timeout_seconds=120,
             )
+            process: subprocess.Popen[str] | None = None
             try:
                 with self._lock:
                     self._process = subprocess.Popen(
@@ -226,6 +250,19 @@ class CadTool:
                 os.close(seccomp_fd)
                 with self._lock:
                     self._process = None
+                # If ``_stream_with_limit`` raised (timeout, memory-limit
+                # overflow, or any other exception), ``process`` is still
+                # alive and would otherwise be leaked: the outer reference
+                # on ``self._process`` has already been cleared, so
+                # ``stop()`` becomes a no-op for this child. Force-kill the
+                # whole process group so the bubblewrap namespace and any
+                # spawned python interpreter exit cleanly.
+                if process is not None:
+                    _kill_process_group(process, force=True)
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        pass
 
             metrics_path = workspace / ".cad_metrics.json"
             preview_path = workspace / "preview.stl"
@@ -316,6 +353,11 @@ class CadTool:
         Keeps the simple "valid geometry, at least one solid, positive volume,
         plausible bounding box" contract even when the quality verifiers are
         no longer in the loop.
+
+        Flat parts (one dimension effectively zero — sheet metal, gaskets,
+        planar faces) are explicitly out of scope: the multi-view rasteriser
+        and STL preview are meaningless for 2D-projection geometry, so the
+        ``math.isclose`` tolerance is anchored to ``_MIN_DIMENSION_MM``.
         """
         try:
             solid_count = int(metrics.get("solid_count", 0) or 0)
@@ -333,8 +375,15 @@ class CadTool:
         except (KeyError, TypeError, ValueError):
             raise ValueError("CAD dimensions are missing or malformed.") from None
         for axis, value in zip(("x", "y", "z"), dim_values):
-            if not (value > 0):
-                raise ValueError(f"CAD dimension {axis} must be positive.")
+            # Use ``math.isclose`` so a tiny but non-zero thickness is accepted
+            # while still rejecting genuine flat / negative parts. The
+            # tolerance is the same as ``_MIN_DIMENSION_MM`` so the runner
+            # (which uses the same constant) stays the source of truth.
+            if math.isclose(value, 0.0, abs_tol=_MIN_DIMENSION_MM):
+                raise ValueError(
+                    f"CAD dimension {axis}={value} mm is effectively zero; "
+                    "flat / 2D-projection parts are not supported."
+                )
             if value < _MIN_DIMENSION_MM or value > _MAX_DIMENSION_MM:
                 raise ValueError(
                     f"CAD dimension {axis}={value} mm is outside the plausible range."

@@ -143,6 +143,14 @@ def _run_model(model_code: str) -> dict[str, object]:
     Kept as a function so the helper routines above can be unit-tested in
     isolation by importing the module without triggering the sandbox side
     effects.
+
+    Resource limits: the bubblewrap sandbox (``agent.sandbox.command``)
+    constrains the subprocess via ``prlimit`` -- ``--cpu=timeout+5`` for
+    CPU-seconds, ``--fsize``, ``--nofile``, ``--nproc``, and ``--as``. The
+    host (``CadTool._execute``) bounds wall-clock time at 120 s with
+    ``_stream_with_limit``; the two timers race benignly because the
+    runner's ``exec(compile(...))`` blocks the main thread for the
+    duration of the build.
     """
     namespace = {"__name__": "__main__", "__file__": "model.py"}
     exec(compile(model_code, "model.py", "exec"), namespace)
@@ -222,7 +230,15 @@ def _run_model(model_code: str) -> dict[str, object]:
     # --- Phase 4: STL preview export --------------------------------------------
     preview = Path("preview.stl")
     preview_tmp = Path(".preview.stl.tmp")
-    export_stl(shape, preview_tmp)
+    try:
+        export_stl(shape, preview_tmp)
+    except Exception:
+        # ``export_stl`` may write partial bytes to ``preview_tmp`` before
+        # raising (e.g. an OOM mid-serialisation). Clean the orphan so the
+        # next build starts from a clean slate and the operator does not see
+        # a confusing half-written STL on disk.
+        preview_tmp.unlink(missing_ok=True)
+        raise
     preview_tmp.replace(preview)
     if not preview.is_file() or preview.stat().st_size == 0:
         raise RuntimeError("CAD execution did not save a usable preview.")
@@ -258,12 +274,40 @@ def _run_model(model_code: str) -> dict[str, object]:
         iso_vertices, iso_triangles = _tessellate(shape)
         _write_isometric_artifact(iso_vertices, iso_triangles)
     if should_render:
+        # Clear any stale review outputs from a previous partial run so the
+        # new render doesn't pick up leftover PNGs (build_contact_sheet
+        # composes from ``sorted(view_dir.glob("*.png"))`` which would
+        # otherwise include files not present in the new manifest).
         review_dir.mkdir(exist_ok=True)
+        for stale in review_dir.glob("*.png"):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+        review_sheet_tmp = Path(".review-sheet.png")
+        if review_sheet_tmp.exists():
+            try:
+                review_sheet_tmp.unlink()
+            except OSError:
+                pass
+        # Share the tessellation with the iso path when possible: when both
+        # ``_WRITE_ISOMETRIC`` and ``_RENDER_VIEWS`` are enabled we already
+        # paid for one ``_tessellate`` call, so pass the result through to
+        # ``render_views`` instead of tessellating a second time. Without
+        # this, every full build re-runs OCP's expensive triangulation.
+        if should_write_iso:
+            render_vertices, render_triangles = iso_vertices, iso_triangles
+            render_source_shape = None
+        else:
+            render_vertices = render_triangles = None
+            render_source_shape = shape
         review_manifest = render_views(
-            source_shape=shape,
+            source_shape=render_source_shape,
             output_dir=review_dir,
             max_workers=int(_RENDER_WORKERS) if "_RENDER_WORKERS" in globals() else 4,
             required_views=int(_REQUIRED_VIEWS) if "_REQUIRED_VIEWS" in globals() else 8,
+            vertices=render_vertices,
+            triangles=render_triangles,
         )
         # build_contact_sheet composes the labelled 4x2 sheet the reviewer will see.
         review_sheet_path = Path(".review-sheet.png")
@@ -294,7 +338,13 @@ def _run_model(model_code: str) -> dict[str, object]:
         "validation_count": len(validation_results),
         "review_manifest": review_manifest_payload,
     }
-    Path(".cad_metrics.json").write_text(json.dumps(cache), encoding="utf-8")
+    metrics_path = Path(".cad_metrics.json")
+    metrics_tmp = Path(".cad_metrics.json.tmp")
+    try:
+        metrics_tmp.write_text(json.dumps(cache), encoding="utf-8")
+        metrics_tmp.replace(metrics_path)
+    finally:
+        metrics_tmp.unlink(missing_ok=True)
     return cache
 
 

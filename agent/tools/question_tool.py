@@ -17,10 +17,15 @@ def normalize_questions(args: dict) -> list[dict]:
         return questions
     input_type = args.get("input_type", "text")
     options = args.get("options") if input_type in {"select", "multiselect"} else []
+    question_text = args.get("question", "")
+    if not isinstance(question_text, str) or not question_text.strip():
+        raise ValueError(
+            "question descriptor is malformed: 'question' missing or empty."
+        )
     return [
         {
             "id": "q1",
-            "question": args["question"],
+            "question": question_text,
             "input_type": input_type,
             "options": options if isinstance(options, list) else [],
         }
