@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import math
 import operator
@@ -8,6 +9,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 from agent.io import atomic_write_text
@@ -25,6 +27,8 @@ BLOCKED_IMPORTS = {
 }
 BLOCKED_CALLS = {"__import__", "breakpoint", "compile", "eval", "exec", "input", "open"}
 EDITABLE_FILES = {"model.py", "summary.md"}
+MAX_FILE_BYTES = 1 * 1024 * 1024
+DEFAULT_READ_LIMIT = 400
 _BINARY_OPERATORS = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
@@ -32,6 +36,13 @@ _BINARY_OPERATORS = {
     ast.Div: operator.truediv,
     ast.Pow: operator.pow,
 }
+_FILE_LOCKS: dict[Path, threading.RLock] = {}
+_FILE_LOCKS_GUARD = threading.Lock()
+
+
+def _file_lock(path: Path) -> threading.RLock:
+    with _FILE_LOCKS_GUARD:
+        return _FILE_LOCKS.setdefault(path, threading.RLock())
 
 
 class ModelPreflight(ast.NodeVisitor):
@@ -259,18 +270,81 @@ class FileTool:
             raise ValueError(preflight.blocked_errors[0])
         return preflight.warnings
 
-    def read(self, filename: str) -> str:
+    def read(
+        self,
+        filename: str,
+        offset: int = 1,
+        limit: int | None = None,
+        known_sha256: str | None = None,
+    ) -> str:
         path = self._path(filename)
         if not path.exists():
             return ""
-        return path.read_text(encoding="utf-8")
+        if path.stat().st_size > MAX_FILE_BYTES:
+            raise ValueError(
+                f"{filename} is too large to read safely (max {MAX_FILE_BYTES // 1024} KiB)."
+            )
+        content = path.read_text(encoding="utf-8")
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        if known_sha256:
+            if len(known_sha256) != 64:
+                raise ValueError("known_sha256 must be a SHA-256 digest.")
+            if known_sha256 == digest:
+                return json.dumps({"unchanged": True, "sha256": digest})
+        if offset < 1:
+            raise ValueError("offset must be at least 1.")
+        if limit is None:
+            if offset == 1 and known_sha256 is None:
+                return content
+            limit = DEFAULT_READ_LIMIT
+        if limit < 1 or limit > 2000:
+            raise ValueError("limit must be between 1 and 2000 lines.")
+        lines = content.splitlines(keepends=True)
+        if offset > len(lines) + 1:
+            raise ValueError(
+                f"offset {offset} exceeds {filename}'s {len(lines)} lines."
+            )
+        chunk = "".join(lines[offset - 1 : offset - 1 + limit])
+        next_offset = offset + len(chunk.splitlines())
+        return json.dumps(
+            {
+                "content": chunk,
+                "sha256": digest,
+                "total_lines": len(lines),
+                "offset": offset,
+                "returned_lines": len(chunk.splitlines()),
+                "next_offset": next_offset if next_offset <= len(lines) else None,
+            },
+            ensure_ascii=False,
+        )
 
-    def write(self, filename: str, content: str) -> str:
-        if filename == "model.py":
-            return self._write_model(content, "write")
-        # Non-model files: simple write without revision tracking.
+    @staticmethod
+    def _validate_expected_sha(
+        filename: str, content: str, expected_sha256: str | None
+    ) -> None:
+        if expected_sha256 is None:
+            return
+        if len(expected_sha256) != 64:
+            raise ValueError("expected_sha256 must be a SHA-256 digest.")
+        actual = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        if actual != expected_sha256:
+            raise ValueError(
+                f"{filename} changed since it was read; refresh the file before editing."
+            )
+
+    def write(
+        self,
+        filename: str,
+        content: str,
+        expected_sha256: str | None = None,
+    ) -> str:
         path = self._path(filename)
-        atomic_write_text(path, content)
+        with _file_lock(path):
+            current = path.read_text(encoding="utf-8") if path.exists() else ""
+            self._validate_expected_sha(filename, current, expected_sha256)
+            if filename == "model.py":
+                return self._write_model(content, "write")
+            atomic_write_text(path, content)
         return f"Wrote {filename} ({len(content)} characters)."
 
     def _write_model(self, content: str, operation: str) -> str:
@@ -291,40 +365,75 @@ class FileTool:
             result += "\nPRE-FLIGHT WARNING: " + " | ".join(warnings)
         return result
 
-    def replace(self, filename: str, old: str, new: str) -> str:
+    def replace(
+        self,
+        filename: str,
+        old: str,
+        new: str,
+        expected_sha256: str | None = None,
+        expected_matches: int | None = None,
+    ) -> str:
         if not old:
             raise ValueError("The text to replace must not be empty.")
-        current = self.read(filename)
-        if old not in current:
-            raise ValueError("The requested text was not found; file was not changed.")
-        updated = current.replace(old, new, 1)
-        if filename == "model.py":
-            return self._write_model(updated, "replace")
-        return self.write(filename, updated)
+        path = self._path(filename)
+        with _file_lock(path):
+            current = path.read_text(encoding="utf-8") if path.exists() else ""
+            self._validate_expected_sha(filename, current, expected_sha256)
+            matches = current.count(old)
+            if matches == 0:
+                raise ValueError("The requested text was not found; file was not changed.")
+            if expected_matches is not None and matches != expected_matches:
+                raise ValueError(
+                    f"Expected {expected_matches} match(es), found {matches}; file was not changed."
+                )
+            updated = current.replace(old, new, 1)
+            if filename == "model.py":
+                return self._write_model(updated, "replace")
+            atomic_write_text(path, updated)
+        return f"Wrote {filename} ({len(updated)} characters)."
 
     def execute(self, args: dict) -> tuple[str, bool]:
         """Dispatch file operations by name. Returns (result_json, waiting=False)."""
         operation = args["operation"]
         filename = args["filename"]
         if operation == "read":
-            result = self.read(filename)
+            result = self.read(
+                filename,
+                args.get("offset", 1),
+                args.get("limit"),
+                args.get("known_sha256"),
+            )
         elif operation == "write":
-            result = self.write(filename, args.get("content", ""))
+            result = self.write(
+                filename, args.get("content", ""), args.get("expected_sha256")
+            )
         elif operation == "replace":
-            result = self.replace(filename, args.get("old", ""), args.get("new", ""))
+            result = self.replace(
+                filename,
+                args.get("old", ""),
+                args.get("new", ""),
+                args.get("expected_sha256"),
+                args.get("expected_matches"),
+            )
         elif operation == "regex_replace":
             result = self.regex_replace(
                 filename,
                 args.get("pattern", ""),
                 args.get("replacement", ""),
                 args.get("count", 1),
+                args.get("expected_sha256"),
             )
         else:
             raise ValueError("Unsupported file operation.")
         return json.dumps(result) if not isinstance(result, str) else result, False
 
     def regex_replace(
-        self, filename: str, pattern: str, replacement: str, count: int = 1
+        self,
+        filename: str,
+        pattern: str,
+        replacement: str,
+        count: int = 1,
+        expected_sha256: str | None = None,
     ) -> str:
         if not pattern:
             raise ValueError("Regex pattern must not be empty.")
@@ -336,15 +445,20 @@ class FileTool:
             raise ValueError("Patch replacement is too large.")
         if not 1 <= count <= 20:
             raise ValueError("Regex replacement count must be between 1 and 20.")
-        current = self.read(filename)
-        updated, replacements = _safe_subn(pattern, replacement, current, count=count)
-        if replacements == 0:
-            raise ValueError("The regex did not match; file was not changed.")
-        detail = ""
-        if filename == "model.py":
-            detail = "\n" + self._write_model(updated, "regex_replace")
-        else:
-            self.write(filename, updated)
+        path = self._path(filename)
+        with _file_lock(path):
+            current = path.read_text(encoding="utf-8") if path.exists() else ""
+            self._validate_expected_sha(filename, current, expected_sha256)
+            updated, replacements = _safe_subn(
+                pattern, replacement, current, count=count
+            )
+            if replacements == 0:
+                raise ValueError("The regex did not match; file was not changed.")
+            detail = ""
+            if filename == "model.py":
+                detail = "\n" + self._write_model(updated, "regex_replace")
+            else:
+                atomic_write_text(path, updated)
         return f"Updated {filename} with {replacements} regex replacement(s).{detail}"
 
 

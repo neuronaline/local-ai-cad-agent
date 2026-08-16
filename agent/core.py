@@ -696,17 +696,33 @@ class AgentRunner:
             tool = tools.file.with_call_id(call_id) if call_id else tools.file
             operation = name.removeprefix("file_")
             if operation == "read":
-                return tool.read(args["filename"]), False
+                return tool.read(
+                    args["filename"],
+                    args.get("offset", 1),
+                    args.get("limit"),
+                    args.get("known_sha256"),
+                ), False
             if operation == "write":
-                return tool.write(args["filename"], args["content"]), False
+                return tool.write(
+                    args["filename"],
+                    args["content"],
+                    args.get("expected_sha256"),
+                ), False
             if operation == "replace":
-                return tool.replace(args["filename"], args["old"], args["new"]), False
+                return tool.replace(
+                    args["filename"],
+                    args["old"],
+                    args["new"],
+                    args.get("expected_sha256"),
+                    args.get("expected_matches"),
+                ), False
             return (
                 tool.regex_replace(
                     args["filename"],
                     args["pattern"],
                     args["replacement"],
                     args.get("count", 1),
+                    args.get("expected_sha256"),
                 ),
                 False,
             )
@@ -717,6 +733,10 @@ class AgentRunner:
         if name == "terminal_check":
             return tools.terminal.check(
                 args["arguments"], args.get("timeout_seconds", 15)
+            ), False
+        if name == "terminal_bash":
+            return tools.terminal.bash(
+                args["command"], args.get("timeout_seconds", 15)
             ), False
         if name == "experience_search":
             return tools.experience.search(args["query"]), False

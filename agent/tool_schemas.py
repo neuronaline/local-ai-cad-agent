@@ -44,22 +44,47 @@ _TAGS = {
 TOOL_SCHEMAS = [
     _tool(
         "file_read",
-        "Read the current complete contents of model.py or summary.md. Use before a targeted replacement when the exact text is unknown.",
-        {"filename": _FILENAME},
+        "Read model.py or summary.md. Use offset and limit for a focused range; the ranged result includes a SHA-256 digest for guarded edits.",
+        {
+            "filename": _FILENAME,
+            "offset": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "One-based starting line. Defaults to 1.",
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 2000,
+                "description": "Maximum lines to return. Omit for the complete file.",
+            },
+            "known_sha256": {
+                "type": "string",
+                "minLength": 64,
+                "maxLength": 64,
+                "description": "Previously returned SHA-256; returns unchanged metadata if it still matches.",
+            },
+        },
         ["filename"],
     ),
     _tool(
         "file_write",
-        "Replace model.py or summary.md with complete new contents. This overwrites the whole file; use a replacement tool for a localized edit.",
+        "Replace model.py or summary.md with complete new contents. This overwrites the whole file; for an existing file, pass expected_sha256 from a ranged read to prevent overwriting a newer edit.",
         {
             "filename": _FILENAME,
             "content": {"type": "string", "description": "Complete file contents."},
+            "expected_sha256": {
+                "type": "string",
+                "minLength": 64,
+                "maxLength": 64,
+                "description": "Optional SHA-256 from file_read; rejects stale writes.",
+            },
         },
         ["filename", "content"],
     ),
     _tool(
         "file_replace",
-        "Replace only the first exact text match. The call fails without changing the file when old is not found.",
+        "Replace only the first exact text match. Optionally require the expected total match count and file SHA-256 to avoid editing an ambiguous or stale target.",
         {
             "filename": _FILENAME,
             "old": {
@@ -70,6 +95,18 @@ TOOL_SCHEMAS = [
             "new": {
                 "type": "string",
                 "description": "Replacement text; may be empty to delete the match.",
+            },
+            "expected_sha256": {
+                "type": "string",
+                "minLength": 64,
+                "maxLength": 64,
+                "description": "Optional SHA-256 from file_read; rejects stale edits.",
+            },
+            "expected_matches": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1000,
+                "description": "Optional total occurrences old must have before the first is replaced.",
             },
         },
         ["filename", "old", "new"],
@@ -96,6 +133,12 @@ TOOL_SCHEMAS = [
                 "maximum": 20,
                 "default": 1,
                 "description": "Maximum replacements; defaults to 1.",
+            },
+            "expected_sha256": {
+                "type": "string",
+                "minLength": 64,
+                "maxLength": 64,
+                "description": "Optional SHA-256 from file_read; rejects stale edits.",
             },
         },
         ["filename", "pattern", "replacement"],
@@ -134,6 +177,20 @@ TOOL_SCHEMAS = [
             "timeout_seconds": _TIMEOUT,
         },
         ["arguments"],
+    ),
+    _tool(
+        "terminal_bash",
+        "Run one read-only shell-style inspection in the sandbox. Shell operators, redirects, substitutions, writes, and network access are rejected.",
+        {
+            "command": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2000,
+                "description": "One read-only command, such as 'rg Cylinder model.py' or 'git status'.",
+            },
+            "timeout_seconds": _TIMEOUT,
+        },
+        ["command"],
     ),
     _tool(
         "question",

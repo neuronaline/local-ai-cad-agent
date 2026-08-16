@@ -82,6 +82,7 @@ def command(
     *,
     writable: bool,
     timeout_seconds: int,
+    writable_tmp: bool = True,
 ) -> tuple[list[str], int]:
     """Build a fail-closed Bubblewrap command and its inherited seccomp fd."""
     if not _BWRAP:
@@ -89,6 +90,9 @@ def command(
     workspace = workspace.resolve()
     python_root = Path(sys.prefix).resolve()
     bind_mode = "--bind" if writable else "--ro-bind"
+    tmp_mount = ["--tmpfs", "/tmp"]
+    if not writable_tmp:
+        tmp_mount.extend(["--remount-ro", "/tmp"])
     seccomp_fd = seccomp_filter_fd()
     sandbox = [
         _BWRAP,
@@ -101,7 +105,7 @@ def command(
         "--disable-userns",
         "--proc", "/proc",
         "--dev", "/dev",
-        "--tmpfs", "/tmp",
+        *tmp_mount,
         "--ro-bind", "/usr", "/usr",
         "--symlink", "usr/bin", "/bin",
         "--symlink", "usr/lib", "/lib",

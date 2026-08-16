@@ -124,6 +124,7 @@ const activityLabels = {
   file_read: 'Reading model',
   terminal_run: 'Checking model',
   terminal_check: 'Checking model',
+  terminal_bash: 'Inspecting workspace',
   experience_search: 'Checking past solutions',
   experience_get: 'Reading past solution',
   experience_add: 'Saving solution',
@@ -256,10 +257,14 @@ async function loadCurrentPreview(previewId) {
   previewLoadPromise = (async () => {
     const project = currentProject;
     try {
+      const meta = await api(`/api/projects/${encodeURIComponent(project)}/preview/meta`);
+      if (!meta.displayable) {
+        hideUnapprovedPreview(meta.review_status);
+        return;
+      }
       const url = `/api/projects/${encodeURIComponent(project)}/preview?ts=${Date.now()}`;
       await viewer.load(url);
       previewProject = project;
-      const meta = await api(`/api/projects/${encodeURIComponent(project)}/preview/meta`);
       loadedPreviewRevision = meta.revision || loadedPreviewRevision;
       if (previewId) {
         try {
@@ -286,6 +291,17 @@ async function loadCurrentPreview(previewId) {
     }
   })();
   return previewLoadPromise;
+}
+
+function hideUnapprovedPreview(reviewStatus = 'pending') {
+  previewProject = '';
+  loadedPreviewRevision = '';
+  modelActions.hidden = true;
+  viewer.clear(
+    reviewStatus === 'fail'
+      ? 'Preview was rejected by review'
+      : 'Preview is awaiting review',
+  );
 }
 
 async function refreshRender() {
@@ -386,7 +402,8 @@ async function syncCurrentPreview() {
       meta.available
       && (previewProject !== currentProject || loadedPreviewRevision !== meta.revision)
     ) {
-      await loadCurrentPreview();
+      if (meta.displayable) await loadCurrentPreview();
+      else hideUnapprovedPreview(meta.review_status);
       loadReviewGallery();
     }
   } catch {
@@ -1029,7 +1046,8 @@ function connectStream() {
     },
     preview_updated: data => {
       if (data.project !== currentProject) return;
-      loadCurrentPreview(data.preview_id);
+      if (data.preview_id) loadCurrentPreview(data.preview_id);
+      else hideUnapprovedPreview('pending');
     },
     revision_updated: data => {
       if (data.project !== currentProject) return;

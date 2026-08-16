@@ -3,6 +3,8 @@ from __future__ import annotations
 import ast
 import json
 import os
+import re
+import shlex
 import signal
 import subprocess
 import threading
@@ -12,6 +14,13 @@ from agent.sandbox import command as sandbox_command
 
 # Maximum bytes to buffer from subprocess stdout/stderr to prevent OOM.
 _MAX_OUTPUT_BYTES = 1 * 1024 * 1024  # 1 MB per stream
+_READ_ONLY_COMMANDS = frozenset({"find", "git", "grep", "head", "ls", "pwd", "rg", "sed", "stat", "tail", "wc"})
+_SHELL_METACHARS = re.compile(r"[;&|<>`\n]|\$\(")
+_NATIVE_EXEC_CODE = (
+    "import json, os, sys\n"
+    "args = json.loads(sys.argv[1])\n"
+    "os.execvp(args[0], args)\n"
+)
 
 
 class _TimedOut(RuntimeError):
@@ -387,6 +396,31 @@ class TerminalTool:
             result = self.run(args["arguments"], args.get("timeout_seconds", 30))
         return json.dumps(result), False
 
+    def bash(self, command: str, timeout_seconds: int = 15) -> dict[str, object]:
+        """Run one read-only shell-style inspection without shell expansion."""
+        if not command or len(command) > 2000:
+            raise ValueError("bash command must be between 1 and 2000 characters.")
+        if _SHELL_METACHARS.search(command):
+            raise ValueError("bash does not allow shell operators, redirects, or substitutions.")
+        try:
+            arguments = shlex.split(command)
+        except ValueError as error:
+            raise ValueError(f"Invalid shell quoting: {error}") from error
+        if not arguments or Path(arguments[0]).name != arguments[0]:
+            raise ValueError("bash command must use a workspace-safe command name.")
+        program = arguments[0]
+        if program not in _READ_ONLY_COMMANDS:
+            raise ValueError(
+                "bash supports only read-only commands: "
+                + ", ".join(sorted(_READ_ONLY_COMMANDS))
+            )
+        forbidden = {"-delete", "-exec", "-execdir", "-i", "--in-place", "--upload-pack"}
+        if any(argument in forbidden for argument in arguments[1:]):
+            raise ValueError("bash command includes a non-read-only option.")
+        if program == "git" and (len(arguments) < 2 or arguments[1] not in {"diff", "log", "rev-parse", "show", "status"}):
+            raise ValueError("bash git supports: diff, log, rev-parse, show, status.")
+        return self._run_command(arguments, timeout_seconds, native=True)
+
     def check(
         self, arguments: list[str], timeout_seconds: int = 15
     ) -> dict[str, object]:
@@ -426,14 +460,18 @@ class TerminalTool:
         raise ValueError("check supports only -c '<code>' or -m <module>.")
 
     def _run_command(
-        self, command: list[str], timeout_seconds: int
+        self, command: list[str], timeout_seconds: int, *, native: bool = False
     ) -> dict[str, object]:
         timeout = max(1, min(timeout_seconds, 120))
+        sandbox_arguments = (
+            ["-c", _NATIVE_EXEC_CODE, json.dumps(command)] if native else command
+        )
         command, seccomp_fd = sandbox_command(
             self.project_dir,
-            command,
+            sandbox_arguments,
             writable=False,
             timeout_seconds=timeout,
+            writable_tmp=not native,
         )
         process: subprocess.Popen[str] | None = None
         try:

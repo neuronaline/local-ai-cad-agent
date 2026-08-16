@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import re
@@ -200,7 +201,10 @@ def test_preview_metadata_changes_when_stl_is_updated(tmp_path: Path):
     client.post("/api/projects/new", json={"name": "demo"})
     preview = settings.workspace_root / "demo" / "preview.stl"
 
-    assert client.get("/api/projects/demo/preview/meta").get_json() == {"available": False}
+    assert client.get("/api/projects/demo/preview/meta").get_json() == {
+        "available": False,
+        "displayable": False,
+    }
 
     preview.write_bytes(b"first")
     first = client.get("/api/projects/demo/preview/meta").get_json()
@@ -208,9 +212,49 @@ def test_preview_metadata_changes_when_stl_is_updated(tmp_path: Path):
     second = client.get("/api/projects/demo/preview/meta").get_json()
 
     assert first["available"] is True
+    assert first["displayable"] is False
     assert first["model_sha256"] is None
     assert second["available"] is True
     assert first["revision"] != second["revision"]
+
+
+def test_preview_metadata_requires_a_passing_current_review(tmp_path: Path):
+    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    client = create_app(settings).test_client()
+    client.post("/api/projects/new", json={"name": "demo"})
+    project = settings.workspace_root / "demo"
+    preview = project / "preview.stl"
+    preview.write_bytes(b"current preview")
+    preview_sha = hashlib.sha256(preview.read_bytes()).hexdigest()
+    model = project / "model.py"
+    model.write_text("# current model\n", encoding="utf-8")
+    model_sha = hashlib.sha256(model.read_bytes()).hexdigest()
+    review = project / ".cad-agent" / "reviews" / ("a" * 64)
+    review.mkdir(parents=True)
+    (review / "manifest.json").write_text(
+        json.dumps({"preview_sha256": preview_sha, "model_sha256": model_sha}),
+        encoding="utf-8",
+    )
+    (review / "result.json").write_text(json.dumps({"status": "fail"}), encoding="utf-8")
+
+    failed = client.get("/api/projects/demo/preview/meta").get_json()
+    assert failed["displayable"] is False
+    assert failed["review_status"] == "fail"
+
+    (review / "result.json").write_text(json.dumps({"status": "pass"}), encoding="utf-8")
+    passed = client.get("/api/projects/demo/preview/meta").get_json()
+    assert passed["displayable"] is True
+    assert passed["review_status"] == "pass"
+
+    model.write_text("# changed model\n", encoding="utf-8")
+    stale_model = client.get("/api/projects/demo/preview/meta").get_json()
+    assert stale_model["displayable"] is False
+    assert stale_model["review_status"] == "pending"
+
+    preview.write_bytes(b"new unreviewed preview")
+    stale = client.get("/api/projects/demo/preview/meta").get_json()
+    assert stale["displayable"] is False
+    assert stale["review_status"] == "pending"
 
 
 def test_preview_completion_requires_matching_display_confirmation(tmp_path: Path):

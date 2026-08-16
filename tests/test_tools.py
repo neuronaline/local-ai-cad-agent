@@ -1,3 +1,4 @@
+import json
 from io import BytesIO
 from pathlib import Path
 
@@ -144,6 +145,29 @@ def test_file_tool_supports_limited_regex_patches(tmp_path: Path):
     assert tool.read("summary.md") == "Width: 12 mm\n"
 
 
+def test_file_read_range_returns_digest_for_guarded_edit(tmp_path: Path):
+    tool = FileTool(tmp_path)
+    tool.write("summary.md", "one\ntwo\nthree\n")
+
+    payload = json.loads(tool.read("summary.md", offset=2, limit=1))
+
+    assert payload["content"] == "two\n"
+    assert payload["offset"] == 2
+    assert payload["next_offset"] == 3
+    with pytest.raises(ValueError, match="changed since it was read"):
+        tool.write("summary.md", "updated\n", expected_sha256="0" * 64)
+
+
+def test_file_replace_can_reject_an_ambiguous_target(tmp_path: Path):
+    tool = FileTool(tmp_path)
+    tool.write("summary.md", "same\nsame\n")
+
+    with pytest.raises(ValueError, match="Expected 1 match"):
+        tool.replace("summary.md", "same", "new", expected_matches=1)
+
+    assert tool.read("summary.md") == "same\nsame\n"
+
+
 def test_file_tool_regex_replace_rejects_pathological_pattern(tmp_path: Path):
     """ReDoS-prone patterns must be killed by the safety timeout."""
     tool = FileTool(tmp_path)
@@ -229,6 +253,19 @@ def test_terminal_tool_reports_python_failures_as_errors(tmp_path: Path):
         TerminalTool(tmp_path).run(["python", "fail.py"])
 
     assert "ValueError: broken" in str(error.value)
+
+
+def test_terminal_bash_allows_only_read_only_commands(tmp_path: Path):
+    tool = TerminalTool(tmp_path)
+
+    with pytest.raises(ValueError, match="shell operators"):
+        tool.bash("pwd; ls")
+    with pytest.raises(ValueError, match="read-only commands"):
+        tool.bash("rm model.py")
+    with pytest.raises(ValueError, match="non-read-only option"):
+        tool.bash("find . -delete")
+    with pytest.raises(RuntimeError, match="exit code"):
+        tool.bash("find . -fprint /tmp/files")
 
 
 def test_terminal_sandbox_hides_environment_and_blocks_network(

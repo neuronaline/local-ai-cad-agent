@@ -745,18 +745,43 @@ def create_app(settings: Settings | None = None) -> Flask:
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
         if not preview_path.is_file() or preview_path.stat().st_size == 0:
-            return jsonify({"available": False})
+            return jsonify({"available": False, "displayable": False})
         stat = preview_path.stat()
+        preview_sha256 = hashlib.sha256(preview_path.read_bytes()).hexdigest()
         model_path = project_dir / "model.py"
         model_sha256 = (
             hashlib.sha256(model_path.read_bytes()).hexdigest()
             if model_path.is_file()
             else None
         )
+        review_status = "not_required"
+        displayable = not app.config["SETTINGS"].review_enabled
+        if not displayable:
+            review_status = "pending"
+            latest_review = _review_latest(project_dir)
+            if latest_review is not None:
+                manifest_path = latest_review / _REVIEW_MANIFEST_NAME
+                result_path = latest_review / _REVIEW_RESULT_NAME
+                try:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    result = json.loads(result_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    manifest = result = None
+                if (
+                    isinstance(manifest, dict)
+                    and manifest.get("preview_sha256") == preview_sha256
+                    and manifest.get("model_sha256") == model_sha256
+                    and isinstance(result, dict)
+                    and result.get("status") in {"pass", "fail", "inconclusive"}
+                ):
+                    review_status = result["status"]
+                    displayable = review_status == "pass"
         return jsonify({
             "available": True,
+            "displayable": displayable,
             "revision": f"{stat.st_mtime_ns}-{stat.st_size}",
             "model_sha256": model_sha256,
+            "review_status": review_status,
         })
 
     @app.post("/api/projects/<project_name>/preview/displayed")
