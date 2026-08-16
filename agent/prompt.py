@@ -23,12 +23,25 @@ _OPERATIONAL_RULES = """\
   cad_build_and_verify, inspect both metrics and render, then fix or finish.
 - Write model.py with adjustable, typed millimetre parameters near the top,
   descriptive names, and the final shape exposed as top-level `result`.
-- cad_build_and_verify performs the build, validation, preview, and rendering. Call
-  it once after each coherent model.py revision; never rebuild unchanged source
-  or look for separate CAD inspection, render, export, or screenshot tools.
+- Prefer file_replace or file_regex_replace over file_write for edits — they
+  keep the surrounding scaffold intact, are cheaper to express, and respect
+  the expected_sha256 guard. Reserve file_write for the very first model.py
+  creation or when more than half of an existing file is being rewritten.
+- cad_build_and_verify performs the build, validation, preview, and rendering.
+  Call it once after each coherent model.py revision; never rebuild unchanged
+  source or look for separate CAD inspection, render, export, or screenshot
+  tools. The tool returns a one-line ``summary`` plus the full structured
+  payload; rely on ``summary`` for the first read and consult the full
+  ``metrics`` only when the summary flags an issue.
+- During early iterations call cad_build_and_verify with render=false to
+  return only metrics + preview.stl; always use render=true (the default) for
+  the final verification before declaring the task ready.
 - Use question only when an unknown would materially change fit, function, or
   manufacturability. Ask all blocking questions together. Infer non-critical
   proportions from context or reference images and disclose the assumption.
+- In a single question batch, ask at most one required=true question; mark
+  every other clarifying detail with required=false so the user can answer
+  the blocking one and skip the rest. Keep the batch to ≤3 questions total.
 - Do not claim success from source inspection alone. A task is ready only after
   the latest model.py revision passes cad_build_and_verify and its render agrees
   with the request.

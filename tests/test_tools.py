@@ -331,31 +331,177 @@ def test_cad_build_recording_is_best_effort(tmp_path: Path, monkeypatch):
     cad._record_build_failure("original CAD error")
 
 
+def test_cad_build_and_verify_legacy_payload(tmp_path: Path, monkeypatch):
     cad = CadTool(tmp_path)
     calls = []
-    metrics = {"solid_count": 1, "is_valid": True}
+    metrics = {
+        "solid_count": 1,
+        "is_valid": True,
+        "dimensions_mm": {"x": 1, "y": 1, "z": 1},
+    }
     wrapped = {
         "metrics": metrics,
         "feature_summary": {},
-        "review_manifest": None,
-        "review_views_dir": None,
-        "review_sheet_path": None,
+        "review_manifest": {"model_sha256": "a" * 64, "preview_sha256": "b" * 64},
+        "review_views_dir": "",
+        "review_sheet_path": "",
     }
     monkeypatch.setattr(
         cad,
         "_execute",
         lambda **kwargs: calls.append(kwargs) or wrapped,
     )
+    monkeypatch.setattr(
+        cad,
+        "promote_review",
+        lambda manifest, *, sandbox_views_dir, sandbox_sheet_path: {"artifact_dir": "/tmp/review"},
+    )
 
     result = cad.build_and_verify()
 
     assert calls == [{"render": True}]
-    assert result == {
-        "metrics": metrics,
+    # Use a structural assertion so adding future optional keys doesn't break
+    # this regression test; ``_summarize_payload`` adds a ``summary`` string
+    # that the agent sees first.
+    assert result["metrics"] is metrics
+    assert result["feature_summary"] == {}
+    assert result["preview"] == "preview.stl"
+    assert result["render"] == "render.png"
+    assert result["review"] == "/tmp/review"
+    assert result["review_manifest"] == wrapped["review_manifest"]
+    assert result["summary"] == (
+        "Solid 1 (valid); bbox 1.0×1.0×1.0 mm; 0.0 cm³; 0 features; with render."
+    )
+
+
+def test_cad_build_and_verify_with_render_false_skips_review_artifacts(
+    tmp_path: Path, monkeypatch
+):
+    pytest.importorskip("build123d")
+    cad = CadTool(tmp_path)
+    (tmp_path / "model.py").write_text(
+        "from build123d import Box\nresult = Box(1, 1, 1)\n", encoding="utf-8"
+    )
+    captured: list[dict] = []
+
+    payload = {
+        "metrics": {"solid_count": 1, "is_valid": True, "dimensions_mm": {"x": 1, "y": 1, "z": 1}},
         "feature_summary": {},
-        "preview": "preview.stl",
-        "render": "render.png",
+        "review_manifest": {"should_be": "ignored"},
+        "review_views_dir": "/tmp/views",
+        "review_sheet_path": "/tmp/sheet.png",
     }
+
+    def fake_execute(**kwargs):
+        captured.append(kwargs)
+        return payload
+
+    monkeypatch.setattr(cad, "_execute", fake_execute)
+
+    result = cad.build_and_verify(render=False)
+
+    assert captured == [{"render": False}]
+    # Structural assertion: review keys must not leak into the render-less
+    # payload, but unrelated future keys (e.g. additional summary fields) can
+    # grow without breaking this regression test.
+    assert result["metrics"] is payload["metrics"]
+    assert result["feature_summary"] == {}
+    assert result["preview"] == "preview.stl"
+    assert result["render"] is None
+    assert "review" not in result
+    assert "review_manifest" not in result
+    assert result["summary"] == (
+        "Solid 1 (valid); bbox 1.0×1.0×1.0 mm; 0.0 cm³; 0 features; metrics-only."
+    )
+
+
+def test_cad_build_and_verify_with_render_true_keeps_legacy_payload(
+    tmp_path: Path, monkeypatch
+):
+    pytest.importorskip("build123d")
+    cad = CadTool(tmp_path)
+    (tmp_path / "model.py").write_text(
+        "from build123d import Box\nresult = Box(1, 1, 1)\n", encoding="utf-8"
+    )
+    captured: list[dict] = []
+
+    payload = {
+        "metrics": {"solid_count": 1, "is_valid": True, "dimensions_mm": {"x": 1, "y": 1, "z": 1}},
+        "feature_summary": {},
+        "review_manifest": {"some": "manifest"},
+        "review_views_dir": None,
+        "review_sheet_path": None,
+    }
+
+    def fake_execute(**kwargs):
+        captured.append(kwargs)
+        return payload
+
+    monkeypatch.setattr(cad, "_execute", fake_execute)
+    monkeypatch.setattr(
+        cad, "promote_review", lambda manifest, *, sandbox_views_dir, sandbox_sheet_path: {"artifact_dir": "/tmp/review"}
+    )
+
+    result = cad.build_and_verify(render=True)
+
+    assert captured == [{"render": True}]
+    assert result["render"] == "render.png"
+    assert result["review_manifest"] == {"some": "manifest"}
+    assert result["review"] == "/tmp/review"
+    assert "summary" in result
+    assert "Solid 1" in result["summary"]
+
+
+def test_cad_build_and_verify_summary_mentions_features(tmp_path: Path, monkeypatch):
+    pytest.importorskip("build123d")
+    cad = CadTool(tmp_path)
+    (tmp_path / "model.py").write_text(
+        "from build123d import Box\nresult = Box(1, 1, 1)\n", encoding="utf-8"
+    )
+    payload = {
+        "metrics": {
+            "solid_count": 2,
+            "is_valid": True,
+            "dimensions_mm": {"x": 10, "y": 20, "z": 30},
+            "volume_mm3": 6_000,
+        },
+        "feature_summary": {
+            "through_hole_count": 3,
+            "blind_hole_count": 1,
+            "fillet_count": 2,
+            "chamfer_count": 0,
+        },
+        "review_manifest": None,
+        "review_views_dir": None,
+        "review_sheet_path": None,
+    }
+    monkeypatch.setattr(cad, "_execute", lambda **kwargs: payload)
+
+    result = cad.build_and_verify(render=False)
+
+    assert "6 features" in result["summary"]
+    assert "6.0 cm³" in result["summary"]
+    assert "10.0×20.0×30.0 mm" in result["summary"]
+
+
+def test_cad_build_and_verify_summary_handles_missing_metrics(tmp_path: Path, monkeypatch):
+    pytest.importorskip("build123d")
+    cad = CadTool(tmp_path)
+    (tmp_path / "model.py").write_text(
+        "from build123d import Box\nresult = Box(1, 1, 1)\n", encoding="utf-8"
+    )
+    payload = {
+        "metrics": None,
+        "feature_summary": {},
+        "review_manifest": None,
+        "review_views_dir": None,
+        "review_sheet_path": None,
+    }
+    monkeypatch.setattr(cad, "_execute", lambda **kwargs: payload)
+
+    result = cad.build_and_verify(render=False)
+
+    assert result["summary"] == "Build produced no metrics."
 
 
 # --------------------------------------------------------------------------- #

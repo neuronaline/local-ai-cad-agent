@@ -148,6 +148,32 @@ function activityLabel(value) {
   return activityLabels[value] || String(value || 'Activity').replace(/[_-]+/g, ' ');
 }
 
+function activityDetail(tool, status, value) {
+  if (!value) return '';
+  if (!['completed', 'error'].includes(status)) return String(value);
+  let payload = value;
+  if (typeof value === 'string') {
+    try { payload = JSON.parse(value); } catch { return value; }
+  }
+  if (!payload || typeof payload !== 'object') return String(payload || '');
+  if (payload.ok === false) return String(payload.error?.message || 'The step failed.');
+  const data = payload.ok === true ? payload.data : payload;
+  if (typeof data === 'string') return data;
+  // ``cad_build_and_verify`` returns a compact ``summary`` string alongside
+  // the structured payload. Prefer it over the legacy fixed message so the
+  // UI accurately reflects whether a render/review was produced or skipped
+  // (render=false iterations return a metrics-only summary).
+  if (tool === 'cad_build_and_verify' && data && typeof data.summary === 'string' && data.summary.trim()) {
+    return data.summary.trim();
+  }
+  if (tool === 'cad_build_and_verify') return 'Model built and review artifacts created.';
+  if (data && typeof data === 'object') {
+    const output = data.stdout || data.stderr || data.message || data.summary;
+    if (typeof output === 'string' && output.trim()) return output.trim();
+  }
+  return status === 'error' ? 'The step failed.' : 'Completed.';
+}
+
 function clearActivity() {
   activityItems.clear();
   toolMessages.clear();
@@ -195,7 +221,7 @@ function addToolMessage(data) {
   const item = activityItems.get(callId) || {callId, tool: data.tool || 'agent'};
   item.tool = data.tool || item.tool;
   item.status = status;
-  item.result = data.result || item.result || '';
+  item.result = activityDetail(item.tool, status, data.result) || item.result || '';
   activityItems.set(callId, item);
   toolMessages.set(callId, item);
 
@@ -507,7 +533,7 @@ async function loadHistory(projectName, options = {}) {
 function addInfoMessage(type, data = {}) {
   if (type === 'agent_status') {
     addToolMessage({
-      call_id: `status-${data.timestamp || crypto.randomUUID()}`,
+      call_id: 'agent-run',
       tool: 'agent',
       status: data.status || 'info',
       result: data.message,
@@ -969,7 +995,7 @@ function connectStream() {
     agent_status: data => {
       if (data.project !== currentProject) return;
       addToolMessage({
-        call_id: `status-${data.timestamp || data.status || crypto.randomUUID()}`,
+        call_id: 'agent-run',
         tool: 'agent',
         status: data.status || 'running',
         result: data.message,

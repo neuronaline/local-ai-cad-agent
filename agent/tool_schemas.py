@@ -145,13 +145,19 @@ TOOL_SCHEMAS = [
     ),
     _tool(
         "cad_build_and_verify",
-        "Build the latest model.py revision and return geometry metrics plus a render. Call after editing model.py; do not repeat unless the source changes.",
-        {},
+        "Build the latest model.py revision and return geometry metrics plus a render. Set render=false to skip render.png (and the multi-view review sheet) when iterating before final verification; do not repeat unless the source changes.",
+        {
+            "render": {
+                "type": "boolean",
+                "default": True,
+                "description": "Generate render.png + multi-view review sheet (true, default) or skip them and only return metrics + preview.stl (false). Use false during early iterations; the final verification must use true.",
+            },
+        },
         [],
     ),
     _tool(
         "terminal_run",
-        'Run one existing Python script from the project root in a writable sandbox. Use arguments ["python", "script.py"]; inline code, modules, subdirectories, and script arguments are rejected.',
+        "Execute an existing Python script from the project root inside a writable sandbox. Use this when you need to run project-specific code that already exists as a file; do NOT use it for one-off inspections (use terminal_check) or shell commands (use terminal_bash). arguments MUST be exactly ['python', 'script.py']; inline code, modules, subdirectories, and script arguments are rejected.",
         {
             "arguments": {
                 "type": "array",
@@ -166,7 +172,7 @@ TOOL_SCHEMAS = [
     ),
     _tool(
         "terminal_check",
-        "Run a read-only Python inspection, pytest, or pip query in the sandbox. arguments must start with python and use -c or -m; use terminal_run for a project script.",
+        "Run a read-only Python inspection, pytest, or pip query in the sandbox. Use this for quick verification (e.g. python -c 'expr', python -m pytest, python -m pip list). NOT for project scripts (use terminal_run) or shell commands (use terminal_bash). arguments must start with python and use -c or -m.",
         {
             "arguments": {
                 "type": "array",
@@ -180,7 +186,7 @@ TOOL_SCHEMAS = [
     ),
     _tool(
         "terminal_bash",
-        "Run one read-only shell-style inspection in the sandbox. Shell operators, redirects, substitutions, writes, and network access are rejected.",
+        "Run one read-only shell-style inspection in the sandbox (e.g. rg, git status, ls). Use this for fast repo navigation when Python would be overkill. NOT for project scripts (use terminal_run) or Python evaluations (use terminal_check). Shell operators, redirects, substitutions, writes, and network access are rejected.",
         {
             "command": {
                 "type": "string",

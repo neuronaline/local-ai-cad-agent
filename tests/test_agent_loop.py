@@ -828,7 +828,7 @@ def test_failed_build_clears_preview_and_returns_structured_error(tmp_path: Path
     project.mkdir(parents=True)
     (project / "conversation.jsonl").write_text("", encoding="utf-8")
     tools = ProjectTools(project, lambda *_, **__: None)
-    tools.cad.build_and_verify = lambda: (_ for _ in ()).throw(
+    tools.cad.build_and_verify = lambda render=True: (_ for _ in ()).throw(
         RuntimeError("broken model")
     )
     runner = AgentRunner(
@@ -947,7 +947,7 @@ def test_review_gate_passes_for_passing_verdict(tmp_path: Path, monkeypatch):
     )
     runner = AgentRunner(settings, lambda *_, **__: None)
     tools = ProjectTools(project, lambda *_, **__: None)
-    tools.cad.build_and_verify = lambda: payload
+    tools.cad.build_and_verify = lambda render=True: payload
 
     review_client = _FakeReviewClient(
         {"status": "pass", "summary": "All good.", "findings": []}
@@ -976,6 +976,47 @@ def test_review_gate_passes_for_passing_verdict(tmp_path: Path, monkeypatch):
     assert review_client.call_count == 1
 
 
+def test_review_updates_the_build_call_in_place(tmp_path: Path, monkeypatch):
+    project = tmp_path / "projects" / "demo"
+    payload = _seed_pass_build(project)
+    settings = Settings(
+        tmp_path / "projects", "https://example.test", "test", 1, "127.0.0.1", 5000
+    )
+    events = []
+    runner = AgentRunner(settings, lambda kind, data, **_: events.append((kind, data)))
+    tools = ProjectTools(project, lambda kind, data, **_: events.append((kind, data)))
+    tools.cad.build_and_verify = lambda render=True: payload
+    monkeypatch.setattr(
+        "agent.cad_review._default_create_client",
+        lambda _settings: _FakeReviewClient(
+            {"status": "pass", "summary": "All good.", "findings": []}
+        ),
+    )
+
+    runner._process_tool_call(
+        tools,
+        "demo",
+        project,
+        {"id": "run-1", "function": {"name": "cad_build_and_verify", "arguments": "{}"}},
+        False,
+        None,
+        None,
+        [],
+    )
+
+    build_events = [
+        data for kind, data in events
+        if kind == "tool_status" and data.get("call_id") == "run-1"
+    ]
+    assert [event["status"] for event in build_events] == [
+        "running", "reviewing", "completed"
+    ]
+    assert not any(
+        kind == "agent_status" and data.get("status") == "reviewing"
+        for kind, data in events
+    )
+
+
 def test_review_gate_blocks_completion_on_blocking_finding(tmp_path: Path, monkeypatch):
     project = tmp_path / "projects" / "demo"
     payload = _seed_pass_build(project)
@@ -984,7 +1025,7 @@ def test_review_gate_blocks_completion_on_blocking_finding(tmp_path: Path, monke
     )
     runner = AgentRunner(settings, lambda *_, **__: None)
     tools = ProjectTools(project, lambda *_, **__: None)
-    tools.cad.build_and_verify = lambda: payload
+    tools.cad.build_and_verify = lambda render=True: payload
 
     review_client = _FakeReviewClient(
         {
@@ -1029,7 +1070,7 @@ def test_review_gate_treats_inconclusive_as_blocking(tmp_path: Path, monkeypatch
     )
     runner = AgentRunner(settings, lambda *_, **__: None)
     tools = ProjectTools(project, lambda *_, **__: None)
-    tools.cad.build_and_verify = lambda: payload
+    tools.cad.build_and_verify = lambda render=True: payload
 
     class InconclusiveClient:
         def chat(self, messages, tools=None):
@@ -1065,7 +1106,7 @@ def test_review_gate_respects_cycle_limit(tmp_path: Path, monkeypatch):
     )
     runner = AgentRunner(settings, lambda *_, **__: None)
     tools = ProjectTools(project, lambda *_, **__: None)
-    tools.cad.build_and_verify = lambda: payload
+    tools.cad.build_and_verify = lambda render=True: payload
 
     review_client = _FakeReviewClient(
         {
@@ -1110,7 +1151,7 @@ def test_review_gate_disabled_skips_review_call(tmp_path: Path, monkeypatch):
     )
     runner = AgentRunner(settings, lambda *_, **__: None)
     tools = ProjectTools(project, lambda *_, **__: None)
-    tools.cad.build_and_verify = lambda: payload
+    tools.cad.build_and_verify = lambda render=True: payload
 
     called = {"count": 0}
 

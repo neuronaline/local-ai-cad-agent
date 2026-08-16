@@ -691,7 +691,11 @@ class AgentRunner:
         call_id: str = "",
     ) -> tuple[object, bool]:
         if name == "cad_build_and_verify":
-            return tools.cad.build_and_verify(), False
+            # ``render`` defaults to True to preserve legacy behavior; the
+            # schema documents the iteration vs. final-verification split.
+            return tools.cad.with_call_id(call_id).build_and_verify(
+                args.get("render", True)
+            ), False
         if name.startswith("file_"):
             tool = tools.file.with_call_id(call_id) if call_id else tools.file
             operation = name.removeprefix("file_")
@@ -866,7 +870,7 @@ class AgentRunner:
             if self._is_cad_build(name, arguments):
                 preview_id = self._register_preview(project, project_dir)
                 review_payload = self._run_post_build_review(
-                    project, project_dir, raw_result
+                    project, project_dir, raw_result, call_id
                 )
                 review_status = review_payload.get("status")
                 if review_status == "limit_reached":
@@ -1020,6 +1024,7 @@ class AgentRunner:
         project: str,
         project_dir: Path,
         raw_result: dict[str, object],
+        call_id: str = "",
     ) -> dict[str, object]:
         """Run the structured multimodal review after a successful build.
 
@@ -1051,8 +1056,14 @@ class AgentRunner:
                 model_source = ""
         request_text = self._user_request_text(project_dir)
         self.publish(
-            "agent_status",
-            {"project": project, "status": "reviewing", "message": "Reviewing the build…"},
+            "tool_status",
+            {
+                "project": project,
+                "call_id": call_id,
+                "tool": "cad_build_and_verify",
+                "status": "reviewing",
+                "result": "Reviewing the build…",
+            },
         )
         try:
             review: ReviewResult = run_review(
@@ -1093,10 +1104,6 @@ class AgentRunner:
             {"project": project, "status": review.status, "summary": review.summary},
         )
         if review.status == "pass":
-            self.publish(
-                "agent_status",
-                {"project": project, "status": "review_passed", "message": review.summary},
-            )
             return {
                 "status": "pass",
                 "summary": review.summary,
@@ -1106,14 +1113,6 @@ class AgentRunner:
         # ``fail`` and ``inconclusive`` both block completion. ``inconclusive``
         # is treated as the documented "never pass without visual evidence".
         blocking = review.status == "fail" and review.is_blocking
-        self.publish(
-            "agent_status",
-            {
-                "project": project,
-                "status": "review_failed",
-                "message": review.summary,
-            },
-        )
         max_cycles = max(1, self.settings.review_max_cycles)
         if self._review_cycles.get(project, 0) >= max_cycles:
             return {

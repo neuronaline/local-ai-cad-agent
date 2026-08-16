@@ -410,6 +410,60 @@ def test_activity_label_fallback_sanitizes_unknown_inputs(js_input, expected):
     assert out["label"] == expected
 
 
+def test_activity_detail_hides_model_facing_json_envelopes():
+    bindings = _extract_js("activityDetail")
+    body = """
+const success = JSON.stringify({ok: true, tool: 'file_write', data: 'Wrote model.py.'});
+const failure = JSON.stringify({ok: false, tool: 'cad_build_and_verify', error: {message: 'Bad edge.'}});
+const build = JSON.stringify({ok: true, tool: 'cad_build_and_verify', data: {metrics: {solid_count: 1}}});
+process.stdout.write(JSON.stringify({
+  success: activityDetail('file_write', 'completed', success),
+  failure: activityDetail('cad_build_and_verify', 'error', failure),
+  build: activityDetail('cad_build_and_verify', 'completed', build),
+}));
+"""
+    out = json.loads(_eval_helper(bindings, body))
+    assert out == {
+        "success": "Wrote model.py.",
+        "failure": "Bad edge.",
+        "build": "Model built and review artifacts created.",
+    }
+
+
+def test_activity_detail_prefers_cad_build_summary_when_present():
+    """``cad_build_and_verify`` now returns a compact ``summary`` string. The
+    activity drawer should surface that one-liner instead of the legacy fixed
+    phrase so render-less iterations read as "metrics-only" rather than
+    "Model built and review artifacts created." which would mislead the user.
+    """
+    bindings = _extract_js("activityDetail")
+    body = """
+const full = JSON.stringify({ok: true, tool: 'cad_build_and_verify', data: {
+  summary: 'Solid 1 (valid); bbox 10.0x20.0x30.0 mm; 6.0 cm3; 6 features; with render.',
+  metrics: {solid_count: 1},
+  preview: 'preview.stl',
+}});
+const minimal = JSON.stringify({ok: true, tool: 'cad_build_and_verify', data: {
+  summary: 'Solid 2 (INVALID); bbox 0.0x0.0x0.0 mm; 0.0 cm3; 0 features; metrics-only.',
+  metrics: {solid_count: 2},
+  preview: 'preview.stl',
+  render: null,
+}});
+process.stdout.write(JSON.stringify({
+  full: activityDetail('cad_build_and_verify', 'completed', full),
+  minimal: activityDetail('cad_build_and_verify', 'completed', minimal),
+}));
+"""
+    out = json.loads(_eval_helper(bindings, body))
+    assert out["full"].startswith("Solid 1 (valid)")
+    assert "with render" in out["full"]
+    assert out["minimal"].startswith("Solid 2 (INVALID)")
+    assert "metrics-only" in out["minimal"]
+    # The legacy phrase must NOT leak through when a summary is provided.
+    assert "Model built and review artifacts created." not in out["full"]
+    assert "Model built and review artifacts created." not in out["minimal"]
+
+
 # ---------------------------------------------------------------------------
 # Issue 5: markActivityRecovered must leave error rows visible.
 # ---------------------------------------------------------------------------

@@ -86,12 +86,16 @@ class CadTool:
         self._review_required_views = max(1, int(review_required_views))
         self._process: subprocess.Popen[str] | None = None
         self._lock = threading.Lock()
-        # Counter surfaced by ``_publish_status`` so operators can detect when
-        # the SSE event bus is dropping ``agent_status`` events without
-        # scraping the host log.
+        self._call_id = ""
+        # Counter surfaced by ``_publish_status`` so operators can detect
+        # dropped activity events without scraping the host log.
         self._status_publish_failures = 0
 
     # ------------------------------------------------------------------ review
+
+    def with_call_id(self, call_id: str) -> CadTool:
+        self._call_id = call_id
+        return self
 
     def _reviews_root(self) -> Path:
         return self.project_dir / ".cad-agent" / "reviews"
@@ -138,8 +142,10 @@ class CadTool:
         target = latest / _REVIEW_SHEET_NAME
         return target if target.is_file() else None
 
-    def _publish_status(self, status: str, message: str) -> None:
-        """Emit an ``agent_status`` SSE event for the active project.
+    def _publish_status(
+        self, status: str, message: str, call_id: str = ""
+    ) -> None:
+        """Emit a phase update for the active build tool.
 
         Used to surface the multi-view rendering phase so the UI activity
         drawer can label the step (``rendering_views``). The publish callback
@@ -150,14 +156,17 @@ class CadTool:
         if not callable(publish):
             return
         try:
-            publish(
-                "agent_status",
-                {
-                    "project": _project_name(self.project_dir),
-                    "status": status,
-                    "message": message,
-                },
-            )
+            event = {
+                "project": _project_name(self.project_dir),
+                "status": status,
+                "result": message,
+            }
+            if call_id:
+                event.update({"call_id": call_id, "tool": "cad_build_and_verify"})
+                publish("tool_status", event)
+            else:
+                event["message"] = event.pop("result")
+                publish("agent_status", event)
         except Exception as error:  # noqa: BLE001 - status events must never fail the build.
             # Status events are advisory: a publish failure (queue full,
             # serialiser bug, network blip on the SSE consumer) must not abort
@@ -167,7 +176,7 @@ class CadTool:
             # in-process counter so long-running sessions can surface it.
             self._status_publish_failures += 1
             logging.getLogger(__name__).warning(
-                "agent_status publish failed (status=%s, project=%s, "
+                "activity status publish failed (status=%s, project=%s, "
                 "total_failures=%d): %s",
                 status,
                 _project_name(self.project_dir),
@@ -192,7 +201,7 @@ class CadTool:
             prelude = "_RENDER_VIEWS = False\n_WRITE_ISOMETRIC = False\n"
         return prelude + RENDERER + "\n" + RUNNER
 
-    def _execute(self, render: bool = False) -> dict[str, Any]:
+    def _execute(self, render: bool = False, call_id: str = "") -> dict[str, Any]:
         model_path = self.project_dir / "model.py"
         if not model_path.exists():
             raise ValueError("model.py does not exist yet.")
@@ -307,6 +316,7 @@ class CadTool:
                 self._publish_status(
                     "rendering_views",
                     "Rendering review views…",
+                    call_id,
                 )
                 staging_views_dir, staging_sheet_path = self._stage_review_artifacts(
                     workspace
@@ -651,36 +661,103 @@ class CadTool:
         payload = self._execute()
         return dict(payload.get("metrics") or {})
 
-    def build_and_verify(self) -> dict[str, Any]:
-        """Build once, validate metrics, and produce preview + multi-view review."""
-        payload = self._execute(render=True)
+    @staticmethod
+    def _summarize_payload(
+        metrics: dict[str, Any] | None,
+        feature_summary: dict[str, Any],
+        render: bool,
+        review_path: str | None,
+    ) -> str:
+        """Return a one-line human-readable summary for the agent's first glance.
+
+        The full structured payload (metrics, feature_summary, review_manifest)
+        is still included below — the agent only needs this summary to decide
+        whether to read further or move on, which keeps the first 1-2 turns
+        after a build cheap.
+        """
+        if not isinstance(metrics, dict):
+            return "Build produced no metrics."
+        dims = metrics.get("dimensions_mm") or {}
+        solid_count = metrics.get("solid_count", 0)
+        is_valid = metrics.get("is_valid", False)
+        volume_mm3 = metrics.get("volume_mm3")
+        try:
+            x = float(dims.get("x", 0))
+            y = float(dims.get("y", 0))
+            z = float(dims.get("z", 0))
+        except (TypeError, ValueError):
+            x = y = z = 0.0
+        feature_count = sum(
+            int(feature_summary.get(key, 0) or 0)
+            for key in (
+                "through_hole_count",
+                "blind_hole_count",
+                "fillet_count",
+                "chamfer_count",
+            )
+        )
+        validity = "valid" if is_valid else "INVALID"
+        try:
+            volume_cm3 = float(volume_mm3 or 0.0) / 1000.0
+            volume_text = f"{volume_cm3:.1f} cm³"
+        except (TypeError, ValueError):
+            volume_text = "unknown volume"
+        render_state = (
+            "with render" if render and review_path else ("metrics-only" if not render else "no review")
+        )
+        return (
+            f"Solid {solid_count} ({validity}); "
+            f"bbox {x:.1f}×{y:.1f}×{z:.1f} mm; "
+            f"{volume_text}; {feature_count} features; {render_state}."
+        )
+
+    def build_and_verify(self, render: bool = True) -> dict[str, Any]:
+        """Build once, validate metrics, and (by default) produce preview + review.
+
+        ``render=False`` skips the legacy ``render.png`` artifact and the
+        multi-view review sheet, returning only ``metrics`` + ``preview.stl``.
+        The metrics still include the canonical geometry sanity checks
+        (bounding box, volume, solid count, is_valid) so a render-less build
+        remains trustworthy for early iteration.
+        """
+        execute_args: dict[str, Any] = {"render": bool(render)}
+        if self._call_id:
+            execute_args["call_id"] = self._call_id
+        payload = self._execute(**execute_args)
         metrics = payload.get("metrics") if isinstance(payload, dict) else None
-        review_manifest = payload.get("review_manifest")
-        review_path: str | None = None
-        if review_manifest:
-            try:
-                promoted = self.promote_review(
-                    review_manifest,
-                    sandbox_views_dir=payload.get("review_views_dir") or "",
-                    sandbox_sheet_path=payload.get("review_sheet_path") or "",
-                )
-                review_path = promoted.get("artifact_dir")
-            except RuntimeError:
-                # Promotion failures are surfaced to the agent by raising; the
-                # caller (AgentRunner) maps them to a CAD_BUILD_FAILED result.
-                raise
+        review_manifest = payload.get("review_manifest") if render else None
         result: dict[str, Any] = {
             "metrics": metrics,
             "preview": "preview.stl",
-            "render": "render.png",
+            "render": "render.png" if render else None,
             "feature_summary": payload.get("feature_summary") or {},
         }
-        if review_path:
-            result["review"] = review_path
-        if review_manifest:
-            # Surface the manifest so the agent loop can drive the structured
-            # reviewer without re-reading ``.cad-agent/reviews/``.
-            result["review_manifest"] = review_manifest
+        if render:
+            review_path: str | None = None
+            if review_manifest:
+                try:
+                    promoted = self.promote_review(
+                        review_manifest,
+                        sandbox_views_dir=payload.get("review_views_dir") or "",
+                        sandbox_sheet_path=payload.get("review_sheet_path") or "",
+                    )
+                    review_path = promoted.get("artifact_dir")
+                except RuntimeError:
+                    # Promotion failures are surfaced to the agent by raising; the
+                    # caller (AgentRunner) maps them to a CAD_BUILD_FAILED result.
+                    raise
+            if review_path:
+                result["review"] = review_path
+            if review_manifest:
+                # Surface the manifest so the agent loop can drive the structured
+                # reviewer without re-reading ``.cad-agent/reviews/``.
+                result["review_manifest"] = review_manifest
+        result["summary"] = self._summarize_payload(
+            metrics,
+            result["feature_summary"],
+            render,
+            result.get("review"),
+        )
         return result
 
     def stop(self) -> None:
