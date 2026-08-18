@@ -10,8 +10,6 @@ import hashlib
 import os
 from typing import Any
 
-import requests
-
 from agent.llm_base import (
     ChatCompletionsClient,
     post_with_cancel,
@@ -61,7 +59,7 @@ class OpenRouterClient(ChatCompletionsClient):
                 "exclude": False,
             }
         if self.settings.openrouter_provider:
-            provider: dict[str, Any] = {"order": [self.settings.openrouter_provider]}
+            provider: dict[str, Any] = {}
             if self.settings.openrouter_force_provider:
                 provider.update(
                     {
@@ -70,6 +68,9 @@ class OpenRouterClient(ChatCompletionsClient):
                         "require_parameters": True,
                     }
                 )
+            else:
+                # Explicit provider order disables OpenRouter's sticky routing.
+                provider["order"] = [self.settings.openrouter_provider]
             payload["provider"] = provider
 
     def _apply_gemini_cache_breakpoint(self, payload: dict[str, Any]) -> None:

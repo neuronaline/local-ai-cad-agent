@@ -6,9 +6,9 @@ import time
 from io import BytesIO
 from pathlib import Path
 
-import yaml
 from PIL import Image
 
+from agent.core import AgentRunner
 from agent.revisions import RevisionOrigin, RevisionStore
 from agent.settings import Settings
 from app import SSE_QUEUE_SIZE, EventBus, create_app
@@ -588,6 +588,8 @@ def test_index_contains_example_prompts(tmp_path: Path, monkeypatch):
     assert response.status_code == 200
     assert b"example-prompt" in response.data
     assert b"mounting plate" in response.data
+    assert response.data.count(b'class="example-prompt"') >= 9
+    assert b"Dual cantilever snap-fit coupon" in response.data
 
 
 # ── Local vendor assets ──
@@ -616,8 +618,6 @@ def test_frontend_source_has_no_cdn_urls():
 
 
 # ── Error message mapping ──
-
-from agent.core import AgentRunner
 
 
 def test_user_error_messages_are_actionable():

@@ -38,21 +38,20 @@ def sanitize_assistant_message(message: dict[str, Any]) -> dict[str, Any]:
 
 
 def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return an API-safe copy with exactly one leading system message.
+    """Return an API-safe copy while preserving a stable system prefix.
 
-    A stable system prefix improves prompt-cache hit rates. Prior messages are
-    immutable references — assistant messages get sanitized downstream.
+    System messages are kept as separate, leading messages. Combining a static
+    prompt with dynamic workspace state changes the cacheable prefix on every
+    state change, defeating provider prompt caches.
     """
-    system_parts: list[str] = []
+    system_messages: list[dict[str, Any]] = []
     non_system: list[dict[str, Any]] = []
     for item in messages:
         if item.get("role") == "system" and isinstance(item.get("content"), str):
-            system_parts.append(item["content"])
+            system_messages.append(item)
         else:
             non_system.append(item)
-    if not system_parts:
-        return non_system
-    return [{"role": "system", "content": "\n\n".join(system_parts)}] + non_system
+    return system_messages + non_system
 
 
 def sanitize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

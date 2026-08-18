@@ -11,6 +11,7 @@ import requests
 from agent.llm_base import create_llm_client
 from agent.openai_client import OpenAIClient
 from agent.openrouter import OpenRouterClient
+from agent.prompt import get_prompt_cache_key
 from agent.settings import LLM_PROVIDERS, Settings, load_settings
 
 
@@ -217,7 +218,7 @@ def test_client_rejects_failed_or_truncated_stream(
 ):
     env_var = "OPENAI_API_KEY" if kind == "openai" else "OPENROUTER_API_KEY"
     monkeypatch.setenv(env_var, "test")
-    target = "agent.llm_base.requests.post" if kind == "openai" else "agent.openrouter.requests.post"
+    target = "agent.llm_base.requests.post"
     monkeypatch.setattr(target, lambda *_a, **_kw: response)
 
     with pytest.raises(RuntimeError, match=message):
@@ -273,12 +274,32 @@ def test_openai_builds_payload_with_reasoning_effort(monkeypatch, tmp_path):
     payload = captured["json"]
     assert payload["model"] == "o4-mini"
     assert payload["reasoning_effort"] == "high"
+    assert payload["prompt_cache_key"] == get_prompt_cache_key()
     # OpenAI does not consume OpenRouter-specific keys.
     for key in ("provider", "session_id", "cache_control"):
         assert key not in payload
     assert captured["headers"]["Authorization"] == "Bearer test"
     assert "HTTP-Referer" not in captured["headers"]
     assert "X-OpenRouter-Title" not in captured["headers"]
+
+
+def test_openai_cache_key_is_stable_and_dynamic_state_follows_system_prompt(tmp_path):
+    client = OpenAIClient(_settings(tmp_path, "openai"))
+    payload = client._build_payload(
+        [
+            {"role": "system", "content": "Stable instructions."},
+            {"role": "user", "content": "<project_state>dynamic</project_state>"},
+            {"role": "user", "content": "Build a bracket."},
+        ],
+        None,
+    )
+
+    assert payload["prompt_cache_key"] == get_prompt_cache_key()
+    assert payload["messages"] == [
+        {"role": "system", "content": "Stable instructions."},
+        {"role": "user", "content": "<project_state>dynamic</project_state>"},
+        {"role": "user", "content": "Build a bracket."},
+    ]
 
 
 def test_openai_endpoint_uses_configured_base_url(monkeypatch, tmp_path):
@@ -307,7 +328,7 @@ def test_openrouter_retries_transient_failure(monkeypatch, tmp_path):
         return _FakeResponse()
 
     monkeypatch.setenv("OPENROUTER_API_KEY", "test")
-    monkeypatch.setattr("agent.openrouter.requests.post", post)
+    monkeypatch.setattr("agent.llm_base.requests.post", post)
     monkeypatch.setattr("agent.llm_base.sleep_with_cancel", lambda _delay, _event: None)
 
     response = OpenRouterClient(_settings(tmp_path, "openrouter")).chat([{"role": "user", "content": "hi"}])
@@ -320,7 +341,7 @@ def test_openrouter_does_not_retry_non_transient_client_error(monkeypatch, tmp_p
     calls: list[int] = []
     monkeypatch.setenv("OPENROUTER_API_KEY", "test")
     monkeypatch.setattr(
-        "agent.openrouter.requests.post",
+        "agent.llm_base.requests.post",
         lambda *_a, **_kw: calls.append(1) or _ClientErrorResponse(),
     )
 
@@ -333,7 +354,7 @@ def test_openrouter_does_not_retry_non_transient_client_error(monkeypatch, tmp_p
 def test_openrouter_builds_cache_safe_sticky_payload_and_keeps_tool_content(monkeypatch, tmp_path):
     captured: dict[str, Any] = {}
     monkeypatch.setenv("OPENROUTER_API_KEY", "test")
-    _capture_post(monkeypatch, "agent.openrouter.requests.post", captured, _FakeResponse)
+    _capture_post(monkeypatch, "agent.llm_base.requests.post", captured, _FakeResponse)
     settings = _settings(
         tmp_path,
         "openrouter",
@@ -366,14 +387,31 @@ def test_openrouter_builds_cache_safe_sticky_payload_and_keeps_tool_content(monk
     assert captured["headers"]["HTTP-Referer"] == "https://cad.example"
 
 
+def test_openrouter_forced_provider_keeps_sticky_routing_eligible(tmp_path):
+    settings = _settings(
+        tmp_path,
+        "openrouter",
+        openrouter_provider="google-vertex/global",
+        openrouter_force_provider=True,
+    )
+    payload = OpenRouterClient(settings)._build_payload([], None)
+
+    assert payload["provider"] == {
+        "only": ["google-vertex/global"],
+        "allow_fallbacks": False,
+        "require_parameters": True,
+    }
+
+
 def test_openrouter_marks_stable_system_prompt_cacheable_for_gemini(monkeypatch, tmp_path):
     captured: dict[str, Any] = {}
     monkeypatch.setenv("OPENROUTER_API_KEY", "test")
-    _capture_post(monkeypatch, "agent.openrouter.requests.post", captured, _FakeResponse)
+    _capture_post(monkeypatch, "agent.llm_base.requests.post", captured, _FakeResponse)
     settings = _settings(tmp_path, "openrouter", openrouter_model="google/gemini-2.5-flash")
 
     OpenRouterClient(settings).chat([
         {"role": "system", "content": "Stable CAD instructions."},
+        {"role": "user", "content": "<project_state>dynamic</project_state>"},
         {"role": "user", "content": "Build a bracket."},
     ])
 
@@ -383,6 +421,10 @@ def test_openrouter_marks_stable_system_prompt_cacheable_for_gemini(monkeypatch,
         "text": "Stable CAD instructions.",
         "cache_control": {"type": "ephemeral"},
     }]
+    assert captured["json"]["messages"][1] == {
+        "role": "user",
+        "content": "<project_state>dynamic</project_state>",
+    }
 
 
 def test_openrouter_honors_retry_after(monkeypatch, tmp_path):
@@ -394,7 +436,7 @@ def test_openrouter_honors_retry_after(monkeypatch, tmp_path):
         return _RateLimitedResponse() if len(calls) == 1 else _FakeResponse()
 
     monkeypatch.setenv("OPENROUTER_API_KEY", "test")
-    monkeypatch.setattr("agent.openrouter.requests.post", post)
+    monkeypatch.setattr("agent.llm_base.requests.post", post)
     monkeypatch.setattr("agent.llm_base.sleep_with_cancel", lambda delay, _event: delays.append(delay))
 
     response = OpenRouterClient(_settings(tmp_path, "openrouter")).chat([{"role": "user", "content": "hi"}])
@@ -407,7 +449,7 @@ def test_openrouter_honors_retry_after(monkeypatch, tmp_path):
 def test_openrouter_sends_reasoning_and_forced_provider_preferences(monkeypatch, tmp_path):
     captured: dict[str, Any] = {}
     monkeypatch.setenv("OPENROUTER_API_KEY", "test")
-    _capture_post(monkeypatch, "agent.openrouter.requests.post", captured, _FakeResponse)
+    _capture_post(monkeypatch, "agent.llm_base.requests.post", captured, _FakeResponse)
     settings = _settings(
         tmp_path,
         "openrouter",
@@ -423,7 +465,6 @@ def test_openrouter_sends_reasoning_and_forced_provider_preferences(monkeypatch,
     assert payload["model"] == "openai/o4-mini"
     assert payload["reasoning"] == {"effort": "high", "exclude": False}
     assert payload["provider"] == {
-        "order": ["openai"],
         "only": ["openai"],
         "allow_fallbacks": False,
         "require_parameters": True,

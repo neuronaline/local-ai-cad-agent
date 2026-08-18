@@ -502,7 +502,7 @@ def test_project_state_tells_agent_to_create_a_missing_model(tmp_path: Path):
 
     state = AgentRunner._project_state_message(project)
 
-    assert state["role"] == "system"
+    assert state["role"] == "user"
     assert "model.py does not exist" in state["content"]
     assert "write_file" in state["content"]
     assert "read_file" in state["content"]
@@ -792,6 +792,7 @@ def test_protocol_history_is_append_only_and_preserves_tool_call_content(
     messages = runner._context(project, "Add a chamfer", [])
 
     assert messages[0]["role"] == "system"
+    assert messages[1]["role"] == "user"
     assert "model.py does not exist" in messages[1]["content"]
     assert [message["role"] for message in messages[2:]] == [
         "user",

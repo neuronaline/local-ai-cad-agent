@@ -350,7 +350,12 @@ class AgentRunner:
             nudged_cad = False
             client = create_llm_client(self.settings)
             client.stop_event = self._stop_event
-            client.session_id = f"{self.settings.llm_provider}:{project}"
+            session_prefix = (
+                self.settings.openrouter_session_prefix
+                if self.settings.llm_provider == "openrouter"
+                else self.settings.llm_provider
+            )
+            client.session_id = f"{session_prefix}:{project}"
             for _ in range(self.settings.agent_tool_call_limit):
                 if self._stop_event.is_set():
                     self.publish(
@@ -572,7 +577,7 @@ class AgentRunner:
 
     @staticmethod
     def _project_state_message(project_dir: Path) -> dict[str, str]:
-        """Provide the model with the current editable-model state."""
+        """Provide dynamic workspace state after the cacheable system prefix."""
         if (project_dir / "model.py").is_file():
             content = (
                 "<project_state>\n"
@@ -587,7 +592,10 @@ class AgentRunner:
                 "cad_screenshot, or cad_review first.\n"
                 "</project_state>"
             )
-        return {"role": "system", "content": content}
+        # Gemini normalizes all system messages into an immutable instruction.
+        # Keeping mutable workspace state in a later user message lets its
+        # explicit system-message cache breakpoint remain reusable.
+        return {"role": "user", "content": content}
 
     @staticmethod
     def _strip_image_parts(item: dict) -> dict:

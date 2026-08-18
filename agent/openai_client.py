@@ -10,6 +10,7 @@ import os
 from typing import Any
 
 from agent.llm_base import ChatCompletionsClient, post_with_cancel, sanitize_messages
+from agent.prompt import get_prompt_cache_key
 from agent.settings import Settings
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
@@ -42,6 +43,7 @@ class OpenAIClient(ChatCompletionsClient):
         payload: dict[str, Any] = {
             "model": self.settings.openai_model,
             "messages": self.sanitize_messages(messages),
+            "prompt_cache_key": get_prompt_cache_key(),
             "stream": True,
             "stream_options": {"include_usage": True},
         }

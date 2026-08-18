@@ -154,6 +154,11 @@ def get_system_prompt() -> str:
     return _PROMPT_CACHE.get()
 
 
+def get_prompt_cache_key() -> str:
+    """Return the stable routing key for requests sharing this prompt prefix."""
+    return f"local-ai-cad-agent:{_PROMPT_CACHE.hash()[:16]}"
+
+
 def get_build123d_playbook() -> str:
     """Return the playbook content, re-reading from disk when it changes."""
     return _PROMPT_CACHE.get_playbook()
