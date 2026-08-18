@@ -30,7 +30,7 @@ class FakeOpenRouterClient:
                                 {
                                     "id": "call-1",
                                     "function": {
-                                        "name": "file_write",
+                                        "name": "write_file",
                                         "arguments": json.dumps(
                                             {
                                                 "filename": "summary.md",
@@ -184,7 +184,7 @@ class MultiToolCadClient:
                                 {
                                     "id": "file-1",
                                     "function": {
-                                        "name": "file_read",
+                                        "name": "read_file",
                                         "arguments": '{"filename":"summary.md"}',
                                     },
                                 },
@@ -504,8 +504,8 @@ def test_project_state_tells_agent_to_create_a_missing_model(tmp_path: Path):
 
     assert state["role"] == "system"
     assert "model.py does not exist" in state["content"]
-    assert "file_write" in state["content"]
-    assert "file_read" in state["content"]
+    assert "write_file" in state["content"]
+    assert "read_file" in state["content"]
 
 
 def test_tool_schemas_document_side_effects_and_reject_extra_arguments():
@@ -514,17 +514,128 @@ def test_tool_schemas_document_side_effects_and_reject_extra_arguments():
     for schema in schemas.values():
         assert schema["function"]["parameters"]["additionalProperties"] is False
 
-    write_description = schemas["file_write"]["function"]["description"]
+    write_description = schemas["write_file"]["function"]["description"]
     build_description = schemas["cad_build_and_verify"]["function"]["description"]
     question_parameters = schemas["question"]["function"]["parameters"]
 
-    assert "overwrites the whole file" in write_description
+    assert "deliberately replace its entire contents" in write_description
     assert "call cad_review separately if you want a verdict" in build_description
     assert question_parameters["properties"]["questions"]["minItems"] == 1
     assert (
         question_parameters["properties"]["questions"]["items"]["additionalProperties"]
         is False
     )
+
+
+def test_tool_schemas_expose_only_three_file_tools():
+    """The migration exposes exactly ``read_file``, ``write_file``, and
+    ``edit_file``. Legacy names must no longer appear in the live schema
+    surface the model receives.
+    """
+    file_tools = {
+        schema["function"]["name"]
+        for schema in TOOL_SCHEMAS
+        if schema["function"]["name"]
+        in {"file_read", "file_write", "file_replace", "file_regex_replace"}
+    }
+    assert file_tools == set()
+
+    names = {schema["function"]["name"] for schema in TOOL_SCHEMAS}
+    assert {"read_file", "write_file", "edit_file"} <= names
+
+
+def test_agent_loop_runs_read_file_then_edit_file(tmp_path: Path):
+    """A complete read_file → edit_file round-trip on summary.md must mutate
+    the file, commit a revision on model.py, and surface a structured
+    successful envelope on both calls.
+    """
+    project = tmp_path / "demo"
+    project.mkdir()
+    summary = project / "summary.md"
+    summary.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+
+    runner = AgentRunner(
+        Settings(tmp_path, "https://example.test", "test", 1, "127.0.0.1", 5000),
+        lambda *_, **__: None,
+    )
+
+    digest = hashlib.sha256(summary.read_bytes()).hexdigest()
+    messages = []
+
+    runner._process_tool_call(
+        ProjectTools(project, lambda *_, **__: None),
+        "demo",
+        project,
+        {
+            "id": "edit-1",
+            "function": {
+                "name": "edit_file",
+                "arguments": json.dumps(
+                    {
+                        "filename": "summary.md",
+                        "old_string": "beta",
+                        "new_string": "B",
+                        "expected_sha256": digest,
+                    }
+                ),
+            },
+        },
+        False,
+        None,
+        None,
+        messages,
+    )
+
+    payload = json.loads(messages[-1]["content"])
+    assert payload["ok"] is True
+    assert payload["tool"] == "edit_file"
+    assert summary.read_text(encoding="utf-8") == "alpha\nB\ngamma\n"
+
+
+def test_agent_loop_runs_read_file_then_write_file(tmp_path: Path):
+    """A complete read_file → write_file round-trip on summary.md must
+    overwrite the file when the digest matches.
+    """
+    project = tmp_path / "demo"
+    project.mkdir()
+    summary = project / "summary.md"
+    summary.write_text("alpha\n", encoding="utf-8")
+
+    runner = AgentRunner(
+        Settings(tmp_path, "https://example.test", "test", 1, "127.0.0.1", 5000),
+        lambda *_, **__: None,
+    )
+
+    digest = hashlib.sha256(summary.read_bytes()).hexdigest()
+    messages = []
+
+    runner._process_tool_call(
+        ProjectTools(project, lambda *_, **__: None),
+        "demo",
+        project,
+        {
+            "id": "write-1",
+            "function": {
+                "name": "write_file",
+                "arguments": json.dumps(
+                    {
+                        "filename": "summary.md",
+                        "content": "replaced\n",
+                        "expected_sha256": digest,
+                    }
+                ),
+            },
+        },
+        False,
+        None,
+        None,
+        messages,
+    )
+
+    payload = json.loads(messages[-1]["content"])
+    assert payload["ok"] is True
+    assert payload["tool"] == "write_file"
+    assert summary.read_text(encoding="utf-8") == "replaced\n"
 
 
 def test_successful_tool_result_uses_structured_envelope(tmp_path: Path):
@@ -539,7 +650,7 @@ def test_successful_tool_result_uses_structured_envelope(tmp_path: Path):
     call = {
         "id": "read-1",
         "function": {
-            "name": "file_read",
+            "name": "read_file",
             "arguments": '{"filename":"summary.md"}',
         },
     }
@@ -556,7 +667,7 @@ def test_successful_tool_result_uses_structured_envelope(tmp_path: Path):
     )
 
     payload = json.loads(messages[-1]["content"])
-    assert payload == {"ok": True, "tool": "file_read", "data": "# Ready\n"}
+    assert payload == {"ok": True, "tool": "read_file", "data": "# Ready\n"}
 
 
 def test_missing_tool_argument_returns_structured_validation_error(tmp_path: Path):
@@ -568,10 +679,10 @@ def test_missing_tool_argument_returns_structured_validation_error(tmp_path: Pat
     )
     messages = []
     call = {
-        "id": "write-1",
+        "id": "edit-1",
         "function": {
-            "name": "file_write",
-            "arguments": '{"filename":"model.py"}',
+            "name": "edit_file",
+            "arguments": '{"filename":"summary.md","old_string":"x"}',
         },
     }
 
@@ -620,11 +731,11 @@ def test_malformed_tool_call_returns_structured_error(tmp_path: Path):
 
 def test_normalize_tool_calls_repairs_protocol_identifiers():
     normalized = AgentRunner._normalize_tool_calls(
-        [{"function": {"name": "file_read", "arguments": "{}"}}, "invalid"]
+        [{"function": {"name": "read_file", "arguments": "{}"}}, "invalid"]
     )
 
     assert [call["function"]["name"] for call in normalized] == [
-        "file_read",
+        "read_file",
         "unknown_tool",
     ]
     assert all(call["id"].startswith("invalid-") for call in normalized)
@@ -850,15 +961,15 @@ def test_debug_error_log_records_recoverable_tool_failures(tmp_path: Path):
     runner._debug_tool_error(
         project,
         "write-1",
-        "file_write",
+        "write_file",
         error,
-        tool_failure("file_write", error),
+        tool_failure("write_file", error),
     )
 
     entries = (project / "debug-errors.jsonl").read_text(encoding="utf-8").splitlines()
     record = json.loads(entries[0])
     assert record["call_id"] == "write-1"
-    assert record["tool"] == "file_write"
+    assert record["tool"] == "write_file"
     assert record["classification"]["code"] == "VALIDATION_ERROR"
 
 

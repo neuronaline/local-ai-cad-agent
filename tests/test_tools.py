@@ -1,5 +1,5 @@
+import hashlib
 import json
-from io import BytesIO
 from pathlib import Path
 
 import numpy as np
@@ -113,64 +113,144 @@ def test_cad_tool_review_settings_are_normalized(
 def test_file_tool_rejects_unsafe_model(tmp_path: Path):
     tool = FileTool(tmp_path)
     with pytest.raises(ValueError, match="Unsafe import blocked"):
-        tool.write("model.py", "import subprocess\n")
+        tool.write_file("model.py", "import subprocess\n")
     assert not (tmp_path / "model.py").exists()
 
     with pytest.raises(ValueError, match="Unsafe function blocked"):
-        tool.write("model.py", "__import__('os').system('id')\n")
+        tool.write_file("model.py", "__import__('os').system('id')\n")
 
     # Attribute-access forms of blocked builtins must be caught too
     # (e.g. __builtins__.eval, builtins.exec). The sandbox is the real
     # boundary; the AST check is the contract development relies on.
     with pytest.raises(ValueError, match="Unsafe function blocked"):
-        tool.write("model.py", "__builtins__.eval('1+1')\n")
+        tool.write_file("model.py", "__builtins__.eval('1+1')\n")
     with pytest.raises(ValueError, match="Unsafe function blocked"):
-        tool.write("model.py", "builtins.exec('print(1)')\n")
+        tool.write_file("model.py", "builtins.exec('print(1)')\n")
 
 
 def test_file_tool_only_edits_allowlisted_files(tmp_path: Path):
     tool = FileTool(tmp_path)
     with pytest.raises(ValueError, match="Only model.py"):
-        tool.write("notes.txt", "nope")
+        tool.write_file("notes.txt", "nope")
 
 
-def test_file_tool_supports_limited_regex_patches(tmp_path: Path):
+def test_write_file_creates_new_file_without_digest(tmp_path: Path):
     tool = FileTool(tmp_path)
-    tool.write("summary.md", "Width: 10 mm\n")
-    result = tool.regex_replace("summary.md", r"\d+", "12")
-    assert result == "Updated summary.md with 1 regex replacement(s)."
-    assert tool.read("summary.md") == "Width: 12 mm\n"
+    result = tool.write_file("summary.md", "Width: 10 mm\n")
+    assert "Wrote summary.md" in result
+    assert tool.read_file("summary.md") == "Width: 10 mm\n"
 
 
-def test_file_read_range_returns_digest_for_guarded_edit(tmp_path: Path):
+def test_write_file_requires_digest_when_file_exists(tmp_path: Path):
     tool = FileTool(tmp_path)
-    tool.write("summary.md", "one\ntwo\nthree\n")
+    tool.write_file("summary.md", "Width: 10 mm\n")
 
-    payload = json.loads(tool.read("summary.md", offset=2, limit=1))
+    with pytest.raises(ValueError, match="call read_file"):
+        tool.write_file("summary.md", "Width: 12 mm\n")
+
+
+def test_write_file_stale_digest_leaves_content_unchanged(tmp_path: Path):
+    tool = FileTool(tmp_path)
+    tool.write_file("summary.md", "Width: 10 mm\n")
+    digest = json.loads(tool.read_file("summary.md", offset=1, limit=1))["sha256"]
+    tool.write_file("summary.md", "Width: 11 mm\n", expected_sha256=digest)
+
+    with pytest.raises(ValueError, match="changed since it was read"):
+        tool.write_file("summary.md", "Width: 12 mm\n", expected_sha256=digest)
+
+    assert tool.read_file("summary.md") == "Width: 11 mm\n"
+
+
+def test_read_file_range_returns_digest_for_guarded_edit(tmp_path: Path):
+    tool = FileTool(tmp_path)
+    tool.write_file("summary.md", "one\ntwo\nthree\n")
+
+    payload = json.loads(tool.read_file("summary.md", offset=2, limit=1))
 
     assert payload["content"] == "two\n"
     assert payload["offset"] == 2
     assert payload["next_offset"] == 3
     with pytest.raises(ValueError, match="changed since it was read"):
-        tool.write("summary.md", "updated\n", expected_sha256="0" * 64)
+        tool.write_file("summary.md", "updated\n", expected_sha256="0" * 64)
 
 
-def test_file_replace_can_reject_an_ambiguous_target(tmp_path: Path):
+def test_read_file_range_digest_can_guard_an_edit(tmp_path: Path):
     tool = FileTool(tmp_path)
-    tool.write("summary.md", "same\nsame\n")
+    tool.write_file("summary.md", "one\ntwo\n")
 
-    with pytest.raises(ValueError, match="Expected 1 match"):
-        tool.replace("summary.md", "same", "new", expected_matches=1)
+    payload = json.loads(tool.read_file("summary.md", offset=1, limit=2))
+    tool.edit_file("summary.md", "two", "updated", payload["sha256"])
 
-    assert tool.read("summary.md") == "same\nsame\n"
+    assert tool.read_file("summary.md") == "one\nupdated\n"
 
 
-def test_file_tool_regex_replace_rejects_pathological_pattern(tmp_path: Path):
-    """ReDoS-prone patterns must be killed by the safety timeout."""
+def test_edit_file_rejects_ambiguous_target(tmp_path: Path):
     tool = FileTool(tmp_path)
-    tool.write("summary.md", "a" * 30)
-    with pytest.raises(RuntimeError, match="safety timeout"):
-        tool.regex_replace("summary.md", "(a+)+b", "X")
+    tool.write_file("summary.md", "same\nsame\n")
+    digest = hashlib.sha256((tool.read_file("summary.md")).encode("utf-8")).hexdigest()
+
+    with pytest.raises(ValueError, match="found 2"):
+        tool.edit_file("summary.md", "same", "new", digest)
+
+    assert tool.read_file("summary.md") == "same\nsame\n"
+
+
+def test_edit_file_rejects_missing_target(tmp_path: Path):
+    tool = FileTool(tmp_path)
+    tool.write_file("summary.md", "anchor here\n")
+    digest = hashlib.sha256((tool.read_file("summary.md")).encode("utf-8")).hexdigest()
+
+    with pytest.raises(ValueError, match="one exact match"):
+        tool.edit_file("summary.md", "nonexistent", "replacement", digest)
+
+    assert tool.read_file("summary.md") == "anchor here\n"
+
+
+def test_edit_file_rejects_missing_file(tmp_path: Path):
+    tool = FileTool(tmp_path)
+
+    with pytest.raises(ValueError, match="use write_file"):
+        tool.edit_file("summary.md", "anything", "replacement", "0" * 64)
+
+
+def test_edit_file_rejects_stale_digest(tmp_path: Path):
+    tool = FileTool(tmp_path)
+    tool.write_file("summary.md", "alpha\n")
+    digest = hashlib.sha256((tool.read_file("summary.md")).encode("utf-8")).hexdigest()
+    tool.write_file("summary.md", "beta\n", expected_sha256=digest)
+
+    with pytest.raises(ValueError, match="changed since it was read"):
+        tool.edit_file("summary.md", "beta", "gamma", "0" * 64)
+
+    assert tool.read_file("summary.md") == "beta\n"
+
+
+def test_edit_file_requires_non_empty_old_string(tmp_path: Path):
+    tool = FileTool(tmp_path)
+    tool.write_file("summary.md", "alpha\n")
+    digest = hashlib.sha256((tool.read_file("summary.md")).encode("utf-8")).hexdigest()
+
+    with pytest.raises(ValueError, match="old_string must not be empty"):
+        tool.edit_file("summary.md", "", "new", digest)
+
+
+def test_edit_file_requires_digest(tmp_path: Path):
+    tool = FileTool(tmp_path)
+    tool.write_file("summary.md", "alpha\n")
+
+    with pytest.raises(ValueError, match="expected_sha256 is required"):
+        tool.edit_file("summary.md", "alpha", "new", None)  # type: ignore[arg-type]
+
+
+def test_edit_file_reports_replaced_line_range(tmp_path: Path):
+    tool = FileTool(tmp_path)
+    tool.write_file("summary.md", "alpha\nbeta\ngamma\n")
+    digest = hashlib.sha256((tool.read_file("summary.md")).encode("utf-8")).hexdigest()
+
+    result = tool.edit_file("summary.md", "beta\n", "B\n", digest)
+
+    assert "replaced lines 2-2 with lines 2-2" in result
+    assert tool.read_file("summary.md") == "alpha\nB\ngamma\n"
 
 
 @pytest.mark.parametrize("keyword", ["center", "start_angle", "end_angle"])
@@ -182,7 +262,7 @@ def test_model_preflight_rejects_ellipse_arc_keywords(tmp_path: Path, keyword: s
     )
 
     with pytest.raises(ValueError, match="use EllipticalCenterArc"):
-        FileTool(tmp_path).write("model.py", code)
+        FileTool(tmp_path).write_file("model.py", code)
 
     assert not (tmp_path / "model.py").exists()
 
@@ -199,7 +279,7 @@ with BuildLine():
 """
 
     with pytest.raises(ValueError, match=r"minimum radius is 13\.416"):
-        FileTool(tmp_path).write("model.py", code)
+        FileTool(tmp_path).write_file("model.py", code)
 
 
 def test_model_preflight_warns_on_fixed_selector_index_after_fillet(tmp_path: Path):
@@ -212,7 +292,7 @@ with BuildPart() as model:
 result = model.part
 """
 
-    result = FileTool(tmp_path).write("model.py", code)
+    result = FileTool(tmp_path).write_file("model.py", code)
 
     assert "PRE-FLIGHT WARNING" in result
     assert "fixed selector index used after a topology-changing operation" in result
@@ -225,7 +305,7 @@ with BuildLine():
     EllipticalCenterArc((0, 8), 30, 22, start_angle=0, end_angle=90)
 """
 
-    result = FileTool(tmp_path).write("model.py", code)
+    result = FileTool(tmp_path).write_file("model.py", code)
 
     assert result.startswith("Wrote model.py")
     assert "WARNING" not in result
@@ -449,9 +529,9 @@ def test_cad_build_and_verify_summary_handles_missing_metrics(tmp_path: Path, mo
 # --------------------------------------------------------------------------- #
 
 
-def test_file_write_creates_revision_after_preflight(tmp_path: Path):
+def test_write_file_creates_revision_after_preflight(tmp_path: Path):
     tool = FileTool(tmp_path)
-    result = tool.write(
+    result = tool.write_file(
         "model.py", "from build123d import Box\nresult = Box(10, 20, 30)\n"
     )
 
@@ -464,41 +544,30 @@ def test_file_write_creates_revision_after_preflight(tmp_path: Path):
     )
 
 
-def test_file_replace_creates_revision(tmp_path: Path):
+def test_edit_file_creates_revision(tmp_path: Path):
     tool = FileTool(tmp_path)
-    tool.write("model.py", "from build123d import Box\nresult = Box(10, 20, 30)\n")
+    tool.write_file("model.py", "from build123d import Box\nresult = Box(10, 20, 30)\n")
     store = RevisionStore(tmp_path)
     first_head = store.head().id
+    digest = hashlib.sha256((tmp_path / "model.py").read_bytes()).hexdigest()
 
-    tool.replace("model.py", "Box(10, 20, 30)", "Box(40, 20, 30)")
+    tool.edit_file("model.py", "Box(10, 20, 30)", "Box(40, 20, 30)", digest)
 
     second_head = store.head()
     assert second_head.id != first_head
     assert second_head.parent_id == first_head
-    assert second_head.origin.operation == "replace"
+    assert second_head.origin.operation == "edit_file"
 
 
-def test_file_regex_replace_creates_revision(tmp_path: Path):
+def test_missing_edit_target_creates_no_revision(tmp_path: Path):
     tool = FileTool(tmp_path)
-    tool.write("model.py", "WIDTH = 10\nresult = WIDTH\n")
-    store = RevisionStore(tmp_path)
-    first_head = store.head().id
-
-    tool.regex_replace("model.py", r"\d+", "20")
-
-    second_head = store.head()
-    assert second_head.id != first_head
-    assert second_head.origin.operation == "regex_replace"
-
-
-def test_file_missing_replace_target_creates_no_revision(tmp_path: Path):
-    tool = FileTool(tmp_path)
-    tool.write("model.py", "result = 1\n")
+    tool.write_file("model.py", "result = 1\n")
     store = RevisionStore(tmp_path)
     head_id = store.head().id
+    digest = hashlib.sha256((tmp_path / "model.py").read_bytes()).hexdigest()
 
-    with pytest.raises(ValueError, match="not found"):
-        tool.replace("model.py", "nonexistent", "whatever")
+    with pytest.raises(ValueError, match="one exact match"):
+        tool.edit_file("model.py", "nonexistent", "whatever", digest)
 
     # No new revision.
     assert store.head().id == head_id
@@ -506,12 +575,13 @@ def test_file_missing_replace_target_creates_no_revision(tmp_path: Path):
 
 def test_file_preflight_failure_creates_no_revision(tmp_path: Path):
     tool = FileTool(tmp_path)
-    tool.write("model.py", "result = 1\n")
+    tool.write_file("model.py", "result = 1\n")
     store = RevisionStore(tmp_path)
     head_id = store.head().id
+    digest = hashlib.sha256((tmp_path / "model.py").read_bytes()).hexdigest()
 
     with pytest.raises(ValueError, match="Unsafe import blocked"):
-        tool.write("model.py", "import subprocess\n")
+        tool.write_file("model.py", "import subprocess\n", expected_sha256=digest)
 
     # No new revision, model.py unchanged.
     assert store.head().id == head_id
@@ -520,12 +590,13 @@ def test_file_preflight_failure_creates_no_revision(tmp_path: Path):
 
 def test_file_noop_write_creates_no_new_revision(tmp_path: Path):
     tool = FileTool(tmp_path)
-    tool.write("model.py", "result = 1\n")
+    tool.write_file("model.py", "result = 1\n")
     store = RevisionStore(tmp_path)
     head_id = store.head().id
+    digest = hashlib.sha256((tmp_path / "model.py").read_bytes()).hexdigest()
 
-    # Write the same content again.
-    tool.write("model.py", "result = 1\n")
+    # Write the same content again with a matching digest.
+    tool.write_file("model.py", "result = 1\n", expected_sha256=digest)
 
     # Same revision (deduplicated).
     assert store.head().id == head_id
@@ -533,7 +604,7 @@ def test_file_noop_write_creates_no_new_revision(tmp_path: Path):
 
 def test_file_tool_result_includes_revision_id_without_paths(tmp_path: Path):
     tool = FileTool(tmp_path)
-    result = tool.write("model.py", "result = 1\n")
+    result = tool.write_file("model.py", "result = 1\n")
 
     assert "revision" in result
     # No internal filesystem paths exposed.
@@ -543,24 +614,24 @@ def test_file_tool_result_includes_revision_id_without_paths(tmp_path: Path):
 
 def test_file_tool_with_call_id_stores_origin(tmp_path: Path):
     tool = FileTool(tmp_path, tool_call_id="call_abc")
-    tool.write("model.py", "result = 1\n")
+    tool.write_file("model.py", "result = 1\n")
 
     store = RevisionStore(tmp_path)
     head = store.head()
     assert head.origin.tool_call_id == "call_abc"
-    assert head.origin.operation == "write"
+    assert head.origin.operation == "write_file"
 
 
 def test_file_tool_direct_construction_without_revisions_works(tmp_path: Path):
     """Existing direct FileTool(tmp_path) test construction remains supported."""
     tool = FileTool(tmp_path)
-    result = tool.write("summary.md", "# Test\n")
+    result = tool.write_file("summary.md", "# Test\n")
     assert result == "Wrote summary.md (7 characters)."
 
 
 def test_file_summary_write_does_not_create_revision(tmp_path: Path):
     tool = FileTool(tmp_path)
-    tool.write("summary.md", "# Test\n")
+    tool.write_file("summary.md", "# Test\n")
 
     store = RevisionStore(tmp_path)
     assert store.head() is None  # No model.py revision created.

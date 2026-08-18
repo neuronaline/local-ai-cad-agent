@@ -5,10 +5,6 @@ import hashlib
 import json
 import math
 import operator
-import os
-import signal
-import subprocess
-import sys
 import threading
 from pathlib import Path
 
@@ -270,7 +266,7 @@ class FileTool:
             raise ValueError(preflight.blocked_errors[0])
         return preflight.warnings
 
-    def read(
+    def read_file(
         self,
         filename: str,
         offset: int = 1,
@@ -332,7 +328,7 @@ class FileTool:
                 f"{filename} changed since it was read; refresh the file before editing."
             )
 
-    def write(
+    def write_file(
         self,
         filename: str,
         content: str,
@@ -341,9 +337,14 @@ class FileTool:
         path = self._path(filename)
         with _file_lock(path):
             current = path.read_text(encoding="utf-8") if path.exists() else ""
+            if path.exists() and expected_sha256 is None:
+                raise ValueError(
+                    f"{filename} already exists; call read_file and provide "
+                    "expected_sha256 before overwriting it."
+                )
             self._validate_expected_sha(filename, current, expected_sha256)
             if filename == "model.py":
-                return self._write_model(content, "write")
+                return self._write_model(content, "write_file")
             atomic_write_text(path, content)
         return f"Wrote {filename} ({len(content)} characters)."
 
@@ -365,177 +366,45 @@ class FileTool:
             result += "\nPRE-FLIGHT WARNING: " + " | ".join(warnings)
         return result
 
-    def replace(
+    def edit_file(
         self,
         filename: str,
-        old: str,
-        new: str,
-        expected_sha256: str | None = None,
-        expected_matches: int | None = None,
+        old_string: str,
+        new_string: str,
+        expected_sha256: str,
     ) -> str:
-        if not old:
-            raise ValueError("The text to replace must not be empty.")
+        if not old_string:
+            raise ValueError("old_string must not be empty.")
+        if expected_sha256 is None:
+            raise ValueError(
+                "expected_sha256 is required; call read_file before editing."
+            )
         path = self._path(filename)
         with _file_lock(path):
-            current = path.read_text(encoding="utf-8") if path.exists() else ""
-            self._validate_expected_sha(filename, current, expected_sha256)
-            matches = current.count(old)
-            if matches == 0:
-                raise ValueError("The requested text was not found; file was not changed.")
-            if expected_matches is not None and matches != expected_matches:
+            if not path.exists():
                 raise ValueError(
-                    f"Expected {expected_matches} match(es), found {matches}; file was not changed."
+                    f"{filename} does not exist; use write_file to create it."
                 )
-            updated = current.replace(old, new, 1)
-            if filename == "model.py":
-                return self._write_model(updated, "replace")
-            atomic_write_text(path, updated)
-        return f"Wrote {filename} ({len(updated)} characters)."
-
-    def execute(self, args: dict) -> tuple[str, bool]:
-        """Dispatch file operations by name. Returns (result_json, waiting=False)."""
-        operation = args["operation"]
-        filename = args["filename"]
-        if operation == "read":
-            result = self.read(
-                filename,
-                args.get("offset", 1),
-                args.get("limit"),
-                args.get("known_sha256"),
-            )
-        elif operation == "write":
-            result = self.write(
-                filename, args.get("content", ""), args.get("expected_sha256")
-            )
-        elif operation == "replace":
-            result = self.replace(
-                filename,
-                args.get("old", ""),
-                args.get("new", ""),
-                args.get("expected_sha256"),
-                args.get("expected_matches"),
-            )
-        elif operation == "regex_replace":
-            result = self.regex_replace(
-                filename,
-                args.get("pattern", ""),
-                args.get("replacement", ""),
-                args.get("count", 1),
-                args.get("expected_sha256"),
-            )
-        else:
-            raise ValueError("Unsupported file operation.")
-        return json.dumps(result) if not isinstance(result, str) else result, False
-
-    def regex_replace(
-        self,
-        filename: str,
-        pattern: str,
-        replacement: str,
-        count: int = 1,
-        expected_sha256: str | None = None,
-    ) -> str:
-        if not pattern:
-            raise ValueError("Regex pattern must not be empty.")
-        # The length cap bounds catastrophic-backtracking risk: Python's re
-        # engine has no timeout, so a short pattern is the safe default.
-        if len(pattern) > 500:
-            raise ValueError("Regex pattern is too long (max 500 characters).")
-        if len(replacement) > 10000:
-            raise ValueError("Patch replacement is too large.")
-        if not 1 <= count <= 20:
-            raise ValueError("Regex replacement count must be between 1 and 20.")
-        path = self._path(filename)
-        with _file_lock(path):
-            current = path.read_text(encoding="utf-8") if path.exists() else ""
+            current = path.read_text(encoding="utf-8")
             self._validate_expected_sha(filename, current, expected_sha256)
-            updated, replacements = _safe_subn(
-                pattern, replacement, current, count=count
-            )
-            if replacements == 0:
-                raise ValueError("The regex did not match; file was not changed.")
-            detail = ""
+            matches = current.count(old_string)
+            if matches != 1:
+                raise ValueError(
+                    f"Expected one exact match, found {matches}; file was not changed."
+                )
+            updated = current.replace(old_string, new_string, 1)
+            start_line = current[: current.find(old_string)].count("\n") + 1
+            old_lines = old_string.count("\n") or 1
+            end_line = start_line + old_lines - 1
+            new_lines = new_string.count("\n") or 1
+            new_end_line = start_line + new_lines - 1
             if filename == "model.py":
-                detail = "\n" + self._write_model(updated, "regex_replace")
+                base = self._write_model(updated, "edit_file")
             else:
                 atomic_write_text(path, updated)
-        return f"Updated {filename} with {replacements} regex replacement(s).{detail}"
-
-
-_REGEX_TIMEOUT_SECONDS = 5.0
-# JSON envelope so the worker can return (text, replacements) without pickling.
-# The worker catches all known top-level failure modes (regex errors, broken
-# stdin, JSON decode failures) and emits the same envelope so the parent can
-# produce actionable error messages instead of generic ``unknown error``.
-_REGEX_WORKER_CODE = (
-    "import json, re, sys\n"
-    "try:\n"
-    "    pattern, replacement, text, count = json.load(sys.stdin)\n"
-    "except (json.JSONDecodeError, EOFError, ValueError) as error:\n"
-    '    json.dump({"ok": False, "error": f"payload read failed: {type(error).__name__}: {error}"}, sys.stdout)\n'
-    "    sys.exit(0)\n"
-    "try:\n"
-    "    updated, replacements = re.subn(\n"
-    "        pattern, replacement, text, count=count, flags=re.DOTALL\n"
-    "    )\n"
-    '    json.dump({"ok": True, "updated": updated, "replacements": replacements}, sys.stdout)\n'
-    "except re.error as error:\n"
-    '    json.dump({"ok": False, "error": str(error)}, sys.stdout)\n'
-)
-
-
-def _safe_subn(
-    pattern: str, replacement: str, text: str, *, count: int
-) -> tuple[str, int]:
-    """Apply re.subn with a wall-clock timeout enforced in a subprocess.
-
-    Python's :mod:`re` module has no native timeout, so a pathological pattern
-    (e.g. ``(a+)+b``) supplied by an untrusted caller can wedge the calling
-    thread with catastrophic backtracking. We run the substitution in a
-    short-lived child process and SIGKILL it if it overruns.
-    """
-    payload = json.dumps([pattern, replacement, text, count]).encode("utf-8")
-    with subprocess.Popen(
-        [sys.executable, "-c", _REGEX_WORKER_CODE],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    ) as worker:
-        try:
-            stdout, stderr = worker.communicate(payload, timeout=_REGEX_TIMEOUT_SECONDS)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(worker.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            worker.wait()
-            raise RuntimeError(
-                "Regex substitution exceeded the safety timeout "
-                f"({_REGEX_TIMEOUT_SECONDS:g}s); the pattern is likely "
-                "catastrophically backtracking."
-            ) from None
-    if worker.returncode != 0:
-        raise RuntimeError(
-            f"Regex worker failed: {(stderr or b'').decode('utf-8', errors='replace').strip() or 'unknown error'}"
+                base = f"Wrote {filename} ({len(updated)} characters)."
+        return (
+            f"{base} "
+            f"(replaced lines {start_line}-{end_line} with lines "
+            f"{start_line}-{new_end_line})."
         )
-    try:
-        result = json.loads(stdout.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise RuntimeError(
-            f"Regex worker returned malformed output: {error}"
-        ) from error
-    if not result.get("ok"):
-        raise ValueError(
-            f"Invalid regex pattern: {result.get('error', 'unknown error')}"
-        )
-    # Coerce ``replacements`` defensively: a malformed shape (e.g. string)
-    # must not propagate as ``TypeError`` from ``int(result[...])``; the
-    # worker has already returned an ``ok: true`` envelope so the only
-    # remaining failure mode is upstream tampering or memory corruption.
-    try:
-        return result["updated"], int(result.get("replacements", 0))
-    except (KeyError, TypeError, ValueError) as error:
-        raise RuntimeError(
-            f"Regex worker returned malformed result: {error}"
-        ) from error

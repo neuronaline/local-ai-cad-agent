@@ -64,7 +64,7 @@ def _synchronized(method: Callable[_P, _R]) -> Callable[_P, _R]:
 @dataclass(frozen=True)
 class RevisionOrigin:
     kind: str  # agent_edit, restore, import, recovery
-    operation: str | None = None  # write, replace, regex_replace
+    operation: str | None = None  # write_file, edit_file
     tool_call_id: str | None = None
 
     def to_dict(self) -> dict:

@@ -65,7 +65,7 @@ class BuildClient:
                                 {
                                     "id": "write-1",
                                     "function": {
-                                        "name": "file_write",
+                                        "name": "write_file",
                                         "arguments": (
                                             json.dumps(
                                                 {

@@ -23,12 +23,14 @@ _OPERATIONAL_RULES = """\
   cad_build_and_verify, inspect both metrics and render, then fix or finish.
 - Write model.py with adjustable, typed millimetre parameters near the top,
   descriptive names, and the final shape exposed as top-level `result`.
-- Prefer file_replace or file_regex_replace over file_write for edits — they
-  keep the surrounding scaffold intact, are cheaper to express, and respect
-  the expected_sha256 guard. Reserve file_write for the very first model.py
-  creation or when more than half of an existing file is being rewritten.
-- In a fresh project, create model.py directly with file_write. Do not attempt
+- In a fresh project, create model.py directly with write_file. Do not attempt
   to read, patch, build, render, or review a model before it exists.
+- Before changing an existing file, call read_file with offset and limit and
+  preserve its SHA-256; pass that digest as expected_sha256 to write_file or
+  edit_file. Use edit_file for a small localized change with one exact target
+  block, and
+  write_file only for a deliberate complete rewrite.
+- After a SHA or match error, re-read the file; do not retry the same edit.
 - cad_build_and_verify performs the build, validation, preview, and rendering.
   It does NOT auto-trigger review — that is a deliberate, separate step.
   Call cad_build_and_verify once after each coherent model.py revision; never

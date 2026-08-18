@@ -37,8 +37,11 @@ _TIMEOUT = {
 
 TOOL_SCHEMAS = [
     _tool(
-        "file_read",
-        "Read model.py or summary.md. Use offset and limit for a focused range; the ranged result includes a SHA-256 digest for guarded edits.",
+        "read_file",
+        "Read model.py or summary.md. Mutations of an existing file require a "
+        "fresh SHA-256 from this tool; pass that digest as expected_sha256 to "
+        "write_file or edit_file. To obtain the digest, specify offset and "
+        "limit; the ranged result includes the current SHA-256 digest.",
         {
             "filename": _FILENAME,
             "offset": {
@@ -62,8 +65,11 @@ TOOL_SCHEMAS = [
         ["filename"],
     ),
     _tool(
-        "file_write",
-        "Replace model.py or summary.md with complete new contents. This overwrites the whole file; for an existing file, pass expected_sha256 from a ranged read to prevent overwriting a newer edit.",
+        "write_file",
+        "Create model.py or summary.md, or deliberately replace its entire "
+        "contents. Overwriting an existing file requires expected_sha256 from a "
+        "recent read_file; a stale or missing digest is rejected without changing "
+        "the file or revision history. Use edit_file for small localized changes.",
         {
             "filename": _FILENAME,
             "content": {"type": "string", "description": "Complete file contents."},
@@ -71,71 +77,35 @@ TOOL_SCHEMAS = [
                 "type": "string",
                 "minLength": 64,
                 "maxLength": 64,
-                "description": "Optional SHA-256 from file_read; rejects stale writes.",
+                "description": "Required when the file already exists. Pass the SHA-256 from read_file; a stale digest is rejected.",
             },
         },
         ["filename", "content"],
     ),
     _tool(
-        "file_replace",
-        "Replace only the first exact text match. Optionally require the expected total match count and file SHA-256 to avoid editing an ambiguous or stale target.",
+        "edit_file",
+        "Replace one exact, uniquely matching block in an existing file. First "
+        "call read_file and provide its current SHA-256 as expected_sha256. A "
+        "stale SHA or ambiguous match does not modify the file.",
         {
             "filename": _FILENAME,
-            "old": {
+            "old_string": {
                 "type": "string",
                 "minLength": 1,
-                "description": "Exact text to find.",
+                "description": "Exact text to find, copied verbatim from read_file.",
             },
-            "new": {
+            "new_string": {
                 "type": "string",
-                "description": "Replacement text; may be empty to delete the match.",
+                "description": "Replacement text; may be empty to delete the block.",
             },
             "expected_sha256": {
                 "type": "string",
                 "minLength": 64,
                 "maxLength": 64,
-                "description": "Optional SHA-256 from file_read; rejects stale edits.",
-            },
-            "expected_matches": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 1000,
-                "description": "Optional total occurrences old must have before the first is replaced.",
+                "description": "Current SHA-256 from read_file; rejects stale edits.",
             },
         },
-        ["filename", "old", "new"],
-    ),
-    _tool(
-        "file_regex_replace",
-        "Apply a bounded Python regex replacement with DOTALL enabled. Use explicit anchors and non-greedy matching for multiline edits.",
-        {
-            "filename": _FILENAME,
-            "pattern": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 500,
-                "description": "Python regular expression; DOTALL is enabled.",
-            },
-            "replacement": {
-                "type": "string",
-                "maxLength": 10000,
-                "description": "Python re.sub replacement text.",
-            },
-            "count": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 20,
-                "default": 1,
-                "description": "Maximum replacements; defaults to 1.",
-            },
-            "expected_sha256": {
-                "type": "string",
-                "minLength": 64,
-                "maxLength": 64,
-                "description": "Optional SHA-256 from file_read; rejects stale edits.",
-            },
-        },
-        ["filename", "pattern", "replacement"],
+        ["filename", "old_string", "new_string", "expected_sha256"],
     ),
     _tool(
         "cad_build_and_verify",

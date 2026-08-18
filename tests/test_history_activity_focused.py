@@ -355,8 +355,7 @@ def test_activity_label_strips_underscores_for_known_tools():
 def test_activity_label_groups_share_the_same_wording():
     """The activity panel renders tool families as a single phrase so users
     do not see three different rows when the agent edits the file three ways.
-    Pinned: file_write/file_replace/file_regex_replace all share 'Updating
-    model'.
+    Pinned: write_file/edit_file all share 'Updating model'.
     """
     bindings = (
         _extract_js("activityLabels", kind="object")
@@ -365,14 +364,13 @@ def test_activity_label_groups_share_the_same_wording():
     )
     body = (
         "process.stdout.write(JSON.stringify({\n"
-        "  file_write: activityLabel('file_write'),\n"
-        "  file_replace: activityLabel('file_replace'),\n"
-        "  file_regex_replace: activityLabel('file_regex_replace'),\n"
+        "  write_file: activityLabel('write_file'),\n"
+        "  edit_file: activityLabel('edit_file'),\n"
         "}));\n"
     )
     out = json.loads(_eval_helper(bindings, body))
 
-    assert out["file_write"] == out["file_replace"] == out["file_regex_replace"]
+    assert out["write_file"] == out["edit_file"]
 
 
 @pytest.mark.parametrize(
@@ -410,11 +408,11 @@ def test_activity_label_fallback_sanitizes_unknown_inputs(js_input, expected):
 def test_activity_detail_hides_model_facing_json_envelopes():
     bindings = _extract_js("activityDetail")
     body = """
-const success = JSON.stringify({ok: true, tool: 'file_write', data: 'Wrote model.py.'});
+const success = JSON.stringify({ok: true, tool: 'write_file', data: 'Wrote model.py.'});
 const failure = JSON.stringify({ok: false, tool: 'cad_build_and_verify', error: {message: 'Bad edge.'}});
 const build = JSON.stringify({ok: true, tool: 'cad_build_and_verify', data: {metrics: {solid_count: 1}}});
 process.stdout.write(JSON.stringify({
-  success: activityDetail('file_write', 'completed', success),
+  success: activityDetail('write_file', 'completed', success),
   failure: activityDetail('cad_build_and_verify', 'error', failure),
   build: activityDetail('cad_build_and_verify', 'completed', build),
 }));
@@ -603,10 +601,10 @@ def test_mark_activity_recovered_leaves_error_rows_visible():
         "activityItems.set('ok-1', {callId: 'ok-1', tool: 'cad_build_and_verify', status: 'running'});\n"
         "makeRow('ok-1', 'running');\n"
         # Error row must stay error and stay visible.
-        "activityItems.set('err-1', {callId: 'err-1', tool: 'file_write', status: 'error'});\n"
+        "activityItems.set('err-1', {callId: 'err-1', tool: 'write_file', status: 'error'});\n"
         "makeRow('err-1', 'error');\n"
         # Already-failed row at error status must also remain untouched.
-        "activityItems.set('err-2', {callId: 'err-2', tool: 'file_write', status: 'error'});\n"
+        "activityItems.set('err-2', {callId: 'err-2', tool: 'write_file', status: 'error'});\n"
         "makeRow('err-2', 'error');\n"
         "markActivityRecovered();\n"
         "process.stdout.write(JSON.stringify({\n"

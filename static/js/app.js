@@ -118,10 +118,9 @@ function addMessage(text, type = 'agent', options = {}) {
 const activityLabels = {
   // Tool schema names published by the backend (agent/tools/tool_schemas.py).
   cad_build_and_verify: 'Building model',
-  file_write: 'Updating model',
-  file_replace: 'Updating model',
-  file_regex_replace: 'Updating model',
-  file_read: 'Reading model',
+  write_file: 'Updating model',
+  edit_file: 'Updating model',
+  read_file: 'Reading model',
   question: 'Requesting input',
   // Phase labels surfaced via ``tool_status`` from the new split tools. The
   // agent no longer auto-reviews; both steps are opt-in, so we give each one

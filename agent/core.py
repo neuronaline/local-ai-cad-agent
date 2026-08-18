@@ -582,8 +582,8 @@ class AgentRunner:
         else:
             content = (
                 "<project_state>\n"
-                "model.py does not exist. Create it directly with file_write; do not "
-                "call file_read, file_replace, file_regex_replace, cad_build_and_verify, "
+                "model.py does not exist. Create it directly with write_file; do not "
+                "call read_file, edit_file, cad_build_and_verify, "
                 "cad_screenshot, or cad_review first.\n"
                 "</project_state>"
             )
@@ -709,37 +709,35 @@ class AgentRunner:
         if name == "cad_review":
             tool = tools.review.with_call_id(call_id) if call_id else tools.review
             return tool.execute(args), False
-        if name.startswith("file_"):
+        if name == "read_file":
             tool = tools.file.with_call_id(call_id) if call_id else tools.file
-            operation = name.removeprefix("file_")
-            if operation == "read":
-                return tool.read(
+            return (
+                tool.read_file(
                     args["filename"],
                     args.get("offset", 1),
                     args.get("limit"),
                     args.get("known_sha256"),
-                ), False
-            if operation == "write":
-                return tool.write(
-                    args["filename"],
-                    args["content"],
-                    args.get("expected_sha256"),
-                ), False
-            if operation == "replace":
-                return tool.replace(
-                    args["filename"],
-                    args["old"],
-                    args["new"],
-                    args.get("expected_sha256"),
-                    args.get("expected_matches"),
-                ), False
+                ),
+                False,
+            )
+        if name == "write_file":
+            tool = tools.file.with_call_id(call_id) if call_id else tools.file
             return (
-                tool.regex_replace(
+                tool.write_file(
                     args["filename"],
-                    args["pattern"],
-                    args["replacement"],
-                    args.get("count", 1),
+                    args.get("content", ""),
                     args.get("expected_sha256"),
+                ),
+                False,
+            )
+        if name == "edit_file":
+            tool = tools.file.with_call_id(call_id) if call_id else tools.file
+            return (
+                tool.edit_file(
+                    args["filename"],
+                    args["old_string"],
+                    args.get("new_string", ""),
+                    args["expected_sha256"],
                 ),
                 False,
             )
@@ -797,7 +795,7 @@ class AgentRunner:
     @staticmethod
     def _is_model_mutation(name: str, arguments: dict) -> bool:
         return (
-            name in {"file_write", "file_replace", "file_regex_replace"}
+            name in {"write_file", "edit_file"}
             and arguments.get("filename") == "model.py"
         )
 
