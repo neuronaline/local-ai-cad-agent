@@ -7,5 +7,8 @@ target-version = "py310"
 [tool.ruff.lint.per-file-ignores]
 "agent/tools/cad_scripts/runner.py" = ["F401", "S102"]
 "agent/tools/cad_scripts/renderer.py" = ["F821"]
+"agent/tools/cad_scripts/screenshot.py" = ["F401", "F821", "E402", "S102"]
+"agent/tools/cad_review_tool.py" = ["TRY004"]
+"agent/tools/cad_screenshot_tool.py" = ["TRY004"]
 "agent/tools/experience_tool.py" = ["TRY004"]
 "agent/tools/question_tool.py" = ["TRY004"]

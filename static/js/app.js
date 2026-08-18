@@ -130,6 +130,14 @@ const activityLabels = {
   experience_add: 'Saving solution',
   experience_update: 'Updating past solutions',
   question: 'Requesting input',
+  // Phase labels surfaced via ``tool_status`` from the new split tools. The
+  // agent no longer auto-reviews; both steps are opt-in, so we give each one
+  // a distinct label that matches what the backend publishes.
+  cad_screenshot: 'Re-rasterising views',
+  cad_review: 'Reviewing build',
+  rendering_subset: 'Re-rasterising subset',
+  screenshot_auto: 'Rendering views for review',
+  reviewing: 'Reviewing',
   // Status / pseudo-tool labels (kept for SSE events and info rows).
   agent: 'Agent',
   usage: 'Usage',
@@ -142,6 +150,13 @@ const activityLabels = {
   completed: 'Completed',
   error: 'Error',
   stopped: 'Stopped',
+  // Review verdicts surfaced by ``review_updated``. ``activityLabel`` falls
+  // back to a generic sanitised string, but listing them explicitly keeps the
+  // pill readable (``Pass`` / ``Fail`` / ``Inconclusive``).
+  pass: 'Pass',
+  fail: 'Fail',
+  inconclusive: 'Inconclusive',
+  limit_reached: 'Limit reached',
 };
 
 function activityLabel(value) {
@@ -187,7 +202,7 @@ function updateActivitySummary() {
     activityPanel.hidden = true;
     return;
   }
-  const running = items.filter(item => ['preparing', 'running', 'started', 'reviewing', 'rendering_views'].includes(item.status));
+  const running = items.filter(item => ['preparing', 'running', 'started', 'reviewing', 'rendering_views', 'rendering_subset', 'screenshot_auto'].includes(item.status));
   const failed = items.filter(item => item.status === 'error');
   const current = running.at(-1);
   activityTitle.textContent = current
@@ -204,7 +219,7 @@ function markActivityRecovered() {
   // hide failed rows — the failure was real and the user needs to see it.
   for (const item of activityItems.values()) {
     const row = activityList.querySelector(`[data-call-id="${CSS.escape(item.callId)}"]`);
-    if (['preparing', 'running', 'started', 'reviewing', 'rendering', 'rendering_views'].includes(item.status)) {
+    if (['preparing', 'running', 'started', 'reviewing', 'rendering', 'rendering_views', 'rendering_subset', 'screenshot_auto'].includes(item.status)) {
       item.status = 'completed';
       if (row) {
         row.dataset.status = 'completed';
@@ -1078,6 +1093,27 @@ function connectStream() {
     revision_updated: data => {
       if (data.project !== currentProject) return;
       syncCurrentPreview();
+    },
+    // Phase-complete events from the split cad_screenshot / cad_review tools.
+    // The intermediate ``tool_status`` events already drive the running rows;
+    // these terminal events refresh the activity pill with the final verdict
+    // (e.g. ``cad_review`` → "Reviewing build · Pass") and re-sync the preview
+    // when the screenshot tool produced a new artifact cache tier.
+    screenshot_updated: data => {
+      if (data.project !== currentProject) return;
+      if (data.cache_hit) {
+        activityTitle.textContent = 'Re-rasterising views · Cache hit';
+        activityPanel.hidden = false;
+      }
+    },
+    review_updated: data => {
+      if (data.project !== currentProject) return;
+      const verdict = activityLabel(data.status || 'inconclusive');
+      const summary = typeof data.summary === 'string' && data.summary.trim()
+        ? ` — ${data.summary.trim().slice(0, 160)}`
+        : '';
+      activityTitle.textContent = `Reviewing build · ${verdict}${summary}`;
+      activityPanel.hidden = false;
     },
   };
   for (const [eventName, handler] of Object.entries(handlers)) {

@@ -22,9 +22,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from collections.abc import Iterable
 from typing import Any
 
 from agent.images import as_chat_image
@@ -130,6 +130,7 @@ class Finding:
     message: str
     view: str | None = None
     repair_hint: str | None = None
+    source: str = "visual"  # "deterministic" or "visual"
 
     def as_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -141,6 +142,8 @@ class Finding:
             payload["view"] = self.view
         if self.repair_hint:
             payload["repair_hint"] = self.repair_hint
+        if self.source:
+            payload["source"] = self.source
         return payload
 
 
@@ -193,9 +196,7 @@ def _coerce_finding(raw: Any, view_ids: Iterable[str]) -> Finding | None:
     if not isinstance(message, str) or not message.strip():
         return None
     view_id = raw.get("view")
-    if not isinstance(view_id, str):
-        view_id = None
-    elif view_id and view_id not in view_ids:
+    if not isinstance(view_id, str) or view_id and view_id not in view_ids:
         view_id = None
     hint = raw.get("repair_hint")
     return Finding(
@@ -204,6 +205,7 @@ def _coerce_finding(raw: Any, view_ids: Iterable[str]) -> Finding | None:
         message=_truncate(message, MAX_MESSAGE_CHARS),
         view=view_id,
         repair_hint=_truncate(hint, MAX_HINT_CHARS) if isinstance(hint, str) else None,
+        source="visual",  # findings produced by the LLM reviewer are always "visual"
     )
 
 
@@ -249,8 +251,14 @@ def parse_review_response(
             coerced = _coerce_finding(entry, view_ids)
             if coerced is not None:
                 findings.append(coerced)
-    # ``pass`` with any blocking finding is incoherent: reclassify.
-    if status == "pass" and any(f.severity == "blocking" for f in findings):
+    # Behavior is always strict: a blocking or major finding reclassifies a
+    # model-reported pass to fail. ``parse_review_response`` only sees the
+    # visual layer's tool call; the deterministic layer adds findings with
+    # ``source="deterministic"`` directly. ``ReviewResult.status`` is the
+    # final verdict assembled by ``review_cad`` once both layers have run.
+    if status == "pass" and any(
+        f.severity in {"blocking", "major"} for f in findings
+    ):
         status = "fail"
         if not summary or summary == "All checks passed.":
             summary = "Blocking finding reported."
@@ -421,6 +429,332 @@ def run_review(
         model_sha256=model_sha,
         preview_sha256=preview_sha,
         allowed_view_ids=view_ids,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Deterministic layer (Python-only checks; no LLM, no network).
+# ---------------------------------------------------------------------------
+
+
+def _deterministic_review(
+    *,
+    metrics: dict[str, Any] | None,
+    feature_summary: dict[str, Any] | None,
+    validation_results: list[dict[str, Any]] | None = None,
+) -> list[Finding]:
+    """Run the deterministic verification suite and return bounded findings.
+
+    These checks always run — they are cheap, parallel-safe, and source
+    the canvas the visual layer later confirms. The findings carry
+    ``source="deterministic"`` so the agent can tell where a result came
+    from when assembling the final verdict.
+    """
+    findings: list[Finding] = []
+    metrics = metrics if isinstance(metrics, dict) else {}
+    feature_summary = feature_summary if isinstance(feature_summary, dict) else {}
+
+    # Geometry sanity — mirror ``cad_tool._enforce_basic_geometry`` so a
+    # deterministic finding fires before the LLM sees the image.
+    try:
+        solid_count = int(metrics.get("solid_count", 0) or 0)
+        is_valid = bool(metrics.get("is_valid"))
+        dimensions = metrics.get("dimensions_mm") or {}
+        volume = float(metrics.get("volume_mm3", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        solid_count = 0
+        is_valid = False
+        dimensions = {}
+        volume = 0.0
+        findings.append(
+            Finding(
+                severity="major",
+                category="dimensions",
+                message="CAD geometry metrics are malformed.",
+                source="deterministic",
+            )
+        )
+    if solid_count < 1:
+        findings.append(
+            Finding(
+                severity="blocking",
+                category="geometry",
+                message="Build did not produce any solids.",
+                source="deterministic",
+            )
+        )
+    if not is_valid:
+        findings.append(
+            Finding(
+                severity="blocking",
+                category="geometry",
+                message="CAD geometry is reported as invalid by the runner.",
+                source="deterministic",
+            )
+        )
+    for axis in ("x", "y", "z"):
+        try:
+            value = float(dimensions.get(axis, 0.0))
+        except (TypeError, ValueError):
+            value = 0.0
+        if value <= 0:
+            findings.append(
+                Finding(
+                    severity="major",
+                    category="dimensions",
+                    message=f"CAD dimension {axis} is non-positive ({value} mm).",
+                    source="deterministic",
+                )
+            )
+    if volume <= 0:
+        findings.append(
+            Finding(
+                severity="major",
+                category="geometry",
+                message="CAD volume is non-positive.",
+                source="deterministic",
+            )
+        )
+
+    # Spec verifiers — propagate the structured ``.cad_validation.json`` so
+    # any spec-driven requirement failures become findings.
+    for entry in validation_results or []:
+        if not isinstance(entry, dict):
+            continue
+        status = str(entry.get("status") or "").strip().lower()
+        severity = entry.get("severity")
+        if status == "pass":
+            continue
+        if severity not in {"blocking", "major", "minor"}:
+            severity = "major" if status == "fail" else "minor"
+        requirement_id = str(entry.get("requirement_id") or "") or "spec"
+        verifier = str(entry.get("verifier") or "spec")
+        message = str(entry.get("message") or f"{verifier} reported {status}.")
+        findings.append(
+            Finding(
+                severity=severity,
+                category="manufacturability"
+                if verifier.startswith("manufactur")
+                else "dimensions",
+                message=f"[{requirement_id}] {message}"[:MAX_MESSAGE_CHARS],
+                source="deterministic",
+            )
+        )
+
+    return findings
+
+
+def _visual_review(
+    *,
+    settings: Any,
+    request_text: str,
+    model_source: str,
+    metrics: dict[str, Any],
+    feature_summary: dict[str, Any],
+    review_manifest: dict[str, Any],
+    sheet_path: Path,
+    single_render_path: Path,
+    stop_event: Any = None,
+    stop_instruction: str | None = None,
+    create_client: Any = None,
+) -> ReviewResult:
+    """Visual-only layer (unchanged legacy ``run_review`` body, renamed).
+
+    Kept separate so ``review_cad`` can call it conditionally (after the
+    deterministic layer) and ``run_review``/tests can still invoke just
+    the visual path. Returns a ``ReviewResult`` whose findings carry
+    ``source="visual"`` so callers can tell which layer produced them.
+
+    ``settings`` may be ``None`` when the orchestrator only wants the
+    deterministic layer (e.g. tests) — in that case the visual layer is
+    skipped and the caller falls back to its own verdict logic.
+    """
+    model_sha = str(review_manifest.get("model_sha256") or "")
+    preview_sha = str(review_manifest.get("preview_sha256") or "")
+    views = review_manifest.get("views") if isinstance(review_manifest, dict) else None
+    view_ids: list[str] = []
+    if isinstance(views, list):
+        for entry in views:
+            if isinstance(entry, dict) and isinstance(entry.get("view_id"), str):
+                view_ids.append(entry["view_id"])
+    sheet_error = _verify_image_artifact(
+        sheet_path, review_manifest.get("contact_sheet"), "contact sheet"
+    )
+    if sheet_error:
+        return _inconclusive(sheet_error, model_sha, preview_sha)
+    render_error = _verify_image_artifact(
+        single_render_path, review_manifest.get("single_render"), "single render"
+    )
+    if render_error:
+        return _inconclusive(render_error, model_sha, preview_sha)
+    if not view_ids:
+        return _inconclusive(
+            "Review manifest has no rendered views.", model_sha, preview_sha
+        )
+    if settings is None:
+        return _inconclusive(
+            "Review skipped: no LLM settings were provided.", model_sha, preview_sha
+        )
+    factory = create_client or _default_create_client
+    client = factory(settings)
+    if stop_event is not None:
+        client.stop_event = stop_event
+    client.require_images = True
+    prompt = _build_prompt(
+        request_text=request_text,
+        model_source=model_source,
+        metrics=metrics,
+        feature_summary=feature_summary,
+        review_manifest=review_manifest,
+        stop_instruction=stop_instruction,
+    )
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {
+                    "type": "text",
+                    "text": "Visual evidence 1 of 2: single isometric render.",
+                },
+                as_chat_image(single_render_path),
+                {
+                    "type": "text",
+                    "text": "Visual evidence 2 of 2: multi-view contact sheet.",
+                },
+                as_chat_image(sheet_path),
+            ],
+        }
+    ]
+    try:
+        response = client.chat(messages, [REVIEW_TOOL_SCHEMA])
+    except Exception as error:  # noqa: BLE001 - surface as inconclusive review
+        return _inconclusive(
+            f"Review model call failed: {type(error).__name__}.",
+            model_sha,
+            preview_sha,
+        )
+    arguments = _extract_tool_call(response)
+    if arguments is None:
+        return _inconclusive(
+            "Review model did not call submit_review.", model_sha, preview_sha
+        )
+    return parse_review_response(
+        arguments,
+        model_sha256=model_sha,
+        preview_sha256=preview_sha,
+        allowed_view_ids=view_ids,
+    )
+
+
+def review_cad(
+    *,
+    settings: Any,
+    request_text: str,
+    model_source: str,
+    metrics: dict[str, Any],
+    feature_summary: dict[str, Any],
+    review_manifest: dict[str, Any] | None,
+    sheet_path: Path | None,
+    single_render_path: Path | None,
+    validation_results: list[dict[str, Any]] | None = None,
+    stop_event: Any = None,
+    stop_instruction: str | None = None,
+    create_client: Any = None,
+) -> ReviewResult:
+    """Compose deterministic + visual findings into the final verdict.
+
+    Deterministic checks always run. The visual layer is skipped only when
+    no visual evidence is available (manifest/paths missing or empty); in
+    that case the verdict collapses to ``inconclusive``. Verdict rules are
+    always strict: any ``blocking`` or ``major`` finding forces ``fail``;
+    only ``minor`` (or no) findings permit ``pass``.
+    """
+    model_sha = (
+        str(review_manifest.get("model_sha256") or "")
+        if isinstance(review_manifest, dict)
+        else ""
+    )
+    preview_sha = (
+        str(review_manifest.get("preview_sha256") or "")
+        if isinstance(review_manifest, dict)
+        else ""
+    )
+    deterministic_findings = _deterministic_review(
+        metrics=metrics if isinstance(metrics, dict) else None,
+        feature_summary=feature_summary if isinstance(feature_summary, dict) else None,
+        validation_results=validation_results,
+    )
+    # Short-circuit: a blocking deterministic finding means the visual
+    # layer cannot rescue the verdict.
+    if any(f.severity == "blocking" for f in deterministic_findings):
+        return ReviewResult(
+            status="fail",
+            summary="Deterministic verification reported blocking failures.",
+            findings=deterministic_findings,
+            model_sha256=model_sha,
+            preview_sha256=preview_sha,
+        )
+    visual: ReviewResult | None = None
+    if (
+        isinstance(review_manifest, dict)
+        and sheet_path is not None
+        and single_render_path is not None
+        and sheet_path.is_file()
+        and single_render_path.is_file()
+    ):
+        visual = _visual_review(
+            settings=settings,
+            request_text=request_text,
+            model_source=model_source,
+            metrics=metrics if isinstance(metrics, dict) else {},
+            feature_summary=feature_summary if isinstance(feature_summary, dict) else {},
+            review_manifest=review_manifest,
+            sheet_path=sheet_path,
+            single_render_path=single_render_path,
+            stop_event=stop_event,
+            stop_instruction=stop_instruction,
+            create_client=create_client,
+        )
+    combined: list[Finding] = list(deterministic_findings)
+    visual_findings: list[Finding] = []
+    visual_status = "skipped"
+    if visual is not None:
+        visual_findings = list(visual.findings)
+        combined.extend(visual_findings)
+        visual_status = visual.status
+    if not combined and visual_status == "skipped":
+        return ReviewResult(
+            status="inconclusive",
+            summary="No visual evidence available for review.",
+            findings=[],
+            model_sha256=model_sha,
+            preview_sha256=preview_sha,
+        )
+    # Strict verdict: any blocking or major forces fail.
+    has_blocking = any(f.severity == "blocking" for f in combined)
+    has_major = any(f.severity == "major" for f in combined)
+    if has_blocking or has_major:
+        status = "fail"
+    elif visual is None:
+        status = "inconclusive"
+    else:
+        status = visual.status if visual.status in {"pass", "fail", "inconclusive"} else "inconclusive"
+    summary = visual.summary if visual is not None and visual.summary else (
+        "Deterministic checks passed; visual layer skipped."
+        if not has_blocking and not has_major
+        else "Review failed."
+    )
+    if has_blocking or has_major:
+        # Override the summary when the strict rule forced fail so the UI
+        # surfaces the source of the failure.
+        summary = summary or "Review failed."
+    return ReviewResult(
+        status=status,
+        summary=_truncate(summary, MAX_SUMMARY_CHARS),
+        findings=combined,
+        model_sha256=model_sha,
+        preview_sha256=preview_sha,
     )
 
 

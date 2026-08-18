@@ -31,10 +31,8 @@ from flask import (
 )
 from werkzeug.exceptions import RequestEntityTooLarge
 
-from agent.core import AgentRunner
-from agent.core import _history_lock_slot
+from agent.core import AgentRunner, _history_lock_slot
 from agent.images import store_images
-from agent.io import atomic_write_text
 from agent.revisions import RevisionIntegrityError, RevisionStore
 from agent.sandbox import _BWRAP, seccomp_filter_fd
 from agent.settings import Settings, load_settings
@@ -754,31 +752,33 @@ def create_app(settings: Settings | None = None) -> Flask:
             if model_path.is_file()
             else None
         )
+        # ``cad_build_and_verify`` no longer auto-runs review, so the preview
+        # is always displayable as soon as ``preview.stl`` is on disk. The
+        # ``review_status`` field is informational: it surfaces the latest
+        # ``cad_review`` verdict when the agent chose to run one, otherwise
+        # it stays at ``"not_required"``. The UI uses it to render a status
+        # pill without blocking the preview.
         review_status = "not_required"
-        displayable = not app.config["SETTINGS"].review_enabled
-        if not displayable:
-            review_status = "pending"
-            latest_review = _review_latest(project_dir)
-            if latest_review is not None:
-                manifest_path = latest_review / _REVIEW_MANIFEST_NAME
-                result_path = latest_review / _REVIEW_RESULT_NAME
-                try:
-                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                    result = json.loads(result_path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
-                    manifest = result = None
-                if (
-                    isinstance(manifest, dict)
-                    and manifest.get("preview_sha256") == preview_sha256
-                    and manifest.get("model_sha256") == model_sha256
-                    and isinstance(result, dict)
-                    and result.get("status") in {"pass", "fail", "inconclusive"}
-                ):
-                    review_status = result["status"]
-                    displayable = review_status == "pass"
+        latest_review = _review_latest(project_dir)
+        if latest_review is not None:
+            manifest_path = latest_review / _REVIEW_MANIFEST_NAME
+            result_path = latest_review / _REVIEW_RESULT_NAME
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                result = json.loads(result_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                manifest = result = None
+            if (
+                isinstance(manifest, dict)
+                and manifest.get("preview_sha256") == preview_sha256
+                and manifest.get("model_sha256") == model_sha256
+                and isinstance(result, dict)
+                and result.get("status") in {"pass", "fail", "inconclusive"}
+            ):
+                review_status = result["status"]
         return jsonify({
             "available": True,
-            "displayable": displayable,
+            "displayable": True,
             "revision": f"{stat.st_mtime_ns}-{stat.st_size}",
             "model_sha256": model_sha256,
             "review_status": review_status,

@@ -19,7 +19,8 @@ A local-first web app that lets you **chat with an AI agent to create parametric
 - **Reference images** — Upload up to 5 images (10 MB each) to guide the agent
 - **Sandboxed execution** — All generated code runs in a Bubblewrap container with blocked network and resource limits
 - **Verified builds** — Each model is built, checked for a valid solid, and rendered before the agent reports completion
-- **Visual review** — A bounded structured reviewer cross-checks a single isometric render against eight labelled orthogonal and isometric views before confirming geometry, dimensions, and features
+- **Visual review** — The agent can call `cad_review` to run a bounded structured reviewer that cross-checks a single isometric render against the labelled multi-view sheet before confirming geometry, dimensions, and features
+- **Targeted screenshots** — The agent can call `cad_screenshot` to re-rasterise one or more canonical views from the latest revision without re-running build123d; a `(model_sha, views, quality)` cache keeps repeated lookups instant
 - **Project management** — Create, rename, and switch between multiple CAD projects with persisted conversation history
 - **Model history** — Inspect source diffs, track successful builds, and restore any retained `model.py` revision
 - **Reusable experience memory** — The agent records verified, non-sensitive CAD fixes for reuse across projects in the same workspace
@@ -122,8 +123,7 @@ per-user configuration file.
 | `openai.reasoning_effort` | *(empty)* | Optional reasoning setting for compatible OpenAI models |
 | `server.host` / `server.port` | `127.0.0.1` / `5000` | Bind address |
 | `ui.show_info_messages` | `true` | Show tool-status info messages in chat |
-| `review.enabled` | `true` | Gate completion on a passing structured visual review |
-| `review.max_cycles` | `3` | Maximum repair attempts the agent may try per user task |
+| `review.enabled` | `true` | When false, `cad_build_and_verify` skips the canonical eight-view rasterisation + contact sheet |
 | `review.render_workers` | `4` | Worker processes used to rasterise the canonical views |
 | `review.required_views` | `8` | Views that must be produced and hashed successfully per build |
 

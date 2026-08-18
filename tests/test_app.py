@@ -196,6 +196,11 @@ def test_empty_preview_is_rejected(tmp_path: Path):
 
 
 def test_preview_metadata_changes_when_stl_is_updated(tmp_path: Path):
+    """Displayable no longer requires a passing review (auto-review is gone).
+
+    The preview is displayable as soon as ``preview.stl`` exists. ``revision``
+    still changes when the file's mtime + size change.
+    """
     settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
     client = create_app(settings).test_client()
     client.post("/api/projects/new", json={"name": "demo"})
@@ -212,13 +217,16 @@ def test_preview_metadata_changes_when_stl_is_updated(tmp_path: Path):
     second = client.get("/api/projects/demo/preview/meta").get_json()
 
     assert first["available"] is True
-    assert first["displayable"] is False
+    assert first["displayable"] is True
     assert first["model_sha256"] is None
     assert second["available"] is True
     assert first["revision"] != second["revision"]
 
 
 def test_preview_metadata_requires_a_passing_current_review(tmp_path: Path):
+    """``review_status`` tracks the deliberate ``cad_review`` verdict, but
+    ``displayable`` stays True so the UI never blocks the preview behind a
+    review that the agent may not have run."""
     settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
     client = create_app(settings).test_client()
     client.post("/api/projects/new", json={"name": "demo"})
@@ -238,7 +246,7 @@ def test_preview_metadata_requires_a_passing_current_review(tmp_path: Path):
     (review / "result.json").write_text(json.dumps({"status": "fail"}), encoding="utf-8")
 
     failed = client.get("/api/projects/demo/preview/meta").get_json()
-    assert failed["displayable"] is False
+    assert failed["displayable"] is True
     assert failed["review_status"] == "fail"
 
     (review / "result.json").write_text(json.dumps({"status": "pass"}), encoding="utf-8")
@@ -248,13 +256,16 @@ def test_preview_metadata_requires_a_passing_current_review(tmp_path: Path):
 
     model.write_text("# changed model\n", encoding="utf-8")
     stale_model = client.get("/api/projects/demo/preview/meta").get_json()
-    assert stale_model["displayable"] is False
-    assert stale_model["review_status"] == "pending"
+    assert stale_model["displayable"] is True
+    # A stale model means the verdict no longer matches the current
+    # preview; ``review_status`` reverts to ``not_required`` to reflect
+    # that no verdict covers the current revision.
+    assert stale_model["review_status"] == "not_required"
 
     preview.write_bytes(b"new unreviewed preview")
     stale = client.get("/api/projects/demo/preview/meta").get_json()
-    assert stale["displayable"] is False
-    assert stale["review_status"] == "pending"
+    assert stale["displayable"] is True
+    assert stale["review_status"] == "not_required"
 
 
 def test_preview_completion_requires_matching_display_confirmation(tmp_path: Path):

@@ -153,12 +153,13 @@ def test_mvp_acceptance_flow(tmp_path: Path, monkeypatch):
     )
     question_client = QuestionClient()
     build_client = BuildClient()
-    # The reviewer is invoked after ``cad_build_and_verify``; the agent asks
-    # one clarification first, then ``build_client`` handles every subsequent
-    # turn (file write, build, structured review, final answer). The main loop
-    # and ``_run_post_build_review`` both call ``create_llm_client``; the first
-    # call returns the question client, every later call returns the build
-    # client so the reviewer can deterministically emit a passing verdict.
+    # The reviewer is invoked when the agent calls ``cad_review``; the agent
+    # asks one clarification first, then ``build_client`` handles every
+    # subsequent turn (file write, build, structured review, final answer).
+    # The main loop calls ``create_llm_client`` for every chat completion;
+    # the first call returns the question client, every later call returns
+    # the build client so the reviewer can deterministically emit a passing
+    # verdict.
     def factory(_settings):
         if not getattr(factory, "_seen", False):
             factory._seen = True

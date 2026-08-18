@@ -733,3 +733,32 @@ def test_normalize_questions_legacy_format_accepts_well_formed_text():
             "options": [],
         }
     ]
+
+
+def test_cad_screenshot_tool_exposes_required_surface():
+    """``CadScreenshotTool`` exposes the constants the schema/agent rely on."""
+    from agent.tools.cad_screenshot_tool import CadScreenshotTool
+
+    assert len(CadScreenshotTool.SUBSET_VIEWS) == 8
+    assert set(CadScreenshotTool.QUALITY_TIERS) == {"low", "standard", "high"}
+    # ``with_call_id`` returns the tool for fluent chaining.
+    tool = CadScreenshotTool(Path("/tmp/project"), publish=None)
+    assert tool.with_call_id("test") is tool
+
+
+def test_cad_review_tool_exposes_required_surface():
+    """``CadReviewTool`` exposes the execute() / with_call_id() surface."""
+    from agent.tools.cad_review_tool import CadReviewTool
+
+    tool = CadReviewTool(Path("/tmp/project"), publish=None)
+    assert tool.with_call_id("test") is tool
+
+
+def test_review_enabled_only_disables_multiview_rasterisation(tmp_path: Path):
+    """The setting keeps render.png while skipping the expensive sheet."""
+    from agent.tools.cad_tool import CadTool
+
+    code = CadTool(tmp_path, review_enabled=False)._runner_code(render=True)
+
+    assert "_RENDER_VIEWS = False" in code
+    assert "_WRITE_ISOMETRIC = True" in code

@@ -145,12 +145,87 @@ TOOL_SCHEMAS = [
     ),
     _tool(
         "cad_build_and_verify",
-        "Build the latest model.py revision and return geometry metrics plus a render. Set render=false to skip render.png (and the multi-view review sheet) when iterating before final verification; do not repeat unless the source changes.",
+        "Build the latest model.py revision, validate basic geometry, export preview.stl, and (when render=true, the default) rasterise the canonical eight views plus a labelled contact sheet. Does NOT trigger review automatically — call cad_review separately if you want a verdict. Set render=false to skip rendering during early iteration; the final verification must use render=true.",
         {
             "render": {
                 "type": "boolean",
                 "default": True,
-                "description": "Generate render.png + multi-view review sheet (true, default) or skip them and only return metrics + preview.stl (false). Use false during early iterations; the final verification must use true.",
+                "description": "Generate canonical eight-view rasterisation + contact sheet (true, default) or skip rendering and return only metrics + preview.stl (false). Use false during early iterations; final verification must use true.",
+            },
+        },
+        [],
+    ),
+    _tool(
+        "cad_screenshot",
+        "Rasterise the latest model.py revision from one or more camera views without re-running build123d. Reuses the artifact cache produced by cad_build_and_verify(render=true) when the (model_sha256, sorted(views), quality) tuple matches; otherwise re-rasterises only the missing subset. Use this when you need a single angle, a subset of canonical views, or a higher-resolution look before deciding whether to call cad_review. Returns file paths and per-image SHA-256 digests; no base64 inline payloads.",
+        {
+            "views": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": [
+                        "x_positive",
+                        "x_negative",
+                        "y_positive",
+                        "y_negative",
+                        "z_positive",
+                        "z_negative",
+                        "isometric_positive",
+                        "isometric_negative",
+                    ],
+                },
+                "minItems": 1,
+                "maxItems": 8,
+                "description": "Subset of canonical view_ids to rasterise. Empty or omitted = the full canonical eight.",
+            },
+            "contact_sheet": {
+                "type": "boolean",
+                "default": True,
+                "description": "If true, also return review-sheet.png combining the chosen views in canonical order. If false, return only per-view PNGs.",
+            },
+            "quality": {
+                "type": "string",
+                "enum": ["low", "standard", "high"],
+                "default": "standard",
+                "description": "low=256x256 + coarse tessellation (0.3 tol); standard=512x512 + 0.1 tol (matches cad_build_and_verify default); high=1024x1024 + 0.05 tol.",
+            },
+            "timeout_seconds": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 120,
+                "default": 30,
+                "description": "Maximum runtime in seconds for the sandbox subprocess (1-120).",
+            },
+        },
+        [],
+    ),
+    _tool(
+        "cad_review",
+        "Run the structured reviewer against the latest CAD build's visual + logical evidence. Deterministic checks (dimensions, volume, solid count, through-hole count, spec requirements) always run first; the multimodal LLM call only runs when visual evidence is present. If no artifact exists yet, cad_review internally calls cad_screenshot to produce one. Behavior is always strict: any blocking or major finding reclassifies the verdict to fail. Call this once you want a verdict — not after every model.py edit. The agent loop does NOT auto-trigger review.",
+        {
+            "views": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": [
+                        "x_positive",
+                        "x_negative",
+                        "y_positive",
+                        "y_negative",
+                        "z_positive",
+                        "z_negative",
+                        "isometric_positive",
+                        "isometric_negative",
+                    ],
+                },
+                "description": "Subset of view_ids the multimodal reviewer should focus on. Empty = all canonical views. The deterministic layer always checks every face, so this only narrows the visual scan.",
+            },
+            "timeout_seconds": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 120,
+                "default": 60,
+                "description": "Maximum runtime in seconds for the visual reviewer (1-120).",
             },
         },
         [],

@@ -93,6 +93,12 @@ class FakeFinalClient:
 
 
 def test_new_task_resets_review_cycle_count(tmp_path: Path, monkeypatch):
+    """Auto-review is gone; the agent no longer maintains ``_review_cycles``.
+
+    Keep a smoke test so the migration is intentional: starting a new task
+    on a runner that previously tracked review cycles no longer raises
+    ``AttributeError``.
+    """
     import agent.core
 
     project_root = tmp_path / "projects"
@@ -108,11 +114,9 @@ def test_new_task_resets_review_cycle_count(tmp_path: Path, monkeypatch):
         Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000),
         lambda *_args, **_kwargs: None,
     )
-    runner._review_cycles["demo"] = 3
-
+    assert not hasattr(runner, "_review_cycles")
     runner._run("demo", "Start a new task")
-
-    assert runner._review_cycles["demo"] == 0
+    assert not hasattr(runner, "_review_cycles")
 
 
 class FailedCadRecoveryClient:
@@ -517,7 +521,7 @@ def test_tool_schemas_document_side_effects_and_reject_extra_arguments():
     question_parameters = schemas["question"]["function"]["parameters"]
 
     assert "overwrites the whole file" in write_description
-    assert "do not repeat unless the source changes" in build_description
+    assert "call cad_review separately if you want a verdict" in build_description
     assert terminal_arguments["minItems"] == terminal_arguments["maxItems"] == 2
     assert question_parameters["properties"]["questions"]["minItems"] == 1
     assert (
@@ -940,6 +944,8 @@ def _seed_pass_build(project: Path) -> dict[str, object]:
 
 
 def test_review_gate_passes_for_passing_verdict(tmp_path: Path, monkeypatch):
+    """Auto-review is gone: a successful ``cad_build_and_verify`` now
+    registers the preview directly and never invokes the reviewer."""
     project = tmp_path / "projects" / "demo"
     payload = _seed_pass_build(project)
     settings = Settings(
@@ -968,15 +974,19 @@ def test_review_gate_passes_for_passing_verdict(tmp_path: Path, monkeypatch):
         messages,
     )
 
-    assert preview_id is not None, "passing review must register a preview"
+    assert preview_id is not None, "successful build must register a preview"
     assert error is None
     assert fix_required is False
-    # The reviewer was invoked exactly once; the verdict it returned lets the
-    # gate forward the build without forcing a regenerate.
-    assert review_client.call_count == 1
+    # No auto-review: the reviewer is never invoked from cad_build_and_verify.
+    assert review_client.call_count == 0
 
 
 def test_review_updates_the_build_call_in_place(tmp_path: Path, monkeypatch):
+    """cad_build_and_verify emits a single ``running`` → ``completed`` transition.
+
+    Auto-review's intermediate ``reviewing`` status is gone; a deliberate
+    ``cad_review`` call emits its own status pair when invoked.
+    """
     project = tmp_path / "projects" / "demo"
     payload = _seed_pass_build(project)
     settings = Settings(
@@ -1008,16 +1018,22 @@ def test_review_updates_the_build_call_in_place(tmp_path: Path, monkeypatch):
         data for kind, data in events
         if kind == "tool_status" and data.get("call_id") == "run-1"
     ]
-    assert [event["status"] for event in build_events] == [
-        "running", "reviewing", "completed"
-    ]
+    assert [event["status"] for event in build_events] == ["running", "completed"]
     assert not any(
-        kind == "agent_status" and data.get("status") == "reviewing"
+        kind == "tool_status" and data.get("status") == "reviewing"
         for kind, data in events
     )
 
 
 def test_review_gate_blocks_completion_on_blocking_finding(tmp_path: Path, monkeypatch):
+    """Auto-review is gone, so a blocking finding no longer blocks completion.
+
+    The legacy test asserted ``preview_id is None`` and ``fix_required is True``
+    because the agent loop used the verdict to force a regenerate. With
+    auto-review removed, a successful ``cad_build_and_verify`` returns a
+    preview unconditionally; the agent invokes ``cad_review`` itself when it
+    wants a verdict.
+    """
     project = tmp_path / "projects" / "demo"
     payload = _seed_pass_build(project)
     settings = Settings(
@@ -1057,12 +1073,18 @@ def test_review_gate_blocks_completion_on_blocking_finding(tmp_path: Path, monke
         messages,
     )
 
-    assert preview_id is None, "blocking finding must invalidate the preview"
-    assert fix_required is True
-    assert error is not None and error != ""
+    assert preview_id is not None, "build path no longer gates on review verdict"
+    assert error is None
+    assert fix_required is False
+    assert review_client.call_count == 0
 
 
 def test_review_gate_treats_inconclusive_as_blocking(tmp_path: Path, monkeypatch):
+    """Auto-review is gone: ``inconclusive`` is no longer surfaced as a build failure.
+
+    The agent now calls ``cad_review`` explicitly; ``inconclusive`` only
+    affects that call's return value, not the build loop.
+    """
     project = tmp_path / "projects" / "demo"
     payload = _seed_pass_build(project)
     settings = Settings(
@@ -1092,18 +1114,21 @@ def test_review_gate_treats_inconclusive_as_blocking(tmp_path: Path, monkeypatch
         messages,
     )
 
-    assert preview_id is None
-    assert fix_required is True
-    assert error is not None
+    assert preview_id is not None
+    assert error is None
+    assert fix_required is False
 
 
 def test_review_gate_respects_cycle_limit(tmp_path: Path, monkeypatch):
+    """The per-task ``review_max_cycles`` knob is gone.
+
+    Verify ``Settings`` no longer carries the field and the runner does not
+    maintain a cycle counter.
+    """
     project = tmp_path / "projects" / "demo"
     payload = _seed_pass_build(project)
-    settings = dataclasses.replace(
-        Settings(tmp_path / "projects", "https://example.test", "test", 1, "127.0.0.1", 5000),
-        review_max_cycles=1,
-    )
+    settings = Settings(tmp_path / "projects", "https://example.test", "test", 1, "127.0.0.1", 5000)
+    assert "review_max_cycles" not in settings.__dataclass_fields__
     runner = AgentRunner(settings, lambda *_, **__: None)
     tools = ProjectTools(project, lambda *_, **__: None)
     tools.cad.build_and_verify = lambda render=True: payload
@@ -1137,12 +1162,21 @@ def test_review_gate_respects_cycle_limit(tmp_path: Path, monkeypatch):
         messages,
     )
 
-    assert preview_id is None
-    assert error is not None and error != ""
-    assert runner._review_cycles.get("demo") == 1
+    assert preview_id is not None
+    assert error is None
+    assert not hasattr(runner, "_review_cycles")
+    # Reviewer is never invoked by cad_build_and_verify — review is opt-in.
+    assert review_client.call_count == 0
 
 
 def test_review_gate_disabled_skips_review_call(tmp_path: Path, monkeypatch):
+    """``review_enabled=False`` still skips the canonical eight-view render.
+
+    Auto-review is gone in every configuration, but the build-time
+    rendering knobs (``review_render_workers``, ``review_required_views``,
+    ``render`` argument) still apply. ``review_enabled=False`` is preserved
+    as the historical "metrics-only build" switch.
+    """
     project = tmp_path / "projects" / "demo"
     payload = _seed_pass_build(project)
     settings = dataclasses.replace(

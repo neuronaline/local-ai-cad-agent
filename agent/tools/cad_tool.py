@@ -78,12 +78,14 @@ class CadTool:
         revisions: RevisionStore | None = None,
         review_render_workers: int = 4,
         review_required_views: int = 8,
+        review_enabled: bool = True,
     ) -> None:
         self.project_dir = project_dir.resolve()
         self._publish = publish
         self._revisions = revisions or RevisionStore(project_dir)
         self._review_render_workers = max(1, int(review_render_workers))
         self._review_required_views = max(1, int(review_required_views))
+        self._review_enabled = bool(review_enabled)
         self._process: subprocess.Popen[str] | None = None
         self._lock = threading.Lock()
         self._call_id = ""
@@ -192,7 +194,7 @@ class CadTool:
     def _runner_code(self, render: bool) -> str:
         if render:
             prelude = (
-                "_RENDER_VIEWS = True\n"
+                f"_RENDER_VIEWS = {self._review_enabled!r}\n"
                 "_WRITE_ISOMETRIC = True\n"
                 f"_RENDER_WORKERS = {self._review_render_workers}\n"
                 f"_REQUIRED_VIEWS = {self._review_required_views}\n"
@@ -211,9 +213,9 @@ class CadTool:
         # definitions (VIEWS, render_views, build_contact_sheet, ...) are
         # visible to the runner's module-level main block. The runner reads
         # the ``_RENDER_VIEWS`` flag to decide whether to rasterise every
-        # canonical view (always required by ``build_and_verify``, skipped
-        # by the cheaper metrics-only ``run`` path); ``_WRITE_ISOMETRIC``
-        # gates the legacy single ``render.png`` artifact.
+        # canonical views (skipped by the metrics-only path and when review
+        # rendering is disabled); ``_WRITE_ISOMETRIC`` gates the legacy
+        # single ``render.png`` artifact.
         code = self._runner_code(render)
 
         with tempfile.TemporaryDirectory(prefix="cad-agent-") as temporary:
@@ -291,8 +293,12 @@ class CadTool:
             metrics = cached["metrics"]
             self._enforce_basic_geometry(metrics)
             self._atomic_copy(preview_path, self.project_dir / "preview.stl")
-            review_manifest = cached.get("review_manifest") if render else None
-            if render:
+            review_manifest = (
+                cached.get("review_manifest")
+                if render and self._review_enabled
+                else None
+            )
+            if render and self._review_enabled:
                 render_path = workspace / "render.png"
                 if not render_path.is_file() or render_path.stat().st_size == 0:
                     error_msg = "CAD execution did not produce a render."

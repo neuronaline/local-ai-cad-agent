@@ -171,3 +171,25 @@ def test_settings_rejects_completely_unparseable_yaml(tmp_path: Path) -> None:
     # subtype or ``YAMLError`` since the settings layer may wrap either.
     with pytest.raises((ValueError, yaml.YAMLError)):
         load_settings(project_root=tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Review gate: ``review_max_cycles`` is gone
+# ---------------------------------------------------------------------------
+
+
+def test_review_max_cycles_field_no_longer_exists(tmp_path: Path) -> None:
+    """``review_max_cycles`` was removed when auto-review went opt-in.
+
+    A leftover key in ``config.yaml`` must be silently ignored so legacy
+    user files keep loading without error.
+    """
+    _write_config(tmp_path, "review:\n  max_cycles: 3\n")
+
+    settings = load_settings(project_root=tmp_path)
+
+    assert "review_max_cycles" not in settings.__dataclass_fields__
+    # Settings still exposes the surviving review knobs.
+    assert settings.review_enabled is True
+    assert settings.review_render_workers == 4
+    assert settings.review_required_views == 8

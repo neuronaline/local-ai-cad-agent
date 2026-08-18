@@ -39,9 +39,12 @@ class Settings:
     agent_tool_call_limit: int = 12
     revision_retention_count: int = 0  # 0 = unlimited, >0 = keep at most N revisions
     agent_debug_log_tool_errors: bool = False
-    # ── Post-build review gate ──
+    # ── Review rendering settings (used by cad_build_and_verify, cad_screenshot) ──
+    # ``review_enabled`` is preserved for the existing ``cad_build_and_verify``
+    # contract: when False the build skips the canonical eight-view rasteriser
+    # and contact sheet. The structured verdict (cad_review) is opt-in by the
+    # agent and never auto-toggles on this flag.
     review_enabled: bool = True
-    review_max_cycles: int = 3
     review_render_workers: int = 4
     review_required_views: int = 8
 
@@ -145,7 +148,6 @@ def load_settings(project_root: Path | None = None) -> Settings:
             agent.get("debug_log_tool_errors", False), "agent.debug_log_tool_errors"
         ),
         review_enabled=_strict_bool(review.get("enabled", True), "review.enabled"),
-        review_max_cycles=_positive_int(review.get("max_cycles", 3), "review.max_cycles"),
         review_render_workers=_positive_int(
             review.get("render_workers", 4), "review.render_workers"
         ),

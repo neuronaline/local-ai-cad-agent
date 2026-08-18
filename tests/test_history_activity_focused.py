@@ -465,6 +465,108 @@ process.stdout.write(JSON.stringify({
 
 
 # ---------------------------------------------------------------------------
+# cad_screenshot / cad_review split: phase labels must be discoverable so the
+# UI activity drawer reflects the new tool_status events and the terminal
+# ``screenshot_updated`` / ``review_updated`` events wired into the SSE
+# handlers map. Pinned by docs/PLAN_cad_screenshot_review_split.md §6 Stage 7.
+# ---------------------------------------------------------------------------
+
+
+def test_activity_labels_cover_split_screenshot_review_keys():
+    """The split tools publish ``cad_screenshot`` / ``cad_review`` and the
+    intermediate ``rendering_subset`` / ``screenshot_auto`` statuses that the
+    activity panel must render as a non-empty human phrase — without raw
+    underscores or schema names leaking through."""
+    bindings = (
+        _extract_js("activityLabels", kind="object")
+        + "\n"
+        + _extract_js("activityLabel")
+    )
+    body = "process.stdout.write(JSON.stringify({});\n".join([
+        f"  {key}: activityLabel({key!r}),\n"
+        for key in (
+            "cad_screenshot",
+            "cad_review",
+            "rendering_subset",
+            "screenshot_auto",
+            "reviewing",
+            "pass",
+            "fail",
+            "inconclusive",
+            "limit_reached",
+        )
+    ])
+    body = (
+        "process.stdout.write(JSON.stringify({"
+        + body.replace("process.stdout.write(JSON.stringify({});\n", "")
+        + "}));\n"
+    )
+    out = json.loads(_eval_helper(bindings, body))
+
+    for key, label in out.items():
+        assert isinstance(label, str) and label, (
+            f"{key!r} label must be a non-empty string, got {label!r}"
+        )
+        assert "_" not in label, (
+            f"{key!r} label {label!r} leaks an underscore into the UI"
+        )
+
+    # Review verdicts must read like user-facing words, not raw schema values.
+    assert out["pass"] == "Pass"
+    assert out["fail"] == "Fail"
+    assert out["inconclusive"] == "Inconclusive"
+
+
+def test_sse_handlers_wire_screenshot_and_review_updated():
+    """The SSE ``handlers`` map inside ``connectStream`` must register both
+    ``screenshot_updated`` and ``review_updated`` so the activity pill updates
+    when the split tools publish their terminal events. The handlers live
+    inline inside ``connectStream`` rather than as a top-level binding, so we
+    extract the function and assert the map keys."""
+    text = JS_SOURCE.read_text(encoding="utf-8")
+    func_match = re.search(
+        r"function connectStream\(\) \{(.*?)\n\}\n",
+        text,
+        re.DOTALL,
+    )
+    assert func_match, "connectStream not found in static/js/app.js"
+    func_body = func_match.group(1)
+    handlers_match = re.search(
+        r"const handlers = \{(.*?)\n  \};",
+        func_body,
+        re.DOTALL,
+    )
+    assert handlers_match, "handlers map literal not found in connectStream"
+
+    body = handlers_match.group(1)
+    # The map must register both new terminal events so the UI can react.
+    assert "screenshot_updated:" in body, (
+        "screenshot_updated handler missing from SSE handlers map"
+    )
+    assert "review_updated:" in body, (
+        "review_updated handler missing from SSE handlers map"
+    )
+
+
+def test_running_filter_includes_new_split_statuses():
+    """``updateActivitySummary`` and ``markActivityRecovered`` decide which
+    activity rows are still 'in flight' by checking against a hard-coded
+    list. The split tools' intermediate statuses (``rendering_subset``,
+    ``screenshot_auto``) must be present so the activity pill keeps showing
+    "Reviewing build · Running" until the terminal event arrives."""
+    for function_name in ("updateActivitySummary", "markActivityRecovered"):
+        func_body = _extract_js(function_name)
+        assert "'rendering_subset'" in func_body, (
+            f"{function_name} must include 'rendering_subset' in its running "
+            "filter so cad_screenshot in-flight rows stay visible"
+        )
+        assert "'screenshot_auto'" in func_body, (
+            f"{function_name} must include 'screenshot_auto' in its running "
+            "filter so cad_review auto-screenshot rows stay visible"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Issue 5: markActivityRecovered must leave error rows visible.
 # ---------------------------------------------------------------------------
 
