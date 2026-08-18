@@ -13,7 +13,7 @@ from agent.openai_client import OpenAIClient
 from agent.openrouter import OpenRouterClient
 from agent.prompt import get_prompt_cache_key
 from agent.settings import LLM_PROVIDERS, Settings, load_settings
-
+from agent.tool_schemas import TOOL_SCHEMAS
 
 # ---------------------------------------------------------------------------
 # Shared fake responses
@@ -114,17 +114,17 @@ class _RateLimitedResponse(_FakeResponse):
 
 
 def _settings(tmp_path, provider: str, **overrides) -> Settings:
-    base = dict(
-        workspace_root=tmp_path,
-        openrouter_base_url="https://example.test",
-        openrouter_model="openai/gpt-4o-mini",
-        openrouter_timeout_seconds=1,
-        host="127.0.0.1",
-        port=5000,
-        openai_base_url="https://example.test",
-        openai_model="gpt-4o-mini",
-        openai_timeout_seconds=1,
-    )
+    base = {
+        "workspace_root": tmp_path,
+        "openrouter_base_url": "https://example.test",
+        "openrouter_model": "openai/gpt-4o-mini",
+        "openrouter_timeout_seconds": 1,
+        "host": "127.0.0.1",
+        "port": 5000,
+        "openai_base_url": "https://example.test",
+        "openai_model": "gpt-4o-mini",
+        "openai_timeout_seconds": 1,
+    }
     if provider == "openai":
         base.update(llm_provider="openai", **overrides)
     else:
@@ -403,7 +403,7 @@ def test_openrouter_forced_provider_keeps_sticky_routing_eligible(tmp_path):
     }
 
 
-def test_openrouter_marks_stable_system_prompt_cacheable_for_gemini(monkeypatch, tmp_path):
+def test_openrouter_advances_gemini_cache_breakpoint_to_latest_message(monkeypatch, tmp_path):
     captured: dict[str, Any] = {}
     monkeypatch.setenv("OPENROUTER_API_KEY", "test")
     _capture_post(monkeypatch, "agent.llm_base.requests.post", captured, _FakeResponse)
@@ -416,15 +416,49 @@ def test_openrouter_marks_stable_system_prompt_cacheable_for_gemini(monkeypatch,
     ])
 
     system = captured["json"]["messages"][0]
-    assert system["content"] == [{
-        "type": "text",
-        "text": "Stable CAD instructions.",
-        "cache_control": {"type": "ephemeral"},
-    }]
+    assert system == {"role": "system", "content": "Stable CAD instructions."}
     assert captured["json"]["messages"][1] == {
         "role": "user",
         "content": "<project_state>dynamic</project_state>",
     }
+    assert captured["json"]["messages"][2] == {
+        "role": "user",
+        "content": [{
+            "type": "text",
+            "text": "Build a bracket.",
+            "cache_control": {"type": "ephemeral"},
+        }],
+    }
+
+
+def test_openrouter_caches_through_tool_results_for_gemini(tmp_path):
+    settings = _settings(tmp_path, "openrouter", openrouter_model="google/gemini-2.5-flash")
+    payload = OpenRouterClient(settings)._build_payload(
+        [
+            {"role": "system", "content": "Stable CAD instructions."},
+            {"role": "user", "content": "Build a bracket."},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "write_file", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "Wrote model.py."},
+        ],
+        TOOL_SCHEMAS[:1],
+    )
+
+    assert payload["messages"][1]["content"] == "Build a bracket."
+    assert payload["messages"][3]["content"] == [{
+        "type": "text",
+        "text": "Wrote model.py.",
+        "cache_control": {"type": "ephemeral"},
+    }]
 
 
 def test_openrouter_honors_retry_after(monkeypatch, tmp_path):

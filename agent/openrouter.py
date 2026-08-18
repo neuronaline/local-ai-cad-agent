@@ -74,21 +74,41 @@ class OpenRouterClient(ChatCompletionsClient):
             payload["provider"] = provider
 
     def _apply_gemini_cache_breakpoint(self, payload: dict[str, Any]) -> None:
-        """Mark the stable system prompt cacheable for Gemini on OpenRouter."""
+        """Advance Gemini's sole cache breakpoint through the conversation.
+
+        OpenRouter uses only the final explicit breakpoint for Gemini. Keeping
+        it on the system prompt caches the instructions but leaves every tool
+        call and tool result as an uncached suffix. Marking the last textual
+        message instead makes the next tool-calling request reuse the complete
+        preceding agent transcript.
+        """
         if (
             not self.settings.openrouter_enable_gemini_cache
             or not self.settings.openrouter_model.startswith("google/gemini-")
         ):
             return
-        for message in payload["messages"]:
-            if message.get("role") != "system" or not isinstance(message.get("content"), str):
+        for message in reversed(payload["messages"]):
+            content = message.get("content")
+            if isinstance(content, str):
+                message["content"] = [
+                    {
+                        "type": "text",
+                        "text": content,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ]
+                return
+            if not isinstance(content, list):
                 continue
-            message["content"] = [{
-                "type": "text",
-                "text": message["content"],
-                "cache_control": {"type": "ephemeral"},
-            }]
-            return
+            for part in reversed(content):
+                if not (
+                    isinstance(part, dict)
+                    and part.get("type") == "text"
+                    and isinstance(part.get("text"), str)
+                ):
+                    continue
+                part["cache_control"] = {"type": "ephemeral"}
+                return
 
     def _build_payload(self, messages, tools):
         payload: dict[str, Any] = {

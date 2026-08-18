@@ -9,9 +9,9 @@ from typing import ClassVar
 import pytest
 
 from agent.core import AgentRunner, ProjectTools
-from agent.tool_schemas import TOOL_SCHEMAS
 from agent.settings import Settings
 from agent.tool_results import failure as tool_failure
+from agent.tool_schemas import TOOL_SCHEMAS
 
 
 class FakeOpenRouterClient:
@@ -516,10 +516,14 @@ def test_tool_schemas_document_side_effects_and_reject_extra_arguments():
 
     write_description = schemas["write_file"]["function"]["description"]
     build_description = schemas["cad_build_and_verify"]["function"]["description"]
+    review_description = schemas["cad_review"]["function"]["description"]
+    screenshot_description = schemas["cad_screenshot"]["function"]["description"]
     question_parameters = schemas["question"]["function"]["parameters"]
 
     assert "deliberately replace its entire contents" in write_description
     assert "call cad_review separately if you want a verdict" in build_description
+    assert "never use it as a routine final step for a small local edit" in review_description
+    assert "do not use it for routine small edits" in screenshot_description
     assert question_parameters["properties"]["questions"]["minItems"] == 1
     assert (
         question_parameters["properties"]["questions"]["items"]["additionalProperties"]
@@ -667,7 +671,12 @@ def test_successful_tool_result_uses_structured_envelope(tmp_path: Path):
     )
 
     payload = json.loads(messages[-1]["content"])
-    assert payload == {"ok": True, "tool": "read_file", "data": "# Ready\n"}
+    assert payload["ok"] is True
+    assert payload["tool"] == "read_file"
+    read_result = json.loads(payload["data"])
+    assert read_result["content"] == "# Ready\n"
+    assert read_result["exists"] is True
+    assert len(read_result["sha256"]) == 64
 
 
 def test_missing_tool_argument_returns_structured_validation_error(tmp_path: Path):

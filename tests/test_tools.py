@@ -138,7 +138,24 @@ def test_write_file_creates_new_file_without_digest(tmp_path: Path):
     tool = FileTool(tmp_path)
     result = tool.write_file("summary.md", "Width: 10 mm\n")
     assert "Wrote summary.md" in result
-    assert tool.read_file("summary.md") == "Width: 10 mm\n"
+    payload = json.loads(tool.read_file("summary.md"))
+    assert payload["content"] == "Width: 10 mm\n"
+    assert payload["exists"] is True
+    assert len(payload["sha256"]) == 64
+
+
+def test_read_file_missing_reports_that_it_cannot_be_edited(tmp_path: Path):
+    payload = json.loads(FileTool(tmp_path).read_file("model.py"))
+
+    assert payload == {
+        "exists": False,
+        "content": "",
+        "sha256": None,
+        "total_lines": 0,
+        "offset": 1,
+        "returned_lines": 0,
+        "next_offset": None,
+    }
 
 
 def test_write_file_requires_digest_when_file_exists(tmp_path: Path):
@@ -158,7 +175,7 @@ def test_write_file_stale_digest_leaves_content_unchanged(tmp_path: Path):
     with pytest.raises(ValueError, match="changed since it was read"):
         tool.write_file("summary.md", "Width: 12 mm\n", expected_sha256=digest)
 
-    assert tool.read_file("summary.md") == "Width: 11 mm\n"
+    assert json.loads(tool.read_file("summary.md"))["content"] == "Width: 11 mm\n"
 
 
 def test_read_file_range_returns_digest_for_guarded_edit(tmp_path: Path):
@@ -181,29 +198,29 @@ def test_read_file_range_digest_can_guard_an_edit(tmp_path: Path):
     payload = json.loads(tool.read_file("summary.md", offset=1, limit=2))
     tool.edit_file("summary.md", "two", "updated", payload["sha256"])
 
-    assert tool.read_file("summary.md") == "one\nupdated\n"
+    assert json.loads(tool.read_file("summary.md"))["content"] == "one\nupdated\n"
 
 
 def test_edit_file_rejects_ambiguous_target(tmp_path: Path):
     tool = FileTool(tmp_path)
     tool.write_file("summary.md", "same\nsame\n")
-    digest = hashlib.sha256((tool.read_file("summary.md")).encode("utf-8")).hexdigest()
+    digest = json.loads(tool.read_file("summary.md"))["sha256"]
 
     with pytest.raises(ValueError, match="found 2"):
         tool.edit_file("summary.md", "same", "new", digest)
 
-    assert tool.read_file("summary.md") == "same\nsame\n"
+    assert json.loads(tool.read_file("summary.md"))["content"] == "same\nsame\n"
 
 
 def test_edit_file_rejects_missing_target(tmp_path: Path):
     tool = FileTool(tmp_path)
     tool.write_file("summary.md", "anchor here\n")
-    digest = hashlib.sha256((tool.read_file("summary.md")).encode("utf-8")).hexdigest()
+    digest = json.loads(tool.read_file("summary.md"))["sha256"]
 
     with pytest.raises(ValueError, match="one exact match"):
         tool.edit_file("summary.md", "nonexistent", "replacement", digest)
 
-    assert tool.read_file("summary.md") == "anchor here\n"
+    assert json.loads(tool.read_file("summary.md"))["content"] == "anchor here\n"
 
 
 def test_edit_file_rejects_missing_file(tmp_path: Path):
@@ -216,19 +233,19 @@ def test_edit_file_rejects_missing_file(tmp_path: Path):
 def test_edit_file_rejects_stale_digest(tmp_path: Path):
     tool = FileTool(tmp_path)
     tool.write_file("summary.md", "alpha\n")
-    digest = hashlib.sha256((tool.read_file("summary.md")).encode("utf-8")).hexdigest()
+    digest = json.loads(tool.read_file("summary.md"))["sha256"]
     tool.write_file("summary.md", "beta\n", expected_sha256=digest)
 
     with pytest.raises(ValueError, match="changed since it was read"):
         tool.edit_file("summary.md", "beta", "gamma", "0" * 64)
 
-    assert tool.read_file("summary.md") == "beta\n"
+    assert json.loads(tool.read_file("summary.md"))["content"] == "beta\n"
 
 
 def test_edit_file_requires_non_empty_old_string(tmp_path: Path):
     tool = FileTool(tmp_path)
     tool.write_file("summary.md", "alpha\n")
-    digest = hashlib.sha256((tool.read_file("summary.md")).encode("utf-8")).hexdigest()
+    digest = json.loads(tool.read_file("summary.md"))["sha256"]
 
     with pytest.raises(ValueError, match="old_string must not be empty"):
         tool.edit_file("summary.md", "", "new", digest)
@@ -245,12 +262,12 @@ def test_edit_file_requires_digest(tmp_path: Path):
 def test_edit_file_reports_replaced_line_range(tmp_path: Path):
     tool = FileTool(tmp_path)
     tool.write_file("summary.md", "alpha\nbeta\ngamma\n")
-    digest = hashlib.sha256((tool.read_file("summary.md")).encode("utf-8")).hexdigest()
+    digest = json.loads(tool.read_file("summary.md"))["sha256"]
 
     result = tool.edit_file("summary.md", "beta\n", "B\n", digest)
 
     assert "replaced lines 2-2 with lines 2-2" in result
-    assert tool.read_file("summary.md") == "alpha\nB\ngamma\n"
+    assert json.loads(tool.read_file("summary.md"))["content"] == "alpha\nB\ngamma\n"
 
 
 @pytest.mark.parametrize("keyword", ["center", "start_angle", "end_angle"])

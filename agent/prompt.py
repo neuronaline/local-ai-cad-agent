@@ -25,10 +25,10 @@ _OPERATIONAL_RULES = """\
   descriptive names, and the final shape exposed as top-level `result`.
 - In a fresh project, create model.py directly with write_file. Do not attempt
   to read, patch, build, render, or review a model before it exists.
-- Before changing an existing file, call read_file with offset and limit and
-  preserve its SHA-256; pass that digest as expected_sha256 to write_file or
-  edit_file. Use edit_file for a small localized change with one exact target
-  block, and
+- Before changing a file, call read_file and inspect its `exists` and
+  `sha256` fields. If it exists, preserve that SHA-256 and pass it as
+  expected_sha256 to write_file or edit_file; if it does not, create it with
+  write_file. Use edit_file for a small localized change with one exact target block, and
   write_file only for a deliberate complete rewrite.
 - After a SHA or match error, re-read the file; do not retry the same edit.
 - cad_build_and_verify performs the build, validation, preview, and rendering.
@@ -46,16 +46,22 @@ _OPERATIONAL_RULES = """\
   standard=512px / 0.1 tol, high=1024px / 0.05 tol). The artifact cache is
   shared with cad_build_and_verify: a matching (model_sha256, sorted(views),
   quality) tuple is served from ``.cad-agent/reviews/<sha>/`` without
-  spawning the sandbox.
+  spawning the sandbox. Do not call it for a small, localized edit when the
+  successful build metrics and normal render already answer the question.
 - cad_review runs the structured verdict (deterministic checks + multimodal
   LLM review) on the latest build. Behavior is always strict: any blocking
   or major finding forces ``status: fail``; only minor findings (or none)
-  permit ``status: pass``. Call cad_review explicitly when you want a
-  verdict — typically once before declaring the task ready. If no visual
-  evidence exists yet, cad_review internally calls cad_screenshot to
-  produce one, so you do not need to chain the two calls yourself.
-- A passing cad_review verdict is a strong signal but not a hard gate: the
-  agent decides when to finish a task based on the available evidence.
+  permit ``status: pass``. It is optional, not a completion gate. Do not call
+  cad_review or cad_screenshot for small, contained changes such as a single
+  dimension, parameter, text, minor fillet, or other local edit after a
+  successful build. Reserve them for complex or high-risk work: multiple
+  interacting features, booleans/topology changes, ambiguous reference
+  geometry, tight fit/clearance requirements, visible-defect risk, or an
+  explicit user request. If no visual evidence exists, cad_review internally
+  calls cad_screenshot, so do not call both unless a targeted view is needed.
+- A passing cad_review verdict is a strong signal, not a hard gate. Keep the
+  context lean by using the build result alone when it provides sufficient
+  evidence for a simple change.
 - Use question only when an unknown would materially change fit, function, or
   manufacturability. Ask all blocking questions together. Infer non-critical
   proportions from context or reference images and disclose the assumption.
@@ -64,9 +70,9 @@ _OPERATIONAL_RULES = """\
   the blocking one and skip the rest. Keep the batch to ≤3 questions total.
 - Do not claim success from source inspection alone. A task is ready only
   after the latest model.py revision passes cad_build_and_verify, and its
-  render agrees with the request. Run cad_review before declaring the task
-  ready whenever a passing verdict adds value (final verification, ambiguous
-  geometry, or visible defect risk).
+  render agrees with the request. For small, contained changes, this build
+  verification is sufficient. Use cad_review only when the complexity or risk
+  criteria above make additional visual evidence worthwhile.
 - After final verification, update summary.md once with exactly these sections:
   - ## Summary — one sentence
   - ## Key dimensions — confirmed values only

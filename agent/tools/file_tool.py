@@ -274,8 +274,21 @@ class FileTool:
         known_sha256: str | None = None,
     ) -> str:
         path = self._path(filename)
+        if offset < 1:
+            raise ValueError("offset must be at least 1.")
         if not path.exists():
-            return ""
+            return json.dumps(
+                {
+                    "exists": False,
+                    "content": "",
+                    "sha256": None,
+                    "total_lines": 0,
+                    "offset": offset,
+                    "returned_lines": 0,
+                    "next_offset": None,
+                },
+                ensure_ascii=False,
+            )
         if path.stat().st_size > MAX_FILE_BYTES:
             raise ValueError(
                 f"{filename} is too large to read safely (max {MAX_FILE_BYTES // 1024} KiB)."
@@ -286,24 +299,26 @@ class FileTool:
             if len(known_sha256) != 64:
                 raise ValueError("known_sha256 must be a SHA-256 digest.")
             if known_sha256 == digest:
-                return json.dumps({"unchanged": True, "sha256": digest})
-        if offset < 1:
-            raise ValueError("offset must be at least 1.")
+                return json.dumps(
+                    {"exists": True, "unchanged": True, "sha256": digest},
+                    ensure_ascii=False,
+                )
         if limit is None:
-            if offset == 1 and known_sha256 is None:
-                return content
-            limit = DEFAULT_READ_LIMIT
-        if limit < 1 or limit > 2000:
+            limit = None if offset == 1 else DEFAULT_READ_LIMIT
+        if limit is not None and (limit < 1 or limit > 2000):
             raise ValueError("limit must be between 1 and 2000 lines.")
         lines = content.splitlines(keepends=True)
         if offset > len(lines) + 1:
             raise ValueError(
                 f"offset {offset} exceeds {filename}'s {len(lines)} lines."
             )
-        chunk = "".join(lines[offset - 1 : offset - 1 + limit])
+        chunk = "".join(
+            lines[offset - 1 :] if limit is None else lines[offset - 1 : offset - 1 + limit]
+        )
         next_offset = offset + len(chunk.splitlines())
         return json.dumps(
             {
+                "exists": True,
                 "content": chunk,
                 "sha256": digest,
                 "total_lines": len(lines),

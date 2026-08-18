@@ -109,6 +109,12 @@ button[aria-pressed="true"], .view-presets .active { border-color: #5d7ed7; back
 .activity-state { color: var(--success); text-transform: capitalize; }
 .activity-item[data-status="error"] .activity-state { color: var(--danger); }
 .activity-detail { grid-column: 1 / -1; overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
+/* Token usage pill shown next to the activity-panel summary. Updated in place
+   by the agent_usage SSE handler so users see live prompt/completion/cache
+   counts without polluting the per-tool activity list. */
+.usage-pill { margin-left: .5rem; padding: 0 .4rem; border-radius: 999px; background: #142340; color: var(--muted); font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; font-size: .65rem; font-weight: 600; letter-spacing: .02em; }
+.usage-pill[data-cache="hit"] { color: #7fd1a8; }
+.usage-pill[data-cache="partial"] { color: #e6c46b; }
 
 .composer { border: 1px solid var(--line); border-radius: 9px; padding: .4rem; background: #0e1828; }
 .composer textarea { width: 100%; min-height: 46px; max-height: 140px; resize: none; border: 0; padding: .35rem .4rem; outline: 0; background: transparent; color: var(--text); }

@@ -38,10 +38,10 @@ _TIMEOUT = {
 TOOL_SCHEMAS = [
     _tool(
         "read_file",
-        "Read model.py or summary.md. Mutations of an existing file require a "
-        "fresh SHA-256 from this tool; pass that digest as expected_sha256 to "
-        "write_file or edit_file. To obtain the digest, specify offset and "
-        "limit; the ranged result includes the current SHA-256 digest.",
+        "Read model.py or summary.md. The response always includes exists and "
+        "the current SHA-256 (when the file exists); pass that digest as "
+        "expected_sha256 to write_file or edit_file. A missing file reports "
+        "exists=false and must be created with write_file.",
         {
             "filename": _FILENAME,
             "offset": {
@@ -121,7 +121,7 @@ TOOL_SCHEMAS = [
     ),
     _tool(
         "cad_screenshot",
-        "Rasterise the latest model.py revision from one or more camera views without re-running build123d. Reuses the artifact cache produced by cad_build_and_verify(render=true) when the (model_sha256, sorted(views), quality) tuple matches; otherwise re-rasterises only the missing subset. Use this when you need a single angle, a subset of canonical views, or a higher-resolution look before deciding whether to call cad_review. Returns file paths and per-image SHA-256 digests; no base64 inline payloads.",
+        "Rasterise the latest model.py revision from one or more camera views without re-running build123d. Reuses the artifact cache produced by cad_build_and_verify(render=true) when the (model_sha256, sorted(views), quality) tuple matches; otherwise re-rasterises only the missing subset. Reserve this for complex or visually ambiguous work; do not use it for routine small edits that already pass cad_build_and_verify. Returns file paths and per-image SHA-256 digests; no base64 inline payloads.",
         {
             "views": {
                 "type": "array",
@@ -165,7 +165,7 @@ TOOL_SCHEMAS = [
     ),
     _tool(
         "cad_review",
-        "Run the structured reviewer against the latest CAD build's visual + logical evidence. Deterministic checks (dimensions, volume, solid count, through-hole count, spec requirements) always run first; the multimodal LLM call only runs when visual evidence is present. If no artifact exists yet, cad_review internally calls cad_screenshot to produce one. Behavior is always strict: any blocking or major finding reclassifies the verdict to fail. Call this once you want a verdict — not after every model.py edit. The agent loop does NOT auto-trigger review.",
+        "Run the structured reviewer against the latest CAD build's visual + logical evidence. Deterministic checks (dimensions, volume, solid count, through-hole count, spec requirements) always run first; the multimodal LLM call only runs when visual evidence is present. If no artifact exists yet, cad_review internally calls cad_screenshot to produce one. Behavior is always strict: any blocking or major finding reclassifies the verdict to fail. This is optional: reserve it for complex, high-risk, visually ambiguous, fit-critical, or user-requested work; never use it as a routine final step for a small local edit. The agent loop does NOT auto-trigger review.",
         {
             "views": {
                 "type": "array",

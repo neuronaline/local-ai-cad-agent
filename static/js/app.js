@@ -19,6 +19,7 @@ const reviewGallery = document.querySelector('#review-gallery');
 const activityPanel = document.querySelector('#activity-panel');
 const activityTitle = document.querySelector('#activity-title');
 const activityList = document.querySelector('#activity-list');
+const usagePill = document.querySelector('#usage-pill');
 const attachmentPreview = document.querySelector('#attachment-preview');
 const modelActions = document.querySelector('#model-actions');
 const viewer = new CadViewer(document.querySelector('#viewer'), document.querySelector('#dimensions'));
@@ -132,7 +133,6 @@ const activityLabels = {
   reviewing: 'Reviewing',
   // Status / pseudo-tool labels (kept for SSE events and info rows).
   agent: 'Agent',
-  usage: 'Usage',
   preparing: 'Preparing',
   running: 'Running',
   rendering: 'Rendering',
@@ -186,6 +186,53 @@ function clearActivity() {
   toolMessages.clear();
   activityList.replaceChildren();
   activityPanel.hidden = true;
+  resetUsagePill();
+}
+
+// Token usage pill lives next to the activity-panel summary. Each
+// ``agent_usage`` SSE event overwrites the pill in place; the activity list
+// itself never sees these events, so tool rows stay readable.
+let lastUsage = null;
+
+function formatTokenCount(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return '—';
+  if (n >= 10000) return `${Math.round(n / 1000)}k`;
+  return String(n);
+}
+
+function updateUsagePill(data = {}) {
+  const prompt = Number(data.prompt_tokens);
+  const completion = Number(data.completion_tokens);
+  const cached = Number(data.cached_tokens || 0);
+  if (!usagePill) return;
+  // Keep the most recent meaningful reading; the backend publishes several
+  // usage events per turn (one per LLM call), and we want the latest one.
+  if (Number.isFinite(prompt)) {
+    lastUsage = { prompt, completion: Number.isFinite(completion) ? completion : null, cached };
+  } else if (!lastUsage) {
+    return;
+  }
+  const snapshot = lastUsage;
+  const promptLabel = formatTokenCount(snapshot.prompt);
+  const completionLabel = formatTokenCount(snapshot.completion);
+  const cachedLabel = formatTokenCount(snapshot.cached);
+  const cacheRatio = snapshot.prompt > 0 ? snapshot.cached / snapshot.prompt : 0;
+  let cacheState = 'miss';
+  if (cacheRatio >= 0.9) cacheState = 'hit';
+  else if (cacheRatio > 0) cacheState = 'partial';
+  usagePill.dataset.cache = cacheState;
+  usagePill.textContent =
+    `↑${promptLabel} ↓${completionLabel} · cache ${cachedLabel}`;
+  usagePill.hidden = false;
+}
+
+function resetUsagePill() {
+  lastUsage = null;
+  if (!usagePill) return;
+  usagePill.textContent = '';
+  usagePill.hidden = true;
+  delete usagePill.dataset.cache;
 }
 
 function updateActivitySummary() {
@@ -548,13 +595,7 @@ function addInfoMessage(type, data = {}) {
   } else if (type === 'tool_status') {
     addToolMessage(data);
   } else if (type === 'agent_usage') {
-    const cache = Number(data.cached_tokens || 0);
-    addToolMessage({
-      call_id: `usage-${crypto.randomUUID()}`,
-      tool: 'usage',
-      status: 'completed',
-      result: `Prompt ${data.prompt_tokens ?? '—'} · Completion ${data.completion_tokens ?? '—'} · Cached ${cache}`,
-    });
+    updateUsagePill(data);
   } else if (type === 'agent_stopped') {
     addToolMessage({
       call_id: `stopped-${crypto.randomUUID()}`,
