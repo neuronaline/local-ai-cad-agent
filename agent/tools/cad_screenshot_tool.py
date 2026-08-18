@@ -40,7 +40,7 @@ from typing import Any
 from agent.sandbox import command as sandbox_command
 from agent.tools.cad_scripts import screenshot as screenshot_script
 from agent.tools.file_tool import FileTool
-from agent.tools.terminal_tool import _stream_with_limit, _TimedOut
+from agent.tools.process_runner import _TimedOut, _stream_with_limit
 
 _LOG = logging.getLogger(__name__)
 

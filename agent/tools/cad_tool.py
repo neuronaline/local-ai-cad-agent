@@ -17,7 +17,7 @@ from typing import Any
 from agent.revisions import RevisionIntegrityError, RevisionStore
 from agent.sandbox import command as sandbox_command
 from agent.tools.file_tool import FileTool
-from agent.tools.terminal_tool import _stream_with_limit, _TimedOut
+from agent.tools.process_runner import _TimedOut, _stream_with_limit
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent / "cad_scripts"
 

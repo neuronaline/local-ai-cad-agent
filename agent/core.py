@@ -33,11 +33,9 @@ from agent.tool_schemas import TOOL_SCHEMAS
 from agent.tools.cad_review_tool import CadReviewTool
 from agent.tools.cad_screenshot_tool import CadScreenshotTool
 from agent.tools.cad_tool import CadTool
-from agent.tools.experience_tool import ExperienceTool
 from agent.tools.file_tool import FileTool
 from agent.tools.question_tool import QuestionTool, normalize_questions
 from agent.tools.question_validator import QuestionValidator
-from agent.tools.terminal_tool import TerminalTool
 
 _LOG = logging.getLogger(__name__)
 
@@ -60,7 +58,6 @@ class ProjectTools:
         # Reconcile on project load: import existing model or recover from crash.
         self.revisions.reconcile()
         self.file = FileTool(project_dir, self.revisions)
-        self.terminal = TerminalTool(project_dir)
         self.cad = CadTool(
             project_dir,
             publish,
@@ -80,12 +77,8 @@ class ProjectTools:
             stop_event=stop_event,
         )
         self.question = QuestionTool(publish)
-        # Experience tool lives at workspace scope, so we need the workspace root.
-        # project_dir is <workspace>/<project>; parent yields the workspace.
-        self.experience = ExperienceTool(project_dir.parent, project_dir.name)
 
     def stop(self) -> None:
-        self.terminal.stop()
         self.cad.stop()
         # Best-effort: screenshot/review may have never been used in this
         # project, so guard against missing attributes on cold start.
@@ -571,36 +564,30 @@ class AgentRunner:
         if not history or history[-1] != user_message:
             history.append(user_message)
             self._append_message(project_dir, user_message)
-        issue_index = ExperienceTool(
-            project_dir.parent, project_dir.name
-        ).context_index()
         return [
             {"role": "system", "content": get_system_prompt()},
-            self._past_issues_message(issue_index),
+            self._project_state_message(project_dir),
             *history,
         ]
 
     @staticmethod
-    def _past_issues_message(issue_index: dict[str, object]) -> dict[str, str]:
-        """Format one run-scoped, compact past-issues snapshot."""
-        if not issue_index.get("available"):
-            content = "<past_issues>\n(unavailable)\n</past_issues>"
+    def _project_state_message(project_dir: Path) -> dict[str, str]:
+        """Provide the model with the current editable-model state."""
+        if (project_dir / "model.py").is_file():
+            content = (
+                "<project_state>\n"
+                "model.py exists. Read it before making a targeted edit.\n"
+                "</project_state>"
+            )
         else:
-            issues = issue_index.get("issues")
-            lines = ["<past_issues>"]
-            if isinstance(issues, list) and issues:
-                for issue in issues:
-                    if not isinstance(issue, dict):
-                        continue
-                    title = issue.get("title")
-                    record_id = issue.get("id")
-                    if isinstance(title, str) and isinstance(record_id, str):
-                        lines.append(f"- {title} — id: {record_id}")
-            if len(lines) == 1:
-                lines.append("(empty)")
-            lines.append("</past_issues>")
-            content = "\n".join(lines)
-        return {"role": "user", "content": content}
+            content = (
+                "<project_state>\n"
+                "model.py does not exist. Create it directly with file_write; do not "
+                "call file_read, file_replace, file_regex_replace, cad_build_and_verify, "
+                "cad_screenshot, or cad_review first.\n"
+                "</project_state>"
+            )
+        return {"role": "system", "content": content}
 
     @staticmethod
     def _strip_image_parts(item: dict) -> dict:
@@ -756,35 +743,6 @@ class AgentRunner:
                 ),
                 False,
             )
-        if name == "terminal_run":
-            return tools.terminal.run(
-                args["arguments"], args.get("timeout_seconds", 30)
-            ), False
-        if name == "terminal_check":
-            return tools.terminal.check(
-                args["arguments"], args.get("timeout_seconds", 15)
-            ), False
-        if name == "terminal_bash":
-            return tools.terminal.bash(
-                args["command"], args.get("timeout_seconds", 15)
-            ), False
-        if name == "experience_search":
-            return tools.experience.search(args["query"]), False
-        if name == "experience_get":
-            return tools.experience.get(args["id"]), False
-        if name == "experience_add":
-            return tools.experience.add(
-                args["title"],
-                args["problem"], args["solution"], args.get("tags")
-            ), False
-        if name == "experience_update":
-            return tools.experience.update(
-                args["id"],
-                args.get("title"),
-                args.get("problem"),
-                args.get("solution"),
-                args.get("tags"),
-            ), False
         if name == "question":
             # execute() validates, normalizes, and publishes the questions;
             # the normalized list is also needed for the persisted state.

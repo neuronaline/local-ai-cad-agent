@@ -8,7 +8,8 @@ from typing import ClassVar
 
 import pytest
 
-from agent.core import TOOL_SCHEMAS, AgentRunner, ProjectTools
+from agent.core import AgentRunner, ProjectTools
+from agent.tool_schemas import TOOL_SCHEMAS
 from agent.settings import Settings
 from agent.tool_results import failure as tool_failure
 
@@ -478,19 +479,7 @@ def test_waiting_question_survives_runner_recreation_and_validates_answer(
 def test_agent_tool_schema_and_dispatch_forbid_export(tmp_path: Path):
     names = {tool["function"]["name"] for tool in TOOL_SCHEMAS}
     assert "cad_build_and_verify" in names
-    assert {
-        "file_read",
-        "file_write",
-        "file_replace",
-        "file_regex_replace",
-        "terminal_run",
-        "terminal_check",
-        "experience_search",
-        "experience_get",
-        "experience_add",
-        "experience_update",
-    } <= names
-    assert {"cad", "file", "terminal", "experience"}.isdisjoint(names)
+    assert {"cad", "file"}.isdisjoint(names)
     assert all(
         "operation" not in schema["function"]["parameters"]["properties"]
         for schema in TOOL_SCHEMAS
@@ -507,6 +496,18 @@ def test_agent_tool_schema_and_dispatch_forbid_export(tmp_path: Path):
         )
 
 
+def test_project_state_tells_agent_to_create_a_missing_model(tmp_path: Path):
+    project = tmp_path / "demo"
+    project.mkdir()
+
+    state = AgentRunner._project_state_message(project)
+
+    assert state["role"] == "system"
+    assert "model.py does not exist" in state["content"]
+    assert "file_write" in state["content"]
+    assert "file_read" in state["content"]
+
+
 def test_tool_schemas_document_side_effects_and_reject_extra_arguments():
     schemas = {schema["function"]["name"]: schema for schema in TOOL_SCHEMAS}
 
@@ -515,14 +516,10 @@ def test_tool_schemas_document_side_effects_and_reject_extra_arguments():
 
     write_description = schemas["file_write"]["function"]["description"]
     build_description = schemas["cad_build_and_verify"]["function"]["description"]
-    terminal_arguments = schemas["terminal_run"]["function"]["parameters"][
-        "properties"
-    ]["arguments"]
     question_parameters = schemas["question"]["function"]["parameters"]
 
     assert "overwrites the whole file" in write_description
     assert "call cad_review separately if you want a verdict" in build_description
-    assert terminal_arguments["minItems"] == terminal_arguments["maxItems"] == 2
     assert question_parameters["properties"]["questions"]["minItems"] == 1
     assert (
         question_parameters["properties"]["questions"]["items"]["additionalProperties"]
@@ -684,6 +681,7 @@ def test_protocol_history_is_append_only_and_preserves_tool_call_content(
     messages = runner._context(project, "Add a chamfer", [])
 
     assert messages[0]["role"] == "system"
+    assert "model.py does not exist" in messages[1]["content"]
     assert [message["role"] for message in messages[2:]] == [
         "user",
         "assistant",
@@ -691,35 +689,9 @@ def test_protocol_history_is_append_only_and_preserves_tool_call_content(
         "assistant",
         "user",
     ]
-    assert messages[1] == {
-        "role": "user",
-        "content": "<past_issues>\n(empty)\n</past_issues>",
-    }
     assert (
         (project / "conversation.jsonl").read_text(encoding="utf-8").startswith(initial)
     )
-
-
-def test_past_issue_index_is_a_run_scoped_snapshot(tmp_path: Path):
-    project = tmp_path / "demo"
-    project.mkdir()
-    runner = AgentRunner(
-        Settings(tmp_path, "https://example.test", "test", 1, "127.0.0.1", 5000),
-        lambda *_, **__: None,
-    )
-
-    messages = runner._context(project, "Make a bracket", [])
-    snapshot = messages[1]["content"]
-
-    ProjectTools(project, lambda *_, **__: None).experience.add(
-        "Fillet recovery",
-        "Fillet fails on sharp edges.",
-        "Apply a chamfer first.",
-    )
-
-    assert messages[1]["content"] == snapshot
-    next_messages = runner._context(project, "Add a fillet", [])
-    assert "Fillet recovery" in next_messages[1]["content"]
 
 
 def test_legacy_history_is_loaded_from_conversation_jsonl(tmp_path: Path):

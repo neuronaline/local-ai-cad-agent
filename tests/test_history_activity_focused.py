@@ -356,7 +356,7 @@ def test_activity_label_groups_share_the_same_wording():
     """The activity panel renders tool families as a single phrase so users
     do not see three different rows when the agent edits the file three ways.
     Pinned: file_write/file_replace/file_regex_replace all share 'Updating
-    model'; terminal_run/terminal_check share 'Checking model'.
+    model'.
     """
     bindings = (
         _extract_js("activityLabels", kind="object")
@@ -368,14 +368,11 @@ def test_activity_label_groups_share_the_same_wording():
         "  file_write: activityLabel('file_write'),\n"
         "  file_replace: activityLabel('file_replace'),\n"
         "  file_regex_replace: activityLabel('file_regex_replace'),\n"
-        "  terminal_run: activityLabel('terminal_run'),\n"
-        "  terminal_check: activityLabel('terminal_check'),\n"
         "}));\n"
     )
     out = json.loads(_eval_helper(bindings, body))
 
     assert out["file_write"] == out["file_replace"] == out["file_regex_replace"]
-    assert out["terminal_run"] == out["terminal_check"]
 
 
 @pytest.mark.parametrize(
@@ -609,7 +606,7 @@ def test_mark_activity_recovered_leaves_error_rows_visible():
         "activityItems.set('err-1', {callId: 'err-1', tool: 'file_write', status: 'error'});\n"
         "makeRow('err-1', 'error');\n"
         # Already-failed row at error status must also remain untouched.
-        "activityItems.set('err-2', {callId: 'err-2', tool: 'terminal_run', status: 'error'});\n"
+        "activityItems.set('err-2', {callId: 'err-2', tool: 'file_write', status: 'error'});\n"
         "makeRow('err-2', 'error');\n"
         "markActivityRecovered();\n"
         "process.stdout.write(JSON.stringify({\n"

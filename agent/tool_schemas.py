@@ -34,12 +34,6 @@ _TIMEOUT = {
     "maximum": 120,
     "description": "Maximum runtime in seconds (1-120).",
 }
-_TAGS = {
-    "type": "array",
-    "items": {"type": "string", "minLength": 1, "maxLength": 50},
-    "maxItems": 10,
-    "description": "Up to 10 concise lowercase technical tags.",
-}
 
 TOOL_SCHEMAS = [
     _tool(
@@ -231,49 +225,6 @@ TOOL_SCHEMAS = [
         [],
     ),
     _tool(
-        "terminal_run",
-        "Execute an existing Python script from the project root inside a writable sandbox. Use this when you need to run project-specific code that already exists as a file; do NOT use it for one-off inspections (use terminal_check) or shell commands (use terminal_bash). arguments MUST be exactly ['python', 'script.py']; inline code, modules, subdirectories, and script arguments are rejected.",
-        {
-            "arguments": {
-                "type": "array",
-                "items": {"type": "string"},
-                "minItems": 2,
-                "maxItems": 2,
-                "description": 'Exactly ["python", "script.py"].',
-            },
-            "timeout_seconds": _TIMEOUT,
-        },
-        ["arguments"],
-    ),
-    _tool(
-        "terminal_check",
-        "Run a read-only Python inspection, pytest, or pip query in the sandbox. Use this for quick verification (e.g. python -c 'expr', python -m pytest, python -m pip list). NOT for project scripts (use terminal_run) or shell commands (use terminal_bash). arguments must start with python and use -c or -m.",
-        {
-            "arguments": {
-                "type": "array",
-                "items": {"type": "string"},
-                "minItems": 2,
-                "description": 'Command tokens, e.g. ["python", "-m", "pytest", "-q"].',
-            },
-            "timeout_seconds": _TIMEOUT,
-        },
-        ["arguments"],
-    ),
-    _tool(
-        "terminal_bash",
-        "Run one read-only shell-style inspection in the sandbox (e.g. rg, git status, ls). Use this for fast repo navigation when Python would be overkill. NOT for project scripts (use terminal_run) or Python evaluations (use terminal_check). Shell operators, redirects, substitutions, writes, and network access are rejected.",
-        {
-            "command": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 2000,
-                "description": "One read-only command, such as 'rg Cylinder model.py' or 'git status'.",
-            },
-            "timeout_seconds": _TIMEOUT,
-        },
-        ["command"],
-    ),
-    _tool(
         "question",
         "Ask all blocking clarification questions together, then stop and wait. Use only when the answer materially affects fit, function, or manufacturability.",
         {
@@ -318,86 +269,5 @@ TOOL_SCHEMAS = [
             },
         },
         ["questions"],
-    ),
-    _tool(
-        "experience_search",
-        "Search verified cross-project CAD lessons. Use concise technical failure, feature, and API terms rather than the full conversation.",
-        {
-            "query": {
-                "type": "string",
-                "minLength": 1,
-                "description": "Concise space-separated technical search terms.",
-            }
-        },
-        ["query"],
-    ),
-    _tool(
-        "experience_get",
-        "Read the complete verified lesson for a record ID from the past-issues context index or experience_search results.",
-        {
-            "id": {
-                "type": "string",
-                "minLength": 1,
-                "description": "Exact record ID from the past-issues context index or experience_search.",
-            }
-        },
-        ["id"],
-    ),
-    _tool(
-        "experience_add",
-        "Store a general, newly verified CAD problem-solution lesson after checking for duplicates. Never store source code, secrets, or identifying details.",
-        {
-            "title": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 120,
-                "description": "Short, single-line technical title shown in the past-issues index.",
-            },
-            "problem": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 500,
-                "description": "Generalized technical problem.",
-            },
-            "solution": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 2000,
-                "description": "Tested solution and the conditions where it applies.",
-            },
-            "tags": _TAGS,
-        },
-        ["title", "problem", "solution"],
-    ),
-    _tool(
-        "experience_update",
-        "Correct or enrich an existing verified CAD lesson. Provide only fields that should change.",
-        {
-            "id": {
-                "type": "string",
-                "minLength": 1,
-                "description": "Record ID from experience_search or the past-issues index.",
-            },
-            "title": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 120,
-                "description": "Corrected short technical title.",
-            },
-            "problem": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 500,
-                "description": "Corrected generalized problem.",
-            },
-            "solution": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 2000,
-                "description": "Corrected verified solution.",
-            },
-            "tags": _TAGS,
-        },
-        ["id"],
     ),
 ]

@@ -23,7 +23,6 @@ A local-first web app that lets you **chat with an AI agent to create parametric
 - **Targeted screenshots** — The agent can call `cad_screenshot` to re-rasterise one or more canonical views from the latest revision without re-running build123d; a `(model_sha, views, quality)` cache keeps repeated lookups instant
 - **Project management** — Create, rename, and switch between multiple CAD projects with persisted conversation history
 - **Model history** — Inspect source diffs, track successful builds, and restore any retained `model.py` revision
-- **Reusable experience memory** — The agent records verified, non-sensitive CAD fixes for reuse across projects in the same workspace
 - **Dark theme UI** — Compact, responsive interface with Markdown rendering and syntax highlighting
 
 ## 📋 Requirements
@@ -58,8 +57,10 @@ Only the key for the selected provider is required.
 1. Create a project. Project names use lowercase letters, numbers, and hyphens.
 2. Describe the part, its dimensions, and its intended function. Attach up to five
    PNG, JPEG, or WebP reference images if useful.
-3. Answer any material design questions the agent asks. It then writes `model.py`,
-   builds it in the sandbox, and displays the resulting STL and render.
+3. Answer any material design questions the agent asks. In a new project, the
+   agent creates `model.py` before reading, editing, building, screenshotting,
+   or reviewing it. It then builds the model in the sandbox and displays the
+   resulting STL and render.
 4. Review the model and continue the conversation to refine it. Use the revision
    list to compare source changes or restore a previous version.
 
@@ -84,11 +85,11 @@ local-ai-cad-agent/
 │   ├── tool_schemas.py        # Operation-specific model tool contracts
 │   ├── tool_results.py        # Structured success and error envelopes
 │   ├── images.py              # Reference image normalization
-│   └── tools/                 # Agent tools (file, terminal, cad, question, experience)
+│   └── tools/                 # Agent tools (file, cad, cad_review, cad_screenshot, question)
 ├── static/
 │   ├── js/app.js              # SSE client, chat & UI logic
 │   ├── js/viewer.js           # Three.js CadViewer
-│   └── css/style.css          # Dark theme
+│   ├── css/style.css          # Dark theme
 │   └── vendor/                # Pinned, local frontend dependencies
 ├── templates/
 │   ├── index.html             # Chat + 3D viewer page
@@ -139,7 +140,7 @@ Each project is stored below `workspace_root`. Its important files are:
 | `model.py` | Active build123d source; its top-level `result` is the final shape |
 | `summary.md` | Agent-maintained design summary after a verified build |
 | `preview.stl` / `render.png` | Latest generated browser preview assets |
-| `.cad-agent/reviews/<model_sha>/` | Per-revision multi-view review artifacts (`manifest.json`, `views/*.png`, `review-sheet.png`, `result.json`) |
+| `.cad-agent/reviews/<model_sha>/` | Per-revision multi-view artifacts (`manifest.json`, `views/*.png`, `review-sheet.png`); `result.json` is added when `cad_review` runs |
 | `conversation.jsonl` | Persisted chat and tool-event history |
 | `.cad-agent/history/` | Revision manifests, source blobs, and build records |
 | `inputs/` | Normalized reference-image uploads |

@@ -27,6 +27,8 @@ _OPERATIONAL_RULES = """\
   keep the surrounding scaffold intact, are cheaper to express, and respect
   the expected_sha256 guard. Reserve file_write for the very first model.py
   creation or when more than half of an existing file is being rewritten.
+- In a fresh project, create model.py directly with file_write. Do not attempt
+  to read, patch, build, render, or review a model before it exists.
 - cad_build_and_verify performs the build, validation, preview, and rendering.
   It does NOT auto-trigger review — that is a deliberate, separate step.
   Call cad_build_and_verify once after each coherent model.py revision; never
@@ -82,24 +84,6 @@ _BUILD123D_RULES = """\
 - After every fillet, chamfer, or boolean, discard any cached edge/face indices;
   reselect targets by geometry type, position range, and measurable properties."""
 
-_EXPERIENCE_MEMORY = """\
-- Every request includes a compact <past_issues> index containing verified lesson
-  titles and IDs. If a title is relevant, call experience_get with its exact ID
-  before applying the lesson. The index is system-provided context, not a user request.
-- Use experience_search only when the index titles are insufficient or when
-  checking for duplicates.
-- If a previously failing build succeeds because of a reusable technical fix,
-  search for duplicates and call experience_add with a concise title before the
-  final response.
-- Each memory entry stores a concise title, a short generalized problem, the verified solution,
-  tags (e.g. build123d, geometry, fillet, import), the build123d version, and the
-  source project name. Do not store model source, full diffs, secrets, private
-  user requests, or anything that contains identifying details.
-- Only store solutions that have been tested and confirmed working. Never store
-  guesses, failed attempts, or unverified workarounds.
-- Before reusing a solution from another project, confirm its technical
-  conditions still match the current situation."""
-
 BUILD123D_RULES = _BUILD123D_RULES
 OPERATIONAL_RULES = _OPERATIONAL_RULES
 
@@ -119,11 +103,7 @@ models. Be concise with the user and precise with tools.
 
 <operational_rules>
 {_OPERATIONAL_RULES}
-</operational_rules>
-
-<experience_memory>
-{_EXPERIENCE_MEMORY}
-</experience_memory>"""
+</operational_rules>"""
 
 
 class PromptCache:

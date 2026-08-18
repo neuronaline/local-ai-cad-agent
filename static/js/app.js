@@ -122,13 +122,6 @@ const activityLabels = {
   file_replace: 'Updating model',
   file_regex_replace: 'Updating model',
   file_read: 'Reading model',
-  terminal_run: 'Checking model',
-  terminal_check: 'Checking model',
-  terminal_bash: 'Inspecting workspace',
-  experience_search: 'Checking past solutions',
-  experience_get: 'Reading past solution',
-  experience_add: 'Saving solution',
-  experience_update: 'Updating past solutions',
   question: 'Requesting input',
   // Phase labels surfaced via ``tool_status`` from the new split tools. The
   // agent no longer auto-reviews; both steps are opt-in, so we give each one

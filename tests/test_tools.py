@@ -17,11 +17,8 @@ from agent.tools.cad_scripts.renderer import (
 )
 from agent.tools.cad_tool import CadTool
 from agent.tools.file_tool import FileTool
+from agent.tools.process_runner import _validate_check_code
 from agent.tools.question_tool import normalize_questions
-from agent.tools.terminal_tool import (
-    TerminalTool,
-    _validate_check_code,
-)
 
 
 def test_review_renderer_uses_correct_barycentric_coordinates():
@@ -232,63 +229,6 @@ with BuildLine():
 
     assert result.startswith("Wrote model.py")
     assert "WARNING" not in result
-
-
-def test_terminal_tool_runs_only_local_python_script(tmp_path: Path):
-    (tmp_path / "check.py").write_text("print('ok')\n", encoding="utf-8")
-    tool = TerminalTool(tmp_path)
-    result = tool.run(["python", "check.py"])
-    assert result["returncode"] == 0
-    assert result["stdout"] == "ok\n"
-    with pytest.raises(ValueError, match="Only Python commands"):
-        tool.run(["bash", "check.py"])
-
-
-def test_terminal_tool_reports_python_failures_as_errors(tmp_path: Path):
-    (tmp_path / "fail.py").write_text(
-        "print('before failure')\nraise ValueError('broken')\n", encoding="utf-8"
-    )
-
-    with pytest.raises(RuntimeError, match="before failure") as error:
-        TerminalTool(tmp_path).run(["python", "fail.py"])
-
-    assert "ValueError: broken" in str(error.value)
-
-
-def test_terminal_bash_allows_only_read_only_commands(tmp_path: Path):
-    tool = TerminalTool(tmp_path)
-
-    with pytest.raises(ValueError, match="shell operators"):
-        tool.bash("pwd; ls")
-    with pytest.raises(ValueError, match="read-only commands"):
-        tool.bash("rm model.py")
-    with pytest.raises(ValueError, match="non-read-only option"):
-        tool.bash("find . -delete")
-    with pytest.raises(RuntimeError, match="exit code"):
-        tool.bash("find . -fprint /tmp/files")
-
-
-def test_terminal_sandbox_hides_environment_and_blocks_network(
-    tmp_path: Path, monkeypatch
-):
-    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
-    host_secret = tmp_path.parent / "host-secret.txt"
-    host_secret.write_text("private", encoding="utf-8")
-    (tmp_path / "probe.py").write_text(
-        "import os, socket\n"
-        "from pathlib import Path\n"
-        "print(os.getenv('OPENROUTER_API_KEY'))\n"
-        f"print(Path({str(host_secret)!r}).exists())\n"
-        "try:\n"
-        "    socket.socket()\n"
-        "except OSError as error:\n"
-        "    print(error.errno)\n",
-        encoding="utf-8",
-    )
-
-    result = TerminalTool(tmp_path).run(["python", "probe.py"])
-
-    assert result["stdout"] == "None\nFalse\n1\n"
 
 
 def test_cad_sandbox_does_not_inherit_api_key(tmp_path: Path, monkeypatch):
@@ -627,7 +567,7 @@ def test_file_summary_write_does_not_create_revision(tmp_path: Path):
 
 
 # --------------------------------------------------------------------------- #
-#  TerminalTool check -c AST validator regression tests
+#  check -c AST validator regression tests (sandbox escape-vector coverage)
 # --------------------------------------------------------------------------- #
 
 
