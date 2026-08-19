@@ -54,7 +54,7 @@ def _synchronized(method: Callable[_P, _R]) -> Callable[_P, _R]:
     """
 
     @wraps(method)
-    def wrapped(self: "RevisionStore", *args: _P.args, **kwargs: _P.kwargs) -> _R:
+    def wrapped(self: RevisionStore, *args: _P.args, **kwargs: _P.kwargs) -> _R:
         with self._lock:
             return method(self, *args, **kwargs)
 
@@ -173,8 +173,6 @@ class RevisionStore:
         # store across every project (audit_033). Per-instance lets parallel
         # projects build/restore/prune concurrently.
         self._lock = threading.RLock()
-        # Revision-list cache (audit_032); invalidated on commit/restore/prune.
-        self._revisions_cache: list[Revision] | None = None
         history = self.project_dir / ".cad-agent" / "history"
         self._head_path = history / "head.json"
         self._blobs_dir = history / "blobs"
@@ -288,14 +286,14 @@ class RevisionStore:
     def _all_revisions(self) -> list[Revision]:
         """Return every readable revision, newest first, for internal operations.
 
-        Cached in memory (audit_032); invalidated on commit/restore/prune.
-
         Must be called while holding ``self._lock`` (audit_185). All public
-        callers wrap this in ``@_synchronized``; new callers must do the same
-        to avoid races with cache invalidation.
+        callers wrap this in ``@_synchronized``; new callers must do the same.
+
+        A directory scan on a few hundred revisions is on the order of
+        microseconds, so the legacy in-memory cache was dropped: it never
+        helped (single-store scans) and it would silently hold stale entries
+        when another ``RevisionStore`` instance mutated the same project.
         """
-        if self._revisions_cache is not None:
-            return list(self._revisions_cache)
         revisions: list[Revision] = []
         if self._revisions_dir.is_dir():
             for entry in self._revisions_dir.iterdir():
@@ -310,13 +308,7 @@ class RevisionStore:
 
         # Sort by created_at descending, then by ID for stability.
         revisions.sort(key=lambda r: (r.created_at, r.id), reverse=True)
-        self._revisions_cache = revisions
         return list(revisions)
-
-
-    def _invalidate_revision_cache(self) -> None:
-        """Drop the in-memory revision list cache (called on mutation)."""
-        self._revisions_cache = None
 
     @_synchronized
     def get(self, revision_id: str) -> Revision:
@@ -433,7 +425,6 @@ class RevisionStore:
         elif self.retention_count > 0:
             self.prune(self.retention_count)
 
-        self._invalidate_revision_cache()
         return revision
 
     @_synchronized
@@ -483,7 +474,6 @@ class RevisionStore:
         if self.retention_count > 0:
             self.prune(self.retention_count)
 
-        self._invalidate_revision_cache()
         return revision
 
     @_synchronized
@@ -617,10 +607,6 @@ class RevisionStore:
             tmp_path.unlink(missing_ok=True)
             raise
 
-    def _write_build(self, build: BuildRecord) -> None:
-        """Backward-compat alias used by older callers and round-trip tests."""
-        self._append_build(build)
-
     @_synchronized
     def last_known_good(self) -> Revision | None:
         """Return the newest revision with a successful build, or None."""
@@ -674,135 +660,29 @@ class RevisionStore:
             self._delete_revision(revision)
             removed += 1
 
-        self._invalidate_revision_cache()
         return removed
 
-    @_synchronized
     def export_history(self, target_dir: Path) -> Path:
-        """Export the complete revision history as a portable JSON archive.
+        """Backward-compat wrapper around :func:`agent.revision_archive.export_history`.
 
-        Returns the path to the created archive file.
-
-        NOTE (audit_031): this method exists for the round-trip test suite only.
-        Production code should not invoke it. Retained on the public class
-        surface because removing it would break the legacy test archive.
+        Production code should not call this method directly; the round-trip
+        test suite drives it through :mod:`agent.revision_archive`. The
+        helper grabs the per-instance lock itself, so this wrapper does not
+        need a :func:`_synchronized` decorator.
         """
-        target_dir = target_dir.resolve()
-        target_dir.mkdir(parents=True, exist_ok=True)
+        from agent.revision_archive import export_history as _export
 
-        revisions_data: list[dict] = []
-        blobs: dict[str, str] = {}
+        return _export(self, target_dir)
 
-        head_data = self._read_json_safe(self._head_path)
-
-        for revision in self._all_revisions():
-            rev_data = revision.to_dict()
-            try:
-                source = self.source(revision.id)
-                blobs[revision.model_sha256] = source
-            except RevisionIntegrityError:
-                rev_data["_source_missing"] = True
-
-            build = self.build_for(revision.id)
-            if build is not None:
-                rev_data["build"] = build.to_dict()
-
-            revisions_data.append(rev_data)
-
-        archive = {
-            "schema_version": SCHEMA_VERSION,
-            "exported_at": _utc_now(),
-            "head": head_data,
-            "revisions": revisions_data,
-            "blobs": blobs,
-        }
-
-        archive_path = target_dir / "cad-agent-history.json"
-        with tempfile.NamedTemporaryFile(
-            mode="w", dir=target_dir, encoding="utf-8", delete=False, suffix=".tmp"
-        ) as temporary:
-            tmp_path = Path(temporary.name)
-            json.dump(archive, temporary, ensure_ascii=False, indent=2)
-        try:
-            tmp_path.replace(archive_path)
-        except BaseException:
-            tmp_path.unlink(missing_ok=True)
-            raise
-
-        return archive_path
-
-    @_synchronized
     def import_history(self, archive_path: Path) -> int:
-        """Import revisions from a previously exported archive.
+        """Backward-compat wrapper around :func:`agent.revision_archive.import_history`.
 
-        Existing history is preserved; imported revisions that would collide
-        with existing IDs are skipped. Build records attached to imported
-        revisions are restored. Returns the number of revisions imported.
-
-        NOTE (audit_031): this method exists for the round-trip test suite only.
-        Production code should not invoke it.
+        Production code should not call this method directly; the round-trip
+        test suite drives it through :mod:`agent.revision_archive`.
         """
-        try:
-            archive = json.loads(archive_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as error:
-            raise RevisionIntegrityError(
-                f"Cannot read history archive: {error}"
-            ) from error
+        from agent.revision_archive import import_history as _import
 
-        if not isinstance(archive, dict):
-            raise RevisionIntegrityError("Invalid history archive format.")
-
-        blobs_data = archive.get("blobs", {})
-        if not isinstance(blobs_data, dict):
-            raise RevisionIntegrityError("Archive blobs section is malformed.")
-
-        imported = 0
-        for revision_data in archive.get("revisions", []):
-            if not isinstance(revision_data, dict):
-                continue
-            rev_id = revision_data.get("id")
-            if not isinstance(rev_id, str) or not _REVISION_ID_RE.fullmatch(rev_id):
-                continue
-
-            # Skip if this revision already exists.
-            if (self._revisions_dir / f"{rev_id}.json").is_file():
-                continue
-
-            model_sha256 = str(revision_data.get("model_sha256", ""))
-            if not _SHA256_RE.fullmatch(model_sha256):
-                continue
-
-            # Write blob if provided.
-            if model_sha256 in blobs_data and not (self._blobs_dir / f"{model_sha256}.py").is_file():
-                blob_content = str(blobs_data[model_sha256])
-                self._write_blob_bytes(blob_content.encode("utf-8"), model_sha256)
-
-            # Write revision manifest.
-            try:
-                revision = Revision.from_dict(revision_data)
-            except (KeyError, TypeError):
-                continue  # Skip malformed revision entries.
-            self._write_revision(revision)
-
-            # Write build record if present.
-            build_data = revision_data.get("build")
-            if isinstance(build_data, dict):
-                try:
-                    self._write_build(BuildRecord.from_dict(build_data))
-                except (KeyError, TypeError):
-                    pass  # Best-effort; skip malformed build data.
-
-            imported += 1
-
-        # If no head exists, adopt the archive head.
-        if self._read_json_safe(self._head_path) is None:
-            head_data = archive.get("head")
-            if isinstance(head_data, dict):
-                head_rev = head_data.get("revision_id")
-                if isinstance(head_rev, str) and (self._revisions_dir / f"{head_rev}.json").is_file():
-                    self._write_head(self.get(head_rev))
-
-        return imported
+        return _import(self, archive_path)
 
     def active_model_digest(self) -> str | None:
         """Return the SHA-256 of the active model.py, or None if absent."""
@@ -898,7 +778,6 @@ class RevisionStore:
         self._write_revision(revision)
         self._write_head(revision)
         self._maybe_import_build(revision)
-        self._invalidate_revision_cache()
         return revision
 
     def _maybe_import_build(self, revision: Revision) -> None:
@@ -919,7 +798,7 @@ class RevisionStore:
         preview_digest = (
             _sha256(preview_path.read_bytes()) if preview_path.is_file() else None
         )
-        self._write_build(
+        self._append_build(
             BuildRecord(
                 revision_id=revision.id,
                 model_sha256=revision.model_sha256,
@@ -945,7 +824,6 @@ class RevisionStore:
         self._write_blob_bytes(source.encode("utf-8"), model_digest)
         self._write_revision(revision)
         self._write_head(revision)
-        self._invalidate_revision_cache()
         return revision
 
     def _write_blob_bytes(self, source_bytes: bytes, sha256: str) -> None:

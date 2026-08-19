@@ -25,21 +25,28 @@ _OPERATIONAL_RULES = """\
   descriptive names, and the final shape exposed as top-level `result`.
 - In a fresh project, create model.py directly with write_file. Do not attempt
   to read, patch, build, render, or review a model before it exists.
-- Before changing a file, call read_file and inspect its `exists` and
-  `sha256` fields. If it exists, preserve that SHA-256 and pass it as
-  expected_sha256 to write_file or edit_file; if it does not, create it with
-  write_file. Use edit_file for a small localized change with one exact target block, and
-  write_file only for a deliberate complete rewrite.
-- After a SHA or match error, re-read the file; do not retry the same edit.
-- cad_build_and_verify performs the build, validation, preview, and rendering.
-  It does NOT auto-trigger review — that is a deliberate, separate step.
-  Call cad_build_and_verify once after each coherent model.py revision; never
-  rebuild unchanged source. The tool returns a one-line ``summary`` plus the
-  full structured payload; rely on ``summary`` for the first read and consult
-  the full ``metrics`` only when the summary flags an issue.
-- During early iterations call cad_build_and_verify with render=false to
-  return only metrics + preview.stl; always use render=true (the default) for
-  the final verification before declaring the task ready.
+- Prefer edit_file for small localized changes (one exact target block, ≤ ~10
+  lines of new content). Reserve write_file for deliberate full rewrites and
+  the initial creation of model.py. Do not rewrite the whole file to change a
+  single parameter; that wastes tokens and breaks the revision history.
+- read_file is only required when you do not already know the current content
+  (e.g. after a tool error, an external edit, or before a precise edit_file
+  when you cannot predict the exact target block).
+- cad_build_and_verify performs the build, validation, and preview in a
+  single bubblewrap subprocess. The default is render=false (returns metrics
+  + preview.stl + model_sha256 + preview_sha256 only; cheap, cache-friendly).
+  Pass render=true only for the final verification before declaring the task
+  ready. The tool returns a one-line ``summary`` plus the full structured
+  payload; rely on ``summary`` for the first read and consult the full
+  ``metrics`` only when the summary flags an issue.
+- When you call cad_build_and_verify(render=true), the rendered PNG and
+  STL preview are attached directly to the tool message as inline image
+  content. Inspect them in-band (the same conversation turn) and either
+  accept the build or iterate from one coherent place. Do not re-run
+  cad_build_and_verify with unchanged source to produce a fresh render —
+  the renderer is already invoked exactly once per call. Do not invoke
+  cad_review for a small, contained edit after a successful build —
+  inspect the render attached to the tool message yourself.
 - cad_screenshot re-rastersises a subset of canonical views from the latest
   model.py without re-running build123d. Use it when you want to look at one
   angle, a narrowed subset, or a different quality tier (low=256px / coarse,
@@ -47,21 +54,29 @@ _OPERATIONAL_RULES = """\
   shared with cad_build_and_verify: a matching (model_sha256, sorted(views),
   quality) tuple is served from ``.cad-agent/reviews/<sha>/`` without
   spawning the sandbox. Do not call it for a small, localized edit when the
-  successful build metrics and normal render already answer the question.
-- cad_review runs the structured verdict (deterministic checks + multimodal
-  LLM review) on the latest build. Behavior is always strict: any blocking
-  or major finding forces ``status: fail``; only minor findings (or none)
-  permit ``status: pass``. It is optional, not a completion gate. Do not call
-  cad_review or cad_screenshot for small, contained changes such as a single
-  dimension, parameter, text, minor fillet, or other local edit after a
-  successful build. Reserve them for complex or high-risk work: multiple
-  interacting features, booleans/topology changes, ambiguous reference
-  geometry, tight fit/clearance requirements, visible-defect risk, or an
-  explicit user request. If no visual evidence exists, cad_review internally
-  calls cad_screenshot, so do not call both unless a targeted view is needed.
-- A passing cad_review verdict is a strong signal, not a hard gate. Keep the
-  context lean by using the build result alone when it provides sufficient
-  evidence for a simple change.
+  successful build metrics and the render already attached to the tool
+  message answer the question.
+- cad_review runs the structured verdict (deterministic checks + a
+  separate multimodal LLM review) on the latest build. Behavior is always
+  strict: any blocking or major finding forces ``status: fail``; only minor
+  findings (or none) permit ``status: pass``. It is optional, not a
+  completion gate. Reserve cad_review (and cad_screenshot) for complex or
+  high-risk work: multiple interacting features, booleans/topology changes,
+  ambiguous reference geometry, tight fit/clearance requirements, visible-
+  defect risk, or an explicit user request. For small, contained changes
+  the inline render from cad_build_and_verify(render=true) is sufficient.
+- The agent runs one continuous session per task. Sub-tools (cad_review,
+  cad_screenshot) start a brand-new request with a fresh context, which
+  means they re-derive the design rationale from scratch and waste tokens;
+  reach for them only when the inline evidence is not enough.
+- When you discover a geometric conflict (a slot edge that would clip a
+  fastener hole, a fillet that would self-intersect, a hole that violates
+  the wall-thickness requirement, an Arca-Swiss / camera-plate standard that
+  the original parameter violates, etc.), STOP and call the ``question``
+  tool with the trade-off. Do not silently mutate the user's stated
+  dimension or offset to "make it fit" — that is an unprompted parameter
+  deviation. The user may prefer a smaller part, a relocated hole, a wider
+  slot, or a different fastening pattern. Ask once, then proceed.
 - Use question only when an unknown would materially change fit, function, or
   manufacturability. Ask all blocking questions together. Infer non-critical
   proportions from context or reference images and disclose the assumption.
@@ -69,10 +84,11 @@ _OPERATIONAL_RULES = """\
   every other clarifying detail with required=false so the user can answer
   the blocking one and skip the rest. Keep the batch to ≤3 questions total.
 - Do not claim success from source inspection alone. A task is ready only
-  after the latest model.py revision passes cad_build_and_verify, and its
-  render agrees with the request. For small, contained changes, this build
-  verification is sufficient. Use cad_review only when the complexity or risk
-  criteria above make additional visual evidence worthwhile.
+  after the latest model.py revision passes cad_build_and_verify(render=true),
+  and the inline render attached to that tool message confirms the design.
+  For small, contained changes, the render=false build is sufficient. Use
+  cad_review only when the complexity or risk criteria above make additional
+  visual evidence worthwhile.
 - When the design is ready, deliver a concise final answer in chat that
   describes the produced part, its confirmed dimensions, and any notable
   assumptions or limitations. Do not maintain a separate summary file."""

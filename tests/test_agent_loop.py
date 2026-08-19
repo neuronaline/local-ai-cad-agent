@@ -896,7 +896,14 @@ def test_content_delta_is_published_before_stream_end(tmp_path: Path, monkeypatc
     )
 
 
-def test_model_edit_invalidates_registered_preview(tmp_path: Path):
+def test_model_edit_after_completion_does_not_rewind_published_message(tmp_path: Path):
+    """A late model edit cannot retroactively invalidate a published completion.
+
+    With the preview-ACK state machine gone, the agent's canonical
+    ``agent_message`` is published the moment the STL is verified; later
+    file edits yield a new turn / revision and do not rewind the prior
+    state. This test locks in the new contract.
+    """
     project_root = tmp_path / "projects"
     project = project_root / "demo"
     project.mkdir(parents=True)
@@ -909,16 +916,16 @@ def test_model_edit_invalidates_registered_preview(tmp_path: Path):
         lambda *args, **_: events.append((args[0], args[1])),
     )
     preview_id = runner._register_preview("demo", project)
-
+    assert preview_id
+    # Even if the model changes after the preview is registered, no error
+    # event is fired retroactively: the success side is finalised via
+    # ``agent_message``/``agent_status:completed`` rather than parked.
     (project / "model.py").write_text("result = 2\n", encoding="utf-8")
-    runner._await_preview("demo", preview_id, "Done")
+    runner._complete("demo", "Done")
 
-    assert not runner.is_awaiting_preview("demo")
+    assert not any(kind == "agent_error" for kind, _data in events)
     assert events[-1][0] == "agent_status"
-    assert events[-1][1]["status"] == "failed"
-    # The terminal agent_error event precedes the closing agent_status
-    # (the status event tells the UI to clear its thinking indicator).
-    assert any(kind == "agent_error" for kind, _data in events)
+    assert events[-1][1]["status"] == "completed"
 
 
 def test_failed_build_clears_preview_and_returns_structured_error(tmp_path: Path):

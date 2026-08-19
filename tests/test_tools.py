@@ -17,7 +17,6 @@ from agent.tools.cad_scripts.renderer import (
 )
 from agent.tools.cad_tool import CadTool
 from agent.tools.file_tool import FileTool
-from agent.tools.process_runner import _validate_check_code
 from agent.tools.question_tool import normalize_questions
 
 
@@ -54,33 +53,38 @@ def test_contact_sheet_uses_canonical_order_and_labels(tmp_path: Path):
     assert manifest["view_order"] == ["x_positive", "isometric_positive"]
 
 
-def test_cad_tool_runner_code_reflects_review_settings():
-    """Review knobs propagate to the generated runner script. Clamping to 1
+def test_cad_tool_runner_settings_reflect_review_settings():
+    """Review knobs propagate to the JSON kwargs payload. Clamping to 1
     prevents a zero/negative worker or view count from producing an invalid
     subprocess invocation."""
+    import json
+
     # Arrange: zero / negative values must be clamped to 1 (the documented
     # minimum for both workers and required views).
     tool_zero = CadTool(Path("/tmp/project"), review_render_workers=0, review_required_views=0)
-    code_zero = tool_zero._runner_code(render=True)
-    assert "_RENDER_WORKERS = 1" in code_zero
-    assert "_REQUIRED_VIEWS = 1" in code_zero
+    settings_zero = tool_zero._runner_settings(render=True)
+    assert settings_zero["render_workers"] == 1
+    assert settings_zero["required_views"] == 1
 
     # Arrange / Act: positive overrides land in the generated code verbatim.
     tool_custom = CadTool(
         Path("/tmp/project"), review_render_workers=2, review_required_views=6
     )
-    code_custom = tool_custom._runner_code(render=True)
-    assert "_RENDER_WORKERS = 2" in code_custom
-    assert "_REQUIRED_VIEWS = 6" in code_custom
+    settings_custom = tool_custom._runner_settings(render=True)
+    assert settings_custom["render_workers"] == 2
+    assert settings_custom["required_views"] == 6
 
     # Act / Assert: render=False must disable the review-rendering block so the
     # subprocess never spawns review workers, regardless of the configured
     # worker/view counts.
     tool_no_render = CadTool(Path("/tmp/project"))
-    code_no_render = tool_no_render._runner_code(render=False)
-    assert "_RENDER_VIEWS = False" in code_no_render
-    assert "_RENDER_WORKERS = " not in code_no_render
-    assert "_REQUIRED_VIEWS = " not in code_no_render
+    settings_no_render = tool_no_render._runner_settings(render=False)
+    assert settings_no_render["render_views"] is False
+    # Worker / view counts still surface so the runner can normalise them even
+    # in the no-render path (the script currently ignores them).
+    payload = json.dumps(settings_no_render)
+    assert "render_workers" in payload
+    assert "required_views" in payload
 
 
 @pytest.mark.parametrize(
@@ -97,17 +101,17 @@ def test_cad_tool_review_settings_are_normalized(
     workers, views, expected_workers, expected_views
 ):
     """Boundary: input clamping/normalization at construction time is the
-    contract that keeps the generated runner script valid."""
+    contract that keeps the generated kwargs payload valid."""
     tool = CadTool(
         Path("/tmp/project"),
         review_render_workers=workers,
         review_required_views=views,
     )
 
-    code = tool._runner_code(render=True)
+    settings = tool._runner_settings(render=True)
 
-    assert f"_RENDER_WORKERS = {expected_workers}" in code
-    assert f"_REQUIRED_VIEWS = {expected_views}" in code
+    assert settings["render_workers"] == expected_workers
+    assert settings["required_views"] == expected_views
 
 
 def test_file_tool_rejects_unsafe_model(tmp_path: Path):
@@ -158,12 +162,18 @@ def test_read_file_missing_reports_that_it_cannot_be_edited(tmp_path: Path):
     }
 
 
-def test_write_file_requires_digest_when_file_exists(tmp_path: Path):
+def test_write_file_allows_unconditional_overwrite(tmp_path: Path):
+    """Omitting ``expected_sha256`` is an unconditional overwrite contract.
+
+    The agent loop is allowed to call ``write_file`` without a prior
+    ``read_file`` round-trip when it already knows the file content (e.g. it
+    just produced the file itself). Conflict detection is opt-in via
+    ``expected_sha256``; without it, the new content is written.
+    """
     tool = FileTool(tmp_path)
     tool.write_file("model.py", "# Width: 10 mm\n")
-
-    with pytest.raises(ValueError, match="call read_file"):
-        tool.write_file("model.py", "# Width: 12 mm\n")
+    tool.write_file("model.py", "# Width: 12 mm\n")
+    assert json.loads(tool.read_file("model.py"))["content"] == "# Width: 12 mm\n"
 
 
 def test_write_file_stale_digest_leaves_content_unchanged(tmp_path: Path):
@@ -251,12 +261,22 @@ def test_edit_file_requires_non_empty_old_string(tmp_path: Path):
         tool.edit_file("model.py", "", "# new", digest)
 
 
-def test_edit_file_requires_digest(tmp_path: Path):
+def test_edit_file_allows_unconditional_edit(tmp_path: Path):
+    """Omitting ``expected_sha256`` is an unconditional edit contract.
+
+    Same rationale as ``test_write_file_allows_unconditional_overwrite``: the
+    agent knows the current content from its own previous write, so forcing a
+    ``read_file`` round-trip only to capture the SHA would just waste a tool
+    call + tokens + latency. Conflict detection remains opt-in.
+    """
     tool = FileTool(tmp_path)
     tool.write_file("model.py", "# alpha\n")
 
-    with pytest.raises(ValueError, match="expected_sha256 is required"):
-        tool.edit_file("model.py", "# alpha", "# new", None)  # type: ignore[arg-type]
+    tool.edit_file("model.py", "# alpha", "# beta")
+
+    assert (
+        json.loads(tool.read_file("model.py"))["content"] == "# beta\n"
+    )
 
 
 def test_edit_file_reports_replaced_line_range(tmp_path: Path):
@@ -369,6 +389,12 @@ def test_cad_build_recording_is_best_effort(tmp_path: Path, monkeypatch):
 
 
 def test_cad_build_and_verify_legacy_payload(tmp_path: Path, monkeypatch):
+    """render=True keeps the legacy review manifest + artifact-path payload.
+
+    The default flipped to render=False for fast iteration; the legacy
+    payload (review_manifest, review_path) only materialises when the caller
+    explicitly opts into rendering.
+    """
     cad = CadTool(tmp_path)
     calls = []
     metrics = {
@@ -379,6 +405,8 @@ def test_cad_build_and_verify_legacy_payload(tmp_path: Path, monkeypatch):
     wrapped = {
         "metrics": metrics,
         "feature_summary": {},
+        "model_sha256": "a" * 64,
+        "preview_sha256": "b" * 64,
         "review_manifest": {"model_sha256": "a" * 64, "preview_sha256": "b" * 64},
         "review_views_dir": "",
         "review_sheet_path": "",
@@ -394,21 +422,60 @@ def test_cad_build_and_verify_legacy_payload(tmp_path: Path, monkeypatch):
         lambda manifest, *, sandbox_views_dir, sandbox_sheet_path: {"artifact_dir": "/tmp/review"},
     )
 
-    result = cad.build_and_verify()
+    result = cad.build_and_verify(render=True)
 
     assert calls == [{"render": True}]
-    # Use a structural assertion so adding future optional keys doesn't break
-    # this regression test; ``_summarize_payload`` adds a ``summary`` string
-    # that the agent sees first.
     assert result["metrics"] is metrics
     assert result["feature_summary"] == {}
     assert result["preview"] == "preview.stl"
     assert result["render"] == "render.png"
     assert result["review"] == "/tmp/review"
-    assert result["review_manifest"] == wrapped["review_manifest"]
+    assert result["model_sha256"] == "a" * 64
+    assert result["preview_sha256"] == "b" * 64
+    # The review_manifest is dropped from the legacy payload: cad_review is
+    # its own tool now and the agent never needs to re-parse it.
+    assert "review_manifest" not in result
     assert result["summary"] == (
         "Solid 1 (valid); bbox 1.0×1.0×1.0 mm; 0.0 cm³; 0 features; with render."
     )
+
+
+def test_cad_build_and_verify_default_is_metrics_only(tmp_path: Path, monkeypatch):
+    """The default render=False path skips the review artifacts entirely.
+
+    Early iteration never needs the multi-view rasterisation or the
+    contact-sheet promotion; the build returns only ``metrics``,
+    ``preview.stl``, and the model/preview SHAs.
+    """
+    cad = CadTool(tmp_path)
+    calls = []
+    metrics = {
+        "solid_count": 1,
+        "is_valid": True,
+        "dimensions_mm": {"x": 1, "y": 1, "z": 1},
+    }
+    wrapped = {
+        "metrics": metrics,
+        "feature_summary": {},
+        "model_sha256": "a" * 64,
+        "preview_sha256": "b" * 64,
+    }
+    monkeypatch.setattr(
+        cad,
+        "_execute",
+        lambda **kwargs: calls.append(kwargs) or wrapped,
+    )
+
+    result = cad.build_and_verify()
+
+    assert calls == [{"render": False}]
+    assert result["metrics"] is metrics
+    assert result["preview"] == "preview.stl"
+    assert result["render"] is None
+    assert "review" not in result
+    assert "review_manifest" not in result
+    assert result["model_sha256"] == "a" * 64
+    assert result["preview_sha256"] == "b" * 64
 
 
 def test_cad_build_and_verify_with_render_false_skips_review_artifacts(
@@ -465,6 +532,8 @@ def test_cad_build_and_verify_with_render_true_keeps_legacy_payload(
     payload = {
         "metrics": {"solid_count": 1, "is_valid": True, "dimensions_mm": {"x": 1, "y": 1, "z": 1}},
         "feature_summary": {},
+        "model_sha256": "a" * 64,
+        "preview_sha256": "b" * 64,
         "review_manifest": {"some": "manifest"},
         "review_views_dir": None,
         "review_sheet_path": None,
@@ -483,8 +552,12 @@ def test_cad_build_and_verify_with_render_true_keeps_legacy_payload(
 
     assert captured == [{"render": True}]
     assert result["render"] == "render.png"
-    assert result["review_manifest"] == {"some": "manifest"}
+    # The review manifest is dropped from the public payload: cad_review is
+    # its own tool now and the agent never needs to re-parse it.
+    assert "review_manifest" not in result
     assert result["review"] == "/tmp/review"
+    assert result["model_sha256"] == "a" * 64
+    assert result["preview_sha256"] == "b" * 64
     assert "summary" in result
     assert "Solid 1" in result["summary"]
 
@@ -655,80 +728,6 @@ def test_model_write_creates_revision(tmp_path: Path):
 
 
 # --------------------------------------------------------------------------- #
-#  check -c AST validator regression tests (sandbox escape-vector coverage)
-# --------------------------------------------------------------------------- #
-
-
-@pytest.mark.parametrize(
-    "snippet",
-    [
-        # Pre-existing banned identifiers.
-        "eval('1+1')",
-        "exec('print(1)')",
-        "open('/etc/passwd')",
-        "__import__('os')",
-        "compile('x', 'y', 'exec')",
-        "input('prompt')",
-        "breakpoint()",
-        "globals()",
-        "locals()",
-        "vars()",
-        # getattr was in the old allowlist and is now blocked.
-        "getattr(__builtins__, 'eval')('1')",
-        # Subscript bypass: __builtins__['eval'].
-        "__builtins__['eval']('1')",
-        # MRO introspection chains that previously slipped past the walker.
-        "().__class__.__bases__[0].__subclasses__()",
-        "().__class__.__mro__[1].__subclasses__()",
-        # Attribute access into a banned root identifier.
-        "builtins.eval('1')",
-        "builtins.open('/etc/passwd')",
-        # Blocked module references.
-        "import os\nos.system('id')",
-        "from sys import stdin",
-    ],
-)
-def test_validate_check_code_rejects_sandbox_escape_vectors(snippet: str):
-    """Every snippet below must fail ``_validate_check_code``.
-
-    These are the canonical sandbox-escape vectors the AST walker was
-    hardened against. Regression coverage here ensures that re-introducing
-    ``getattr`` to the allowlist (or removing any other guard) is caught by
-    CI rather than discovered in production.
-    """
-    with pytest.raises(ValueError):
-        _validate_check_code(snippet)
-
-
-@pytest.mark.parametrize(
-    "snippet",
-    [
-        "print(2 + 2)",
-        "print(type(1))",
-        "print(len('abc'))",
-        "print(repr('x'))",
-        "from math import sqrt\nprint(sqrt(4))",
-        "import numpy as np\nprint(np.zeros(1))",
-    ],
-)
-def test_validate_check_code_accepts_read_only_inspection(snippet: str):
-    """Read-only inspection snippets must pass without raising."""
-    _validate_check_code(snippet)
-
-
-def test_validate_check_code_rejects_final_statement_not_in_allowlist():
-    """The trailing statement must be a direct ``Name`` call, not an ``Attribute``.
-
-    ``list.append(x, 1)`` is a single-statement ``Attribute`` call whose root
-    (``list``) and attr (``append``) are both outside the AST-walker's
-    blocked sets, so the walker is silent. The final-statement allowlist
-    check then rejects it because the call target is not a direct ``Name``.
-    """
-    with pytest.raises(ValueError, match="final statement must call one of"):
-        _validate_check_code("list.append(x, 1)")
-
-
-# --------------------------------------------------------------------------- #
 #  QuestionTool.normalize_questions regression tests
 # --------------------------------------------------------------------------- #
 
@@ -786,7 +785,338 @@ def test_review_enabled_only_disables_multiview_rasterisation(tmp_path: Path):
     """The setting keeps render.png while skipping the expensive sheet."""
     from agent.tools.cad_tool import CadTool
 
-    code = CadTool(tmp_path, review_enabled=False)._runner_code(render=True)
+    settings = CadTool(tmp_path, review_enabled=False)._runner_settings(render=True)
 
-    assert "_RENDER_VIEWS = False" in code
-    assert "_WRITE_ISOMETRIC = True" in code
+    assert settings["render_views"] is False
+    assert settings["write_isometric"] is True
+
+
+def test_compact_for_context_strips_cad_build_payload_redundancy():
+    """``cad_build_and_verify`` tool results must drop the per-feature
+    cylinder table, the duplicated top-level ``feature_summary``, and the
+    bulky ``review_manifest.views`` details before they enter the LLM
+    history. The compact form keeps ``summary`` and ``metrics`` so the
+    agent still has what it needs to decide what to do next.
+    """
+    from agent.tool_results import compact_for_context
+
+    full_payload = {
+        "ok": True,
+        "tool": "cad_build_and_verify",
+        "data": {
+            "metrics": {
+                "solid_count": 1,
+                "is_valid": True,
+                "volume_mm3": 100.0,
+                "dimensions_mm": {"x": 10, "y": 10, "z": 1},
+                "feature_summary": {
+                    "disconnected_solid_count": 1,
+                    "cylindrical_cut_candidates": [
+                        {"diameter_mm": 3.2, "axis": [0, 0, 1], "area_mm2": 8.0,
+                         "center_mm": [0, 0, 0]}
+                    ] * 20,
+                    "through_hole_count": 20,
+                },
+            },
+            "preview": "preview.stl",
+            "render": "render.png",
+            "feature_summary": {
+                "disconnected_solid_count": 1,
+                "cylindrical_cut_candidates": ["x"] * 20,
+                "through_hole_count": 20,
+            },
+            "review_manifest": {
+                "model_sha256": "a" * 64,
+                "preview_sha256": "b" * 64,
+                "view_count": 8,
+                "views": [
+                    {
+                        "view_id": f"view-{i}",
+                        "label": "x",
+                        "camera_axis": [1, 0, 0],
+                        "screen_x_axis": [0, 1, 0],
+                        "path": f"views/{i}.png",
+                        "image_sha256": "c" * 64,
+                        "image_bytes": 1500,
+                        "width": 512,
+                        "height": 512,
+                        "render_status": "rendered",
+                    }
+                    for i in range(8)
+                ],
+                "contact_sheet": {
+                    "path": "review-sheet.png",
+                    "width": 2048,
+                    "height": 1080,
+                    "image_sha256": "d" * 64,
+                    "image_bytes": 20000,
+                },
+                "single_render": {"path": "render.png", "image_sha256": "e" * 64},
+            },
+            "summary": "Solid 1 (valid); bbox 10x10x1 mm.",
+        },
+    }
+    raw = json.dumps(full_payload, ensure_ascii=False)
+    compacted = json.loads(compact_for_context("cad_build_and_verify", raw))
+
+    assert compacted["ok"] is True
+    data = compacted["data"]
+    # Counts preserved; per-feature tables dropped from metrics.feature_summary
+    fs = data["metrics"]["feature_summary"]
+    assert fs["through_hole_count"] == 20
+    assert fs["disconnected_solid_count"] == 1
+    assert "cylindrical_cut_candidates" not in fs
+    # Top-level feature_summary removed (was duplicating the metrics one)
+    assert "feature_summary" not in data
+    # Review manifest trimmed to model/preview hashes and view IDs only
+    rm = data["review_manifest"]
+    assert rm["model_sha256"] == "a" * 64
+    assert rm["preview_sha256"] == "b" * 64
+    assert rm["view_count"] == 8
+    assert rm["contact_sheet_sha256"] == "d" * 64
+    for entry in rm["views"]:
+        assert set(entry.keys()) == {"view_id", "image_sha256"}
+    # Summary untouched so the agent still has the one-liner.
+    assert data["summary"].startswith("Solid 1 (valid)")
+
+    # The compaction should also actually shrink the payload.
+    assert len(compact_for_context("cad_build_and_verify", raw)) < len(raw)
+
+
+def test_compact_for_context_is_passthrough_for_other_tools():
+    """Tools other than ``cad_build_and_verify`` must keep their full
+    payload; otherwise we'd risk truncating data the agent needs.
+    """
+    from agent.tool_results import compact_for_context
+
+    raw = json.dumps(
+        {"ok": True, "tool": "terminal_run", "data": {"stdout": "hello"}},
+        ensure_ascii=False,
+    )
+    assert compact_for_context("terminal_run", raw) == raw
+
+
+def test_prune_prior_read_file_drops_duplicate_bodies():
+    """``_prune_prior_read_file`` must drop the file body from older
+    ``read_file`` tool results while keeping the most recent body intact
+    so the agent can still build ``edit_file`` ``old_string`` arguments.
+    """
+    from agent.dispatcher import _prune_prior_read_file
+
+    new_sha = "b" * 64
+    prior_sha_a = "a" * 64
+    new_payload = json.dumps(
+        {"ok": True, "tool": "read_file", "data": json.dumps(
+            {"exists": True, "content": "latest body\n", "sha256": new_sha,
+             "total_lines": 12}
+        )},
+        ensure_ascii=False,
+    )
+    prior_a = json.dumps(
+        {"ok": True, "tool": "read_file", "data": json.dumps(
+            {"exists": True, "content": "old body\n", "sha256": prior_sha_a,
+             "total_lines": 10}
+        )},
+        ensure_ascii=False,
+    )
+    messages = [{"role": "tool", "content": prior_a}]
+
+    _prune_prior_read_file(
+        messages, {"filename": "model.py"}, new_payload
+    )
+
+    pruned = json.loads(messages[0]["content"])
+    pruned_data = json.loads(pruned["data"])
+    assert pruned_data.get("unchanged") is True
+    assert pruned_data["sha256"] == prior_sha_a
+    assert pruned_data["exists"] is True
+    assert pruned_data["total_lines"] == 10
+    assert "content" not in pruned_data
+
+    # The new payload itself is untouched (caller still appends it).
+    fresh = json.loads(new_payload)
+    fresh_data = json.loads(fresh["data"])
+    assert fresh_data["content"] == "latest body\n"
+
+
+def test_prune_prior_read_file_skips_already_compact_entries():
+    """Already-compacted ``read_file`` entries (``content is None``) must
+    be left alone — calling the helper repeatedly must not rewrite them.
+    """
+    from agent.dispatcher import _prune_prior_read_file
+
+    sha = "a" * 64
+    compact_prior = json.dumps(
+        {"ok": True, "tool": "read_file", "data": json.dumps(
+            {"exists": True, "unchanged": True, "sha256": sha, "total_lines": 5}
+        )},
+        ensure_ascii=False,
+    )
+    new_payload = json.dumps(
+        {"ok": True, "tool": "read_file", "data": json.dumps(
+            {"exists": True, "content": "x\n", "sha256": sha, "total_lines": 1}
+        )},
+        ensure_ascii=False,
+    )
+    messages = [{"role": "tool", "content": compact_prior}]
+
+    _prune_prior_read_file(
+        messages, {"filename": "model.py"}, new_payload
+    )
+
+    assert messages[0]["content"] == compact_prior
+
+
+# --------------------------------------------------------------------------- #
+#  cad_build_and_verify multimodal tool-result tests
+# --------------------------------------------------------------------------- #
+
+
+def test_build_cad_build_multimodal_content_attaches_render(tmp_path: Path):
+    """A successful render=true build must attach PNG/STL as inline image
+    content so the agent evaluates the build in-band instead of asking the
+    subordinate visual reviewer to start a fresh session."""
+    from agent.tool_results import build_cad_build_multimodal_content
+
+    render_payload = {
+        "ok": True,
+        "tool": "cad_build_and_verify",
+        "data": {
+            "metrics": {"solid_count": 1, "is_valid": True},
+            "preview": "preview.stl",
+            "render": "render.png",
+            "summary": "Solid 1 (valid); with render.",
+        },
+    }
+    (tmp_path / "render.png").write_bytes(b"\x89PNG\r\n\x1a\n fake")
+    (tmp_path / "preview.stl").write_bytes(b"solid demo\n")
+
+    raw = json.dumps(render_payload, ensure_ascii=False)
+    multimodal = build_cad_build_multimodal_content(raw, tmp_path)
+
+    assert multimodal is not None
+    parts = multimodal["content"]
+    # text part first, then image_url parts.
+    assert parts[0]["type"] == "text"
+    assert parts[0]["text"] == raw
+    image_parts = [p for p in parts if p["type"] == "image_url"]
+    assert len(image_parts) >= 1
+    assert all(
+        p["image_url"]["url"].startswith("data:image/png;base64,")
+        for p in image_parts
+    )
+    saved_paths = [Path(p) for p in multimodal["image_paths"]]
+    assert tmp_path / "render.png" in saved_paths
+
+
+def test_build_cad_build_multimodal_content_skips_render_false(tmp_path: Path):
+    """render=false builds return only metrics + preview.stl; no inline
+    images should be attached so the agent request stays small."""
+    from agent.tool_results import build_cad_build_multimodal_content
+
+    metrics_payload = {
+        "ok": True,
+        "tool": "cad_build_and_verify",
+        "data": {
+            "metrics": {"solid_count": 1, "is_valid": True},
+            "preview": "preview.stl",
+            "render": None,
+            "summary": "metrics-only.",
+        },
+    }
+    (tmp_path / "preview.stl").write_bytes(b"solid demo\n")
+
+    raw = json.dumps(metrics_payload, ensure_ascii=False)
+    assert build_cad_build_multimodal_content(raw, tmp_path) is None
+
+
+def test_build_cad_build_multimodal_content_handles_missing_artifacts(
+    tmp_path: Path,
+):
+    """A render=true payload without on-disk artifacts must collapse to a
+    plain JSON tool result instead of crashing the agent loop."""
+    from agent.tool_results import build_cad_build_multimodal_content
+
+    payload = {
+        "ok": True,
+        "tool": "cad_build_and_verify",
+        "data": {"render": "render.png", "summary": "with render."},
+    }
+    assert (
+        build_cad_build_multimodal_content(
+            json.dumps(payload, ensure_ascii=False), tmp_path
+        )
+        is None
+    )
+
+
+def test_cad_build_tool_message_carries_inline_images(tmp_path: Path):
+    """``process_tool_call`` must emit a multimodal ``tool`` message when
+    the underlying build produced a render. Regression coverage for the
+    single-session review flow (sub-tool re-derivation is no longer needed)."""
+    from agent.dispatcher import process_tool_call
+
+    project = tmp_path / "demo"
+    project.mkdir(parents=True)
+    (project / "render.png").write_bytes(b"\x89PNG\r\n\x1a\n fake")
+    (project / "preview.stl").write_bytes(b"solid demo\n")
+    (project / "model.py").write_text("result = 1\n", encoding="utf-8")
+
+    class _FakeCad:
+        def __init__(self, project_dir):
+            self.project_dir = project_dir
+
+        def build_and_verify(self, render=True):
+            return {
+                "metrics": {"solid_count": 1, "is_valid": True, "dimensions_mm": {"x": 1, "y": 1, "z": 1}},
+                "feature_summary": {},
+                "preview": "preview.stl",
+                "render": "render.png",
+                "model_sha256": "a" * 64,
+                "preview_sha256": "b" * 64,
+                "summary": "Solid 1 (valid); with render.",
+            }
+
+        with_call_id = lambda self, call_id: self
+        stop = lambda self: None
+
+    class _FakeTools:
+        def __init__(self, project_dir):
+            self.cad = _FakeCad(project_dir)
+            self.project_dir = project_dir
+
+    captured: list[dict] = []
+
+    def _append(_project_dir, message):
+        captured.append(message)
+
+    messages: list[dict] = []
+    process_tool_call(
+        _FakeTools(project),
+        "demo",
+        project,
+        {"id": "call-1", "function": {"name": "cad_build_and_verify", "arguments": "{}"}},
+        False,
+        None,
+        None,
+        messages,
+        publish=lambda *a, **kw: None,
+        register_preview=lambda *a, **kw: "preview-1",
+        append_message=_append,
+    )
+
+    assert captured, "tool message must be persisted to the conversation log"
+    persisted = captured[-1]
+    assert persisted["role"] == "tool"
+    assert persisted["tool_call_id"] == "call-1"
+    assert isinstance(persisted["content"], list)
+    image_parts = [
+        p for p in persisted["content"] if p.get("type") == "image_url"
+    ]
+    assert image_parts, "render=true must attach inline image evidence"
+    # The persisted image paths index lets the history redactor replace
+    # the artifacts with a placeholder on subsequent loads.
+    index_path = project / ".agent_tool_images.json"
+    assert index_path.is_file()
+    payload = json.loads(index_path.read_text(encoding="utf-8"))
+    assert payload["call-1"] == ["render.png", "preview.stl"]

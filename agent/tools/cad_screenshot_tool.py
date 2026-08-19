@@ -40,7 +40,8 @@ from typing import Any
 from agent.sandbox import command as sandbox_command
 from agent.tools.cad_scripts import screenshot as screenshot_script
 from agent.tools.file_tool import FileTool
-from agent.tools.process_runner import _TimedOut, _stream_with_limit
+from agent.tools.process_runner import _stream_with_limit, _TimedOut
+from agent.tools.tool_events import publish_tool_phase
 
 _LOG = logging.getLogger(__name__)
 
@@ -249,30 +250,14 @@ class CadScreenshotTool:
             return None
 
     def _emit_status(self, status: str, message: str) -> None:
-        publish = self._publish
-        if not callable(publish):
-            return
-        try:
-            event: dict[str, Any] = {
-                "project": self.project_dir.name,
-                "status": status,
-                "result": message,
-            }
-            if self._call_id:
-                event.update(
-                    {"call_id": self._call_id, "tool": "cad_screenshot"}
-                )
-                publish("tool_status", event)
-            else:
-                event["message"] = event.pop("result")
-                publish("agent_status", event)
-        except Exception:  # noqa: BLE001 - activity events must never fail the tool.
-            _LOG.warning(
-                "screenshot status publish failed (status=%s, project=%s): ignored",
-                status,
-                self.project_dir.name,
-                exc_info=_LOG.isEnabledFor(logging.DEBUG),
-            )
+        publish_tool_phase(
+            self._publish,
+            project=self.project_dir.name,
+            tool="cad_screenshot",
+            call_id=self._call_id,
+            status=status,
+            message=message,
+        )
 
     # ------------------------------------------------------------------ main entry
 
@@ -378,54 +363,28 @@ class CadScreenshotTool:
         timeout_seconds: int,
     ) -> dict[str, Any]:
         """Spawn the sandbox subprocess, read the manifest, validate it."""
-        # Concatenate the same renderer + screenshot modules runner.py uses.
-        # ``renderer.py`` is concatenated first to provide ``VIEWS``,
-        # ``rasterize_view``, ``build_contact_sheet``; ``screenshot.py``
-        # contributes ``SUBSET_VIEWS``, ``QUALITY_TOLERANCES``,
-        # ``render_subset``, ``build_contact_sheet_subset``,
-        # ``_run_subset_pipeline``. The runner-side main block (concatenated
-        # below) exec's model.py and writes the manifest.
-        renderer = (Path(screenshot_script.__file__).parent / "renderer.py").read_text(
+        # Copy ``renderer.py`` and ``screenshot.py`` as siblings into the
+        # bubblewrap workspace so ``screenshot.py`` can ``import renderer``
+        # directly. Pass the per-call settings as a JSON kwargs payload on
+        # ``argv[1]``; the script's :func:`main` parses them and writes the
+        # manifest. This replaces the previous source-string concatenation
+        # (which stripped screenshot.py's ``__main__`` guard and rewrote it).
+        script_dir = Path(screenshot_script.__file__).resolve().parent
+        renderer_source = (script_dir / "renderer.py").read_text(encoding="utf-8")
+        screenshot_source = (script_dir / "screenshot.py").read_text(
             encoding="utf-8"
-        )
-        screenshot = Path(screenshot_script.__file__).read_text(encoding="utf-8")
-        # The screenshot module's ``__main__`` guard writes the manifest
-        # itself, so we strip it before concatenating and replace it with our
-        # own block that wires the args from argv.
-        if 'if __name__ == "__main__":' in screenshot:
-            screenshot = screenshot.split(
-                'if __name__ == "__main__":', 1
-            )[0]
-        main_block = (
-            "import json as _screenshot_json, sys as _screenshot_sys\n"
-            "if __name__ == '__main__':\n"
-            "    _argv = list(_screenshot_sys.argv)\n"
-            "    _payload = _run(_argv)\n"
-            "    _staging = _screenshot_json.loads(_argv[1]).get('output_dir', '.screenshot-staging')\n"
-            "    _staging_path = __import__('pathlib').Path(_staging)\n"
-            "    _staging_path.mkdir(parents=True, exist_ok=True)\n"
-            "    _manifest_path = _staging_path / '.screenshot_manifest.json'\n"
-            "    _tmp = _manifest_path.with_suffix(_manifest_path.suffix + '.tmp')\n"
-            "    _tmp.write_text(_screenshot_json.dumps(_payload, ensure_ascii=False), encoding='utf-8')\n"
-            "    _tmp.replace(_manifest_path)\n"
-        )
-        # Pre-disable review rendering so renderer.py's main block (if any)
-        # would skip the canonical eight render.
-        code = (
-            "_RENDER_VIEWS = False\n"
-            "_WRITE_ISOMETRIC = False\n"
-            + renderer
-            + "\n\n"
-            + screenshot
-            + "\n\n"
-            + main_block
         )
         with tempfile.TemporaryDirectory(prefix="cad-screenshot-") as tmp_root:
             workspace = Path(tmp_root)
             (workspace / "model.py").write_text(
                 model_path.read_text(encoding="utf-8"), encoding="utf-8"
             )
-            (workspace / "screenshot.py").write_text(code, encoding="utf-8")
+            (workspace / "renderer.py").write_text(
+                renderer_source, encoding="utf-8"
+            )
+            (workspace / "screenshot.py").write_text(
+                screenshot_source, encoding="utf-8"
+            )
             staging = workspace / ".screenshot-staging"
             staging.mkdir(parents=True, exist_ok=True)
             (staging / "views").mkdir(exist_ok=True)
@@ -441,9 +400,6 @@ class CadScreenshotTool:
                     "quality": quality,
                     "contact_sheet": contact_sheet,
                 }
-            )
-            (workspace / ".screenshot_args.json").write_text(
-                args_payload, encoding="utf-8"
             )
             command, seccomp_fd = sandbox_command(
                 workspace,

@@ -2,20 +2,18 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { STLLoader } from 'three/addons/loaders/STLLoader.js';
 
-const DEFAULT_GRID = Object.freeze({width: 200, depth: 200, divisions: 20});
+const DEFAULT_GRID = Object.freeze({size: 200, divisions: 20});
 
 function readGridConfig(appConfig) {
-  // ``app-config`` ships viewer grid dimensions from the server (parsed from
-  // ``viewer.grid.extent`` in config.yaml). Fall back to the legacy defaults
+  // ``app-config`` ships the viewer grid size from the server (parsed from
+  // ``viewer.grid`` in config.yaml). Fall back to the legacy defaults
   // when the field is missing or malformed so the viewer never crashes.
   const candidate = appConfig && appConfig.viewerGrid;
   const result = {...DEFAULT_GRID};
   if (!candidate || typeof candidate !== 'object') return result;
-  const width = Number(candidate.width);
-  const depth = Number(candidate.depth);
+  const size = Number(candidate.size);
   const divisions = Number(candidate.divisions);
-  if (Number.isFinite(width) && width > 0) result.width = width;
-  if (Number.isFinite(depth) && depth > 0) result.depth = depth;
+  if (Number.isFinite(size) && size > 0) result.size = size;
   if (Number.isFinite(divisions) && divisions >= 1) {
     result.divisions = Math.min(2000, Math.round(divisions));
   }
@@ -60,9 +58,9 @@ export class CadViewer {
   _buildGridHelper() {
     // THREE.GridHelper's first argument is the total size (the helper centres
     // itself on the origin) and the second is the number of divisions per
-    // side. Both come from the parsed viewer.grid.extent config.
+    // side. Both come from the parsed viewer.grid config.
     return new THREE.GridHelper(
-      this.grid.width,
+      this.grid.size,
       this.grid.divisions,
       '#2b3c5c',
       '#18243a',
@@ -70,7 +68,7 @@ export class CadViewer {
   }
 
   _describeGrid() {
-    return `${this.grid.width} × ${this.grid.depth} mm grid (${this.grid.divisions} divisions)`;
+    return `${this.grid.size} × ${this.grid.size} mm grid (${this.grid.divisions} divisions)`;
   }
 
   _refreshGridWarning() {
@@ -82,9 +80,9 @@ export class CadViewer {
       return;
     }
     const dims = this.cadDimensions;
-    const exceedsX = dims.x > this.grid.width;
-    const exceedsZ = dims.z > this.grid.depth;
-    const exceedsHeight = dims.y > Math.max(this.grid.width, this.grid.depth) * 2;
+    const exceedsX = dims.x > this.grid.size;
+    const exceedsZ = dims.z > this.grid.size;
+    const exceedsHeight = dims.y > this.grid.size * 2;
     if (!exceedsX && !exceedsZ && !exceedsHeight) {
       this.gridWarning.hidden = true;
       this.gridWarning.textContent = '';
@@ -92,8 +90,8 @@ export class CadViewer {
       return;
     }
     const offenders = [];
-    if (exceedsX) offenders.push(`X ${dims.x.toFixed(1)} mm > ${this.grid.width} mm`);
-    if (exceedsZ) offenders.push(`Z ${dims.z.toFixed(1)} mm > ${this.grid.depth} mm`);
+    if (exceedsX) offenders.push(`X ${dims.x.toFixed(1)} mm > ${this.grid.size} mm`);
+    if (exceedsZ) offenders.push(`Z ${dims.z.toFixed(1)} mm > ${this.grid.size} mm`);
     if (exceedsHeight) {
       offenders.push(`Y ${dims.y.toFixed(1)} mm > tolerance`);
     }

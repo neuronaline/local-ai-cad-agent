@@ -92,7 +92,7 @@ class BuildClient:
                                     "id": "run-1",
                                     "function": {
                                         "name": "cad_build_and_verify",
-                                        "arguments": "{}",
+                                        "arguments": json.dumps({"render": True}),
                                     },
                                 }
                             ],
@@ -204,12 +204,14 @@ def test_mvp_acceptance_flow(tmp_path: Path, monkeypatch):
     assert (project / "render.png").is_file()
 
     state = client.get("/api/projects/mounting-bracket/state").get_json()
-    assert state["status"] == "rendering"
-    response = client.post(
+    # The agent turn completes the moment the STL is verified; no preview
+    # ACK round-trip is required, so the state falls back to idle and the
+    # preview/displayed endpoint is gone.
+    assert state == {"status": "idle"}
+    assert client.post(
         "/api/projects/mounting-bracket/preview/displayed",
-        json={"preview_id": state["preview_id"]},
-    )
-    assert response.status_code == 200
+        json={"preview_id": "any"},
+    ).status_code == 404
     history = client.get("/api/projects/mounting-bracket/history").get_json()["events"]
     # The final assistant turn reaches conversation.jsonl so the UI history
     # drawer can replay it; we only assert the canonical role/content pair

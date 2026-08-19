@@ -18,7 +18,6 @@ import requests
 
 from agent.settings import Settings
 
-
 PROVIDER_LABELS = {"openrouter": "OpenRouter", "openai": "OpenAI"}
 
 
@@ -298,6 +297,11 @@ class ChatCompletionsClient:
         self.settings = settings
         self.stop_event = None
         self.session_id: str | None = None
+        # ``agent_role`` lets sub-tools (e.g. the visual reviewer) tag the
+        # call so provider-side telemetry distinguishes the parent agent loop
+        # from its subordinate evaluators. The same underlying base prompt is
+        # reused, so the cache prefix stays stable.
+        self.agent_role: str | None = None
         self.last_usage: dict[str, Any] | None = None
         self.stream_callback = None
         self.require_images = False

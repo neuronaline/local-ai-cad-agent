@@ -1,43 +1,42 @@
 """Multi-view PNG renderer used inside the bubblewrap sandbox subprocess.
 
-The runner.py script concatenates this module and runs it after a successful
-build123d tessellation. Views are rasterised in parallel with a bounded
-``ProcessPoolExecutor`` (default four workers) using ``fork`` so the workers
-inherit the bubblewrap sandbox. Each view produces a 512x512 PNG that the
-runner promotes into the per-review ``views/`` directory.
+The runner / screenshot modules import this one for the canonical ``VIEWS``
+list, ``rasterize_view``, ``build_contact_sheet``, ``render_views``, and the
+parallel ``render_subset``. Each caller (build / subset) reads its own
+arguments from a JSON payload on ``argv[1]`` and writes a separate artifact
+manifest, so this module owns only the rendering primitives.
 
 Public entry points:
-- ``VIEWS``: ordered list of canonical view specs used by both the parallel
-  rasteriser and the test suite.
-- ``render_views(...)``: writes ``views/<view_id>.png`` for every required
-  view, returns a manifest payload describing the run.
-- ``render_iso(vertices, triangles, output_path)``: legacy isometric helper
-  kept for the ``render.png`` artifact so the existing
-  ``/api/projects/<name>/render`` endpoint keeps working.
 
-This module is concatenated with ``runner.py`` at execution time, so it
-deliberately omits any ``from __future__`` imports — those must be confined
-to the head of the concatenated file.
+- :data:`VIEWS`: ordered list of canonical view specs.
+- :func:`rasterize_view`: render one orthographic view to an HxWx3 array.
+- :func:`render_views`: parallel multi-view rasteriser writing ``*.png`` per
+  required view. Returns a manifest payload describing the run.
+- :func:`render_subset`: per-request subset re-tessellator used by
+  ``screenshot.py``.
+- :func:`render_iso`: single legacy isometric helper kept for ``render.png``.
+- :func:`build_contact_sheet`: labelled 4x2 composite for the reviewer.
+- :func:`build_contact_sheet_subset`: subset-only composite used by
+  ``screenshot.py``.
+
+Real tests import this module directly, so there is no runtime
+``from __future__`` hack. ``runner.py`` / ``screenshot.py`` ``import renderer``
+when they themselves run inside the sandbox, so the source-file structure
+mirrors a normal Python package boundary.
 """
-# ruff: noqa: F821 - the bare 'shape' reference is injected by runner.py when concatenated.
+
 import hashlib
 import math
 import os
 import tempfile
 import time
+from collections.abc import Iterable, Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
-from collections.abc import Iterable, Sequence
 from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw
-
-# ``shape`` is injected by runner.py when this module is concatenated and run.
-# The renderer is also exercised as a standalone module in tests, where the
-# shape argument is replaced by ``render_views`` callers.
-shape = globals().get("shape")  # type: ignore[name-defined]
-
 
 # ---------------------------------------------------------------------------
 # Camera / view specifications
@@ -283,15 +282,15 @@ def _worker_render(args: tuple[str, dict[str, object]]) -> dict[str, object]:
     screen_vertices = projected_xy * scale + offset
     pixels = _shade_pixels(vertices, triangles, screen_vertices, depths, light)
     image = Image.fromarray(pixels, "RGB")
-    buffer = tempfile.NamedTemporaryFile(
+    with tempfile.NamedTemporaryFile(
         prefix=f"view-{view_id}-", suffix=".png", delete=False
-    )
+    ) as buffer:
+        buffer_path = Path(buffer.name)
     try:
-        buffer.close()
-        image.save(buffer.name, "PNG", optimize=True)
-        data = Path(buffer.name).read_bytes()
+        image.save(buffer_path, "PNG", optimize=True)
+        data = buffer_path.read_bytes()
     finally:
-        Path(buffer.name).unlink(missing_ok=True)
+        buffer_path.unlink(missing_ok=True)
     return {
         "view_id": view_id,
         "bytes": data,
@@ -423,7 +422,7 @@ def render_views(
         "view_count": len(selected),
         "workers": workers,
         "duration_seconds": round(time.monotonic() - started, 3),
-        "tessellated_triangles": int(len(triangles)),
+        "tessellated_triangles": len(triangles),
         "views": view_entries,
     }
 

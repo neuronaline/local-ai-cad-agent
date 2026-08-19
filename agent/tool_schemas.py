@@ -66,10 +66,12 @@ TOOL_SCHEMAS = [
     ),
     _tool(
         "write_file",
-        "Create model.py, or deliberately replace its entire "
-        "contents. Overwriting an existing file requires expected_sha256 from a "
-        "recent read_file; a stale or missing digest is rejected without changing "
-        "the file or revision history. Use edit_file for small localized changes.",
+        "Create model.py, or deliberately replace its entire contents. Use this "
+        "ONLY for the initial creation of model.py or a deliberate full rewrite; "
+        "for any small localized change (≤ ~10 lines, a single parameter, a "
+        "block with a clear old/new boundary), prefer edit_file to avoid wasting "
+        "tokens and breaking the revision history. ``expected_sha256`` is "
+        "optional; omit it unless you want strict conflict detection.",
         {
             "filename": _FILENAME,
             "content": {"type": "string", "description": "Complete file contents."},
@@ -77,16 +79,17 @@ TOOL_SCHEMAS = [
                 "type": "string",
                 "minLength": 64,
                 "maxLength": 64,
-                "description": "Required when the file already exists. Pass the SHA-256 from read_file; a stale digest is rejected.",
+                "description": "Optional. SHA-256 from a recent read_file; a stale digest is rejected. Omit when you want an unconditional overwrite.",
             },
         },
         ["filename", "content"],
     ),
     _tool(
         "edit_file",
-        "Replace one exact, uniquely matching block in an existing file. First "
-        "call read_file and provide its current SHA-256 as expected_sha256. A "
-        "stale SHA or ambiguous match does not modify the file.",
+        "Replace one exact, uniquely matching block in an existing file. Prefer "
+        "this over write_file for any small localized change (single parameter, "
+        "narrow bug fix, ≤ ~10 lines). ``expected_sha256`` is optional; omit it "
+        "unless you are guarding against a concurrent external edit.",
         {
             "filename": _FILENAME,
             "old_string": {
@@ -102,19 +105,19 @@ TOOL_SCHEMAS = [
                 "type": "string",
                 "minLength": 64,
                 "maxLength": 64,
-                "description": "Current SHA-256 from read_file; rejects stale edits.",
+                "description": "Optional. Current SHA-256 from read_file; pass only when you want to reject stale edits. Omit for an unconditional edit.",
             },
         },
-        ["filename", "old_string", "new_string", "expected_sha256"],
+        ["filename", "old_string", "new_string"],
     ),
     _tool(
         "cad_build_and_verify",
-        "Build the latest model.py revision, validate basic geometry, export preview.stl, and (when render=true, the default) rasterise the canonical eight views plus a labelled contact sheet. Does NOT trigger review automatically — call cad_review separately if you want a verdict. Set render=false to skip rendering during early iteration; the final verification must use render=true.",
+        "Build the latest model.py revision, validate basic geometry, export preview.stl, and (when render=true) rasterise the canonical eight views plus a labelled contact sheet. Does NOT trigger review automatically — call cad_review separately if you want a verdict. Default is render=false: returns only metrics + preview.stl + model_sha256 + preview_sha256 (cheap, cache-friendly). Pass render=true only for the final verification before declaring the task ready.",
         {
             "render": {
                 "type": "boolean",
-                "default": True,
-                "description": "Generate canonical eight-view rasterisation + contact sheet (true, default) or skip rendering and return only metrics + preview.stl (false). Use false during early iterations; final verification must use true.",
+                "default": False,
+                "description": "Generate canonical eight-view rasterisation + contact sheet (true) or skip rendering and return only metrics + preview.stl (false, default). Use false during early iterations; final verification must use true.",
             },
         },
         [],

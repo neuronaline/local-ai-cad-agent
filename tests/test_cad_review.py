@@ -10,11 +10,10 @@ from agent.cad_review import (
     REVIEW_TOOL_SCHEMA,
     Finding,
     ReviewResult,
+    _visual_review,
     parse_review_response,
-    run_review,
     write_review_result,
 )
-
 
 MODEL_SHA = "a" * 64
 PREVIEW_SHA = "b" * 64
@@ -221,7 +220,7 @@ class _FakeClient:
         return self.response
 
 
-def test_run_review_returns_pass_for_valid_tool_call(tmp_path: Path):
+def test_visual_review_returns_pass_for_valid_tool_call(tmp_path: Path):
     sheet = tmp_path / "sheet.png"
     render = tmp_path / "render.png"
     sheet_info = _write_image(sheet)
@@ -252,7 +251,7 @@ def test_run_review_returns_pass_for_valid_tool_call(tmp_path: Path):
             evidence_labels.append(
                 [
                     part["text"]
-                    for part in messages[0]["content"]
+                    for part in messages[-1]["content"]
                     if part.get("type") == "text"
                     and part.get("text", "").startswith("Visual evidence")
                 ]
@@ -264,7 +263,7 @@ def test_run_review_returns_pass_for_valid_tool_call(tmp_path: Path):
                 }
             }]}}]}
 
-    result = run_review(
+    result = _visual_review(
         settings=object(),
         request_text="Build a 60x40 bracket.",
         model_source="result = 1",
@@ -285,7 +284,7 @@ def test_run_review_returns_pass_for_valid_tool_call(tmp_path: Path):
     ]]
 
 
-def test_run_review_returns_inconclusive_when_tool_call_missing(tmp_path: Path):
+def test_visual_review_returns_inconclusive_when_tool_call_missing(tmp_path: Path):
     sheet = tmp_path / "sheet.png"
     render = tmp_path / "render.png"
     sheet_info = _write_image(sheet)
@@ -298,8 +297,9 @@ def test_run_review_returns_inconclusive_when_tool_call_missing(tmp_path: Path):
         "single_render": render_info,
     }
     client = _FakeClient({"choices": [{"message": {"role": "assistant", "content": "looks good"}}]})
-    create_client = lambda _settings: client
-    result = run_review(
+    def create_client(_settings):
+        return client
+    result = _visual_review(
         settings=object(),
         request_text="Build",
         model_source="result = 1",
@@ -313,7 +313,7 @@ def test_run_review_returns_inconclusive_when_tool_call_missing(tmp_path: Path):
     assert result.status == "inconclusive"
 
 
-def test_run_review_returns_inconclusive_when_sheet_missing(tmp_path: Path):
+def test_visual_review_returns_inconclusive_when_sheet_missing(tmp_path: Path):
     render = tmp_path / "render.png"
     render_info = _write_image(render)
     manifest = {
@@ -324,7 +324,7 @@ def test_run_review_returns_inconclusive_when_sheet_missing(tmp_path: Path):
         "single_render": render_info,
     }
     client = _FakeClient({"choices": [{"message": {"role": "assistant", "content": ""}}]})
-    result = run_review(
+    result = _visual_review(
         settings=object(),
         request_text="Build",
         model_source="",
@@ -338,7 +338,7 @@ def test_run_review_returns_inconclusive_when_sheet_missing(tmp_path: Path):
     assert result.status == "inconclusive"
 
 
-def test_run_review_requires_a_matching_single_render(tmp_path: Path):
+def test_visual_review_requires_a_matching_single_render(tmp_path: Path):
     sheet = tmp_path / "sheet.png"
     sheet_info = _write_image(sheet)
     manifest = {
@@ -353,7 +353,7 @@ def test_run_review_requires_a_matching_single_render(tmp_path: Path):
     }
     client = _FakeClient({})
 
-    result = run_review(
+    result = _visual_review(
         settings=object(),
         request_text="Build",
         model_source="",
@@ -368,7 +368,7 @@ def test_run_review_requires_a_matching_single_render(tmp_path: Path):
     assert result.status == "inconclusive"
 
 
-def test_run_review_propagates_llm_errors_as_inconclusive(tmp_path: Path):
+def test_visual_review_propagates_llm_errors_as_inconclusive(tmp_path: Path):
     sheet = tmp_path / "sheet.png"
     render = tmp_path / "render.png"
     sheet_info = _write_image(sheet)
@@ -387,8 +387,9 @@ def test_run_review_propagates_llm_errors_as_inconclusive(tmp_path: Path):
         def chat(self, messages, tools=None):
             raise RuntimeError("network down")
 
-    create_client = lambda _settings: FailingClient()
-    result = run_review(
+    def create_client(_settings):
+        return FailingClient()
+    result = _visual_review(
         settings=object(),
         request_text="Build",
         model_source="",
@@ -402,7 +403,7 @@ def test_run_review_propagates_llm_errors_as_inconclusive(tmp_path: Path):
     assert result.status == "inconclusive"
 
 
-def test_run_review_uses_stop_event_when_provided(tmp_path: Path):
+def test_visual_review_uses_stop_event_when_provided(tmp_path: Path):
     sheet = tmp_path / "sheet.png"
     render = tmp_path / "render.png"
     sheet_info = _write_image(sheet)
@@ -424,8 +425,9 @@ def test_run_review_uses_stop_event_when_provided(tmp_path: Path):
                 "function": {"name": "submit_review", "arguments": json.dumps(_valid_arguments())}
             }]}}]}
 
-    create_client = lambda _settings: StopAwareClient()
-    run_review(
+    def create_client(_settings):
+        return StopAwareClient()
+    _visual_review(
         settings=object(),
         request_text="Build",
         model_source="",

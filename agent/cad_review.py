@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from agent.images import as_chat_image
+from agent.prompt import get_system_prompt
 
 
 def _default_create_client(settings: Any) -> Any:
@@ -337,7 +338,7 @@ def _verify_image_artifact(
     return None
 
 
-def run_review(
+def _visual_review(
     *,
     settings: Any,
     request_text: str,
@@ -351,10 +352,18 @@ def run_review(
     stop_instruction: str | None = None,
     create_client: Any = None,
 ) -> ReviewResult:
-    """Invoke the structured reviewer and return a parsed ``ReviewResult``.
+    """Visual-only layer.
 
-    The LLM is forced to use the ``submit_review`` tool. Missing tool calls,
-    rejected image inputs, and parse failures collapse to ``inconclusive``.
+    Pulls the view IDs from the manifest, verifies the contact-sheet and
+    single render hashes against the manifest, builds the multimodal
+    message, invokes the LLM, and parses the structured ``submit_review``
+    tool-call. The visual layer is skipped (returns ``inconclusive``) when:
+
+    - any image fails its hash check, or
+    - the manifest has no rendered views, or
+    - ``settings`` is ``None`` (so the caller — usually a test with no
+      LLM configured — only wants the deterministic layer).
+
     ``create_client`` defaults to ``agent.core.create_llm_client`` so test
     monkeypatches that target the core module take effect here.
     """
@@ -380,20 +389,36 @@ def run_review(
         return _inconclusive(
             "Review manifest has no rendered views.", model_sha, preview_sha
         )
+    if settings is None:
+        return _inconclusive(
+            "Review skipped: no LLM settings were provided.", model_sha, preview_sha
+        )
     factory = create_client or _default_create_client
     client = factory(settings)
     if stop_event is not None:
         client.stop_event = stop_event
+    # Tag the subordinate call so provider-side telemetry distinguishes the
+    # reviewer from the parent agent loop. The shared base system prompt keeps
+    # the prompt prefix cache key stable across both call sites.
+    client.agent_role = "reviewer"
     client.require_images = True
     prompt = _build_prompt(
         request_text=request_text,
         model_source=model_source,
         metrics=metrics,
-        feature_summary=feature_summary,
         review_manifest=review_manifest,
         stop_instruction=stop_instruction,
     )
+    # Reuse the parent agent's system prompt so the provider-side prefix cache
+    # key stays stable across both call sites. The base prompt is shared with
+    # the parent agent loop; the review-specific instructions are folded into
+    # the user message below.
     messages: list[dict[str, Any]] = [
+        {
+            "role": "system",
+            "content": get_system_prompt()
+            + "\n\n<role>\nYou are the visual reviewer. Focus on the geometry evidence; produce a structured verdict via submit_review.\n</role>",
+        },
         {
             "role": "user",
             "content": [
@@ -409,7 +434,7 @@ def run_review(
                 },
                 as_chat_image(sheet_path),
             ],
-        }
+        },
     ]
     try:
         response = client.chat(messages, [REVIEW_TOOL_SCHEMA])
@@ -544,109 +569,6 @@ def _deterministic_review(
     return findings
 
 
-def _visual_review(
-    *,
-    settings: Any,
-    request_text: str,
-    model_source: str,
-    metrics: dict[str, Any],
-    feature_summary: dict[str, Any],
-    review_manifest: dict[str, Any],
-    sheet_path: Path,
-    single_render_path: Path,
-    stop_event: Any = None,
-    stop_instruction: str | None = None,
-    create_client: Any = None,
-) -> ReviewResult:
-    """Visual-only layer (unchanged legacy ``run_review`` body, renamed).
-
-    Kept separate so ``review_cad`` can call it conditionally (after the
-    deterministic layer) and ``run_review``/tests can still invoke just
-    the visual path. Returns a ``ReviewResult`` whose findings carry
-    ``source="visual"`` so callers can tell which layer produced them.
-
-    ``settings`` may be ``None`` when the orchestrator only wants the
-    deterministic layer (e.g. tests) — in that case the visual layer is
-    skipped and the caller falls back to its own verdict logic.
-    """
-    model_sha = str(review_manifest.get("model_sha256") or "")
-    preview_sha = str(review_manifest.get("preview_sha256") or "")
-    views = review_manifest.get("views") if isinstance(review_manifest, dict) else None
-    view_ids: list[str] = []
-    if isinstance(views, list):
-        for entry in views:
-            if isinstance(entry, dict) and isinstance(entry.get("view_id"), str):
-                view_ids.append(entry["view_id"])
-    sheet_error = _verify_image_artifact(
-        sheet_path, review_manifest.get("contact_sheet"), "contact sheet"
-    )
-    if sheet_error:
-        return _inconclusive(sheet_error, model_sha, preview_sha)
-    render_error = _verify_image_artifact(
-        single_render_path, review_manifest.get("single_render"), "single render"
-    )
-    if render_error:
-        return _inconclusive(render_error, model_sha, preview_sha)
-    if not view_ids:
-        return _inconclusive(
-            "Review manifest has no rendered views.", model_sha, preview_sha
-        )
-    if settings is None:
-        return _inconclusive(
-            "Review skipped: no LLM settings were provided.", model_sha, preview_sha
-        )
-    factory = create_client or _default_create_client
-    client = factory(settings)
-    if stop_event is not None:
-        client.stop_event = stop_event
-    client.require_images = True
-    prompt = _build_prompt(
-        request_text=request_text,
-        model_source=model_source,
-        metrics=metrics,
-        feature_summary=feature_summary,
-        review_manifest=review_manifest,
-        stop_instruction=stop_instruction,
-    )
-    messages: list[dict[str, Any]] = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {
-                    "type": "text",
-                    "text": "Visual evidence 1 of 2: single isometric render.",
-                },
-                as_chat_image(single_render_path),
-                {
-                    "type": "text",
-                    "text": "Visual evidence 2 of 2: multi-view contact sheet.",
-                },
-                as_chat_image(sheet_path),
-            ],
-        }
-    ]
-    try:
-        response = client.chat(messages, [REVIEW_TOOL_SCHEMA])
-    except Exception as error:  # noqa: BLE001 - surface as inconclusive review
-        return _inconclusive(
-            f"Review model call failed: {type(error).__name__}.",
-            model_sha,
-            preview_sha,
-        )
-    arguments = _extract_tool_call(response)
-    if arguments is None:
-        return _inconclusive(
-            "Review model did not call submit_review.", model_sha, preview_sha
-        )
-    return parse_review_response(
-        arguments,
-        model_sha256=model_sha,
-        preview_sha256=preview_sha,
-        allowed_view_ids=view_ids,
-    )
-
-
 def review_cad(
     *,
     settings: Any,
@@ -763,7 +685,6 @@ def _build_prompt(
     request_text: str,
     model_source: str,
     metrics: dict[str, Any],
-    feature_summary: dict[str, Any],
     review_manifest: dict[str, Any],
     stop_instruction: str | None,
 ) -> str:
@@ -774,6 +695,11 @@ def _build_prompt(
     ]
     contact = review_manifest.get("contact_sheet") or {}
     view_order = contact.get("view_order") if isinstance(contact, dict) else None
+    # The single ``## Geometry metrics`` block carries both the geometry
+    # metrics and the ``feature_summary`` sub-object (the same dictionary the
+    # host surfaces via ``.cad_metrics.json``). Re-iterating the same payload
+    # under a separate ``## Feature summary`` header used to double the prompt
+    # size and look like a header mismatch in the reviewer's tool outputs.
     sections = [
         "You are reviewing a CAD build against the user's request.",
         "",
@@ -784,9 +710,6 @@ def _build_prompt(
         "",
         "## Geometry metrics",
         json.dumps(metrics or {}, indent=2, ensure_ascii=False),
-        "",
-        "## Feature summary",
-        json.dumps(feature_summary or {}, indent=2, ensure_ascii=False),
         "",
         "## Available views",
         "\n".join(manifest_lines) or "(none)",

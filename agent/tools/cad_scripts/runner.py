@@ -1,7 +1,12 @@
 """Sandbox-side runner: tessellate, validate, and render the CAD model.
 
-Executed by ``CadTool._execute`` after bwrap concatenates this file with
-``renderer.py``. The runner writes three artifacts consumed by the host:
+Executed by ``CadTool._execute`` after the host copies ``runner.py`` and
+its ``renderer.py`` sibling into the bubblewrap workspace. ``runner.py``
+imports ``renderer`` for the canonical :data:`VIEWS`,
+:func:`render_views`, and :func:`build_contact_sheet` helpers rather than
+relying on source-file concatenation.
+
+Three artifacts are consumed by the host:
 
 - ``preview.stl``: the triangulated mesh (kept for STL compatibility).
 - ``render.png``: a single backward-compatible isometric PNG.
@@ -11,24 +16,42 @@ Executed by ``CadTool._execute`` after bwrap concatenates this file with
 - ``.review-views/<view_id>.png`` and ``.review-sheet.png``: the multi-view
   rasterisation the host promotes into ``.cad-agent/reviews/<sha>/``.
 
-This module deliberately omits ``from __future__ import annotations`` so it
-can be concatenated after ``renderer.py`` without violating Python's
-"future imports must appear at the top of the file" rule.
+A single ``main(argv)`` entry point reads its settings from a JSON payload on
+``argv[1]``. The host (``CadTool._execute``) writes the JSON next to the
+script so the runtime contract is a real Python function call instead of an
+injected module-level global.
 """
-# ruff: noqa: F401 - ``np`` is re-exported via the concatenated renderer module.
+
 import hashlib
 import json
 import math
+import sys
 from pathlib import Path
 
 import numpy as np
 from build123d import export_step, export_stl
 
-
-# ``runner.py`` is concatenated with ``renderer.py`` so the symbols defined
-# there (``VIEWS``, ``render_views``, ``build_contact_sheet``, ``rasterize_view``,
-# ``render_iso``, ``ViewSpec``, ``_tessellate``, ``_project``, ``_frame``,
-# ``_shade_pixels``) are available in this module's globals.
+# ``renderer`` is a sibling module in the same sandbox workspace; defer the
+# import so this file stays importable from the host side (it is consumed
+# indirectly by ``agent.tools.cad_tool`` which only reads path constants).
+try:
+    from renderer import (  # type: ignore[import-not-found]
+        _HEIGHT,
+        _WIDTH,
+        _tessellate,
+        _write_isometric_artifact,
+        build_contact_sheet,
+        render_views,
+    )
+except ModuleNotFoundError:
+    # Host-side import — the rasteriser is unused. Provide stand-ins so the
+    # module can still be imported for ``Path(__file__).parent`` access.
+    _WIDTH = 512  # type: ignore[assignment]
+    _HEIGHT = 512  # type: ignore[assignment]
+    _tessellate = None  # type: ignore[assignment]
+    _write_isometric_artifact = None  # type: ignore[assignment]
+    build_contact_sheet = None  # type: ignore[assignment]
+    render_views = None  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +123,7 @@ def _candidate_cut_axes(shape) -> list[dict[str, object]]:
             center = None
         try:
             axis = _unit(face.normal_at(0.5, 0.5))
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001, S112 - malformed faces are skipped
             continue
         candidates.append(
             {
@@ -137,12 +160,21 @@ def _count_disconnected_solids(shape) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _run_model(model_code: str) -> dict[str, object]:
+def _run_model(
+    model_code: str, settings: dict[str, object] | None = None
+) -> dict[str, object]:
     """Execute ``model_code`` and emit the structured ``.cad_metrics.json`` payload.
 
     Kept as a function so the helper routines above can be unit-tested in
     isolation by importing the module without triggering the sandbox side
     effects.
+
+    ``settings`` is an optional dict holding the render-phase flags previously
+    encoded as module-level globals (``_RENDER_VIEWS``, ``_WRITE_ISOMETRIC``,
+    ``_RENDER_WORKERS``, ``_REQUIRED_VIEWS``). When called from
+    :func:`main`, ``settings`` is parsed from the JSON payload on ``argv[1]``
+    so the runtime contract is a real function argument rather than an
+    injected global.
 
     Resource limits: the bubblewrap sandbox (``agent.sandbox.command``)
     constrains the subprocess via ``prlimit`` -- ``--cpu=timeout+5`` for
@@ -152,6 +184,12 @@ def _run_model(model_code: str) -> dict[str, object]:
     runner's ``exec(compile(...))`` blocks the main thread for the
     duration of the build.
     """
+    settings = settings or {}
+    should_render = bool(settings.get("render_views", True))
+    should_write_iso = bool(settings.get("write_isometric", False))
+    render_workers = int(settings.get("render_workers", 4) or 4)
+    required_views = int(settings.get("required_views", 8) or 8)
+
     namespace = {"__name__": "__main__", "__file__": "model.py"}
     exec(compile(model_code, "model.py", "exec"), namespace)
     shape = namespace.get("result")
@@ -263,11 +301,9 @@ def _run_model(model_code: str) -> dict[str, object]:
 
     # --- Phase 6: backward-compatible single render.png + multi-view rasterisation
     review_dir = Path(".review-views")
-    should_render = "_RENDER_VIEWS" not in globals() or bool(_RENDER_VIEWS)
     review_manifest_payload: dict[str, object]
     sheet_info_payload: dict[str, object]
     single_render_payload: dict[str, object] = {}
-    should_write_iso = "_WRITE_ISOMETRIC" in globals() and bool(_WRITE_ISOMETRIC)
     if should_write_iso:
         # Backward-compatible single isometric PNG (render.png). The renderer
         # tessellates the shape once more for this single image because the
@@ -313,8 +349,8 @@ def _run_model(model_code: str) -> dict[str, object]:
         review_manifest = render_views(
             source_shape=render_source_shape,
             output_dir=review_dir,
-            max_workers=int(_RENDER_WORKERS) if "_RENDER_WORKERS" in globals() else 4,
-            required_views=int(_REQUIRED_VIEWS) if "_REQUIRED_VIEWS" in globals() else 8,
+            max_workers=render_workers,
+            required_views=required_views,
             vertices=render_vertices,
             triangles=render_triangles,
         )
@@ -358,5 +394,29 @@ def _run_model(model_code: str) -> dict[str, object]:
     return cache
 
 
+def _parse_settings(argv: list[str]) -> dict[str, object]:
+    """Decode the JSON kwargs payload on ``argv[1]``."""
+    raw = argv[1] if len(argv) > 1 else "{}"
+    parsed = json.loads(raw) if raw else {}
+    if not isinstance(parsed, dict):
+        raise TypeError("argv[1] must be a JSON object.")
+    return parsed
+
+
+def main(argv: list[str] | None = None) -> dict[str, object]:
+    """Sandbox entry point: parse JSON kwargs, build the model, write metrics.
+
+    Called as ``python runner.py '<json kwargs>'`` by
+    ``agent.tools.cad_tool`` inside the bubblewrap subprocess. Also
+    unit-testable from the repo root by passing ``argv`` directly. Returns
+    the cache dict so callers can inspect the structured payload.
+    """
+    args = list(sys.argv if argv is None else argv)
+    settings = _parse_settings(args)
+    model_path = Path(str(settings.get("model_path", "model.py")))
+    model_code = model_path.read_text(encoding="utf-8")
+    return _run_model(model_code, settings=settings)
+
+
 if __name__ == "__main__":
-    _run_model(Path("model.py").read_text(encoding="utf-8"))
+    main()

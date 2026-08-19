@@ -339,7 +339,8 @@ class FileTool:
         actual = hashlib.sha256(content.encode("utf-8")).hexdigest()
         if actual != expected_sha256:
             raise ValueError(
-                f"{filename} changed since it was read; refresh the file before editing."
+                f"{filename} changed since it was read (current sha256={actual}); "
+                "call read_file again and use that digest as expected_sha256."
             )
 
     def write_file(
@@ -351,11 +352,12 @@ class FileTool:
         path = self._path(filename)
         with _file_lock(path):
             current = path.read_text(encoding="utf-8") if path.exists() else ""
-            if path.exists() and expected_sha256 is None:
-                raise ValueError(
-                    f"{filename} already exists; call read_file and provide "
-                    "expected_sha256 before overwriting it."
-                )
+            # ``expected_sha256`` is optional. When omitted, the caller is
+            # declaring an unconditional overwrite; we still capture the
+            # current SHA so the caller can pass it on the next edit if they
+            # want strict conflict detection. This avoids forcing a redundant
+            # ``read_file`` round-trip before every ``write_file`` (the model
+            # already knows its own last write produced a known SHA).
             self._validate_expected_sha(filename, current, expected_sha256)
             return self._write_model(content, "write_file")
 
@@ -382,14 +384,18 @@ class FileTool:
         filename: str,
         old_string: str,
         new_string: str,
-        expected_sha256: str,
+        expected_sha256: str | None = None,
     ) -> str:
         if not old_string:
             raise ValueError("old_string must not be empty.")
-        if expected_sha256 is None:
-            raise ValueError(
-                "expected_sha256 is required; call read_file before editing."
-            )
+        # ``expected_sha256`` is optional: omitting it means an unconditional
+        # edit (the same pattern as ``write_file``). The agent already knows
+        # the current content from its own previous write, so a redundant
+        # ``read_file`` round-trip only to capture the SHA would just waste a
+        # tool call + tokens + latency. Conflict detection remains opt-in via
+        # ``expected_sha256``; pass it when you want to guarantee no concurrent
+        # edit. If expected_sha256 mismatches, re-read; do not retry the same
+        # edit blindly.
         path = self._path(filename)
         with _file_lock(path):
             if not path.exists():

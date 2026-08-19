@@ -202,6 +202,30 @@ def test_redact_helper_is_a_pure_function():
     assert plain == {"role": "user", "content": "hi"}
 
 
+def test_redact_helper_redacts_inline_tool_images():
+    """A ``tool`` message from ``cad_build_and_verify`` may carry inline render
+    evidence. The history redactor must replace those base64 payloads with a
+    placeholder so the History endpoint never echoes image bytes."""
+    long_payload = "data:image/png;base64," + ("A" * 256)
+    tool_event = {
+        "role": "tool",
+        "tool_call_id": "call-1",
+        "content": [
+            {"type": "text", "text": "Solid 1 (valid); with render."},
+            {"type": "image_url", "image_url": {"url": long_payload}},
+        ],
+    }
+    redacted = _redact_history_event(tool_event)
+    parts = redacted["content"]
+    assert parts[0]["type"] == "text"
+    assert "Solid 1 (valid)" in parts[0]["text"]
+    assert parts[1] == {"type": "text", "text": "[Inline render 1]"}
+    # The base64 payload has been removed from the response.
+    dumped = json.dumps(redacted, ensure_ascii=False)
+    assert long_payload not in dumped
+    assert "AA" not in dumped
+
+
 # ---------------------------------------------------------------------------
 # Issue 4 (frontend): normalizeHistoryContent handles list content.
 # ---------------------------------------------------------------------------
@@ -741,7 +765,6 @@ def test_load_history_drawer_mode_does_not_mutate_main_feed():
         "var activityPanel = { hidden: false };\n"
         "var activityList = { replaceChildren() {} };\n"
         "var activityItems = new Map();\n"
-        "var toolMessages = new Map();\n"
         "var showInfoMessages = true;\n"
         "var currentProject = 'demo';\n"
         "var api = async function() { return { events: [\n"
@@ -757,7 +780,7 @@ def test_load_history_drawer_mode_does_not_mutate_main_feed():
         "}\n"
         "function normalizeHistoryContent(c) { return typeof c === 'string' ? c : ''; }\n"
         "function addInfoMessage() {}\n"
-        "function clearActivity() { activityItems.clear(); toolMessages.clear(); }\n"
+        "function clearActivity() { activityItems.clear(); }\n"
         "var chatEmptyTpl = null;\n"
         + _extract_js("loadHistory")
     )
@@ -790,7 +813,6 @@ def test_load_history_main_mode_clears_feed_and_renders_events():
         "var activityPanel = { hidden: false };\n"
         "var activityList = { replaceChildren() {} };\n"
         "var activityItems = new Map();\n"
-        "var toolMessages = new Map();\n"
         "var showInfoMessages = true;\n"
         "var api = async function() { return { events: [\n"
         "  {role: 'user', content: 'first message'},\n"
@@ -804,7 +826,7 @@ def test_load_history_main_mode_clears_feed_and_renders_events():
         "}\n"
         "function normalizeHistoryContent(c) { return typeof c === 'string' ? c : ''; }\n"
         "function addInfoMessage() {}\n"
-        "function clearActivity() { activityItems.clear(); toolMessages.clear(); }\n"
+        "function clearActivity() { activityItems.clear(); }\n"
         "var chatEmptyTpl = null;\n"
         + _extract_js("loadHistory")
     )
@@ -874,8 +896,7 @@ def test_apply_conversation_reset_clears_feed_drawer_and_activity():
         "var historyContent = { items: ['prev'], replaceChildren() { this.items.length = 0; } };\n"
         "var questionArea = { cleared: false, replaceChildren() { this.cleared = true; } };\n"
         "var activityItems = new Map([['x', {}]]);\n"
-        "var toolMessages = new Map([['y', {}]]);\n"
-        "function clearActivity() { activityItems.clear(); toolMessages.clear(); }\n"
+        "function clearActivity() { activityItems.clear(); }\n"
         "var thinkingCalls = [];\n"
         "function setThinking(active) { thinkingCalls.push(active); }\n"
         "var currentProject = 'demo';\n"
@@ -890,7 +911,6 @@ def test_apply_conversation_reset_clears_feed_drawer_and_activity():
         "  history_items: historyContent.items,\n"
         "  question_cleared: questionArea.cleared,\n"
         "  activity_items: Array.from(activityItems.keys()),\n"
-        "  tool_messages: Array.from(toolMessages.keys()),\n"
         "  thinking_calls: thinkingCalls,\n"
         "}));"
     )
@@ -905,7 +925,6 @@ def test_apply_conversation_reset_clears_feed_drawer_and_activity():
     assert out["history_items"] == []
     assert out["question_cleared"] is True
     assert out["activity_items"] == []
-    assert out["tool_messages"] == []
     # Thinking indicator is released (False) so a stale spinner cannot leak past reset.
     assert out["thinking_calls"] == [False]
 
@@ -919,7 +938,6 @@ def test_apply_conversation_reset_reclones_chat_empty_template():
         "var historyContent = { replaceChildren() {} };\n"
         "var questionArea = { replaceChildren() {} };\n"
         "var activityItems = new Map();\n"
-        "var toolMessages = new Map();\n"
         "function clearActivity() {}\n"
         "function setThinking() {}\n"
         "var currentProject = 'demo';\n"

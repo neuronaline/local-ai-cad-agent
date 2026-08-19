@@ -1,11 +1,9 @@
 """Sandbox-side subset rasteriser for ``cad_screenshot``.
 
-This script runs inside the same bubblewrap subprocess as ``runner.py``.
-``CadScreenshotTool`` concatenates it after ``renderer.py`` so the rendering
-primitives (``VIEWS``, ``rasterize_view``, ``build_contact_sheet``) are
-available as globals. It re-tessellates ``shape`` once with the requested
-quality (coarse/standard/fine tolerance) and writes only the requested
-view subset to ``output_dir`` — never the full canonical eight.
+Imports ``renderer`` directly for the canonical :data:`VIEWS`,
+:func:`rasterize_view`, and :func:`build_contact_sheet` primitives. Re-tessellates
+``shape`` once with the requested quality and writes only the requested view
+subset to ``output_dir``.
 
 Public entry points:
 
@@ -15,23 +13,35 @@ Public entry points:
   view and returns a manifest payload describing the run.
 - ``build_contact_sheet_subset(...)`` — composes a sheet from the rendered
   subset in canonical order.
-
-The module deliberately omits ``from __future__ import annotations`` so it
-can be concatenated after ``renderer.py`` without violating Python's
-"future imports must appear at the top of the file" rule.
+- ``main(argv)`` — JSON-kwarg CLI entry point that the sandbox subprocess invokes.
 """
-
+# ``renderer`` and ``main`` are siblings in the same sandbox workspace; a normal
+# absolute-import style keeps the suite testable from the repo root. The
+# import is wrapped so the host side (``agent.tools.cad_screenshot_tool``)
+# can still pull ``SUBSET_VIEWS`` / ``QUALITY_TOLERANCES`` from this module
+# without needing the renderer side of the workspace on its import path.
 import hashlib
 import math
+import sys
 import time
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
-# ``shape`` is injected by the runner-side main block when this module is
-# concatenated and run. The renderer primitives (``VIEWS``, ``rasterize_view``,
-# ``build_contact_sheet``, ``_tessellate``) are globals from ``renderer.py``.
+try:
+    from renderer import (  # type: ignore[import-not-found]  # sandbox sibling import
+        VIEWS,
+        _tessellate,
+        rasterize_view,
+    )
+except ModuleNotFoundError:
+    # Host-side import (only ``SUBSET_VIEWS`` / ``QUALITY_TOLERANCES`` are
+    # consumed by the orchestrator). The subset rasteriser is not callable
+    # in this mode; ``render_subset`` raises a clear error when invoked.
+    VIEWS = None  # type: ignore[assignment]
+    _tessellate = None  # type: ignore[assignment]
+    rasterize_view = None  # type: ignore[assignment]
 
 # ---------------------------------------------------------------------------
 # Subset + quality configuration
@@ -261,10 +271,32 @@ def build_contact_sheet_subset(
 
 
 # ---------------------------------------------------------------------------
-# Main entry point — invoked by the orchestrator after concatenation with
-# ``renderer.py`` (which provides VIEWS, rasterize_view, build_contact_sheet,
-# ``_tessellate``).
+# Main entry point — invoked by ``agent.tools.cad_screenshot_tool``.
+# ``renderer.py`` is a sibling module in the same sandbox workspace, imported
+# once at module load time.
 # ---------------------------------------------------------------------------
+
+# ``ImageDraw`` is only needed by ``build_contact_sheet_subset``; defer the
+# import to keep the top-of-file PIL surface narrow.
+try:
+    from PIL import ImageDraw
+except ImportError:  # pragma: no cover - Pillow is required by the runner anyway.
+    ImageDraw = None  # type: ignore[assignment]
+
+
+def _resolve_shape(model_path: Path) -> object:
+    """Exec ``model.py`` and return the build123d ``result`` shape."""
+    model_code = model_path.read_text(encoding="utf-8")
+    namespace = {"__name__": "__main__", "__file__": "model.py"}
+    exec(compile(model_code, "model.py", "exec"), namespace)
+    shape = namespace.get("result")
+    if shape is None and getattr(namespace.get("part"), "part", None) is not None:
+        shape = namespace["part"].part
+    if shape is None:
+        raise ValueError(
+            "model.py must expose the final build123d shape as `result`."
+        )
+    return shape
 
 
 def _run_subset_pipeline(
@@ -276,20 +308,10 @@ def _run_subset_pipeline(
 ) -> dict[str, object]:
     """Exec ``model.py`` and rasterise only the requested subset.
 
-    Called from the runner-style ``__main__`` block below. Returns a
-    manifest dict that the orchestrator validates + promotes into
+    Returns a manifest dict that the orchestrator validates + promotes into
     ``.cad-agent/reviews/<sha>/``.
     """
-    model_code = model_path.read_text(encoding="utf-8")
-    namespace = {"__name__": "__main__", "__file__": "model.py"}
-    exec(compile(model_code, "model.py", "exec"), namespace)
-    shape = namespace.get("result")
-    if shape is None and getattr(namespace.get("part"), "part", None) is not None:
-        shape = namespace["part"].part
-    if shape is None:
-        raise ValueError(
-            "model.py must expose the final build123d shape as `result`."
-        )
+    shape = _resolve_shape(model_path)
     views_dir = output_dir / "views"
     views_dir.mkdir(parents=True, exist_ok=True)
     payload = render_subset(shape, views_dir, requested_views, quality=quality)
@@ -313,6 +335,7 @@ def _run_subset_pipeline(
         if preview_path.is_file()
         else ""
     )
+    model_code = model_path.read_text(encoding="utf-8")
     return {
         "model_sha256": hashlib.sha256(model_code.encode("utf-8")).hexdigest(),
         "preview_sha256": preview_sha256,
@@ -332,48 +355,46 @@ def _run_subset_pipeline(
     }
 
 
-# Importing ``ImageDraw`` lazily keeps the top-of-file PIL import narrow; it
-# is needed by ``build_contact_sheet_subset`` which is only called when the
-# orchestrator asks for a contact sheet.
-try:
-    from PIL import ImageDraw
-except ImportError:  # pragma: no cover - Pillow is required by the runner anyway.
-    ImageDraw = None  # type: ignore[assignment]
-
-
-def _run(argv: list[str]) -> dict[str, object]:
-    """Standalone main: parse argv, call ``_run_subset_pipeline``."""
+def _parse_json_argv(argv: list[str]) -> dict[str, object]:
     import json
-    import sys
 
-    kwargs_raw = argv[1] if len(argv) > 1 else "{}"
-    kwargs = json.loads(kwargs_raw) if kwargs_raw else {}
-    model_path = Path(kwargs.get("model_path", "model.py"))
-    output_dir = Path(kwargs.get("output_dir", ".screenshot-staging"))
-    requested_views = tuple(kwargs.get("requested_views") or [])
-    quality = kwargs.get("quality", "standard")
+    raw = argv[1] if len(argv) > 1 else "{}"
+    parsed = json.loads(raw) if raw else {}
+    if not isinstance(parsed, dict):
+        raise TypeError("argv[1] must be a JSON object.")
+    return parsed
+
+
+def main(argv: list[str] | None = None) -> dict[str, object]:
+    """Sandbox entry point: parse JSON kwargs, render subset, write manifest.
+
+    Called as ``python screenshot.py '<json kwargs>'`` by
+    ``agent.tools.cad_screenshot_tool`` inside the bubblewrap subprocess. Also
+    unit-testable from the repo root by passing ``argv`` directly.
+    """
+    import json
+
+    args = list(sys.argv if argv is None else argv)
+    kwargs = _parse_json_argv(args)
+    model_path = Path(str(kwargs.get("model_path", "model.py")))
+    output_dir = Path(str(kwargs.get("output_dir", ".screenshot-staging")))
+    requested_views = tuple(kwargs.get("requested_views") or ())
+    quality = str(kwargs.get("quality", "standard"))
     contact_sheet = bool(kwargs.get("contact_sheet", True))
-    return _run_subset_pipeline(
+    payload = _run_subset_pipeline(
         model_path=model_path,
         requested_views=requested_views,
         output_dir=output_dir,
         quality=quality,
         contact_sheet=contact_sheet,
     )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = output_dir / ".screenshot_manifest.json"
+    tmp_path = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    tmp_path.replace(manifest_path)
+    return payload
 
 
 if __name__ == "__main__":
-    import json as _json
-    import sys as _sys
-
-    _payload = _run(list(_sys.argv))
-    _staging = Path(
-        _json.loads(_sys.argv[1]).get("output_dir", ".screenshot-staging")
-        if len(_sys.argv) > 1
-        else "{}"
-    )
-    _staging.mkdir(parents=True, exist_ok=True)
-    _manifest_path = _staging / ".screenshot_manifest.json"
-    _tmp = _manifest_path.with_suffix(_manifest_path.suffix + ".tmp")
-    _tmp.write_text(_json.dumps(_payload, ensure_ascii=False), encoding="utf-8")
-    _tmp.replace(_manifest_path)
+    main()

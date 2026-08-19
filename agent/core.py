@@ -17,6 +17,21 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
+from agent.conversation import (
+    ConversationStore,
+    shared_history_lock,
+)
+from agent.conversation import (
+    _history_lock_slot as _conversation_history_lock_slot,
+)
+from agent.dispatcher import (
+    cancel_remaining_tool_calls,
+    dispatch,
+    is_cad_build,
+    is_model_mutation,
+    normalize_tool_calls,
+    process_tool_call,
+)
 from agent.images import as_chat_image
 from agent.llm_base import (
     RequestCancelled,
@@ -27,14 +42,12 @@ from agent.llm_base import (
 from agent.prompt import get_system_prompt
 from agent.revisions import RevisionStore
 from agent.settings import Settings
-from agent.tool_results import failure as tool_failure
-from agent.tool_results import success as tool_success
 from agent.tool_schemas import TOOL_SCHEMAS
 from agent.tools.cad_review_tool import CadReviewTool
 from agent.tools.cad_screenshot_tool import CadScreenshotTool
 from agent.tools.cad_tool import CadTool
 from agent.tools.file_tool import FileTool
-from agent.tools.question_tool import QuestionTool, normalize_questions
+from agent.tools.question_tool import QuestionTool
 from agent.tools.question_validator import QuestionValidator
 
 _LOG = logging.getLogger(__name__)
@@ -91,24 +104,20 @@ class ProjectTools:
                 _LOG.debug("Tool stop failed", exc_info=True)
 
 
-# Lock shared with the SSE EventBus so conversation.jsonl writes from the agent
-# serialise with the events the bus emits.
-_history_lock_slot: list[threading.Lock] = [threading.Lock()]
+# Re-export the conversation store's lock slot under the legacy local name.
+# Flask replaces this slot with EventBus._history_lock at startup; keeping the
+# *same list* ensures ConversationStore appends and EventBus status writes
+# serialize against one another.
+_history_lock_slot = _conversation_history_lock_slot
 
 
 def _shared_history_lock() -> threading.Lock:
     """Return the active history lock (configurable by the Flask app)."""
-    return _history_lock_slot[0]
+    return shared_history_lock()
 
 
 class AgentRunner:
     """One-thread-per-task chat-completions driver with tool dispatch."""
-
-    # Per-project cache of the truncated conversation history. Bounded so
-    # project create/delete churn does not accumulate unbounded memory; entries
-    # for directories that no longer exist are evicted on access.
-    _HISTORY_CACHE_MAX = 32
-    _history_cache: dict[str, list[dict]] = {}
 
     def __init__(
         self,
@@ -126,8 +135,6 @@ class AgentRunner:
         self._lock = threading.Lock()
         self._history_lock: threading.Lock = history_lock or threading.Lock()
         self._waiting_questions: dict[str, dict[str, object]] = {}
-        self._preview_attempts: dict[tuple[str, str], dict[str, str]] = {}
-        self._pending_completions: dict[str, dict[str, str]] = {}
         # Set by the active _run() inside its finally clause so callers can
         # observe completion reliably without polling thread.is_alive().
         self._run_complete: threading.Event = threading.Event()
@@ -149,62 +156,13 @@ class AgentRunner:
 
     def has_active_state_for(self, project: str) -> bool:
         """Return whether the project has an agent run that must not be deleted."""
-        if self.is_running() and self.active_project() == project:
-            return True
-        if self.is_awaiting_preview(project):
-            return True
         # A persisted waiting question is recoverable UI state, not an active
         # worker.  It must not prevent deleting the project.
-        return False
+        return self.is_running() and self.active_project() == project
 
     def active_project(self) -> str | None:
         with self._lock:
             return self._active_project
-
-    def is_awaiting_preview(self, project: str | None = None) -> bool:
-        with self._lock:
-            return bool(
-                self._pending_completions
-                if project is None
-                else project in self._pending_completions
-            )
-
-    def pending_preview_id(self, project: str) -> str | None:
-        with self._lock:
-            pending = self._pending_completions.get(project)
-            return pending["preview_id"] if pending else None
-
-    def confirm_preview(self, project: str, preview_id: str) -> bool:
-        completion = None
-        with self._lock:
-            attempt = self._preview_attempts.get((project, preview_id))
-            if not attempt or not self._preview_matches(project, attempt):
-                return False
-            attempt["status"] = "displayed"
-            pending = self._pending_completions.get(project)
-            if pending and pending["preview_id"] == preview_id:
-                completion = self._pending_completions.pop(project)
-        if completion:
-            self._complete(project, completion["message"])
-        return True
-
-    def fail_preview(self, project: str, preview_id: str, message: str) -> bool:
-        error_message = (
-            f"Drawing could not be displayed: {message or 'the preview is invalid.'}"
-        )
-        should_publish = False
-        with self._lock:
-            attempt = self._preview_attempts.get((project, preview_id))
-            if not attempt:
-                return False
-            attempt.update({"status": "error", "error": error_message})
-            pending = self._pending_completions.get(project)
-            if pending and pending["preview_id"] == preview_id:
-                self._pending_completions.pop(project)
-                should_publish = True
-        if should_publish:
-            self.publish("agent_error", {"project": project, "message": error_message})
-        return True
 
     def waiting_question(self, project: str) -> dict[str, object] | None:
         with self._lock:
@@ -239,10 +197,7 @@ class AgentRunner:
     def _start_locked(
         self, project: str, message: str, image_paths: list[Path]
     ) -> bool:
-        if (
-            (self._thread is not None and not self._run_complete.is_set())
-            or self._pending_completions
-        ):
+        if self._thread is not None and not self._run_complete.is_set():
             return False
         self._stop_event.clear()
         self._run_complete.clear()
@@ -268,10 +223,7 @@ class AgentRunner:
         project_dir = self.settings.workspace_root / project
         formatted = self._format_answer(question, answer)
         with self._lock:
-            if (
-                (self._thread is not None and not self._run_complete.is_set())
-                or self._pending_completions
-            ):
+            if self._thread is not None and not self._run_complete.is_set():
                 return False
             # Persist the user answer BEFORE starting the new thread so the
             # thread's _context() reads it from the canonical log instead of
@@ -291,23 +243,10 @@ class AgentRunner:
                 target_project is None or target_project == self._active_project
             )
             if project is None:
-                affected = list(
-                    dict.fromkeys(
-                        list(self._waiting_questions)
-                        + list(self._pending_completions)
-                        + [key[0] for key in self._preview_attempts]
-                    )
-                )
+                affected = list(dict.fromkeys(list(self._waiting_questions)))
                 self._waiting_questions.clear()
-                self._pending_completions.clear()
-                self._preview_attempts.clear()
             else:
                 self._waiting_questions.pop(project, None)
-                self._pending_completions.pop(project, None)
-                for key in [
-                    key for key in self._preview_attempts if key[0] == project
-                ]:
-                    self._preview_attempts.pop(key, None)
                 affected = [project]
             if stop_active_task:
                 self._stop_event.set()
@@ -368,9 +307,6 @@ class AgentRunner:
                     )
                     return
                 message_id = uuid.uuid4().hex
-                self.publish(
-                    "agent_stream_start", {"project": project, "message_id": message_id}
-                )
 
                 def publish_stream(
                     event: dict,
@@ -444,7 +380,11 @@ class AgentRunner:
                             # No tools were used at all — just a conversation; complete silently.
                             self._complete(project, content)
                         return
-                    self._await_preview(project, preview_id, content)
+                    # CAD succeeded; the agent turn completes unconditionally.
+                    # The UI loads the preview asynchronously and reports any
+                    # render failure through ``agent_error``; the agent's
+                    # canonical answer does not wait for the browser.
+                    self._complete(project, content)
                     return
                 any_tool_used = True
                 processed_call_ids: set[str] = set()
@@ -599,79 +539,27 @@ class AgentRunner:
 
     @staticmethod
     def _strip_image_parts(item: dict) -> dict:
-        """Replace inline image parts with placeholders when loading history."""
-        content = item.get("content")
-        if item.get("role") != "user" or not isinstance(content, list):
-            return item
-        parts: list[object] = []
-        replaced = False
-        image_index = 0
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "image_url":
-                replaced = True
-                image_index += 1
-                name = part.get("filename") or f"reference-{image_index}"
-                parts.append({"type": "text", "text": f"[image: {name}]"})
-            else:
-                parts.append(part)
-        if not replaced:
-            return item
-        cleaned = dict(item)
-        cleaned["content"] = parts
-        return cleaned
+        """Replace inline image parts with placeholders when loading history.
+
+        Thin wrapper around :meth:`ConversationStore._strip_image_parts`;
+        kept as a classmethod so existing call sites and tests that import
+        it continue to work.
+        """
+        return ConversationStore._strip_image_parts(item)
 
     @classmethod
     def _truncate_history(cls, history: list[dict]) -> list[dict]:
-        if len(history) <= cls.MAX_HISTORY:
-            return history
-        return history[-cls.MAX_HISTORY:]
+        return ConversationStore._truncate(history)
 
     @classmethod
     def _load_history(cls, project_dir: Path) -> list[dict]:
-        """Load the conversation history from a single canonical jsonl file."""
-        cache_key = str(project_dir)
-        cached = cls._history_cache.get(cache_key)
-        if cached is not None:
-            # Evict stale entries whose project directory has been removed.
-            if not project_dir.exists():
-                cls._history_cache.pop(cache_key, None)
-            else:
-                return list(cached)
-        history: list[dict] = []
-        log_path = project_dir / "conversation.jsonl"
-        if log_path.exists():
-            for line in log_path.read_text(encoding="utf-8").splitlines():
-                try:
-                    item = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(item, dict) and item.get("role") in {
-                    "user",
-                    "assistant",
-                    "tool",
-                }:
-                    history.append(item)
-        history = [cls._strip_image_parts(item) for item in history]
-        history = cls._truncate_history(history)
-        # Bound the cache size with FIFO eviction to avoid unbounded growth
-        # from long-lived processes with many project create/delete cycles.
-        while len(cls._history_cache) >= cls._HISTORY_CACHE_MAX:
-            oldest = next(iter(cls._history_cache))
-            if oldest == cache_key:
-                break
-            cls._history_cache.pop(oldest, None)
-        cls._history_cache[cache_key] = list(history)
-        return history
+        """Load the canonical conversation.jsonl for ``project_dir``."""
+        return ConversationStore.load(project_dir)
 
     @classmethod
     def _append_message(cls, project_dir: Path, message: dict) -> None:
-        """Append a message to the conversation log (the single canonical sink)."""
-        cls._history_cache.pop(str(project_dir), None)
-        with _shared_history_lock():
-            with (project_dir / "conversation.jsonl").open("a", encoding="utf-8") as log:
-                log.write(
-                    json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n"
-                )
+        """Append a message to the canonical conversation log."""
+        ConversationStore.append(project_dir, message)
 
     @classmethod
     def clear_history(cls, project_dir: Path) -> bool:
@@ -682,18 +570,7 @@ class AgentRunner:
         removed, ``False`` when the project had no recorded conversation.
         The model, preview, renders, and revision blobs are left untouched.
         """
-        cache_key = str(project_dir)
-        cls._history_cache.pop(cache_key, None)
-        log_path = project_dir / "conversation.jsonl"
-        removed = False
-        with _shared_history_lock():
-            try:
-                log_path.unlink()
-            except FileNotFoundError:
-                pass
-            else:
-                removed = True
-        return removed
+        return ConversationStore.clear(project_dir)
 
     def _publish_usage(self, project: str, usage: dict | None) -> None:
         if not usage:
@@ -717,8 +594,6 @@ class AgentRunner:
 
     # ------------------------------------------------------------------ dispatch
 
-    MAX_HISTORY = 100
-
     def _execute(
         self,
         tools: ProjectTools,
@@ -727,111 +602,21 @@ class AgentRunner:
         args: dict,
         call_id: str = "",
     ) -> tuple[object, bool]:
-        if name == "cad_build_and_verify":
-            # ``render`` defaults to True to preserve legacy behavior; the
-            # schema documents the iteration vs. final-verification split.
-            return tools.cad.with_call_id(call_id).build_and_verify(
-                args.get("render", True)
-            ), False
-        if name == "cad_screenshot":
-            tool = tools.screenshot.with_call_id(call_id) if call_id else tools.screenshot
-            return tool.execute(args), False
-        if name == "cad_review":
-            tool = tools.review.with_call_id(call_id) if call_id else tools.review
-            return tool.execute(args), False
-        if name == "read_file":
-            tool = tools.file.with_call_id(call_id) if call_id else tools.file
-            return (
-                tool.read_file(
-                    args["filename"],
-                    args.get("offset", 1),
-                    args.get("limit"),
-                    args.get("known_sha256"),
-                ),
-                False,
-            )
-        if name == "write_file":
-            tool = tools.file.with_call_id(call_id) if call_id else tools.file
-            return (
-                tool.write_file(
-                    args["filename"],
-                    args.get("content", ""),
-                    args.get("expected_sha256"),
-                ),
-                False,
-            )
-        if name == "edit_file":
-            tool = tools.file.with_call_id(call_id) if call_id else tools.file
-            return (
-                tool.edit_file(
-                    args["filename"],
-                    args["old_string"],
-                    args.get("new_string", ""),
-                    args["expected_sha256"],
-                ),
-                False,
-            )
-        if name == "question":
-            # execute() validates, normalizes, and publishes the questions;
-            # the normalized list is also needed for the persisted state.
-            result, _waiting = tools.question.execute(args, project=project)
-            questions = normalize_questions(args)
-            title = args.get("title", "")
-            question_state = {
-                "title": title.strip() if isinstance(title, str) else "",
-                "questions": questions,
-            }
-            state_path = tools.project_dir / ".agent_state.json"
-            temporary_state = tools.project_dir / ".agent_state.json.tmp"
-            temporary_state.write_text(
-                json.dumps(
-                    {"status": "WAITING_FOR_USER", "waiting_question": question_state}
-                ),
-                encoding="utf-8",
-            )
-            temporary_state.replace(state_path)
-            with self._lock:
-                self._waiting_questions[project] = question_state
-            return result, True
-        tool = getattr(tools, name)
-        return tool.execute(args)
+        """Backward-compatible thin wrapper around :func:`dispatcher.dispatch`."""
+        return dispatch(tools, project, name, args, call_id)
 
     @staticmethod
     def _normalize_tool_calls(raw_calls: object) -> list[dict]:
-        """Ensure persisted tool calls remain valid protocol messages."""
-        if not isinstance(raw_calls, list):
-            return []
-        normalized: list[dict] = []
-        for raw_call in raw_calls:
-            call = raw_call if isinstance(raw_call, dict) else {}
-            function = call.get("function")
-            function = function if isinstance(function, dict) else {}
-            name = function.get("name")
-            arguments = function.get("arguments")
-            normalized.append(
-                {
-                    "id": str(call.get("id") or f"invalid-{uuid.uuid4().hex}"),
-                    "type": "function",
-                    "function": {
-                        "name": name
-                        if isinstance(name, str) and name
-                        else "unknown_tool",
-                        "arguments": arguments if isinstance(arguments, str) else "{}",
-                    },
-                }
-            )
-        return normalized
+        """Backwards-compatible alias for :func:`dispatcher.normalize_tool_calls`."""
+        return normalize_tool_calls(raw_calls)
 
     @staticmethod
     def _is_model_mutation(name: str, arguments: dict) -> bool:
-        return (
-            name in {"write_file", "edit_file"}
-            and arguments.get("filename") == "model.py"
-        )
+        return is_model_mutation(name, arguments)
 
     @staticmethod
     def _is_cad_build(name: str, arguments: dict) -> bool:
-        return name == "cad_build_and_verify"
+        return is_cad_build(name, arguments)
 
     def _process_tool_call(
         self,
@@ -844,72 +629,21 @@ class AgentRunner:
         cad_error: str | None,
         messages: list[dict],
     ) -> tuple[str | None, str | None, bool, bool]:
-        """Execute a single tool call, update state, return new (preview, error, fix_required, waiting)."""
-        call = call if isinstance(call, dict) else {}
-        call_id = str(call.get("id") or f"invalid-{uuid.uuid4().hex}")
-        function = call.get("function")
-        name = function.get("name") if isinstance(function, dict) else ""
-        if not isinstance(name, str) or not name:
-            name = "unknown_tool"
-        preview_id = prev_preview_id
-        waiting = False
-        arguments: dict = {}
-        try:
-            argument_text = (
-                function.get("arguments") if isinstance(function, dict) else ""
-            )
-            arguments = json.loads(argument_text or "{}")
-            if not isinstance(arguments, dict):
-                raise TypeError("Tool arguments must be a JSON object.")
-            tool_event = {
-                "project": project,
-                "call_id": call_id,
-                "tool": name,
-                "arguments": arguments,
-            }
-            self.publish("tool_status", {**tool_event, "status": "running"})
-            if self._is_cad_build(name, arguments):
-                preview_id = None
-            raw_result, waiting = self._execute(
-                tools, project, name, arguments, call_id
-            )
-            result = tool_success(name, raw_result)
-            if self._is_model_mutation(name, arguments):
-                preview_id = None
-                cad_error = None
-                cad_fix_required = True
-                self.publish("revision_updated", {"project": project})
-            if self._is_cad_build(name, arguments):
-                preview_id = self._register_preview(project, project_dir)
-                self.publish(
-                    "preview_updated",
-                    {"project": project, "preview_id": preview_id},
-                )
-            self.publish(
-                "tool_status",
-                {**tool_event, "status": "completed", "result": result},
-            )
-        except Exception as error:  # noqa: BLE001 - Tool errors are useful LLM context.
-            result, waiting = tool_failure(name, error), False
-            self._debug_tool_error(project_dir, call_id, name, error, result)
-            if self._is_cad_build(name, arguments):
-                cad_error = str(error)
-                cad_fix_required = True
-                preview_id = None
-            self.publish(
-                "tool_status",
-                {
-                    "project": project,
-                    "call_id": call_id,
-                    "tool": name,
-                    "arguments": arguments,
-                    "status": "error",
-                    "result": result,
-                },
-            )
-        messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
-        self._append_message(project_dir, messages[-1])
-        return preview_id, cad_error, cad_fix_required, waiting
+        """Backwards-compatible thin wrapper around :func:`dispatcher.process_tool_call`."""
+        return process_tool_call(
+            tools,
+            project,
+            project_dir,
+            call,
+            cad_fix_required,
+            prev_preview_id,
+            cad_error,
+            messages,
+            publish=self.publish,
+            register_preview=self._register_preview,
+            append_message=self._append_message,
+            debug_log=self._debug_tool_error,
+        )
 
     @classmethod
     def _cancel_remaining_tool_calls(
@@ -919,14 +653,14 @@ class AgentRunner:
         processed_call_ids: set[str],
         messages: list[dict],
     ) -> None:
-        """Write cancelled tool-result entries for unprocessed calls."""
-        cancelled = json.dumps({"error": "Tool call cancelled (question or stop)."})
-        for tc in tool_calls:
-            cid = tc.get("id", "")
-            if cid and cid not in processed_call_ids:
-                entry = {"role": "tool", "tool_call_id": cid, "content": cancelled}
-                messages.append(entry)
-                cls._append_message(project_dir, entry)
+        """Backwards-compatible thin wrapper around the dispatcher's equivalent."""
+        cancel_remaining_tool_calls(
+            project_dir,
+            tool_calls,
+            processed_call_ids,
+            messages,
+            append_message=cls._append_message,
+        )
 
     @staticmethod
     def _user_error_message(detail: str, err_type: str, *, provider: str = "openrouter") -> str:
@@ -972,32 +706,17 @@ class AgentRunner:
     # ------------------------------------------------------------------ preview tracking
 
     def _register_preview(self, project: str, project_dir: Path) -> str:
+        """Return a fresh ``preview_id`` correlation token.
+
+        The token is published alongside ``preview_updated`` so the UI can
+        decide whether to fetch the new STL. The agent turn no longer parks
+        its completion on a browser ACK; the host's render-failure path
+        surfaces any consumer error through ``agent_error`` independently.
+        """
         preview_path = project_dir / "preview.stl"
         if not preview_path.is_file() or preview_path.stat().st_size == 0:
             raise RuntimeError("CAD execution did not save a usable preview.")
-        preview_id = uuid.uuid4().hex
-        digest = hashlib.sha256(preview_path.read_bytes()).hexdigest()
-        with self._lock:
-            self._preview_attempts[(project, preview_id)] = {
-                "digest": digest,
-                "model_digest": self._model_digest(project_dir) or "",
-                "status": "loading",
-            }
-        return preview_id
-
-    def _preview_matches(self, project: str, attempt: dict[str, str]) -> bool:
-        preview_path = self.settings.workspace_root / project / "preview.stl"
-        project_dir = preview_path.parent
-        try:
-            return (
-                preview_path.is_file()
-                and preview_path.stat().st_size > 0
-                and hashlib.sha256(preview_path.read_bytes()).hexdigest()
-                == attempt["digest"]
-                and (self._model_digest(project_dir) or "") == attempt["model_digest"]
-            )
-        except (KeyError, OSError):
-            return False
+        return uuid.uuid4().hex
 
     @staticmethod
     def _model_digest(project_dir: Path) -> str | None:
@@ -1024,37 +743,6 @@ class AgentRunner:
             return False
         return isinstance(cached, dict) and cached.get("model_sha256") == model_digest
 
-    def _await_preview(self, project: str, preview_id: str, message: str) -> None:
-        completion = None
-        error_message = None
-        with self._lock:
-            attempt = self._preview_attempts.get((project, preview_id))
-            if not attempt or not self._preview_matches(project, attempt):
-                error_message = "Drawing was not saved correctly; the preview file is missing or changed."
-            elif attempt["status"] == "displayed":
-                completion = message
-            elif attempt["status"] == "error":
-                error_message = attempt["error"]
-            else:
-                self._pending_completions[project] = {
-                    "preview_id": preview_id,
-                    "message": message,
-                }
-        if completion:
-            self._complete(project, completion)
-        elif error_message:
-            self.publish("agent_error", {"project": project, "message": error_message})
-            self._publish_terminal_failure(project)
-        else:
-            self.publish(
-                "agent_status",
-                {
-                    "project": project,
-                    "status": "rendering",
-                    "message": "Waiting for the drawing to become visible...",
-                },
-            )
-
     def _publish_terminal_failure(self, project: str) -> None:
         # Mirror _complete's success-side agent_status so the UI clears the
         # thinking indicator on every error path. agent_status:stopped is
@@ -1073,8 +761,9 @@ class AgentRunner:
         The agent loop persists the assistant turn via ``_append_message``;
         this method ensures the final user-facing response is recorded
         even when the loop reaches ``_complete`` without persisting the
-        assistant message (e.g. the ``_await_preview`` path). The agent
-        loop and ``_complete`` together guarantee a single canonical entry.
+        assistant message (the legacy preview-Await path used to do this).
+        The agent loop and ``_complete`` together guarantee a single
+        canonical entry.
         """
         project_dir = self.settings.workspace_root / project
         history = self._load_history(project_dir)
@@ -1120,9 +809,13 @@ class AgentRunner:
                 "message": str(error),
                 "classification": error_detail,
             }
-            with _shared_history_lock():
-                with (project_dir / "debug-errors.jsonl").open("a", encoding="utf-8") as log:
-                    log.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            with (
+                _shared_history_lock(),
+                (project_dir / "debug-errors.jsonl").open(
+                    "a", encoding="utf-8"
+                ) as log,
+            ):
+                log.write(json.dumps(entry, ensure_ascii=False) + "\n")
         except (OSError, TypeError, ValueError):
             # Debug logging must not affect the agent's recovery path.
             return

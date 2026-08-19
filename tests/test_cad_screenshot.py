@@ -246,20 +246,16 @@ def test_subset_views_matches_orchestrator_constant():
 def test_subset_view_spec_resolves_known_ids():
     """Subset resolution returns matching ``ViewSpec`` entries for known ids."""
     sys.path.insert(0, str(Path("agent/tools/cad_scripts").resolve()))
-    import renderer as _renderer  # type: ignore
     import screenshot as _screenshot  # type: ignore
 
-    _screenshot.VIEWS = _renderer.VIEWS  # inject the canonical view specs
     spec = _screenshot._view_spec_by_id("isometric_positive")
     assert spec.view_id == "isometric_positive"
 
 
 def test_subset_view_spec_rejects_unknown_ids():
     sys.path.insert(0, str(Path("agent/tools/cad_scripts").resolve()))
-    import renderer as _renderer  # type: ignore
     import screenshot as _screenshot  # type: ignore
 
-    _screenshot.VIEWS = _renderer.VIEWS
     with pytest.raises(ValueError, match="Unknown view id"):
         _screenshot._view_spec_by_id("not_a_real_view")
 

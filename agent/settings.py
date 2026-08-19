@@ -1,6 +1,7 @@
 """Configuration loading for the local CAD agent."""
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -48,11 +49,9 @@ class Settings:
     review_render_workers: int = 4
     review_required_views: int = 8
     # ── 3D preview viewer (Three.js grid plane) ──
-    # Ground grid extent in mm. ``width`` × ``depth`` cover the XZ plane; the
-    # third value is the number of divisions per side so the cell size is
-    # ``width / divisions`` mm. Defaults match the previous hard-coded grid.
-    viewer_grid_width: float = 200.0
-    viewer_grid_depth: float = 200.0
+    # Square ground grid in mm; ``size`` covers both X and Z, ``divisions``
+    # is the cell count per side. Defaults match the previous hard-coded grid.
+    viewer_grid_size: float = 200.0
     viewer_grid_divisions: int = 20
 
     @property
@@ -63,13 +62,9 @@ class Settings:
         return self.openrouter_model
 
     @property
-    def viewer_grid_extent(self) -> tuple[float, float, int]:
-        """Return ``(width, depth, divisions)`` for the preview viewport grid."""
-        return (
-            self.viewer_grid_width,
-            self.viewer_grid_depth,
-            self.viewer_grid_divisions,
-        )
+    def viewer_grid_extent(self) -> tuple[float, int]:
+        """Return ``(size, divisions)`` for the preview viewport grid."""
+        return (self.viewer_grid_size, self.viewer_grid_divisions)
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -80,16 +75,6 @@ def _read_yaml(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise TypeError(f"Configuration must be a mapping: {path}")
     return data
-
-
-def _merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    merged = base.copy()
-    for key, value in override.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _merge(merged[key], value)
-        else:
-            merged[key] = value
-    return merged
 
 
 def _strict_bool(value: Any, name: str) -> bool:
@@ -113,76 +98,61 @@ def _validate_timeout_seconds(value: Any, name: str) -> int:
     return _positive_int(value, name)
 
 
-def _parse_grid_extent(value: Any) -> tuple[float, float, int]:
-    """Parse a grid extent string into ``(width, depth, divisions)``.
+def _parse_grid_extent(value: Any) -> tuple[float, int]:
+    """Parse ``viewer.grid.size``/``viewer.grid.divisions`` into ``(size, divisions)``.
 
-    Accepts either a ``"WxDxD"`` triple (e.g. ``"256x256x256"``) or a mapping
-    with explicit ``width`` / ``depth`` / ``divisions`` keys. ``width`` and
-    ``depth`` are non-negative floats in mm; ``divisions`` is a positive
-    integer. When only width is supplied, ``depth`` mirrors it and
-    ``divisions`` falls back to ``20``.
+    Accepts either a mapping with explicit ``size`` / ``divisions`` keys or a
+    bare numeric/string value for ``size`` (in mm). ``divisions`` always
+    defaults to 20 to match the previous behaviour. The removed
+    ``viewer.grid.extent`` mapping/string is accepted as a compatibility
+    alias; its width remains the square grid size because that was also the
+    dimension passed to Three.js previously.
     """
-    width: float | None = None
-    depth: float | None = None
+    size: float | None = None
     divisions: int | None = None
-    if isinstance(value, str):
-        parts = [token.strip() for token in value.split("x") if token.strip()]
-        if not parts:
-            raise ValueError("viewer.grid.extent must not be empty.")
-        try:
-            numbers = [float(token) for token in parts]
-        except ValueError as error:
-            raise ValueError(
-                "viewer.grid.extent must be a triple of numbers like '256x256x256'."
-            ) from error
-        if len(numbers) == 1:
-            width = depth = numbers[0]
-            divisions = 20
-        elif len(numbers) == 2:
-            width, depth = numbers
-            divisions = 20
-        elif len(numbers) == 3:
-            width, depth, divisions = (
-                numbers[0],
-                numbers[1],
-                int(numbers[2]),
-            )
-        else:
-            raise ValueError(
-                "viewer.grid.extent accepts 1, 2, or 3 numbers "
-                "(width, depth, divisions); got "
-                f"{len(numbers)}."
-            )
-    elif isinstance(value, dict):
-        if "width" in value:
-            width = float(value["width"])
-        if "depth" in value:
-            depth = float(value["depth"])
+    if isinstance(value, dict):
+        if "size" in value:
+            size = float(value["size"])
         if "divisions" in value:
             divisions = int(value["divisions"])
+        legacy_extent = value.get("extent")
+        if size is None and legacy_extent is not None:
+            if isinstance(legacy_extent, dict):
+                legacy_size = legacy_extent.get("width", legacy_extent.get("depth"))
+                if legacy_size is not None:
+                    size = float(legacy_size)
+                if divisions is None and "divisions" in legacy_extent:
+                    divisions = int(legacy_extent["divisions"])
+            elif isinstance(legacy_extent, str):
+                parts = [part.strip() for part in legacy_extent.split("x")]
+                if not 1 <= len(parts) <= 3 or any(not part for part in parts):
+                    raise ValueError("viewer.grid.extent must contain 1 to 3 numbers.")
+                size = float(parts[0])
+                if divisions is None and len(parts) == 3:
+                    divisions = int(float(parts[2]))
+            elif isinstance(legacy_extent, (int, float)) and not isinstance(
+                legacy_extent, bool
+            ):
+                size = float(legacy_extent)
+            else:
+                raise ValueError("viewer.grid.extent must be numeric or a mapping.")
     elif isinstance(value, (int, float)) and not isinstance(value, bool):
-        # Bare numeric value = square grid with the legacy 20 divisions.
-        width = depth = float(value)
-        divisions = 20
+        size = float(value)
+    elif isinstance(value, str):
+        size = float(value.strip())
     elif value is None:
         pass
     else:
-        raise ValueError(
-            "viewer.grid.extent must be a string like '256x256x256' or a mapping."
-        )
-    if width is None:
-        width = 200.0
-    if depth is None:
-        depth = width
+        raise ValueError("viewer.grid must be a number or a mapping with size/divisions.")
+    if size is None:
+        size = 200.0
     if divisions is None:
         divisions = 20
-    if width <= 0 or depth <= 0:
-        raise ValueError(
-            "viewer.grid width and depth must be positive mm values."
-        )
+    if not math.isfinite(size) or size <= 0:
+        raise ValueError("viewer.grid size must be a positive mm value.")
     if divisions < 1:
         raise ValueError("viewer.grid divisions must be a positive integer.")
-    return width, depth, divisions
+    return size, divisions
 
 
 def load_settings(project_root: Path | None = None) -> Settings:
@@ -210,9 +180,7 @@ def load_settings(project_root: Path | None = None) -> Settings:
 
     # Each provider keeps its own model; ``settings.llm_model`` returns the
     # active one so callers do not need to branch on the provider.
-    grid_width, grid_depth, grid_divisions = _parse_grid_extent(
-        viewer_grid.get("extent") if isinstance(viewer_grid, dict) else None
-    )
+    grid_size, grid_divisions = _parse_grid_extent(viewer_grid)
 
     return Settings(
         workspace_root=Path(config.get("workspace_root", "~/CAD-Agent-Projects")).expanduser(),
@@ -247,8 +215,7 @@ def load_settings(project_root: Path | None = None) -> Settings:
         review_required_views=_positive_int(
             review.get("required_views", 8), "review.required_views"
         ),
-        viewer_grid_width=grid_width,
-        viewer_grid_depth=grid_depth,
+        viewer_grid_size=grid_size,
         viewer_grid_divisions=grid_divisions,
     )
 

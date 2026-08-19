@@ -5,9 +5,11 @@ pythonpath = ["."]
 target-version = "py310"
 
 [tool.ruff.lint.per-file-ignores]
+# The ``cad_scripts/*`` modules re-export helpers (``json``, ``sys``, ...) that
+# look unused to a static checker but are part of the sandbox entry-point
+# surface or sibling-module imports.
 "agent/tools/cad_scripts/runner.py" = ["F401", "S102"]
-"agent/tools/cad_scripts/renderer.py" = ["F821"]
-"agent/tools/cad_scripts/screenshot.py" = ["F401", "F821", "E402", "S102"]
+"agent/tools/cad_scripts/screenshot.py" = ["F401", "E402", "S102"]
 "agent/tools/cad_review_tool.py" = ["TRY004"]
 "agent/tools/cad_screenshot_tool.py" = ["TRY004"]
 "agent/tools/process_runner.py" = ["TRY004"]

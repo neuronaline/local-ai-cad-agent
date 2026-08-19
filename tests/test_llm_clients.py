@@ -403,6 +403,30 @@ def test_openrouter_forced_provider_keeps_sticky_routing_eligible(tmp_path):
     }
 
 
+def test_openrouter_agent_role_trace_propagates_to_payload(tmp_path):
+    """Subordinate evaluators identify their trace span.
+
+    The ``agent_role`` attribute on the client is forwarded through
+    OpenRouter's documented ``trace.span_name`` field. The base prompt and
+    ``session_id`` are unchanged, so the cache prefix key stays stable.
+    """
+    client = OpenRouterClient(_settings(tmp_path, "openrouter"))
+    client.agent_role = "reviewer"
+    client.session_id = "test-session-abc"
+    payload = client._build_payload([], None)
+    assert payload.get("trace") == {"span_name": "reviewer"}
+    assert payload.get("session_id") == hashlib.sha256(
+        b"test-session-abc"
+    ).hexdigest()[:64]
+
+
+def test_openrouter_agent_role_default_is_absent(tmp_path):
+    """The default agent loop must not identify a subordinate trace span."""
+    payload = OpenRouterClient(_settings(tmp_path, "openrouter"))._build_payload(
+        [], None
+    )
+    assert "trace" not in payload
+
 def test_openrouter_advances_gemini_cache_breakpoint_to_latest_message(monkeypatch, tmp_path):
     captured: dict[str, Any] = {}
     monkeypatch.setenv("OPENROUTER_API_KEY", "test")

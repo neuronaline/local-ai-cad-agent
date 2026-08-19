@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 import math
 import os
 import shutil
@@ -17,17 +16,15 @@ from typing import Any
 from agent.revisions import RevisionIntegrityError, RevisionStore
 from agent.sandbox import command as sandbox_command
 from agent.tools.file_tool import FileTool
-from agent.tools.process_runner import _TimedOut, _stream_with_limit
+from agent.tools.process_runner import _stream_with_limit, _TimedOut
+from agent.tools.tool_events import publish_tool_phase
 
+# Sandbox-side script files. The host copies these into the bubblewrap
+# workspace so the runner can ``import renderer`` instead of relying on a
+# source-string concatenation.
 _SCRIPTS_DIR = Path(__file__).resolve().parent / "cad_scripts"
-
-
-def _read_script(name: str) -> str:
-    return (_SCRIPTS_DIR / name).read_text(encoding="utf-8")
-
-
-RUNNER = _read_script("runner.py")
-RENDERER = _read_script("renderer.py")
+_RUNNER_FILENAME = "runner.py"
+_RENDERER_FILENAME = "renderer.py"
 
 
 # Hard validation bounds shared with the runner; enforced here so callers see
@@ -39,9 +36,7 @@ _MIN_VOLUME_MM3 = 0.0
 # Review artifacts live under <project>/.cad-agent/reviews/<model_sha256>/.
 # A new manifest only invalidates the previous review when ``preview_sha256``
 # changes; same (model_sha256, preview_sha256) hits the on-disk cache.
-_REVIEWS_ROOT = ".cad-agent/reviews"
 _REVIEW_MANIFEST_NAME = "manifest.json"
-_REVIEW_RESULT_NAME = "result.json"
 _REVIEW_VIEWS_DIR = "views"
 _REVIEW_SHEET_NAME = "review-sheet.png"
 
@@ -89,9 +84,6 @@ class CadTool:
         self._process: subprocess.Popen[str] | None = None
         self._lock = threading.Lock()
         self._call_id = ""
-        # Counter surfaced by ``_publish_status`` so operators can detect
-        # dropped activity events without scraping the host log.
-        self._status_publish_failures = 0
 
     # ------------------------------------------------------------------ review
 
@@ -99,50 +91,8 @@ class CadTool:
         self._call_id = call_id
         return self
 
-    def _reviews_root(self) -> Path:
-        return self.project_dir / ".cad-agent" / "reviews"
-
     def _review_dir(self, model_sha256: str) -> Path:
-        return self._reviews_root() / model_sha256
-
-    def latest_review_dir(self) -> Path | None:
-        """Return the most recently modified review directory, if any."""
-        root = self._reviews_root()
-        if not root.is_dir():
-            return None
-        candidates = [path for path in root.iterdir() if path.is_dir()]
-        if not candidates:
-            return None
-        return max(candidates, key=lambda path: path.stat().st_mtime)
-
-    def review_manifest_path(self) -> Path | None:
-        """Return the manifest path inside the latest review directory."""
-        latest = self.latest_review_dir()
-        if latest is None:
-            return None
-        manifest = latest / _REVIEW_MANIFEST_NAME
-        return manifest if manifest.is_file() else None
-
-    def review_result_path(self) -> Path | None:
-        latest = self.latest_review_dir()
-        if latest is None:
-            return None
-        result = latest / _REVIEW_RESULT_NAME
-        return result if result.is_file() else None
-
-    def review_view_path(self, view_id: str) -> Path | None:
-        latest = self.latest_review_dir()
-        if latest is None:
-            return None
-        target = latest / _REVIEW_VIEWS_DIR / f"{view_id}.png"
-        return target if target.is_file() else None
-
-    def review_sheet_path(self) -> Path | None:
-        latest = self.latest_review_dir()
-        if latest is None:
-            return None
-        target = latest / _REVIEW_SHEET_NAME
-        return target if target.is_file() else None
+        return self.project_dir / ".cad-agent" / "reviews" / model_sha256
 
     def _publish_status(
         self, status: str, message: str, call_id: str = ""
@@ -152,56 +102,41 @@ class CadTool:
         Used to surface the multi-view rendering phase so the UI activity
         drawer can label the step (``rendering_views``). The publish callback
         is optional so tests that instantiate ``CadTool`` without a publish
-        function keep working.
+        function keep working. Implementation is delegated to the shared
+        :func:`agent.tools.tool_events.publish_tool_phase` helper.
         """
-        publish = self._publish
-        if not callable(publish):
-            return
-        try:
-            event = {
-                "project": _project_name(self.project_dir),
-                "status": status,
-                "result": message,
-            }
-            if call_id:
-                event.update({"call_id": call_id, "tool": "cad_build_and_verify"})
-                publish("tool_status", event)
-            else:
-                event["message"] = event.pop("result")
-                publish("agent_status", event)
-        except Exception as error:  # noqa: BLE001 - status events must never fail the build.
-            # Status events are advisory: a publish failure (queue full,
-            # serialiser bug, network blip on the SSE consumer) must not abort
-            # the CAD build. But the failure used to be silently swallowed,
-            # leaving operators with no signal when the activity panel froze.
-            # Log it so the failure is observable in the host log, and bump an
-            # in-process counter so long-running sessions can surface it.
-            self._status_publish_failures += 1
-            logging.getLogger(__name__).warning(
-                "activity status publish failed (status=%s, project=%s, "
-                "total_failures=%d): %s",
-                status,
-                _project_name(self.project_dir),
-                self._status_publish_failures,
-                error,
-                exc_info=logging.getLogger(__name__).isEnabledFor(
-                    logging.DEBUG
-                ),
-            )
+        publish_tool_phase(
+            self._publish,
+            project=_project_name(self.project_dir),
+            tool="cad_build_and_verify",
+            call_id=call_id or self._call_id,
+            status=status,
+            message=message,
+        )
 
     # ------------------------------------------------------------------ build
 
-    def _runner_code(self, render: bool) -> str:
+    def _runner_settings(self, render: bool) -> dict[str, Any]:
+        """JSON-kwarg payload forwarded to ``runner.main`` as ``argv[1]``.
+
+        Replaces the legacy module-level globals (``_RENDER_VIEWS``,
+        ``_WRITE_ISOMETRIC``, ``_RENDER_WORKERS``, ``_REQUIRED_VIEWS``) so
+        ``runner.py`` uses a normal Python function call rather than reading
+        injected globals.
+        """
         if render:
-            prelude = (
-                f"_RENDER_VIEWS = {self._review_enabled!r}\n"
-                "_WRITE_ISOMETRIC = True\n"
-                f"_RENDER_WORKERS = {self._review_render_workers}\n"
-                f"_REQUIRED_VIEWS = {self._review_required_views}\n"
-            )
-        else:
-            prelude = "_RENDER_VIEWS = False\n_WRITE_ISOMETRIC = False\n"
-        return prelude + RENDERER + "\n" + RUNNER
+            return {
+                "render_views": self._review_enabled,
+                "write_isometric": True,
+                "render_workers": self._review_render_workers,
+                "required_views": self._review_required_views,
+            }
+        return {
+            "render_views": False,
+            "write_isometric": False,
+            "render_workers": self._review_render_workers,
+            "required_views": self._review_required_views,
+        }
 
     def _execute(self, render: bool = False, call_id: str = "") -> dict[str, Any]:
         model_path = self.project_dir / "model.py"
@@ -209,22 +144,27 @@ class CadTool:
             raise ValueError("model.py does not exist yet.")
         model_code = model_path.read_text(encoding="utf-8")
         FileTool.validate_model(model_code)
-        # renderer.py is concatenated ahead of runner.py so the renderer's
-        # definitions (VIEWS, render_views, build_contact_sheet, ...) are
-        # visible to the runner's module-level main block. The runner reads
-        # the ``_RENDER_VIEWS`` flag to decide whether to rasterise every
-        # canonical views (skipped by the metrics-only path and when review
-        # rendering is disabled); ``_WRITE_ISOMETRIC`` gates the legacy
-        # single ``render.png`` artifact.
-        code = self._runner_code(render)
+        # Copy ``renderer.py`` and ``runner.py`` as siblings into the workspace
+        # so the runner can ``import renderer`` at runtime. Pass the render
+        # settings as a JSON kwargs payload on ``argv[1]`` instead of mutating
+        # module-level globals; this restores a real module boundary between
+        # the host and the sandbox.
+        settings_payload = json.dumps(self._runner_settings(render))
 
         with tempfile.TemporaryDirectory(prefix="cad-agent-") as temporary:
             workspace = Path(temporary)
             (workspace / "model.py").write_text(model_code, encoding="utf-8")
-            (workspace / "runner.py").write_text(code, encoding="utf-8")
+            (workspace / _RUNNER_FILENAME).write_text(
+                (_SCRIPTS_DIR / _RUNNER_FILENAME).read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            (workspace / _RENDERER_FILENAME).write_text(
+                (_SCRIPTS_DIR / _RENDERER_FILENAME).read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
             command, seccomp_fd = sandbox_command(
                 workspace,
-                ["runner.py"],
+                [_RUNNER_FILENAME, settings_payload],
                 writable=True,
                 timeout_seconds=120,
             )
@@ -458,11 +398,11 @@ class CadTool:
         build failure by the calling agent.
         """
         if not isinstance(review_manifest, dict):
-            raise RuntimeError("Review manifest is missing or malformed.")
+            raise TypeError("Review manifest is missing or malformed.")
         model_sha256 = review_manifest.get("model_sha256")
         preview_sha256 = review_manifest.get("preview_sha256")
         if not (isinstance(model_sha256, str) and isinstance(preview_sha256, str)):
-            raise RuntimeError("Review manifest is missing model/preview hashes.")
+            raise TypeError("Review manifest is missing model/preview hashes.")
         views = review_manifest.get("views")
         contact_sheet = review_manifest.get("contact_sheet")
         single_render = review_manifest.get("single_render")
@@ -471,7 +411,7 @@ class CadTool:
             or not isinstance(contact_sheet, dict)
             or not isinstance(single_render, dict)
         ):
-            raise RuntimeError("Review manifest is missing visual evidence metadata.")
+            raise TypeError("Review manifest is missing visual evidence metadata.")
         single_render_sha = single_render.get("image_sha256")
         if not isinstance(single_render_sha, str) or len(single_render_sha) != 64:
             raise RuntimeError("Review manifest has no valid single render hash.")
@@ -502,7 +442,7 @@ class CadTool:
                 expected_sha = entry.get("image_sha256")
                 expected_size = int(entry.get("image_bytes") or 0)
                 if not (isinstance(view_id, str) and isinstance(expected_sha, str)):
-                    raise RuntimeError("Review view entry is missing identifiers.")
+                    raise TypeError("Review view entry is missing identifiers.")
                 source = views_dir / f"{view_id}.png"
                 if not source.is_file() or source.stat().st_size == 0:
                     raise RuntimeError(
@@ -601,36 +541,6 @@ class CadTool:
                 return False
         return True
 
-    def write_review_result(self, result: dict[str, Any]) -> Path:
-        """Persist the structured multimodal reviewer result.
-
-        A fresh result overwrites any existing ``result.json`` so the UI
-        always surfaces the latest verdict for the active review.
-        """
-        latest = self.latest_review_dir()
-        if latest is None:
-            raise RuntimeError("No review directory is available to record a result.")
-        target = latest / _REVIEW_RESULT_NAME
-        payload = dict(result)
-        payload.setdefault("written_at", _utc_now())
-        CadTool._atomic_copy_bytes(
-            json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"), target
-        )
-        return target
-
-    @staticmethod
-    def _atomic_copy_bytes(data: bytes, target: Path) -> None:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            dir=target.parent, delete=False
-        ) as temporary:
-            temporary_path = Path(temporary.name)
-            temporary.write(data)
-        try:
-            temporary_path.replace(target)
-        finally:
-            temporary_path.unlink(missing_ok=True)
-
     @staticmethod
     def _failure_detail(output: str) -> str:
         """Extract the most relevant traceback frames and the final error message."""
@@ -657,7 +567,8 @@ class CadTool:
                     if i + 1 < len(lines):
                         frames.append(lines[i + 1])
             final = next(
-                (l for l in reversed(lines) if l.strip()), "Unknown CAD error."
+                (line for line in reversed(lines) if line.strip()),
+                "Unknown CAD error.",
             )
             frames.append(final)
         return "\n".join(dict.fromkeys(frames))[-2000:]
@@ -717,11 +628,15 @@ class CadTool:
             f"{volume_text}; {feature_count} features; {render_state}."
         )
 
-    def build_and_verify(self, render: bool = True) -> dict[str, Any]:
-        """Build once, validate metrics, and (by default) produce preview + review.
+    def build_and_verify(self, render: bool = False) -> dict[str, Any]:
+        """Build once, validate metrics, and (optionally) produce preview + review.
 
-        ``render=False`` skips the legacy ``render.png`` artifact and the
-        multi-view review sheet, returning only ``metrics`` + ``preview.stl``.
+        ``render=False`` (default) skips the legacy ``render.png`` artifact and
+        the multi-view review sheet, returning only ``metrics`` + ``preview.stl``
+        + ``model_sha256`` + ``preview_sha256``. This is the fast, cache-friendly
+        path for early iteration — the agent should switch to ``render=True``
+        only for the final verification before declaring the task ready.
+
         The metrics still include the canonical geometry sanity checks
         (bounding box, volume, solid count, is_valid) so a render-less build
         remains trustworthy for early iteration.
@@ -731,33 +646,38 @@ class CadTool:
             execute_args["call_id"] = self._call_id
         payload = self._execute(**execute_args)
         metrics = payload.get("metrics") if isinstance(payload, dict) else None
-        review_manifest = payload.get("review_manifest") if render else None
+        # Surface the model + preview SHAs once at the top level instead of
+        # nesting them inside ``review_manifest``. The structured reviewer has
+        # its own tool (``cad_review``); the agent does not need to re-parse a
+        # full manifest just to correlate a build with its result.
+        model_sha = (
+            payload.get("model_sha256") if isinstance(payload, dict) else None
+        )
+        preview_sha = (
+            payload.get("preview_sha256") if isinstance(payload, dict) else None
+        )
         result: dict[str, Any] = {
             "metrics": metrics,
             "preview": "preview.stl",
             "render": "render.png" if render else None,
             "feature_summary": payload.get("feature_summary") or {},
         }
+        if model_sha:
+            result["model_sha256"] = model_sha
+        if preview_sha:
+            result["preview_sha256"] = preview_sha
         if render:
+            review_manifest = payload.get("review_manifest")
             review_path: str | None = None
             if review_manifest:
-                try:
-                    promoted = self.promote_review(
-                        review_manifest,
-                        sandbox_views_dir=payload.get("review_views_dir") or "",
-                        sandbox_sheet_path=payload.get("review_sheet_path") or "",
-                    )
-                    review_path = promoted.get("artifact_dir")
-                except RuntimeError:
-                    # Promotion failures are surfaced to the agent by raising; the
-                    # caller (AgentRunner) maps them to a CAD_BUILD_FAILED result.
-                    raise
+                promoted = self.promote_review(
+                    review_manifest,
+                    sandbox_views_dir=payload.get("review_views_dir") or "",
+                    sandbox_sheet_path=payload.get("review_sheet_path") or "",
+                )
+                review_path = promoted.get("artifact_dir")
             if review_path:
                 result["review"] = review_path
-            if review_manifest:
-                # Surface the manifest so the agent loop can drive the structured
-                # reviewer without re-reading ``.cad-agent/reviews/``.
-                result["review_manifest"] = review_manifest
         result["summary"] = self._summarize_payload(
             metrics,
             result["feature_summary"],
@@ -776,9 +696,3 @@ class CadTool:
             process.wait(timeout=2)
         except subprocess.TimeoutExpired:
             _kill_process_group(process, force=True)
-
-
-def _utc_now() -> str:
-    from datetime import datetime, timezone
-
-    return datetime.now(timezone.utc).isoformat()

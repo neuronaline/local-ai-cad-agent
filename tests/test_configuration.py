@@ -200,77 +200,81 @@ def test_review_max_cycles_field_no_longer_exists(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_viewer_grid_extent_default_matches_legacy_grid(tmp_path: Path) -> None:
+def test_viewer_grid_default_matches_legacy_grid(tmp_path: Path) -> None:
     """Without a ``viewer.grid`` block the preview grid stays 200×200 mm /
     20 divisions — the previous hard-coded numbers."""
     _write_config(tmp_path, "")
 
     settings = load_settings(project_root=tmp_path)
 
-    assert settings.viewer_grid_width == 200.0
-    assert settings.viewer_grid_depth == 200.0
+    assert settings.viewer_grid_size == 200.0
     assert settings.viewer_grid_divisions == 20
-    assert settings.viewer_grid_extent == (200.0, 200.0, 20)
+    assert settings.viewer_grid_extent == (200.0, 20)
 
 
-def test_viewer_grid_extent_parses_3d_string(tmp_path: Path) -> None:
-    """The user-facing ``WxDxD`` string format works end-to-end."""
-    _write_config(tmp_path, "viewer:\n  grid:\n    extent: 256x256x256\n")
-
-    settings = load_settings(project_root=tmp_path)
-
-    assert settings.viewer_grid_width == 256.0
-    assert settings.viewer_grid_depth == 256.0
-    assert settings.viewer_grid_divisions == 256
-    assert settings.viewer_grid_extent == (256.0, 256.0, 256)
-
-
-def test_viewer_grid_extent_accepts_mapping(tmp_path: Path) -> None:
-    """Explicit ``width`` / ``depth`` / ``divisions`` keys are also valid."""
+def test_viewer_grid_size_mapping(tmp_path: Path) -> None:
+    """Explicit ``size`` / ``divisions`` keys are also valid."""
     _write_config(
         tmp_path,
-        "viewer:\n  grid:\n    extent:\n      width: 320\n      depth: 240\n      divisions: 32\n",
+        "viewer:\n  grid:\n    size: 320\n    divisions: 32\n",
     )
 
     settings = load_settings(project_root=tmp_path)
 
-    assert settings.viewer_grid_width == 320.0
-    assert settings.viewer_grid_depth == 240.0
+    assert settings.viewer_grid_size == 320.0
     assert settings.viewer_grid_divisions == 32
 
 
-def test_viewer_grid_extent_single_number_mirrors_depth(tmp_path: Path) -> None:
-    """A bare number supplies both width and depth with the legacy 20
-    divisions, so ``"500"`` means a 500×500 mm grid with 20 cells per side."""
-    _write_config(tmp_path, "viewer:\n  grid:\n    extent: 500\n")
+def test_viewer_grid_size_accepts_bare_number(tmp_path: Path) -> None:
+    """A bare grid number supplies ``size`` with the legacy 20 divisions."""
+    _write_config(tmp_path, "viewer:\n  grid: 500\n")
 
     settings = load_settings(project_root=tmp_path)
 
-    assert settings.viewer_grid_width == 500.0
-    assert settings.viewer_grid_depth == 500.0
+    assert settings.viewer_grid_size == 500.0
     assert settings.viewer_grid_divisions == 20
 
 
-def test_viewer_grid_extent_rejects_non_positive_values(tmp_path: Path) -> None:
-    """A zero or negative side must be rejected — the grid would otherwise
-    disappear or render inverted geometry."""
-    _write_config(tmp_path, "viewer:\n  grid:\n    extent: 0x0x0\n")
+def test_viewer_grid_legacy_extent_preserves_the_rendered_width(
+    tmp_path: Path,
+) -> None:
+    """Existing configs keep their displayed grid size while migrating."""
+    _write_config(tmp_path, "viewer:\n  grid:\n    extent: 320x240x32\n")
+
+    settings = load_settings(project_root=tmp_path)
+
+    assert settings.viewer_grid_size == 320.0
+    assert settings.viewer_grid_divisions == 32
+
+
+def test_viewer_grid_rejects_non_finite_size(tmp_path: Path) -> None:
+    """NaN cannot produce a usable Three.js grid and must fail fast."""
+    _write_config(tmp_path, "viewer:\n  grid: .nan\n")
 
     with pytest.raises(ValueError, match="positive"):
         load_settings(project_root=tmp_path)
 
 
-def test_viewer_grid_extent_rejects_zero_divisions(tmp_path: Path) -> None:
+def test_viewer_grid_rejects_non_positive_values(tmp_path: Path) -> None:
+    """A zero or negative ``size`` must be rejected — the grid would
+    otherwise disappear or render inverted geometry."""
+    _write_config(tmp_path, "viewer:\n  grid:\n    size: 0\n")
+
+    with pytest.raises(ValueError, match="positive"):
+        load_settings(project_root=tmp_path)
+
+
+def test_viewer_grid_rejects_zero_divisions(tmp_path: Path) -> None:
     """Zero divisions would render a blank grid; reject it up front."""
-    _write_config(tmp_path, "viewer:\n  grid:\n    extent: 256x256x0\n")
+    _write_config(tmp_path, "viewer:\n  grid:\n    size: 256\n    divisions: 0\n")
 
     with pytest.raises(ValueError, match="divisions"):
         load_settings(project_root=tmp_path)
 
 
-def test_viewer_grid_extent_rejects_non_numeric_string(tmp_path: Path) -> None:
+def test_viewer_grid_rejects_non_numeric_string(tmp_path: Path) -> None:
     """Garbage tokens must fail the loader rather than silently falling back."""
-    _write_config(tmp_path, "viewer:\n  grid:\n    extent: 'wide'\n")
+    _write_config(tmp_path, "viewer:\n  grid:\n    size: 'wide'\n")
 
-    with pytest.raises(ValueError, match="viewer.grid"):
+    with pytest.raises(ValueError):
         load_settings(project_root=tmp_path)

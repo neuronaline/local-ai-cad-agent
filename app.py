@@ -78,7 +78,7 @@ class EventBus:
                 current = self.app.config.get("SETTINGS")
                 if current is not None:
                     return current.workspace_root
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001, S110 - fall back to startup settings
                 pass
         return self.settings.workspace_root
 
@@ -160,9 +160,12 @@ def _redact_history_event(event: dict[str, Any]) -> dict[str, Any]:
     user-image attachments so the LLM can still consume it. Returning those
     blobs through the History endpoint makes responses unnecessarily large
     and exposes content the UI does not need; substitute a lightweight
-    ``[Reference image]`` marker instead.
+    ``[Reference image N]`` marker instead. Tool-role messages produced by
+    ``cad_build_and_verify`` may carry inline render evidence; redact those
+    with the same shield so the History view never echoes base64.
     """
-    if event.get("role") != "user":
+    role = event.get("role")
+    if role not in {"user", "tool"}:
         return event
     content = event.get("content")
     if not isinstance(content, list):
@@ -170,11 +173,14 @@ def _redact_history_event(event: dict[str, Any]) -> dict[str, Any]:
     redacted = False
     parts: list[Any] = []
     image_index = 0
+    placeholder = "[Reference image {n}]" if role == "user" else "[Inline render {n}]"
     for part in content:
         if isinstance(part, dict) and part.get("type") == "image_url":
             redacted = True
             image_index += 1
-            parts.append({"type": "text", "text": f"[Reference image {image_index}]"})
+            parts.append(
+                {"type": "text", "text": placeholder.format(n=image_index)}
+            )
         else:
             parts.append(part)
     if not redacted:
@@ -464,8 +470,7 @@ def create_app(settings: Settings | None = None) -> Flask:
             "index.html",
             project_name=name,
             show_info_messages=app.config["SETTINGS"].show_info_messages,
-            viewer_grid_width=app.config["SETTINGS"].viewer_grid_width,
-            viewer_grid_depth=app.config["SETTINGS"].viewer_grid_depth,
+            viewer_grid_size=app.config["SETTINGS"].viewer_grid_size,
             viewer_grid_divisions=app.config["SETTINGS"].viewer_grid_divisions,
         )
 
@@ -546,7 +551,7 @@ def create_app(settings: Settings | None = None) -> Flask:
                 return jsonify(
                     {"error": "Cannot reset a project with active agent state."}
                 ), 409
-            if runner.is_running() or runner.is_awaiting_preview():
+            if runner.is_running():
                 return jsonify(
                     {"error": "Cannot reset while an agent task is running."}
                 ), 409
@@ -623,18 +628,17 @@ def create_app(settings: Settings | None = None) -> Flask:
         runner = app.config["AGENT_RUNNER"]
         if runner.waiting_question(project_name):
             return jsonify({"error": "Answer the pending question before sending another message."}), 409
-        if idempotency_key:
-            if _idempotency_check(app, idempotency_key):
-                if runner.is_running() or runner.is_awaiting_preview():
-                    return jsonify(
-                        {
-                            "accepted": True,
-                            "duplicate": True,
-                            "error": "Your message is already being processed.",
-                        }
-                    ), 202
-                _idempotency_forget(app, idempotency_key)
-        if runner.is_running() or runner.is_awaiting_preview():
+        if idempotency_key and _idempotency_check(app, idempotency_key):
+            if runner.is_running():
+                return jsonify(
+                    {
+                        "accepted": True,
+                        "duplicate": True,
+                        "error": "Your message is already being processed.",
+                    }
+                ), 202
+            _idempotency_forget(app, idempotency_key)
+        if runner.is_running():
             return jsonify({"error": "An agent task is already running."}), 409
         with _project_lock(app, project_name):
             try:
@@ -647,7 +651,6 @@ def create_app(settings: Settings | None = None) -> Flask:
             if (
                 runner.waiting_question(project_name)
                 or runner.is_running()
-                or runner.is_awaiting_preview()
             ):
                 for image_path in image_paths:
                     image_path.unlink(missing_ok=True)
@@ -720,9 +723,6 @@ def create_app(settings: Settings | None = None) -> Flask:
             return jsonify({"status": "waiting_for_user", "question": question})
         if runner.is_running() and runner.active_project() == project_name:
             return jsonify({"status": "running"})
-        preview_id = runner.pending_preview_id(project_name)
-        if preview_id:
-            return jsonify({"status": "rendering", "preview_id": preview_id})
         return jsonify({"status": "idle"})
 
     @app.get("/api/projects/<project_name>/history")
@@ -745,8 +745,7 @@ def create_app(settings: Settings | None = None) -> Flask:
                     event = json.loads(line)
                     if not isinstance(event, dict):
                         continue
-                    if current_settings.show_info_messages or event.get("type") not in INFO_EVENT_TYPES:
-                        events.append(_redact_history_event(event))
+                    events.append(_redact_history_event(event))
                 except json.JSONDecodeError:
                     pass
         return jsonify({"events": events})
@@ -797,7 +796,10 @@ def create_app(settings: Settings | None = None) -> Flask:
         # it stays at ``"not_required"``. The UI uses it to render a status
         # pill without blocking the preview.
         review_status = "not_required"
-        latest_review = _review_latest(project_dir)
+        if model_sha256 is not None:
+            latest_review = _review_for_model(project_dir, model_sha256)
+        else:
+            latest_review = None
         if latest_review is not None:
             manifest_path = latest_review / _REVIEW_MANIFEST_NAME
             result_path = latest_review / _REVIEW_RESULT_NAME
@@ -822,35 +824,6 @@ def create_app(settings: Settings | None = None) -> Flask:
             "review_status": review_status,
         })
 
-    @app.post("/api/projects/<project_name>/preview/displayed")
-    def preview_displayed(project_name: str):
-        try:
-            _project_path(app.config["SETTINGS"], project_name)
-        except (ValueError, FileNotFoundError) as error:
-            return jsonify({"error": str(error)}), 404
-        payload = request.get_json(silent=True) or {}
-        preview_id = str(payload.get("preview_id", ""))
-        if not preview_id:
-            return jsonify({"error": "Preview id is required."}), 400
-        if not app.config["AGENT_RUNNER"].confirm_preview(project_name, preview_id):
-            return jsonify({"error": "The preview is stale, missing, or does not match this task."}), 409
-        return jsonify({"displayed": True})
-
-    @app.post("/api/projects/<project_name>/preview/failed")
-    def preview_failed(project_name: str):
-        try:
-            _project_path(app.config["SETTINGS"], project_name)
-        except (ValueError, FileNotFoundError) as error:
-            return jsonify({"error": str(error)}), 404
-        payload = request.get_json(silent=True) or {}
-        preview_id = str(payload.get("preview_id", ""))
-        message = str(payload.get("message", "")).strip()
-        if not preview_id:
-            return jsonify({"error": "Preview id is required."}), 400
-        if not app.config["AGENT_RUNNER"].fail_preview(project_name, preview_id, message):
-            return jsonify({"error": "The preview does not belong to this task."}), 409
-        return jsonify({"failed": True})
-
     # ------------------------------------------------------------------ #
     #  Multi-view review APIs (read-only views into .cad-agent/reviews/)
     # ------------------------------------------------------------------ #
@@ -860,15 +833,20 @@ def create_app(settings: Settings | None = None) -> Flask:
     _REVIEW_VIEWS_SUBDIR = "views"
     _REVIEW_SHEET_NAME = "review-sheet.png"
 
-    def _review_latest(project_dir: Path) -> Path | None:
-        """Return the most recently modified review directory, or ``None``."""
-        root = project_dir / ".cad-agent" / "reviews"
-        if not root.is_dir():
+    def _review_for_model(project_dir: Path, model_sha256: str) -> Path | None:
+        """Return the review directory matching ``model_sha256``, or ``None``.
+
+        Review directories are content-addressed by ``model_sha256``; this
+        binding replaces the older mtime-based "latest" lookup so cache
+        hits, restores, and file touches cannot accidentally rebind a
+        verdict to a different revision.
+        """
+        if not model_sha256:
             return None
-        candidates = [path for path in root.iterdir() if path.is_dir()]
-        if not candidates:
+        review_dir = project_dir / ".cad-agent" / "reviews" / model_sha256
+        if not review_dir.is_dir():
             return None
-        return max(candidates, key=lambda path: path.stat().st_mtime)
+        return review_dir
 
     @app.get("/api/projects/<project_name>/review/manifest")
     def review_manifest(project_name: str):
@@ -876,7 +854,11 @@ def create_app(settings: Settings | None = None) -> Flask:
             project_dir = _project_path(app.config["SETTINGS"], project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
-        latest = _review_latest(project_dir)
+        model_path = project_dir / "model.py"
+        if not model_path.is_file():
+            return jsonify({"error": "model.py is missing."}), 404
+        model_sha = hashlib.sha256(model_path.read_bytes()).hexdigest()
+        latest = _review_for_model(project_dir, model_sha)
         if latest is None:
             return jsonify({"error": "No review has been generated yet."}), 404
         manifest_path = latest / _REVIEW_MANIFEST_NAME
@@ -903,7 +885,11 @@ def create_app(settings: Settings | None = None) -> Flask:
             project_dir = _project_path(app.config["SETTINGS"], project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
-        latest = _review_latest(project_dir)
+        model_path = project_dir / "model.py"
+        if not model_path.is_file():
+            return jsonify({"error": "model.py is missing."}), 404
+        model_sha = hashlib.sha256(model_path.read_bytes()).hexdigest()
+        latest = _review_for_model(project_dir, model_sha)
         if latest is None:
             return jsonify({"error": "No review has been generated yet."}), 404
         sheet_path = latest / _REVIEW_SHEET_NAME
@@ -921,7 +907,11 @@ def create_app(settings: Settings | None = None) -> Flask:
         # canonical names to avoid path traversal via the URL.
         if not view_id or "/" in view_id or "\\" in view_id or view_id.startswith("."):
             return jsonify({"error": "Unknown review view."}), 404
-        latest = _review_latest(project_dir)
+        model_path = project_dir / "model.py"
+        if not model_path.is_file():
+            return jsonify({"error": "model.py is missing."}), 404
+        model_sha = hashlib.sha256(model_path.read_bytes()).hexdigest()
+        latest = _review_for_model(project_dir, model_sha)
         if latest is None:
             return jsonify({"error": "No review has been generated yet."}), 404
         view_path = latest / _REVIEW_VIEWS_SUBDIR / f"{view_id}.png"

@@ -48,6 +48,13 @@ class OpenRouterClient(ChatCompletionsClient):
     def _apply_provider_payload(self, payload: dict[str, Any]) -> None:
         if self.session_id:
             payload["session_id"] = hashlib.sha256(self.session_id.encode()).hexdigest()[:64]
+        # Tag subordinate evaluators through OpenRouter's documented tracing
+        # surface so the request remains valid and observability can distinguish
+        # reviewer spans from the parent agent loop.
+        if self.agent_role:
+            trace = payload.setdefault("trace", {})
+            if isinstance(trace, dict):
+                trace.setdefault("span_name", self.agent_role)
         if (
             self.settings.openrouter_enable_anthropic_cache
             and self.settings.openrouter_model.startswith("anthropic/")

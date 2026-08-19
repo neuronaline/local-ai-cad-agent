@@ -10,6 +10,7 @@ from pathlib import Path
 
 from PIL import Image
 
+from agent.conversation import shared_history_lock
 from agent.core import AgentRunner
 from agent.revisions import RevisionOrigin, RevisionStore
 from agent.settings import Settings
@@ -29,6 +30,17 @@ def test_project_lifecycle(tmp_path: Path):
     assert len(projects_data["projects"]) == 1
     assert projects_data["projects"][0]["name"] == "mounting-bracket"
     assert projects_data["projects"][0]["model_status"] == "none"
+
+
+def test_conversation_store_uses_event_bus_history_lock(tmp_path: Path):
+    """Agent messages and EventBus status events serialize JSONL writes."""
+    settings = Settings(
+        tmp_path / "projects", "https://example.test", "test-model", 1,
+        "127.0.0.1", 5000,
+    )
+    app = create_app(settings)
+
+    assert shared_history_lock() is app.config["EVENT_BUS"]._history_lock
 
 
 def test_chat_ignores_client_supplied_routing_preferences(tmp_path: Path, monkeypatch):
@@ -149,7 +161,13 @@ def test_info_messages_are_persisted_and_returned_in_history(tmp_path: Path):
     assert events[-1]["data"]["result"] == "Preview updated."
 
 
-def test_info_messages_remain_stored_but_are_hidden_when_disabled(tmp_path: Path):
+def test_info_messages_remain_stored_and_are_visible_to_the_api_frontend_filters(tmp_path: Path):
+    """The backend no longer filters info events; the UI suppresses them.
+
+    ``ui.show_info_messages = false`` must keep the events on disk so the
+    history view can replay them, but the history endpoint now returns the
+    raw stream. The frontend toggles visibility client-side instead.
+    """
     settings = Settings(
         tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000, show_info_messages=False
     )
@@ -160,7 +178,7 @@ def test_info_messages_remain_stored_but_are_hidden_when_disabled(tmp_path: Path
 
     history = client.get("/api/projects/demo/history").get_json()["events"]
     raw_history = (settings.workspace_root / "demo" / "conversation.jsonl").read_text(encoding="utf-8")
-    assert history == []
+    assert any(event.get("type") == "agent_status" for event in history)
     assert '"type": "agent_status"' in raw_history
     assert b'"showInfoMessages": false' in client.get("/project/demo").data
 
@@ -239,7 +257,7 @@ def test_preview_metadata_requires_a_passing_current_review(tmp_path: Path):
     model = project / "model.py"
     model.write_text("# current model\n", encoding="utf-8")
     model_sha = hashlib.sha256(model.read_bytes()).hexdigest()
-    review = project / ".cad-agent" / "reviews" / ("a" * 64)
+    review = project / ".cad-agent" / "reviews" / model_sha
     review.mkdir(parents=True)
     (review / "manifest.json").write_text(
         json.dumps({"preview_sha256": preview_sha, "model_sha256": model_sha}),
@@ -270,7 +288,9 @@ def test_preview_metadata_requires_a_passing_current_review(tmp_path: Path):
     assert stale["review_status"] == "not_required"
 
 
-def test_preview_completion_requires_matching_display_confirmation(tmp_path: Path):
+def test_preview_completion_is_published_without_browser_ack(tmp_path: Path):
+    """The agent completes immediately on successful build; the UI loads
+    the STL asynchronously and reports any render failure independently."""
     settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
     app = create_app(settings)
     client = app.test_client()
@@ -278,55 +298,45 @@ def test_preview_completion_requires_matching_display_confirmation(tmp_path: Pat
     project = settings.workspace_root / "demo"
     preview = project / "preview.stl"
     preview.write_bytes(b"solid demo\nendsolid demo\n")
+    # Drive the agent's terminal status manually: a successful build should
+    # publish agent_message immediately, regardless of whether the browser
+    # has loaded the preview.
     runner = app.config["AGENT_RUNNER"]
-    preview_id = runner._register_preview("demo", project)
-    runner._await_preview("demo", preview_id, "Task completed.")
+    runner._complete("demo", "Task completed.")
 
-    assert client.get("/api/projects/demo/state").get_json() == {
-        "status": "rendering",
-        "preview_id": preview_id,
-    }
+    history = client.get("/api/projects/demo/history").get_json()["events"]
+    assert history[-1] == {"role": "assistant", "content": "Task completed."}
+    assert client.get("/api/projects/demo/state").get_json() == {"status": "idle"}
+    # The legacy ACK endpoints are gone; the agent turn no longer waits.
     assert client.post(
         "/api/projects/demo/preview/displayed",
-        json={"preview_id": "wrong"},
-    ).status_code == 409
-    assert not any(
-        event.get("role") == "assistant"
-        for event in client.get("/api/projects/demo/history").get_json()["events"]
-    )
-
-    response = client.post(
-        "/api/projects/demo/preview/displayed",
-        json={"preview_id": preview_id},
-    )
-
-    assert response.status_code == 200
-    assert client.get("/api/projects/demo/state").get_json() == {"status": "idle"}
-    history = client.get("/api/projects/demo/history").get_json()["events"]
-    assert history[-1]["content"] == "Task completed."
+        json={"preview_id": "anything"},
+    ).status_code == 404
 
 
-def test_preview_render_failure_is_reported_as_an_error(tmp_path: Path):
+def test_preview_state_endpoint_no_longer_returns_rendering(tmp_path: Path):
+    """``/state`` reports ``idle`` after a successful build; the preview-id
+    correlation token still exists but is no longer surfaced through the
+    state machine."""
     settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
     app = create_app(settings)
     client = app.test_client()
     client.post("/api/projects/new", json={"name": "demo"})
-    project = settings.workspace_root / "demo"
-    (project / "preview.stl").write_bytes(b"solid demo\nendsolid demo\n")
-    runner = app.config["AGENT_RUNNER"]
-    preview_id = runner._register_preview("demo", project)
-    runner._await_preview("demo", preview_id, "Task completed.")
-
-    response = client.post(
-        "/api/projects/demo/preview/failed",
-        json={"preview_id": preview_id, "message": "The preview contains no triangles."},
+    (settings.workspace_root / "demo" / "preview.stl").write_bytes(
+        b"solid demo\nendsolid demo\n"
     )
-
-    assert response.status_code == 200
-    history = client.get("/api/projects/demo/history").get_json()["events"]
-    assert history[-1]["type"] == "agent_error"
-    assert "contains no triangles" in history[-1]["data"]["message"]
-    assert not any(event.get("content") == "Task completed." for event in history)
+    runner = app.config["AGENT_RUNNER"]
+    preview_id = runner._register_preview(
+        "demo", settings.workspace_root / "demo"
+    )
+    assert preview_id
+    # Without a running task, the state endpoint falls through to idle.
+    assert client.get("/api/projects/demo/state").get_json() == {"status": "idle"}
+    # /preview/displayed no longer exists, so the legacy error flow is gone.
+    assert client.post(
+        "/api/projects/demo/preview/failed",
+        json={"preview_id": preview_id, "message": "render failed"},
+    ).status_code == 404
 
 
 def test_chat_stores_normalized_image_attachment(tmp_path: Path):
@@ -921,6 +931,9 @@ def test_restore_422_for_corrupt_revision(tmp_path: Path):
 
 
 def test_restore_rebuilds_and_registers_preview(tmp_path: Path, monkeypatch):
+    """Restore rebuilds the model and exposes a preview_id for the UI; the
+    preview no longer needs an explicit browser ACK to consider the task
+    done."""
     _settings, _app, client, project_dir, _revisions = _setup_project_with_revisions(tmp_path, 0)
     store = RevisionStore(project_dir)
     old = store.commit("result = 'old'\n", RevisionOrigin(kind="agent_edit"))
@@ -939,11 +952,14 @@ def test_restore_rebuilds_and_registers_preview(tmp_path: Path, monkeypatch):
     assert response.status_code == 200
     assert data["build_status"] == "succeeded"
     assert data["metrics"]["dimensions_mm"] == {"x": 10.0, "y": 20.0, "z": 30.0}
-    displayed = client.post(
+    # The browser no longer ACKs display; the preview_id is still surfaced
+    # so the SSE consumer can correlate, but a follow-up POST to the
+    # legacy endpoint is no longer required.
+    assert data["preview_id"]
+    assert client.post(
         "/api/projects/demo/preview/displayed",
         json={"preview_id": data["preview_id"]},
-    )
-    assert displayed.status_code == 200
+    ).status_code == 404
 
 
 def test_revision_list_rejects_non_integer_limit(tmp_path: Path):
@@ -970,12 +986,37 @@ def test_revision_list_reports_corrupt_history(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
-def _seed_review(project_dir: Path, *, model_sha: str, view_count: int = 2) -> None:
-    """Write a fake ``.cad-agent/reviews/<sha>/`` directory the endpoints can serve."""
+def _seed_review(
+    project_dir: Path, *, model_sha: str, view_count: int = 2
+) -> str:
+    """Write a fake ``.cad-agent/reviews/<sha>/`` directory the endpoints can serve.
+
+    Also writes ``model.py`` whose SHA matches the seeded review so the
+    model-sha-keyed review lookup succeeds. Returns the SHA actually
+    used (which may differ from the caller's argument when the body
+    content does not self-hash to the supplied hex).
+    """
     review_root = project_dir / ".cad-agent" / "reviews" / model_sha
     views_dir = review_root / "views"
     views_dir.mkdir(parents=True, exist_ok=True)
-    payload = {
+    model_path = project_dir / "model.py"
+    # The endpoint looks up the review dir by the SHA of ``model.py``;
+    # content-addressed, so the only requirement is that the digest equals
+    # the directory name we are about to seed. Use a unique body and
+    # relocate the seed when its SHA differs from the caller's argument.
+    model_path.write_bytes(model_sha.encode("utf-8") + b"\n")
+    actual_sha = hashlib.sha256(model_path.read_bytes()).hexdigest()
+    if actual_sha != model_sha:
+        # Drop the placeholder dir we created above and re-seed under the
+        # actual digest so the endpoint lookup (model SHA -> review dir)
+        # actually finds the artifacts.
+        import shutil
+        shutil.rmtree(review_root, ignore_errors=True)
+        model_sha = actual_sha
+        review_root = project_dir / ".cad-agent" / "reviews" / model_sha
+        views_dir = review_root / "views"
+        views_dir.mkdir(parents=True, exist_ok=True)
+    review_payload = {
         "model_sha256": model_sha,
         "preview_sha256": "deadbeef" * 8,
         "view_count": view_count,
@@ -1004,13 +1045,14 @@ def _seed_review(project_dir: Path, *, model_sha: str, view_count: int = 2) -> N
         ],
     }
     (review_root / "manifest.json").write_text(
-        json.dumps(payload), encoding="utf-8"
+        json.dumps(review_payload), encoding="utf-8"
     )
     (review_root / "review-sheet.png").write_bytes(b"\x89PNG\r\n\x1a\n stub-sheet")
-    for entry in payload["views"]:
+    for entry in review_payload["views"]:
         (views_dir / f"{entry['view_id']}.png").write_bytes(
             b"\x89PNG\r\n\x1a\n stub-view-" + entry["view_id"].encode()
         )
+    return model_sha
 
 
 def test_review_endpoints_404_when_no_review_exists(tmp_path: Path):
@@ -1028,8 +1070,7 @@ def test_review_manifest_returns_persisted_payload(tmp_path: Path):
     client = create_app(settings).test_client()
     client.post("/api/projects/new", json={"name": "demo"})
     project_dir = settings.workspace_root / "demo"
-    model_sha = "a" * 64
-    _seed_review(project_dir, model_sha=model_sha, view_count=3)
+    model_sha = _seed_review(project_dir, model_sha="a" * 64, view_count=3)
 
     response = client.get("/api/projects/demo/review/manifest")
     assert response.status_code == 200
@@ -1045,19 +1086,17 @@ def test_review_sheet_and_view_serve_png_payloads(tmp_path: Path):
     client = create_app(settings).test_client()
     client.post("/api/projects/new", json={"name": "demo"})
     project_dir = settings.workspace_root / "demo"
-    model_sha = "b" * 64
-    _seed_review(project_dir, model_sha=model_sha, view_count=2)
+    model_sha = _seed_review(project_dir, model_sha="b" * 64, view_count=2)
 
     sheet = client.get("/api/projects/demo/review/sheet")
     assert sheet.status_code == 200
     assert sheet.mimetype == "image/png"
     # The endpoint returns the exact sheet bytes that were promoted into
     # ``.cad-agent/reviews/<sha>/review-sheet.png``.
-    project_dir = settings.workspace_root / "demo"
-    seeded_sheet = (project_dir / ".cad-agent" / "reviews" / ("b" * 64) / "review-sheet.png").read_bytes()
+    seeded_sheet = (project_dir / ".cad-agent" / "reviews" / model_sha / "review-sheet.png").read_bytes()
     assert sheet.data == seeded_sheet
 
-    seeded_view = (project_dir / ".cad-agent" / "reviews" / ("b" * 64) / "views" / "view_0.png").read_bytes()
+    seeded_view = (project_dir / ".cad-agent" / "reviews" / model_sha / "views" / "view_0.png").read_bytes()
     view = client.get("/api/projects/demo/review/view/view_0")
     assert view.status_code == 200
     assert view.mimetype == "image/png"
@@ -1084,8 +1123,7 @@ def test_review_manifest_includes_result_when_present(tmp_path: Path):
     client = create_app(settings).test_client()
     client.post("/api/projects/new", json={"name": "demo"})
     project_dir = settings.workspace_root / "demo"
-    model_sha = "d" * 64
-    _seed_review(project_dir, model_sha=model_sha)
+    model_sha = _seed_review(project_dir, model_sha="d" * 64)
     review_dir = project_dir / ".cad-agent" / "reviews" / model_sha
     (review_dir / "result.json").write_text(
         json.dumps(

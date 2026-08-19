@@ -37,7 +37,6 @@ let previewLoadPromise = null;
 let renderImageUrl = '';
 let renderLoadSequence = 0;
 let reviewLoadSequence = 0;
-const toolMessages = new Map();
 const activityItems = new Map();
 const ALLOWED_TAGS = new Set([
   'p', 'br', 'b', 'strong', 'i', 'em', 'u', 's', 'del',
@@ -156,7 +155,6 @@ const activityLabels = {
   cad_review: 'Reviewing build',
   rendering_subset: 'Re-rasterising subset',
   screenshot_auto: 'Rendering views for review',
-  reviewing: 'Reviewing',
   // Status / pseudo-tool labels (kept for SSE events and info rows).
   agent: 'Agent',
   preparing: 'Preparing',
@@ -209,7 +207,6 @@ function activityDetail(tool, status, value) {
 
 function clearActivity() {
   activityItems.clear();
-  toolMessages.clear();
   activityList.replaceChildren();
   activityPanel.hidden = true;
   resetUsagePill();
@@ -303,7 +300,6 @@ function addToolMessage(data) {
   item.status = status;
   item.result = activityDetail(item.tool, status, data.result) || item.result || '';
   activityItems.set(callId, item);
-  toolMessages.set(callId, item);
 
   let row = activityList.querySelector(`[data-call-id="${CSS.escape(callId)}"]`);
   if (!row) {
@@ -379,21 +375,9 @@ async function loadCurrentPreview(previewId) {
       await viewer.load(url);
       previewProject = project;
       loadedPreviewRevision = meta.revision || loadedPreviewRevision;
-      if (previewId) {
-        try {
-          await api(`/api/projects/${encodeURIComponent(project)}/preview/displayed`, {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({preview_id: previewId}),
-          });
-        } catch (err) {
-          await api(`/api/projects/${encodeURIComponent(project)}/preview/failed`, {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({preview_id: previewId, message: err.message}),
-          });
-        }
-      }
+      // The agent turn has already completed by the time we render; failures
+      // here are surfaced as a chat-side error and never block the canonical
+      // ``agent_message`` from being persisted.
       await refreshRender();
       modelActions.hidden = false;
       loadReviewGallery();
@@ -541,9 +525,6 @@ async function loadCurrentState() {
     showQuestion({project: currentProject, ...q});
   } else if (data.status === 'running') {
     setThinking(true);
-  } else if (data.status === 'rendering' && data.preview_id) {
-    setThinking(true);
-    await loadCurrentPreview(data.preview_id);
   }
 }
 
@@ -1120,11 +1101,6 @@ function connectStream() {
       if (data.project !== currentProject) return;
       showQuestion(data);
     },
-    agent_stream_start: data => {
-      if (data.project !== currentProject) return;
-      // Lazily allocate the streaming card on the first delta; this avoids
-      // creating an empty card when the model turn will be tool-only.
-    },
     agent_content_delta: data => {
       if (data.project !== currentProject) return;
       // Backend publishes agent_content_delta for content chunks. The delta
@@ -1132,8 +1108,6 @@ function connectStream() {
       const chunk = data.content ?? data.delta ?? '';
       if (chunk) appendStreamingDelta(data.message_id, chunk);
     },
-    agent_reasoning_delta: data => { /* hidden by policy */ },
-    agent_tool_call_delta: data => { /* not surfaced */ },
     agent_stream_end: data => {
       if (data.project !== currentProject) return;
       const messageId = data.message_id;
@@ -1156,8 +1130,9 @@ function connectStream() {
       }
       // Prefer the active streaming card so the final message replaces the
       // streamed text instead of appending a duplicate card. If there is no
-      // streaming card (e.g. the run completed via _await_preview without
-      // deltas, or events were missed over a reset), fall back to a new card.
+      // streaming card (e.g. events were missed over a reset, or the
+      // backend published a non-streamed final answer), fall back to a new
+      // card.
       if (pendingFinalCard) {
         renderAgentContent(pendingFinalCard, finalText);
         pendingFinalCard.dataset.raw = finalText;

@@ -24,11 +24,11 @@ from pathlib import Path
 from typing import Any
 
 from agent.cad_review import (
-    ALLOWED_SEVERITIES,
     review_cad,
     write_review_result,
 )
 from agent.tools.cad_screenshot_tool import CadScreenshotTool
+from agent.tools.tool_events import publish_tool_phase
 
 _LOG = logging.getLogger(__name__)
 
@@ -151,7 +151,6 @@ class CadReviewTool:
             single_render_path=render_path,
             validation_results=validation_results,
             stop_event=self._stop_event,
-            stop_instruction=self._stop_instruction(),
         )
         # Persist the verdict next to the manifest so the UI status pill
         # can render without a separate API call.
@@ -188,7 +187,6 @@ class CadReviewTool:
             if finding.source == "visual"
         ]
         result_payload["deterministic"] = {
-            "checks_run": _deterministic_checks_run(metrics, feature_summary),
             "findings": deterministic,
         }
         result_payload["visual_review"] = (
@@ -223,28 +221,14 @@ class CadReviewTool:
     # ------------------------------------------------------------------ helpers
 
     def _emit_status(self, status: str, message: str) -> None:
-        publish = self._publish
-        if not callable(publish):
-            return
-        try:
-            event: dict[str, Any] = {
-                "project": self.project_dir.name,
-                "status": status,
-                "result": message,
-            }
-            if self._call_id:
-                event.update({"call_id": self._call_id, "tool": "cad_review"})
-                publish("tool_status", event)
-            else:
-                event["message"] = event.pop("result")
-                publish("agent_status", event)
-        except Exception:  # noqa: BLE001 - activity events must never fail the tool.
-            _LOG.warning(
-                "cad_review status publish failed (status=%s, project=%s): ignored",
-                status,
-                self.project_dir.name,
-                exc_info=_LOG.isEnabledFor(logging.DEBUG),
-            )
+        publish_tool_phase(
+            self._publish,
+            project=self.project_dir.name,
+            tool="cad_review",
+            call_id=self._call_id,
+            status=status,
+            message=message,
+        )
 
     def _load_inputs(self) -> tuple[Any, Any, list[dict[str, Any]] | None]:
         """Read deterministic evidence only when it matches ``model.py``."""
@@ -389,56 +373,3 @@ class CadReviewTool:
                 if fragments:
                     return "\n".join(fragments)
         return ""
-
-    def _stop_instruction(self) -> str | None:
-        return None
-
-
-def _deterministic_checks_run(
-    metrics: Any, feature_summary: Any
-) -> list[str]:
-    """Best-effort enumeration of which deterministic checks the layer ran.
-
-    Used by the UI to render a short checklist next to the verdict. We
-    keep the list short — the actual checks live in
-    ``agent.cad_review._deterministic_review`` and may grow over time.
-    """
-    checks: list[str] = []
-    if isinstance(metrics, dict):
-        checks.append("solid_count")
-        checks.append("is_valid")
-        checks.append("dimensions")
-        checks.append("volume")
-    if isinstance(feature_summary, dict) and "through_hole_count" in feature_summary:
-        checks.append("through_holes")
-    # The orchestrator already loaded validation_results; surface the
-    # spec line so the UI can label the result without knowing the
-    # internals.
-    checks.append("spec.requirements")
-    return checks
-
-
-def _coerce_finding_dict(raw: Any) -> dict[str, Any] | None:
-    """Best-effort coercion of a single finding dict (defensive)."""
-    if not isinstance(raw, dict):
-        return None
-    severity = raw.get("severity")
-    if severity not in ALLOWED_SEVERITIES:
-        return None
-    category = raw.get("category")
-    message = raw.get("message")
-    if not isinstance(message, str) or not message.strip():
-        return None
-    out: dict[str, Any] = {
-        "severity": severity,
-        "category": category if isinstance(category, str) else "geometry",
-        "message": message[:240],
-        "source": raw.get("source") or "visual",
-    }
-    view = raw.get("view")
-    if isinstance(view, str) and view:
-        out["view"] = view
-    hint = raw.get("repair_hint")
-    if isinstance(hint, str) and hint:
-        out["repair_hint"] = hint[:240]
-    return out

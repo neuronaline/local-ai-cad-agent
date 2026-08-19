@@ -522,7 +522,7 @@ def test_prune_preserves_active_head_outside_retention_window(tmp_path: Path):
     store = RevisionStore(tmp_path, retention_count=10)
     r1 = store.commit(MODEL_A, RevisionOrigin(kind="agent_edit"))
     store.commit(MODEL_B, RevisionOrigin(kind="agent_edit"))
-    r3 = store.commit(MODEL_C, RevisionOrigin(kind="agent_edit"))
+    store.commit(MODEL_C, RevisionOrigin(kind="agent_edit"))
 
     # Force head.json back to the oldest revision (simulating an external rewrite).
     head_path = tmp_path / ".cad-agent" / "history" / "head.json"
@@ -634,6 +634,38 @@ def test_import_handles_malformed_archive(tmp_path: Path):
     bad.write_text("not json", encoding="utf-8")
     with pytest.raises(RevisionIntegrityError, match="Cannot read"):
         store.import_history(bad)
+
+
+def test_revision_archive_module_round_trips_independently(tmp_path: Path):
+    """``agent.revision_archive`` exposes the same round-trip helpers without
+    requiring the legacy ``RevisionStore.export_history``/``import_history``
+    methods. Locks in the dedup contract from audit_031."""
+    from agent.revision_archive import export_history, import_history
+
+    store = RevisionStore(tmp_path)
+    r1 = store.commit(MODEL_A, RevisionOrigin(kind="agent_edit"))
+    store.record_build_success(r1.id, {"solid_count": 1}, tmp_path / "preview.stl")
+
+    archive = export_history(store, tmp_path / "export")
+    assert archive.is_file()
+
+    target = tmp_path / "imported"
+    target.mkdir()
+    store2 = RevisionStore(target)
+    count = import_history(store2, archive)
+    assert count == 1
+    assert store2.head() is not None
+    assert store2.head().model_sha256 == r1.model_sha256
+
+
+def test_revision_archive_rejects_malformed_archive(tmp_path: Path):
+    from agent.revision_archive import import_history
+
+    store = RevisionStore(tmp_path)
+    bad = tmp_path / "bad.json"
+    bad.write_text("not json", encoding="utf-8")
+    with pytest.raises(RevisionIntegrityError, match="Cannot read"):
+        import_history(store, bad)
 
 
 # --------------------------------------------------------------------------- #
