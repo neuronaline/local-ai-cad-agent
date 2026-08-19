@@ -673,6 +673,28 @@ class AgentRunner:
                     json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n"
                 )
 
+    @classmethod
+    def clear_history(cls, project_dir: Path) -> bool:
+        """Reset the agent's memory for ``project_dir``.
+
+        Truncates the canonical ``conversation.jsonl`` log and evicts the
+        in-memory history cache entry. Returns ``True`` when a log file was
+        removed, ``False`` when the project had no recorded conversation.
+        The model, preview, renders, and revision blobs are left untouched.
+        """
+        cache_key = str(project_dir)
+        cls._history_cache.pop(cache_key, None)
+        log_path = project_dir / "conversation.jsonl"
+        removed = False
+        with _shared_history_lock():
+            try:
+                log_path.unlink()
+            except FileNotFoundError:
+                pass
+            else:
+                removed = True
+        return removed
+
     def _publish_usage(self, project: str, usage: dict | None) -> None:
         if not usage:
             return

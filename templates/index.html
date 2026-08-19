@@ -53,18 +53,43 @@
           <textarea id="message" placeholder="Describe the part, dimensions, fit, and required features…" rows="2" required aria-label="Part description"></textarea>
           <div id="attachment-preview" class="attachment-preview" aria-live="polite"></div>
           <div class="action-bar">
-            <label id="dropzone" class="attach-button" for="attachments" title="Add reference images"><span aria-hidden="true">＋</span><span id="attachment-label">Attach</span><input id="attachments" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden></label>
+            <label id="dropzone" class="attach-button icon-only" for="attachments" title="Add reference images" aria-label="Add reference images">
+              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <path d="M20.5 11.6 12.3 19.8a5.4 5.4 0 0 1-7.6-7.6l8.6-8.6a3.6 3.6 0 0 1 5.1 5.1l-8.6 8.6a1.8 1.8 0 0 1-2.5-2.5l7.7-7.7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              <input id="attachments" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden>
+            </label>
+            <span id="attachment-label" class="sr-only">Attach reference images</span>
             <span class="composer-hint">Enter sends · Shift+Enter adds a line</span>
-            <button id="history-btn" type="button" class="quiet">History</button>
-            <button id="stop" type="button" class="danger" hidden>Stop</button>
-            <button type="submit">Send</button>
+            <button id="history-btn" type="button" class="quiet icon-only" title="History" aria-label="History">
+              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <path d="M3 12a9 9 0 1 0 3.6-7.2M3 4v5h5M12 8v5l3 2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </button>
+            <button id="reset-context" type="button" class="quiet icon-only" title="Reset context" aria-label="Reset context">
+              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <path d="M4 12a8 8 0 0 1 13.7-5.6M20 4v4h-4M20 12a8 8 0 0 1-13.7 5.6M4 20v-4h4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </button>
+            <button id="send-toggle" type="button" class="send-toggle" title="Send" aria-label="Send">
+              <span class="send-toggle-icon" data-mode="send">
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                  <path d="M4 12 20 4l-4 16-4-6.5L4 12Z" fill="currentColor" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
+                </svg>
+              </span>
+              <span class="send-toggle-icon" data-mode="stop" hidden>
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                  <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/>
+                </svg>
+              </span>
+            </button>
           </div>
         </form>
       </section>
       <div id="panel-resizer" class="panel-resizer" role="separator" aria-orientation="vertical" aria-label="Resize panels"></div>
       <section class="viewer-panel">
         <header class="viewer-toolbar">
-          <div class="viewer-title"><h2>Preview</h2><span id="dimensions">No preview yet</span></div>
+          <div class="viewer-title"><h2>Preview</h2><span id="dimensions">No preview yet</span><span id="grid-warning" class="grid-warning" hidden title="Model exceeds the configured grid surface"></span></div>
           <div class="viewer-actions" aria-label="Preview controls">
             <div class="view-presets" role="group" aria-label="Standard views">
               <button type="button" class="quiet icon-only active" data-view="iso" title="Isometric view" aria-label="Isometric view">◈</button>
@@ -115,7 +140,15 @@
       <div id="model-content" class="drawer-content" hidden></div>
     </aside>
     <script id="app-config" type="application/json">
-      {{ {'projectName': project_name, 'showInfoMessages': show_info_messages} | tojson }}
+      {{ {
+        'projectName': project_name,
+        'showInfoMessages': show_info_messages,
+        'viewerGrid': {
+          'width': viewer_grid_width,
+          'depth': viewer_grid_depth,
+          'divisions': viewer_grid_divisions,
+        }
+      } | tojson }}
     </script>
     <script type="importmap">
       {

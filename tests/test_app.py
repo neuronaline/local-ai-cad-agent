@@ -1,7 +1,9 @@
 import hashlib
 import json
 import os
+import queue
 import re
+import threading
 import time
 from io import BytesIO
 from pathlib import Path
@@ -469,6 +471,148 @@ def test_delete_project(tmp_path: Path):
     assert response.status_code == 404
 
 
+def test_reset_project_clears_conversation_and_preserves_model(tmp_path: Path):
+    """``/reset`` wipes ``conversation.jsonl`` (and the in-memory cache) but
+    leaves ``model.py``, ``preview.stl``, ``render.png``, revisions, and
+    reviews untouched. The ``conversation_reset`` SSE event must be emitted so
+    the UI can drop its chat feed."""
+    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    app = create_app(settings)
+    client = app.test_client()
+    bus = app.config["EVENT_BUS"]
+    runner = app.config["AGENT_RUNNER"]
+
+    subscriber = bus.subscribe()
+    try:
+        client.post("/api/projects/new", json={"name": "demo"})
+        project_dir = settings.workspace_root / "demo"
+
+        # Seed the on-disk artifacts that the endpoint must NOT touch.
+        model_path = project_dir / "model.py"
+        model_path.write_text("# current model\n", encoding="utf-8")
+        preview_path = project_dir / "preview.stl"
+        preview_path.write_bytes(b"solid demo\nendsolid demo\n")
+        render_path = project_dir / "render.png"
+        render_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+        revision_dir = project_dir / ".cad-agent" / "revisions" / ("a" * 64)
+        revision_dir.mkdir(parents=True)
+        (revision_dir / "model.py").write_text("# historic model\n", encoding="utf-8")
+        review_dir = project_dir / ".cad-agent" / "reviews" / ("b" * 64)
+        review_dir.mkdir(parents=True)
+        (review_dir / "result.json").write_text('{"status": "pass"}', encoding="utf-8")
+
+        # Seed a conversation and prime the in-memory cache.
+        log = project_dir / "conversation.jsonl"
+        with log.open("w", encoding="utf-8") as log_file:
+            for entry in (
+                {"role": "user", "content": "make a bracket"},
+                {"role": "assistant", "content": "Sure."},
+                {"role": "tool", "content": "ok"},
+            ):
+                log_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        seeded_history = runner._load_history(project_dir)
+        assert len(seeded_history) == 3
+
+        # Drain the SSE queue of the bus-subscribe and project_created events.
+        while True:
+            try:
+                subscriber.get_nowait()
+            except queue.Empty:
+                break
+
+        response = client.post("/api/projects/demo/reset")
+        assert response.status_code == 200
+        body = response.get_json()
+        assert body == {"reset": True, "removed": True}
+
+        # conversation.jsonl is gone, history cache is empty, but the model +
+        # preview + render + revision + review survive byte-for-byte.
+        assert not log.exists()
+        assert len(runner._load_history(project_dir)) == 0
+        assert model_path.read_text(encoding="utf-8") == "# current model\n"
+        assert preview_path.read_bytes() == b"solid demo\nendsolid demo\n"
+        assert render_path.read_bytes() == b"\x89PNG\r\n\x1a\nfake"
+        assert (revision_dir / "model.py").read_text(encoding="utf-8") == "# historic model\n"
+        assert (review_dir / "result.json").read_text(encoding="utf-8") == '{"status": "pass"}'
+
+        # The /history endpoint reflects the empty conversation.
+        assert client.get("/api/projects/demo/history").get_json() == {"events": []}
+
+        # The conversation_reset SSE event was published for this project.
+        events: list[dict] = []
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                events.append(subscriber.get_nowait())
+            except queue.Empty:
+                time.sleep(0.01)
+        resets = [
+            evt
+            for evt in events
+            if evt
+            and evt.get("type") == "conversation_reset"
+            and evt.get("data", {}).get("project") == "demo"
+        ]
+        assert resets, f"conversation_reset event missing; got {events!r}"
+        assert resets[-1]["data"]["removed"] is True
+    finally:
+        bus.unsubscribe(subscriber)
+
+
+def test_reset_project_is_idempotent_when_no_history_exists(tmp_path: Path):
+    """Resetting a fresh project succeeds and reports ``removed=False``."""
+    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    client = create_app(settings).test_client()
+    client.post("/api/projects/new", json={"name": "demo"})
+
+    response = client.post("/api/projects/demo/reset")
+    assert response.status_code == 200
+    assert response.get_json() == {"reset": True, "removed": False}
+
+
+def test_reset_project_requires_existing_project(tmp_path: Path):
+    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    client = create_app(settings).test_client()
+
+    response = client.post("/api/projects/missing/reset")
+    assert response.status_code == 404
+
+
+def test_reset_project_refuses_when_agent_state_is_active(tmp_path: Path):
+    """Resetting while a run is in-flight must 409 so it cannot race the worker."""
+    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    app = create_app(settings)
+    client = app.test_client()
+    runner = app.config["AGENT_RUNNER"]
+
+    client.post("/api/projects/new", json={"name": "demo"})
+    project_dir = settings.workspace_root / "demo"
+    (project_dir / "conversation.jsonl").write_text(
+        json.dumps({"role": "user", "content": "before"}) + "\n", encoding="utf-8"
+    )
+
+    # Pretend the runner is mid-task for this project.
+    with runner._lock:
+        runner._active_project = "demo"
+        runner._stop_event = threading.Event()
+        runner._thread = threading.Thread(target=lambda: None)
+        runner._thread.start()
+        # Defensive: the runner treats _run_complete as the authoritative
+        # signal, so make sure it agrees with the live thread.
+        runner._run_complete.clear()
+
+    try:
+        response = client.post("/api/projects/demo/reset")
+        assert response.status_code == 409
+        # The conversation.jsonl must remain so the in-flight run is not corrupted.
+        assert (project_dir / "conversation.jsonl").exists()
+    finally:
+        runner._thread.join(timeout=1.0)
+        with runner._lock:
+            runner._active_project = None
+            runner._thread = None
+
+
 def test_rename_project(tmp_path: Path):
     settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
     client = create_app(settings).test_client()
@@ -531,10 +675,10 @@ def test_project_modified_at_tracks_file_content_changes(tmp_path: Path):
     client = create_app(settings).test_client()
     client.post("/api/projects/new", json={"name": "demo"})
     first = client.get("/api/projects").get_json()["projects"][0]["modified_at"]
-    summary = settings.workspace_root / "demo" / "summary.md"
-    summary.write_text("updated", encoding="utf-8")
+    model = settings.workspace_root / "demo" / "model.py"
+    model.write_text("# updated\n", encoding="utf-8")
     future = time.time() + 10
-    os.utime(summary, (future, future))
+    os.utime(model, (future, future))
 
     second = client.get("/api/projects").get_json()["projects"][0]["modified_at"]
 

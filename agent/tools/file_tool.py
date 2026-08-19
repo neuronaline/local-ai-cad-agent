@@ -8,7 +8,6 @@ import operator
 import threading
 from pathlib import Path
 
-from agent.io import atomic_write_text
 from agent.revisions import RevisionOrigin, RevisionStore
 
 BLOCKED_IMPORTS = {
@@ -22,7 +21,7 @@ BLOCKED_IMPORTS = {
     "sys",
 }
 BLOCKED_CALLS = {"__import__", "breakpoint", "compile", "eval", "exec", "input", "open"}
-EDITABLE_FILES = {"model.py", "summary.md"}
+EDITABLE_FILES = {"model.py"}
 MAX_FILE_BYTES = 1 * 1024 * 1024
 DEFAULT_READ_LIMIT = 400
 _BINARY_OPERATORS = {
@@ -246,7 +245,7 @@ class FileTool:
 
     def _path(self, filename: str) -> Path:
         if filename not in EDITABLE_FILES:
-            raise ValueError("Only model.py and summary.md can be edited.")
+            raise ValueError("Only model.py can be edited.")
         path = (self.project_dir / filename).resolve()
         if path.parent != self.project_dir:
             raise ValueError("Path escapes the project directory.")
@@ -358,10 +357,7 @@ class FileTool:
                     "expected_sha256 before overwriting it."
                 )
             self._validate_expected_sha(filename, current, expected_sha256)
-            if filename == "model.py":
-                return self._write_model(content, "write_file")
-            atomic_write_text(path, content)
-        return f"Wrote {filename} ({len(content)} characters)."
+            return self._write_model(content, "write_file")
 
     def _write_model(self, content: str, operation: str) -> str:
         """Validate, commit revision, and atomically write model.py."""
@@ -413,11 +409,7 @@ class FileTool:
             end_line = start_line + old_lines - 1
             new_lines = new_string.count("\n") or 1
             new_end_line = start_line + new_lines - 1
-            if filename == "model.py":
-                base = self._write_model(updated, "edit_file")
-            else:
-                atomic_write_text(path, updated)
-                base = f"Wrote {filename} ({len(updated)} characters)."
+            base = self._write_model(updated, "edit_file")
         return (
             f"{base} "
             f"(replaced lines {start_line}-{end_line} with lines "

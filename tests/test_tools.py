@@ -136,10 +136,10 @@ def test_file_tool_only_edits_allowlisted_files(tmp_path: Path):
 
 def test_write_file_creates_new_file_without_digest(tmp_path: Path):
     tool = FileTool(tmp_path)
-    result = tool.write_file("summary.md", "Width: 10 mm\n")
-    assert "Wrote summary.md" in result
-    payload = json.loads(tool.read_file("summary.md"))
-    assert payload["content"] == "Width: 10 mm\n"
+    result = tool.write_file("model.py", "# Width: 10 mm\n")
+    assert "Wrote model.py" in result
+    payload = json.loads(tool.read_file("model.py"))
+    assert payload["content"] == "# Width: 10 mm\n"
     assert payload["exists"] is True
     assert len(payload["sha256"]) == 64
 
@@ -160,114 +160,114 @@ def test_read_file_missing_reports_that_it_cannot_be_edited(tmp_path: Path):
 
 def test_write_file_requires_digest_when_file_exists(tmp_path: Path):
     tool = FileTool(tmp_path)
-    tool.write_file("summary.md", "Width: 10 mm\n")
+    tool.write_file("model.py", "# Width: 10 mm\n")
 
     with pytest.raises(ValueError, match="call read_file"):
-        tool.write_file("summary.md", "Width: 12 mm\n")
+        tool.write_file("model.py", "# Width: 12 mm\n")
 
 
 def test_write_file_stale_digest_leaves_content_unchanged(tmp_path: Path):
     tool = FileTool(tmp_path)
-    tool.write_file("summary.md", "Width: 10 mm\n")
-    digest = json.loads(tool.read_file("summary.md", offset=1, limit=1))["sha256"]
-    tool.write_file("summary.md", "Width: 11 mm\n", expected_sha256=digest)
+    tool.write_file("model.py", "# Width: 10 mm\n")
+    digest = json.loads(tool.read_file("model.py", offset=1, limit=1))["sha256"]
+    tool.write_file("model.py", "# Width: 11 mm\n", expected_sha256=digest)
 
     with pytest.raises(ValueError, match="changed since it was read"):
-        tool.write_file("summary.md", "Width: 12 mm\n", expected_sha256=digest)
+        tool.write_file("model.py", "# Width: 12 mm\n", expected_sha256=digest)
 
-    assert json.loads(tool.read_file("summary.md"))["content"] == "Width: 11 mm\n"
+    assert json.loads(tool.read_file("model.py"))["content"] == "# Width: 11 mm\n"
 
 
 def test_read_file_range_returns_digest_for_guarded_edit(tmp_path: Path):
     tool = FileTool(tmp_path)
-    tool.write_file("summary.md", "one\ntwo\nthree\n")
+    tool.write_file("model.py", "# one\n# two\n# three\n")
 
-    payload = json.loads(tool.read_file("summary.md", offset=2, limit=1))
+    payload = json.loads(tool.read_file("model.py", offset=2, limit=1))
 
-    assert payload["content"] == "two\n"
+    assert payload["content"] == "# two\n"
     assert payload["offset"] == 2
     assert payload["next_offset"] == 3
     with pytest.raises(ValueError, match="changed since it was read"):
-        tool.write_file("summary.md", "updated\n", expected_sha256="0" * 64)
+        tool.write_file("model.py", "# updated\n", expected_sha256="0" * 64)
 
 
 def test_read_file_range_digest_can_guard_an_edit(tmp_path: Path):
     tool = FileTool(tmp_path)
-    tool.write_file("summary.md", "one\ntwo\n")
+    tool.write_file("model.py", "# one\n# two\n")
 
-    payload = json.loads(tool.read_file("summary.md", offset=1, limit=2))
-    tool.edit_file("summary.md", "two", "updated", payload["sha256"])
+    payload = json.loads(tool.read_file("model.py", offset=1, limit=2))
+    tool.edit_file("model.py", "# two", "# updated", payload["sha256"])
 
-    assert json.loads(tool.read_file("summary.md"))["content"] == "one\nupdated\n"
+    assert json.loads(tool.read_file("model.py"))["content"] == "# one\n# updated\n"
 
 
 def test_edit_file_rejects_ambiguous_target(tmp_path: Path):
     tool = FileTool(tmp_path)
-    tool.write_file("summary.md", "same\nsame\n")
-    digest = json.loads(tool.read_file("summary.md"))["sha256"]
+    tool.write_file("model.py", "# same\n# same\n")
+    digest = json.loads(tool.read_file("model.py"))["sha256"]
 
     with pytest.raises(ValueError, match="found 2"):
-        tool.edit_file("summary.md", "same", "new", digest)
+        tool.edit_file("model.py", "# same", "# new", digest)
 
-    assert json.loads(tool.read_file("summary.md"))["content"] == "same\nsame\n"
+    assert json.loads(tool.read_file("model.py"))["content"] == "# same\n# same\n"
 
 
 def test_edit_file_rejects_missing_target(tmp_path: Path):
     tool = FileTool(tmp_path)
-    tool.write_file("summary.md", "anchor here\n")
-    digest = json.loads(tool.read_file("summary.md"))["sha256"]
+    tool.write_file("model.py", "# anchor here\n")
+    digest = json.loads(tool.read_file("model.py"))["sha256"]
 
     with pytest.raises(ValueError, match="one exact match"):
-        tool.edit_file("summary.md", "nonexistent", "replacement", digest)
+        tool.edit_file("model.py", "# nonexistent", "# replacement", digest)
 
-    assert json.loads(tool.read_file("summary.md"))["content"] == "anchor here\n"
+    assert json.loads(tool.read_file("model.py"))["content"] == "# anchor here\n"
 
 
 def test_edit_file_rejects_missing_file(tmp_path: Path):
     tool = FileTool(tmp_path)
 
     with pytest.raises(ValueError, match="use write_file"):
-        tool.edit_file("summary.md", "anything", "replacement", "0" * 64)
+        tool.edit_file("model.py", "# anything", "# replacement", "0" * 64)
 
 
 def test_edit_file_rejects_stale_digest(tmp_path: Path):
     tool = FileTool(tmp_path)
-    tool.write_file("summary.md", "alpha\n")
-    digest = json.loads(tool.read_file("summary.md"))["sha256"]
-    tool.write_file("summary.md", "beta\n", expected_sha256=digest)
+    tool.write_file("model.py", "# alpha\n")
+    digest = json.loads(tool.read_file("model.py"))["sha256"]
+    tool.write_file("model.py", "# beta\n", expected_sha256=digest)
 
     with pytest.raises(ValueError, match="changed since it was read"):
-        tool.edit_file("summary.md", "beta", "gamma", "0" * 64)
+        tool.edit_file("model.py", "# beta", "# gamma", "0" * 64)
 
-    assert json.loads(tool.read_file("summary.md"))["content"] == "beta\n"
+    assert json.loads(tool.read_file("model.py"))["content"] == "# beta\n"
 
 
 def test_edit_file_requires_non_empty_old_string(tmp_path: Path):
     tool = FileTool(tmp_path)
-    tool.write_file("summary.md", "alpha\n")
-    digest = json.loads(tool.read_file("summary.md"))["sha256"]
+    tool.write_file("model.py", "# alpha\n")
+    digest = json.loads(tool.read_file("model.py"))["sha256"]
 
     with pytest.raises(ValueError, match="old_string must not be empty"):
-        tool.edit_file("summary.md", "", "new", digest)
+        tool.edit_file("model.py", "", "# new", digest)
 
 
 def test_edit_file_requires_digest(tmp_path: Path):
     tool = FileTool(tmp_path)
-    tool.write_file("summary.md", "alpha\n")
+    tool.write_file("model.py", "# alpha\n")
 
     with pytest.raises(ValueError, match="expected_sha256 is required"):
-        tool.edit_file("summary.md", "alpha", "new", None)  # type: ignore[arg-type]
+        tool.edit_file("model.py", "# alpha", "# new", None)  # type: ignore[arg-type]
 
 
 def test_edit_file_reports_replaced_line_range(tmp_path: Path):
     tool = FileTool(tmp_path)
-    tool.write_file("summary.md", "alpha\nbeta\ngamma\n")
-    digest = json.loads(tool.read_file("summary.md"))["sha256"]
+    tool.write_file("model.py", "# alpha\n# beta\n# gamma\n")
+    digest = json.loads(tool.read_file("model.py"))["sha256"]
 
-    result = tool.edit_file("summary.md", "beta\n", "B\n", digest)
+    result = tool.edit_file("model.py", "# beta\n", "# B\n", digest)
 
     assert "replaced lines 2-2 with lines 2-2" in result
-    assert json.loads(tool.read_file("summary.md"))["content"] == "alpha\nB\ngamma\n"
+    assert json.loads(tool.read_file("model.py"))["content"] == "# alpha\n# B\n# gamma\n"
 
 
 @pytest.mark.parametrize("keyword", ["center", "start_angle", "end_angle"])
@@ -642,16 +642,16 @@ def test_file_tool_with_call_id_stores_origin(tmp_path: Path):
 def test_file_tool_direct_construction_without_revisions_works(tmp_path: Path):
     """Existing direct FileTool(tmp_path) test construction remains supported."""
     tool = FileTool(tmp_path)
-    result = tool.write_file("summary.md", "# Test\n")
-    assert result == "Wrote summary.md (7 characters)."
+    result = tool.write_file("model.py", "# Test\n")
+    assert result.startswith("Wrote model.py")
 
 
-def test_file_summary_write_does_not_create_revision(tmp_path: Path):
+def test_model_write_creates_revision(tmp_path: Path):
     tool = FileTool(tmp_path)
-    tool.write_file("summary.md", "# Test\n")
+    tool.write_file("model.py", "# Test\n")
 
     store = RevisionStore(tmp_path)
-    assert store.head() is None  # No model.py revision created.
+    assert store.head() is not None  # model.py edit always creates a revision.
 
 
 # --------------------------------------------------------------------------- #

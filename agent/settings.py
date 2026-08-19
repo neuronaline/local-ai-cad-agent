@@ -47,6 +47,13 @@ class Settings:
     review_enabled: bool = True
     review_render_workers: int = 4
     review_required_views: int = 8
+    # ── 3D preview viewer (Three.js grid plane) ──
+    # Ground grid extent in mm. ``width`` × ``depth`` cover the XZ plane; the
+    # third value is the number of divisions per side so the cell size is
+    # ``width / divisions`` mm. Defaults match the previous hard-coded grid.
+    viewer_grid_width: float = 200.0
+    viewer_grid_depth: float = 200.0
+    viewer_grid_divisions: int = 20
 
     @property
     def llm_model(self) -> str:
@@ -54,6 +61,15 @@ class Settings:
         if self.llm_provider == "openai":
             return self.openai_model
         return self.openrouter_model
+
+    @property
+    def viewer_grid_extent(self) -> tuple[float, float, int]:
+        """Return ``(width, depth, divisions)`` for the preview viewport grid."""
+        return (
+            self.viewer_grid_width,
+            self.viewer_grid_depth,
+            self.viewer_grid_divisions,
+        )
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -97,6 +113,78 @@ def _validate_timeout_seconds(value: Any, name: str) -> int:
     return _positive_int(value, name)
 
 
+def _parse_grid_extent(value: Any) -> tuple[float, float, int]:
+    """Parse a grid extent string into ``(width, depth, divisions)``.
+
+    Accepts either a ``"WxDxD"`` triple (e.g. ``"256x256x256"``) or a mapping
+    with explicit ``width`` / ``depth`` / ``divisions`` keys. ``width`` and
+    ``depth`` are non-negative floats in mm; ``divisions`` is a positive
+    integer. When only width is supplied, ``depth`` mirrors it and
+    ``divisions`` falls back to ``20``.
+    """
+    width: float | None = None
+    depth: float | None = None
+    divisions: int | None = None
+    if isinstance(value, str):
+        parts = [token.strip() for token in value.split("x") if token.strip()]
+        if not parts:
+            raise ValueError("viewer.grid.extent must not be empty.")
+        try:
+            numbers = [float(token) for token in parts]
+        except ValueError as error:
+            raise ValueError(
+                "viewer.grid.extent must be a triple of numbers like '256x256x256'."
+            ) from error
+        if len(numbers) == 1:
+            width = depth = numbers[0]
+            divisions = 20
+        elif len(numbers) == 2:
+            width, depth = numbers
+            divisions = 20
+        elif len(numbers) == 3:
+            width, depth, divisions = (
+                numbers[0],
+                numbers[1],
+                int(numbers[2]),
+            )
+        else:
+            raise ValueError(
+                "viewer.grid.extent accepts 1, 2, or 3 numbers "
+                "(width, depth, divisions); got "
+                f"{len(numbers)}."
+            )
+    elif isinstance(value, dict):
+        if "width" in value:
+            width = float(value["width"])
+        if "depth" in value:
+            depth = float(value["depth"])
+        if "divisions" in value:
+            divisions = int(value["divisions"])
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        # Bare numeric value = square grid with the legacy 20 divisions.
+        width = depth = float(value)
+        divisions = 20
+    elif value is None:
+        pass
+    else:
+        raise ValueError(
+            "viewer.grid.extent must be a string like '256x256x256' or a mapping."
+        )
+    if width is None:
+        width = 200.0
+    if depth is None:
+        depth = width
+    if divisions is None:
+        divisions = 20
+    if width <= 0 or depth <= 0:
+        raise ValueError(
+            "viewer.grid width and depth must be positive mm values."
+        )
+    if divisions < 1:
+        raise ValueError("viewer.grid divisions must be a positive integer.")
+    return width, depth, divisions
+
+
 def load_settings(project_root: Path | None = None) -> Settings:
     project_root = project_root or Path(__file__).resolve().parents[1]
     config = _read_yaml(project_root / "config.yaml")
@@ -107,6 +195,8 @@ def load_settings(project_root: Path | None = None) -> Settings:
     ui = config.get("ui", {})
     agent = config.get("agent", {})
     review = config.get("review", {})
+    viewer = config.get("viewer", {})
+    viewer_grid = viewer.get("grid", {}) if isinstance(viewer, dict) else {}
 
     # llm.provider selects which adapter AgentRunner should use. Settings
     # for the inactive provider are still loaded so users can switch without
@@ -120,6 +210,9 @@ def load_settings(project_root: Path | None = None) -> Settings:
 
     # Each provider keeps its own model; ``settings.llm_model`` returns the
     # active one so callers do not need to branch on the provider.
+    grid_width, grid_depth, grid_divisions = _parse_grid_extent(
+        viewer_grid.get("extent") if isinstance(viewer_grid, dict) else None
+    )
 
     return Settings(
         workspace_root=Path(config.get("workspace_root", "~/CAD-Agent-Projects")).expanduser(),
@@ -154,6 +247,9 @@ def load_settings(project_root: Path | None = None) -> Settings:
         review_required_views=_positive_int(
             review.get("required_views", 8), "review.required_views"
         ),
+        viewer_grid_width=grid_width,
+        viewer_grid_depth=grid_depth,
+        viewer_grid_divisions=grid_divisions,
     )
 
 

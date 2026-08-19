@@ -17,7 +17,7 @@ image is provided, use it for shape and proportion while treating stated
 dimensions as authoritative. State any important assumption in the final reply."""
 
 _OPERATIONAL_RULES = """\
-- Edit only the active project's model.py and summary.md. All other files are
+- Edit only the active project's model.py. All other files are
   read-only or managed by the system.
 - For CAD work, use this loop: resolve blocking ambiguity, edit model.py, call
   cad_build_and_verify, inspect both metrics and render, then fix or finish.
@@ -73,11 +73,9 @@ _OPERATIONAL_RULES = """\
   render agrees with the request. For small, contained changes, this build
   verification is sufficient. Use cad_review only when the complexity or risk
   criteria above make additional visual evidence worthwhile.
-- After final verification, update summary.md once with exactly these sections:
-  - ## Summary — one sentence
-  - ## Key dimensions — confirmed values only
-  - ## Design decisions — notable choices and assumptions
-  - ## Limitations — unresolved issues, skipped operations, warnings"""
+- When the design is ready, deliver a concise final answer in chat that
+  describes the produced part, its confirmed dimensions, and any notable
+  assumptions or limitations. Do not maintain a separate summary file."""
 
 _BUILD123D_RULES = """\
 - On failure, read the tool's code, phase, message, and hint; change model.py

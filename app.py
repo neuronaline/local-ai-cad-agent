@@ -464,6 +464,9 @@ def create_app(settings: Settings | None = None) -> Flask:
             "index.html",
             project_name=name,
             show_info_messages=app.config["SETTINGS"].show_info_messages,
+            viewer_grid_width=app.config["SETTINGS"].viewer_grid_width,
+            viewer_grid_depth=app.config["SETTINGS"].viewer_grid_depth,
+            viewer_grid_divisions=app.config["SETTINGS"].viewer_grid_divisions,
         )
 
     @app.get("/api/projects")
@@ -518,6 +521,41 @@ def create_app(settings: Settings | None = None) -> Flask:
                 return jsonify({"error": "Cannot delete a project with active agent state."}), 409
             shutil.rmtree(project_dir)
         return jsonify({"deleted": True})
+
+    @app.post("/api/projects/<project_name>/reset")
+    def reset_project(project_name: str):
+        """Clear the agent's conversation memory without touching the model.
+
+        Removes ``conversation.jsonl`` so the next chat turn starts a fresh
+        context. ``model.py``, ``preview.stl``, ``render.png``, revisions, and
+        review artifacts are left intact. Refuses to run while an agent task
+        or a pending preview is in-flight so a reset cannot race the worker.
+        """
+        current_settings = app.config["SETTINGS"]
+        try:
+            project_dir = _project_path(current_settings, project_name)
+        except (ValueError, FileNotFoundError) as error:
+            return jsonify({"error": str(error)}), 404
+        with _project_lock(app, project_name):
+            try:
+                project_dir = _project_path(current_settings, project_name)
+            except (ValueError, FileNotFoundError) as error:
+                return jsonify({"error": str(error)}), 404
+            runner = app.config["AGENT_RUNNER"]
+            if runner.has_active_state_for(project_name):
+                return jsonify(
+                    {"error": "Cannot reset a project with active agent state."}
+                ), 409
+            if runner.is_running() or runner.is_awaiting_preview():
+                return jsonify(
+                    {"error": "Cannot reset while an agent task is running."}
+                ), 409
+            removed = runner.clear_history(project_dir)
+        bus.publish(
+            "conversation_reset",
+            {"project": project_name, "removed": removed},
+        )
+        return jsonify({"reset": True, "removed": removed})
 
     @app.put("/api/projects/<project_name>/rename")
     def rename_project(project_name: str):

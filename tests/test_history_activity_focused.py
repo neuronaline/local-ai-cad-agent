@@ -859,6 +859,138 @@ def test_init_loads_main_history_before_connecting_stream():
 
 
 # ---------------------------------------------------------------------------
+# Issue 5 (frontend): conversation_reset SSE event wipes the chat UI.
+# ---------------------------------------------------------------------------
+
+
+def test_apply_conversation_reset_clears_feed_drawer_and_activity():
+    """``applyConversationReset`` must mirror an empty backend state: main
+    feed and history drawer are wiped, the question area is reset, and the
+    thinking indicator is released so the next user message starts on a
+    clean canvas. Activity state must also be cleared."""
+    bindings = (
+        # DOM stubs that record what the helper touches.
+        "var feed = { items: ['prev'], replaceChildren() { this.items.length = 0; }, appendChild(n) { this.items.push(n); } };\n"
+        "var historyContent = { items: ['prev'], replaceChildren() { this.items.length = 0; } };\n"
+        "var questionArea = { cleared: false, replaceChildren() { this.cleared = true; } };\n"
+        "var activityItems = new Map([['x', {}]]);\n"
+        "var toolMessages = new Map([['y', {}]]);\n"
+        "function clearActivity() { activityItems.clear(); toolMessages.clear(); }\n"
+        "var thinkingCalls = [];\n"
+        "function setThinking(active) { thinkingCalls.push(active); }\n"
+        "var currentProject = 'demo';\n"
+        # No chat-empty template in this stub: helper falls back to a synthesized empty-state node.
+        "var document = { querySelector() { return null; }, createElement(tag) { return { tag: tag, className: '', textContent: '' }; } };\n"
+        + _extract_js("applyConversationReset")
+    )
+    body = (
+        "applyConversationReset();\n"
+        "process.stdout.write(JSON.stringify({\n"
+        "  feed_items: feed.items,\n"
+        "  history_items: historyContent.items,\n"
+        "  question_cleared: questionArea.cleared,\n"
+        "  activity_items: Array.from(activityItems.keys()),\n"
+        "  tool_messages: Array.from(toolMessages.keys()),\n"
+        "  thinking_calls: thinkingCalls,\n"
+        "}));"
+    )
+    out = json.loads(_eval_helper(bindings, body))
+    # The prior card is dropped and the empty-state placeholder is re-inserted.
+    assert len(out["feed_items"]) == 1
+    assert out["feed_items"][0]["tag"] == "div"
+    assert out["feed_items"][0]["className"] == "empty-state"
+    assert out["feed_items"][0]["textContent"] == (
+        'Project "demo" selected. Describe a part to begin.'
+    )
+    assert out["history_items"] == []
+    assert out["question_cleared"] is True
+    assert out["activity_items"] == []
+    assert out["tool_messages"] == []
+    # Thinking indicator is released (False) so a stale spinner cannot leak past reset.
+    assert out["thinking_calls"] == [False]
+
+
+def test_apply_conversation_reset_reclones_chat_empty_template():
+    """When the #chat-empty template is present in the DOM, the helper must
+    clone it back into the freshly cleared feed (matching the empty-state
+    recovery logic in ``loadHistory``)."""
+    bindings = (
+        "var feed = { items: ['prev'], replaceChildren() { this.items.length = 0; }, appendChild(n) { this.items.push(n); } };\n"
+        "var historyContent = { replaceChildren() {} };\n"
+        "var questionArea = { replaceChildren() {} };\n"
+        "var activityItems = new Map();\n"
+        "var toolMessages = new Map();\n"
+        "function clearActivity() {}\n"
+        "function setThinking() {}\n"
+        "var currentProject = 'demo';\n"
+        "var cloneCalls = 0;\n"
+        "var document = { querySelector() { return { content: { cloneNode: function(_d){ cloneCalls++; return '<cloned-empty/>'; } } }; } };\n"
+        + _extract_js("applyConversationReset")
+    )
+    body = (
+        "applyConversationReset();\n"
+        "process.stdout.write(JSON.stringify({\n"
+        "  cloned: cloneCalls,\n"
+        "  feed_size: feed.items.length,\n"
+        "}));"
+    )
+    out = json.loads(_eval_helper(bindings, body))
+    assert out["cloned"] == 1
+    assert out["feed_size"] == 1
+
+
+def test_conversation_reset_sse_listener_is_wired_in_app_js():
+    """The SSE ``conversation_reset`` listener must exist in ``app.js`` and
+    delegate to ``applyConversationReset`` for the matching project only.
+    Source-level check: it pins the contract that the backend event reaches
+    the right helper without parsing every line of the listener body."""
+    text = JS_SOURCE.read_text(encoding="utf-8")
+    assert "eventSource.addEventListener('conversation_reset'" in text, (
+        "conversation_reset listener missing from static/js/app.js"
+    )
+    assert "applyConversationReset" in text, (
+        "applyConversationReset helper missing from static/js/app.js"
+    )
+    # The listener body must guard on the project name so events for other
+    # tabs/projects cannot wipe the wrong chat feed.
+    listener_match = re.search(
+        r"eventSource\.addEventListener\('conversation_reset', event => \{(.*?)\}\);",
+        text,
+        re.DOTALL,
+    )
+    assert listener_match, "conversation_reset listener body not found"
+    body = listener_match.group(1)
+    assert "currentProject" in body, (
+        "conversation_reset listener must compare data.project against currentProject"
+    )
+    assert "applyConversationReset()" in body, (
+        "conversation_reset listener must call applyConversationReset()"
+    )
+
+
+def test_reset_button_handler_posts_to_reset_endpoint():
+    """The reset button handler must POST to ``/api/projects/<name>/reset``
+    and ask the user to confirm before destroying the conversation."""
+    text = JS_SOURCE.read_text(encoding="utf-8")
+    assert "id=\"reset-context\"" in Path(
+        Path(__file__).resolve().parents[1] / "templates/index.html"
+    ).read_text(encoding="utf-8"), (
+        "Reset context button missing from templates/index.html"
+    )
+    handler_match = re.search(
+        r"resetButton\.addEventListener\('click', async \(\) => \{(.*?)\}\);",
+        text,
+        re.DOTALL,
+    )
+    assert handler_match, "resetButton click handler missing from static/js/app.js"
+    body = handler_match.group(1)
+    assert "/reset" in body, "Reset handler must call the /reset endpoint"
+    assert "window.confirm" in body, (
+        "Reset handler must ask the user to confirm before destroying memory"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Issue 2 (template): empty state is re-clonable after history loads.
 # ---------------------------------------------------------------------------
 

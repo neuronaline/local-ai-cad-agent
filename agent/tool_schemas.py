@@ -25,7 +25,7 @@ def _tool(
 
 _FILENAME = {
     "type": "string",
-    "enum": ["model.py", "summary.md"],
+    "enum": ["model.py"],
     "description": "Project file to read or edit.",
 }
 _TIMEOUT = {
@@ -38,7 +38,7 @@ _TIMEOUT = {
 TOOL_SCHEMAS = [
     _tool(
         "read_file",
-        "Read model.py or summary.md. The response always includes exists and "
+        "Read model.py. The response always includes exists and "
         "the current SHA-256 (when the file exists); pass that digest as "
         "expected_sha256 to write_file or edit_file. A missing file reports "
         "exists=false and must be created with write_file.",
@@ -66,7 +66,7 @@ TOOL_SCHEMAS = [
     ),
     _tool(
         "write_file",
-        "Create model.py or summary.md, or deliberately replace its entire "
+        "Create model.py, or deliberately replace its entire "
         "contents. Overwriting an existing file requires expected_sha256 from a "
         "recent read_file; a stale or missing digest is rejected without changing "
         "the file or revision history. Use edit_file for small localized changes.",

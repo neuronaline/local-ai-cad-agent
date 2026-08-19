@@ -2,11 +2,33 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { STLLoader } from 'three/addons/loaders/STLLoader.js';
 
+const DEFAULT_GRID = Object.freeze({width: 200, depth: 200, divisions: 20});
+
+function readGridConfig(appConfig) {
+  // ``app-config`` ships viewer grid dimensions from the server (parsed from
+  // ``viewer.grid.extent`` in config.yaml). Fall back to the legacy defaults
+  // when the field is missing or malformed so the viewer never crashes.
+  const candidate = appConfig && appConfig.viewerGrid;
+  const result = {...DEFAULT_GRID};
+  if (!candidate || typeof candidate !== 'object') return result;
+  const width = Number(candidate.width);
+  const depth = Number(candidate.depth);
+  const divisions = Number(candidate.divisions);
+  if (Number.isFinite(width) && width > 0) result.width = width;
+  if (Number.isFinite(depth) && depth > 0) result.depth = depth;
+  if (Number.isFinite(divisions) && divisions >= 1) {
+    result.divisions = Math.min(2000, Math.round(divisions));
+  }
+  return result;
+}
+
 export class CadViewer {
-  constructor(container, dimensions) {
+  constructor(container, dimensions, appConfig = {}) {
     this.container = container;
     this.dimensions = dimensions;
     this.emptyState = container.querySelector('#viewer-empty');
+    this.gridWarning = document.querySelector('#grid-warning');
+    this.grid = readGridConfig(appConfig);
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color('#0d1524');
     this.camera = new THREE.PerspectiveCamera(45, 1, 0.1, 10000);
@@ -22,7 +44,7 @@ export class CadViewer {
     const light = new THREE.DirectionalLight(0xffffff, 3);
     light.position.set(80, 120, 100);
     this.scene.add(light);
-    this.gridHelper = new THREE.GridHelper(200, 20, '#2b3c5c', '#18243a');
+    this.gridHelper = this._buildGridHelper();
     this.scene.add(this.gridHelper);
     this.loader = new STLLoader();
     this.model = null;
@@ -33,6 +55,51 @@ export class CadViewer {
     new ResizeObserver(() => this.resize()).observe(container);
     this.resize();
     this.animate();
+  }
+
+  _buildGridHelper() {
+    // THREE.GridHelper's first argument is the total size (the helper centres
+    // itself on the origin) and the second is the number of divisions per
+    // side. Both come from the parsed viewer.grid.extent config.
+    return new THREE.GridHelper(
+      this.grid.width,
+      this.grid.divisions,
+      '#2b3c5c',
+      '#18243a',
+    );
+  }
+
+  _describeGrid() {
+    return `${this.grid.width} × ${this.grid.depth} mm grid (${this.grid.divisions} divisions)`;
+  }
+
+  _refreshGridWarning() {
+    if (!this.gridWarning) return;
+    if (!this.model || !this.cadDimensions) {
+      this.gridWarning.hidden = true;
+      this.gridWarning.textContent = '';
+      delete this.gridWarning.dataset.state;
+      return;
+    }
+    const dims = this.cadDimensions;
+    const exceedsX = dims.x > this.grid.width;
+    const exceedsZ = dims.z > this.grid.depth;
+    const exceedsHeight = dims.y > Math.max(this.grid.width, this.grid.depth) * 2;
+    if (!exceedsX && !exceedsZ && !exceedsHeight) {
+      this.gridWarning.hidden = true;
+      this.gridWarning.textContent = '';
+      delete this.gridWarning.dataset.state;
+      return;
+    }
+    const offenders = [];
+    if (exceedsX) offenders.push(`X ${dims.x.toFixed(1)} mm > ${this.grid.width} mm`);
+    if (exceedsZ) offenders.push(`Z ${dims.z.toFixed(1)} mm > ${this.grid.depth} mm`);
+    if (exceedsHeight) {
+      offenders.push(`Y ${dims.y.toFixed(1)} mm > tolerance`);
+    }
+    this.gridWarning.hidden = false;
+    this.gridWarning.dataset.state = 'exceeds';
+    this.gridWarning.textContent = `Model exceeds ${this._describeGrid()}: ${offenders.join('; ')}`;
   }
 
   resize() {
@@ -65,6 +132,7 @@ export class CadViewer {
     this.dimensions.textContent = message;
     this.emptyState.querySelector('strong').textContent = message;
     this.emptyState.hidden = false;
+    this._refreshGridWarning();
   }
 
   hasModel() {
@@ -94,6 +162,7 @@ export class CadViewer {
             this._hideSpinner();
             this.clear();
             this.cadDimensions = size;
+            this._refreshGridWarning();
             geometry.center();
             const material = new THREE.MeshStandardMaterial({
               color: '#8ea8ff', metalness: 0.12, roughness: 0.56, wireframe: this.wireframe,

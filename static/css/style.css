@@ -119,14 +119,28 @@ button[aria-pressed="true"], .view-presets .active { border-color: #5d7ed7; back
 .composer { border: 1px solid var(--line); border-radius: 9px; padding: .4rem; background: #0e1828; }
 .composer textarea { width: 100%; min-height: 46px; max-height: 140px; resize: none; border: 0; padding: .35rem .4rem; outline: 0; background: transparent; color: var(--text); }
 .action-bar { gap: .35rem; margin-top: .25rem; }
-.attach-button { display: inline-flex; align-items: center; gap: .25rem; margin-right: auto; border: 1px solid var(--line); border-radius: 6px; padding: .34rem .5rem; color: #c1cee2; cursor: pointer; font-size: .72rem; font-weight: 650; }
+.attach-button { display: inline-flex; align-items: center; justify-content: center; margin-right: auto; border: 1px solid var(--line); border-radius: 6px; padding: 0; color: #c1cee2; cursor: pointer; }
 .attach-button:hover, .attach-button.is-dragging { border-color: var(--accent); color: var(--text); }
 .composer-hint { color: #71819b; font-size: .65rem; white-space: nowrap; }
+.send-toggle { display: grid; place-items: center; width: 32px; height: 32px; padding: 0; border: 0; border-radius: 7px; background: var(--accent); color: var(--accent-ink); }
+.send-toggle:hover { filter: brightness(1.08); }
+.send-toggle[data-mode="stop"] { background: #cc5060; color: #fff; }
+.send-toggle[data-mode="stop"]:hover { background: #d96876; }
+.send-toggle:disabled { opacity: .45; cursor: not-allowed; }
+.icon { width: 16px; height: 16px; display: block; }
+.send-toggle .icon { width: 18px; height: 18px; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .attachment-preview { display: flex; flex-wrap: wrap; gap: .35rem; padding: 0 .25rem .2rem; }
 .attachment-item { display: flex; max-width: 185px; align-items: center; gap: .35rem; border: 1px solid var(--line); border-radius: 6px; padding: .2rem; color: var(--muted); font-size: .66rem; }
 .attachment-item img { width: 28px; height: 28px; border-radius: 4px; object-fit: cover; }
 .attachment-item span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .attachment-item button { margin-left: auto; flex: 0 0 auto; }
+
+/* Inline attachment preview inside user-sent chat messages. Same visual
+   language as the composer thumbnails so the user immediately sees what
+   they attached before the model acknowledges it. */
+.message-attachments { display: flex; flex-wrap: wrap; gap: .35rem; margin-bottom: .35rem; }
+.message-attachments .attachment-thumb { width: 88px; height: 88px; border: 1px solid var(--line); border-radius: 6px; object-fit: cover; background: #06080d; }
 
 .question-form { display: grid; gap: .5rem; border: 1px solid #465f91; border-radius: var(--radius); padding: .65rem; background: #15233b; }
 .question-form label { display: grid; gap: .25rem; color: #cbd7ee; font-size: .78rem; }
@@ -139,6 +153,8 @@ input, select, textarea { border: 1px solid var(--line); border-radius: 6px; bac
 .viewer-title { min-width: 0; gap: .55rem; }
 .viewer-title h2 { margin: 0; font-size: .86rem; }
 #dimensions { overflow: hidden; color: var(--muted); font-size: .7rem; text-overflow: ellipsis; white-space: nowrap; }
+.grid-warning { padding: .08rem .38rem; border-radius: 999px; background: #2b1d0e; border: 1px solid #6a5328; color: #f3dfb6; font-size: .62rem; font-weight: 700; letter-spacing: .02em; white-space: nowrap; }
+.grid-warning[data-state="exceeds"] { border-color: #d68a2e; color: #ffd6a0; }
 .viewer-actions { justify-content: flex-end; gap: .3rem; }
 .viewer-actions button { padding: .32rem .47rem; font-size: .7rem; }
 .view-presets { display: flex; gap: 2px; padding-right: .2rem; border-right: 1px solid var(--line); }

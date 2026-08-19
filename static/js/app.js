@@ -6,7 +6,10 @@ const message = document.querySelector('#message');
 const dropzone = document.querySelector('#dropzone');
 const attachments = document.querySelector('#attachments');
 const attachmentLabel = document.querySelector('#attachment-label');
-const stopButton = document.querySelector('#stop');
+const sendToggle = document.querySelector('#send-toggle');
+const sendIcon = sendToggle?.querySelector('[data-mode="send"]');
+const stopIcon = sendToggle?.querySelector('[data-mode="stop"]');
+const resetButton = document.querySelector('#reset-context');
 const questionArea = document.querySelector('#question-area');
 const renderSection = document.querySelector('#render-section');
 const renderBody = document.querySelector('#render-body');
@@ -22,10 +25,10 @@ const activityList = document.querySelector('#activity-list');
 const usagePill = document.querySelector('#usage-pill');
 const attachmentPreview = document.querySelector('#attachment-preview');
 const modelActions = document.querySelector('#model-actions');
-const viewer = new CadViewer(document.querySelector('#viewer'), document.querySelector('#dimensions'));
 const appConfig = JSON.parse(document.querySelector('#app-config')?.textContent || '{}');
 const showInfoMessages = appConfig.showInfoMessages ?? true;
 const currentProject = appConfig.projectName || '';
+const viewer = new CadViewer(document.querySelector('#viewer'), document.querySelector('#dimensions'), appConfig);
 
 let selectedFiles = [];
 let previewProject = '';
@@ -111,6 +114,29 @@ function addMessage(text, type = 'agent', options = {}) {
     renderAgentContent(item, text || '');
     return item;
   }
+  if (type === 'user') {
+    item.classList.add('user-message');
+    if (Array.isArray(options.images) && options.images.length) {
+      const strip = document.createElement('div');
+      strip.className = 'message-attachments';
+      for (const img of options.images) {
+        const el = document.createElement('img');
+        el.className = 'attachment-thumb';
+        el.src = img.src;
+        el.alt = img.alt || 'attachment';
+        el.loading = 'lazy';
+        strip.appendChild(el);
+      }
+      item.appendChild(strip);
+    }
+    const textNode = document.createElement('div');
+    textNode.className = 'message-text';
+    textNode.textContent = text || '';
+    item.appendChild(textNode);
+    target.appendChild(item);
+    return item;
+  }
+  // ``error`` and other bare-message types keep the simple text rendering path.
   item.textContent = text || '';
   target.appendChild(item);
   return item;
@@ -307,7 +333,14 @@ function addToolMessage(data) {
 }
 
 function setThinking(active) {
-  stopButton.hidden = !active;
+  if (sendToggle) {
+    sendToggle.dataset.mode = active ? 'stop' : 'send';
+    sendToggle.title = active ? 'Stop' : 'Send';
+    sendToggle.setAttribute('aria-label', active ? 'Stop' : 'Send');
+    sendToggle.disabled = false;
+    if (sendIcon) sendIcon.hidden = active;
+    if (stopIcon) stopIcon.hidden = !active;
+  }
   if (active) {
     if (!document.querySelector('.thinking-indicator')) {
       const el = document.createElement('div');
@@ -618,12 +651,17 @@ chatForm.addEventListener('submit', async event => {
   if (!currentProject) return addMessage('Create a project first.', 'error');
   const text = message.value.trim();
   if (!text) return;
-  const btn = chatForm.querySelector('button[type="submit"]');
-  btn.disabled = true;
+  if (sendToggle) sendToggle.disabled = true;
   message.disabled = true;
+  // Snapshot attached files and their preview URLs so we can render the
+  // images inline in the chat feed before sending them to the server.
+  const imagePayload = selectedFiles.map((file) => ({
+    src: URL.createObjectURL(file),
+    alt: file.name,
+  }));
   try {
     clearActivity();
-    addMessage(text, 'user');
+    addMessage(text, 'user', {images: imagePayload});
     setThinking(true);
     message.value = '';
     const idempotencyKey = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -650,25 +688,49 @@ chatForm.addEventListener('submit', async event => {
     addMessage(error.message, 'error');
     setThinking(false);
   } finally {
-    btn.disabled = false;
+    if (sendToggle) sendToggle.disabled = false;
     message.disabled = false;
     message.focus();
   }
 });
 
-stopButton.addEventListener('click', async () => {
+sendToggle?.addEventListener('click', async () => {
+  // Single button toggles between Send and Stop based on agent state.
+  if (sendToggle.dataset.mode === 'stop') {
+    if (!currentProject) return;
+    sendToggle.disabled = true;
+    try {
+      await api('/api/stop', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({project: currentProject}),
+      });
+    } catch (error) {
+      addMessage(error.message, 'error');
+    } finally {
+      sendToggle.disabled = false;
+    }
+    return;
+  }
+  chatForm.dispatchEvent(new Event('submit'));
+});
+
+resetButton.addEventListener('click', async () => {
   if (!currentProject) return;
-  stopButton.disabled = true;
+  const proceed = window.confirm(
+    'Reset the AI\u2019s conversation memory for this project?\n\nThe model, preview, and revisions are kept. The next message starts a fresh context.'
+  );
+  if (!proceed) return;
+  resetButton.disabled = true;
   try {
-    await api('/api/stop', {
+    await api(`/api/projects/${encodeURIComponent(currentProject)}/reset`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({project: currentProject}),
     });
   } catch (error) {
     addMessage(error.message, 'error');
   } finally {
-    stopButton.disabled = false;
+    resetButton.disabled = false;
   }
 });
 
@@ -1180,6 +1242,36 @@ function connectStream() {
     // converges to the persisted conversation, project state, and preview.
     syncAfterStreamReset().catch(err => console.error('stream_reset sync failed', err));
   });
+
+  eventSource.addEventListener('conversation_reset', event => {
+    // The backend cleared this project's conversation.jsonl. The model and
+    // preview are unchanged, but the chat feed (and the history drawer if
+    // open) must drop everything so the next turn starts on an empty canvas.
+    try {
+      const data = JSON.parse(event.data);
+      if (!data || data.project !== currentProject) return;
+      applyConversationReset();
+    } catch {}
+  });
+}
+
+function applyConversationReset() {
+  // Wipe the main feed, dismiss any pending question, and clear activity so
+  // the UI matches the freshly truncated conversation.jsonl. The drawer is
+  // refreshed lazily the next time it is opened.
+  clearActivity();
+  feed.replaceChildren();
+  questionArea.replaceChildren();
+  const emptyTpl = document.querySelector('#chat-empty');
+  if (emptyTpl) feed.appendChild(emptyTpl.content.cloneNode(true));
+  else {
+    const empty = document.createElement('div');
+    empty.className = 'empty-state';
+    empty.textContent = `Project "${currentProject}" selected. Describe a part to begin.`;
+    feed.appendChild(empty);
+  }
+  historyContent.replaceChildren();
+  setThinking(false);
 }
 
 // Populate the chat input with the text of an example-prompt button. Uses

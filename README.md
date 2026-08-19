@@ -138,7 +138,6 @@ Each project is stored below `workspace_root`. Its important files are:
 | Path | Purpose |
 |---|---|
 | `model.py` | Active build123d source; its top-level `result` is the final shape |
-| `summary.md` | Agent-maintained design summary after a verified build |
 | `preview.stl` / `render.png` | Latest generated browser preview assets |
 | `.cad-agent/reviews/<model_sha>/` | Per-revision multi-view artifacts (`manifest.json`, `views/*.png`, `review-sheet.png`); `result.json` is added when `cad_review` runs |
 | `conversation.jsonl` | Persisted chat and tool-event history |

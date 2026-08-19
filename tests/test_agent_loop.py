@@ -33,7 +33,7 @@ class FakeOpenRouterClient:
                                         "name": "write_file",
                                         "arguments": json.dumps(
                                             {
-                                                "filename": "summary.md",
+                                                "filename": "model.py",
                                                 "content": "# Confirmed\n",
                                             }
                                         ),
@@ -185,7 +185,7 @@ class MultiToolCadClient:
                                     "id": "file-1",
                                     "function": {
                                         "name": "read_file",
-                                        "arguments": '{"filename":"summary.md"}',
+                                        "arguments": '{"filename":"model.py"}',
                                     },
                                 },
                             ],
@@ -267,7 +267,7 @@ def test_agent_does_not_complete_without_a_new_drawing(tmp_path: Path, monkeypat
 
     runner._run("demo", "Make a bracket")
 
-    assert (project_dir / "summary.md").read_text(encoding="utf-8") == "# Confirmed\n"
+    assert (project_dir / "model.py").read_text(encoding="utf-8") == "# Confirmed\n"
     assert not any(kind == "agent_message" for kind, _data in events)
     assert any(
         kind == "agent_error" and "did not produce a new CAD preview" in data["message"]
@@ -549,21 +549,21 @@ def test_tool_schemas_expose_only_three_file_tools():
 
 
 def test_agent_loop_runs_read_file_then_edit_file(tmp_path: Path):
-    """A complete read_file → edit_file round-trip on summary.md must mutate
-    the file, commit a revision on model.py, and surface a structured
-    successful envelope on both calls.
+    """A complete read_file → edit_file round-trip on model.py must mutate
+    the file, commit a revision, and surface a structured successful
+    envelope on both calls.
     """
     project = tmp_path / "demo"
     project.mkdir()
-    summary = project / "summary.md"
-    summary.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+    model = project / "model.py"
+    model.write_text("# alpha\n# beta\n# gamma\n", encoding="utf-8")
 
     runner = AgentRunner(
         Settings(tmp_path, "https://example.test", "test", 1, "127.0.0.1", 5000),
         lambda *_, **__: None,
     )
 
-    digest = hashlib.sha256(summary.read_bytes()).hexdigest()
+    digest = hashlib.sha256(model.read_bytes()).hexdigest()
     messages = []
 
     runner._process_tool_call(
@@ -576,9 +576,9 @@ def test_agent_loop_runs_read_file_then_edit_file(tmp_path: Path):
                 "name": "edit_file",
                 "arguments": json.dumps(
                     {
-                        "filename": "summary.md",
-                        "old_string": "beta",
-                        "new_string": "B",
+                        "filename": "model.py",
+                        "old_string": "# beta",
+                        "new_string": "# B",
                         "expected_sha256": digest,
                     }
                 ),
@@ -593,24 +593,24 @@ def test_agent_loop_runs_read_file_then_edit_file(tmp_path: Path):
     payload = json.loads(messages[-1]["content"])
     assert payload["ok"] is True
     assert payload["tool"] == "edit_file"
-    assert summary.read_text(encoding="utf-8") == "alpha\nB\ngamma\n"
+    assert model.read_text(encoding="utf-8") == "# alpha\n# B\n# gamma\n"
 
 
 def test_agent_loop_runs_read_file_then_write_file(tmp_path: Path):
-    """A complete read_file → write_file round-trip on summary.md must
+    """A complete read_file → write_file round-trip on model.py must
     overwrite the file when the digest matches.
     """
     project = tmp_path / "demo"
     project.mkdir()
-    summary = project / "summary.md"
-    summary.write_text("alpha\n", encoding="utf-8")
+    model = project / "model.py"
+    model.write_text("# alpha\n", encoding="utf-8")
 
     runner = AgentRunner(
         Settings(tmp_path, "https://example.test", "test", 1, "127.0.0.1", 5000),
         lambda *_, **__: None,
     )
 
-    digest = hashlib.sha256(summary.read_bytes()).hexdigest()
+    digest = hashlib.sha256(model.read_bytes()).hexdigest()
     messages = []
 
     runner._process_tool_call(
@@ -623,8 +623,8 @@ def test_agent_loop_runs_read_file_then_write_file(tmp_path: Path):
                 "name": "write_file",
                 "arguments": json.dumps(
                     {
-                        "filename": "summary.md",
-                        "content": "replaced\n",
+                        "filename": "model.py",
+                        "content": "# replaced\n",
                         "expected_sha256": digest,
                     }
                 ),
@@ -639,13 +639,13 @@ def test_agent_loop_runs_read_file_then_write_file(tmp_path: Path):
     payload = json.loads(messages[-1]["content"])
     assert payload["ok"] is True
     assert payload["tool"] == "write_file"
-    assert summary.read_text(encoding="utf-8") == "replaced\n"
+    assert model.read_text(encoding="utf-8") == "# replaced\n"
 
 
 def test_successful_tool_result_uses_structured_envelope(tmp_path: Path):
     project = tmp_path / "demo"
     project.mkdir()
-    (project / "summary.md").write_text("# Ready\n", encoding="utf-8")
+    (project / "model.py").write_text("# Ready\n", encoding="utf-8")
     runner = AgentRunner(
         Settings(tmp_path, "https://example.test", "test", 1, "127.0.0.1", 5000),
         lambda *_, **__: None,
@@ -655,7 +655,7 @@ def test_successful_tool_result_uses_structured_envelope(tmp_path: Path):
         "id": "read-1",
         "function": {
             "name": "read_file",
-            "arguments": '{"filename":"summary.md"}',
+            "arguments": '{"filename":"model.py"}',
         },
     }
 
@@ -691,7 +691,7 @@ def test_missing_tool_argument_returns_structured_validation_error(tmp_path: Pat
         "id": "edit-1",
         "function": {
             "name": "edit_file",
-            "arguments": '{"filename":"summary.md","old_string":"x"}',
+            "arguments": '{"filename":"model.py","old_string":"x"}',
         },
     }
 
@@ -802,11 +802,13 @@ def test_protocol_history_is_append_only_and_preserves_tool_call_content(
 
     assert messages[0]["role"] == "system"
     assert messages[1]["role"] == "user"
-    assert "model.py does not exist" in messages[1]["content"]
+    assert "model.py exists" in messages[1]["content"]
     assert [message["role"] for message in messages[2:]] == [
         "user",
         "assistant",
         "tool",
+        "assistant",
+        "user",
         "assistant",
         "user",
     ]

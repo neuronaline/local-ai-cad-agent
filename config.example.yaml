@@ -47,3 +47,21 @@ review:
   enabled: true
   render_workers: 4
   required_views: 8
+
+# 3D preview viewer settings. ``viewer.grid.extent`` controls the ground grid
+# in the Three.js preview viewport. Format is ``width x depth x divisions``
+# (mm × mm × cell count) — for example, ``256x256x256`` renders a 256 mm by
+# 256 mm grid with 256 divisions per side (1 mm cells). Single- and
+# two-number strings are accepted too and default the missing pieces; you
+# can also pass the keys explicitly:
+#   viewer:
+#     grid:
+#       extent:
+#         width: 256
+#         depth: 256
+#         divisions: 256
+# Models whose bounding box exceeds the configured grid surface will show
+# a warning in the preview header.
+viewer:
+  grid:
+    extent: 200x200x20
