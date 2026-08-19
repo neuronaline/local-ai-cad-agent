@@ -70,7 +70,7 @@ class EventBus:
         self.app = app
         self._subscribers: list[queue.Queue[dict[str, Any] | None]] = []
         self._lock = threading.Lock()
-        self._history_lock = threading.Lock()
+        self._history_lock = threading.RLock()
 
     def _workspace_root(self) -> Path:
         if self.app is not None:

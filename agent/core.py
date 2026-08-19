@@ -852,5 +852,9 @@ class AgentRunner:
             "role": role,
             "content": content,
         }
-        with (project_dir / "conversation.jsonl").open("a", encoding="utf-8") as log:
-            log.write(json.dumps(item, ensure_ascii=False) + "\n")
+        # Route through ``ConversationStore.append`` so the canonical write
+        # path holds ``shared_history_lock`` and invalidates the cache. The
+        # previous direct ``open(..., "a")`` shortcut interleaved bytes with
+        # concurrent canonical writes and left the in-memory cache stale,
+        # which then dropped the question-log line on the next history load.
+        ConversationStore.append(project_dir, item)

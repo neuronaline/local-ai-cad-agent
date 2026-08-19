@@ -26,12 +26,29 @@ class RequestCancelled(RuntimeError):
 
 
 def sanitize_assistant_message(message: dict[str, Any]) -> dict[str, Any]:
-    """Copy a model response while retaining standard content and tool fields."""
+    """Copy a model response while retaining standard content and tool fields.
+
+    Only the canonical Chat Completions fields are kept so the persisted
+    record round-trips cleanly. Anything else the provider returns
+    (``audio``, ``function_call``, ``refusal``, ``annotations``, ``logprobs``,
+    ``name``, vendor-specific blobs, …) is dropped; otherwise the persisted
+    record cannot be compared with the canonical ``{"role", "content"}``
+    shape that ``AgentRunner._complete`` writes when it needs to re-append
+    the final assistant turn, and a duplicate assistant entry would be
+    emitted on the next history load.
+    """
     sanitized = deepcopy(message)
     sanitized.pop("reasoning", None)
     sanitized.pop("reasoning_details", None)
     for key in list(sanitized):
         if key.startswith("_"):
+            sanitized.pop(key, None)
+    # Drop any non-canonical field. Anything not in this whitelist is
+    # provider-specific metadata that the canonical assistant record
+    # (and the LLM context) does not carry.
+    allowed = {"role", "content", "tool_calls"}
+    for key in list(sanitized):
+        if key not in allowed:
             sanitized.pop(key, None)
     return sanitized
 
