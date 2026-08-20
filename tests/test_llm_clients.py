@@ -314,6 +314,146 @@ def test_openai_endpoint_uses_configured_base_url(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Tool-message image relocation (OpenAI spec compliance)
+# ---------------------------------------------------------------------------
+
+
+def test_relocate_tool_images_moves_image_url_parts_to_user_message():
+    """Multimodal tool messages are rejected by both OpenAI and Gemini because
+    the Chat Completions spec only permits ``image_url`` in user messages.
+    ``relocate_tool_images`` must move the image parts into a trailing user
+    turn so the model still sees the visuals without violating the spec."""
+    from agent.llm_base import relocate_tool_images
+
+    image = {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,AAA"},
+    }
+    messages = [
+        {"role": "user", "content": "build a bracket"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "cad_build_and_verify", "arguments": "{}"}}
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "c1",
+            "content": [
+                {"type": "text", "text": "build ok"},
+                image,
+            ],
+        },
+    ]
+
+    relocated = relocate_tool_images(messages)
+
+    assert len(relocated) == 4
+    # The tool message keeps its text but loses the image parts.
+    tool = relocated[2]
+    assert tool["role"] == "tool"
+    assert tool["tool_call_id"] == "c1"
+    assert tool["content"] == [{"type": "text", "text": "build ok"}]
+    # The trailing user turn carries the relocated image.
+    follow_up = relocated[3]
+    assert follow_up["role"] == "user"
+    assert isinstance(follow_up["content"], list)
+    assert follow_up["content"][0]["type"] == "text"
+    # Image parts must be deep-copied, not shared with the original list.
+    assert follow_up["content"][1] == image
+    assert follow_up["content"][1] is not image
+    # The original tool message content is untouched in the caller's buffer.
+    assert messages[2]["content"][1] is image
+
+
+def test_relocate_tool_images_passes_text_only_tool_messages_through():
+    from agent.llm_base import relocate_tool_images
+
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "tool", "tool_call_id": "c1", "content": "no images here"},
+    ]
+    assert relocate_tool_images(messages) is not messages
+    assert relocate_tool_images(messages) == messages
+
+
+def test_relocate_tool_images_handles_image_only_tool_messages():
+    from agent.llm_base import relocate_tool_images
+
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}}
+    messages = [{"role": "tool", "tool_call_id": "c1", "content": [image]}]
+
+    relocated = relocate_tool_images(messages)
+    assert relocated[0]["role"] == "tool"
+    # With no text parts left, fall back to a deterministic placeholder so
+    # the tool message is never empty.
+    assert relocated[0]["content"] == "An attached image was unavailable."
+    assert relocated[1]["role"] == "user"
+    assert relocated[1]["content"][1] == image
+
+
+def test_sanitize_messages_removes_image_url_from_tool_messages(tmp_path, monkeypatch):
+    """End-to-end: ``OpenAIClient.chat`` must not POST a payload where any
+    ``tool`` message still contains ``image_url`` parts."""
+    from agent.llm_base import sanitize_messages
+
+    captured: dict[str, Any] = {}
+    monkeypatch.setenv("OPENAI_API_KEY", "test")
+    _capture_post(monkeypatch, "agent.llm_base.requests.post", captured, _EmptyResponse)
+    settings = _settings(tmp_path, "openai")
+    client = OpenAIClient(settings)
+
+    messages = sanitize_messages(
+        [
+            {"role": "user", "content": "build a bracket"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "cad_build_and_verify", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "content": [
+                    {"type": "text", "text": "ok"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,AAA"},
+                    },
+                ],
+            },
+        ]
+    )
+    client.chat(messages)
+
+    sent = captured["json"]["messages"]
+    for message in sent:
+        if message["role"] != "tool":
+            continue
+        content = message["content"]
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            assert not (
+                isinstance(part, dict) and part.get("type") == "image_url"
+            ), f"tool message still carries image_url: {message!r}"
+    # The trailing image parts must end up in a user-role message.
+    assert sent[-1]["role"] == "user"
+    assert any(
+        isinstance(part, dict) and part.get("type") == "image_url"
+        for part in sent[-1]["content"]
+    )
+
+
+# ---------------------------------------------------------------------------
 # OpenRouter-specific behavior
 # ---------------------------------------------------------------------------
 

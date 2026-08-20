@@ -77,7 +77,76 @@ def sanitize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if message.get("role") != "assistant":
             continue
         sanitized[index] = sanitize_assistant_message(message)
-    return sanitized
+    return relocate_tool_images(sanitized)
+
+
+def relocate_tool_images(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Move ``image_url`` parts out of ``tool`` messages into user messages.
+
+    The OpenAI Chat Completions spec (and the providers that implement it,
+    including OpenAI itself and Google Vertex's Gemini) only permits
+    ``image_url`` content parts inside messages with ``role: user``. Tool-role
+    messages carrying inline images are rejected:
+
+    * OpenAI: ``Image URLs are only allowed for messages with role 'user',
+      but this message with role 'tool' contains an image URL.``
+    * Google Vertex (Gemini): ``Requests ending with a model turn are not
+      supported.`` when the trailing tool message contains image parts.
+
+    ``cad_build_and_verify`` previously attached the rendered PNG/STL to the
+    tool message so the agent could inspect the build in-band. To preserve
+    that contract we relocate the image parts into a trailing user message
+    that re-states the tool result; the conversation still ends on a user
+    turn, the model still sees the visuals, and the persisted JSONL form is
+    untouched (the history redactor already collapses inline images to
+    placeholders on subsequent loads).
+    """
+    relocated: list[dict[str, Any]] = []
+    for message in messages:
+        role = message.get("role")
+        content = message.get("content")
+        if (
+            role != "tool"
+            or not isinstance(content, list)
+            or not any(
+                isinstance(part, dict) and part.get("type") == "image_url"
+                for part in content
+            )
+        ):
+            relocated.append(message)
+            continue
+        text_parts = [
+            part
+            for part in content
+            if not (isinstance(part, dict) and part.get("type") == "image_url")
+        ]
+        image_parts = [
+            part
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "image_url"
+        ]
+        tool_copy = deepcopy(message)
+        tool_copy["content"] = text_parts or "An attached image was unavailable."
+        relocated.append(tool_copy)
+        relocated.append(
+            {
+                "role": "user",
+                "content": (
+                    [
+                        {
+                            "type": "text",
+                            "text": (
+                                "The image(s) above are the artifacts returned "
+                                "by your most recent tool call. Inspect them and "
+                                "continue the task."
+                            ),
+                        }
+                    ]
+                    + [deepcopy(part) for part in image_parts]
+                ),
+            }
+        )
+    return relocated
 
 
 def without_images(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
