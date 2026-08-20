@@ -13,6 +13,7 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 
+from agent.activity_log import ActivityLogger
 from agent.tool_results import build_cad_build_multimodal_content, compact_for_context
 from agent.tool_results import failure as tool_failure
 from agent.tool_results import success as tool_success
@@ -183,6 +184,8 @@ def process_tool_call(
     register_preview: Callable[[str, Path], str],
     append_message: Callable[[Path, dict], None],
     debug_log: Callable[[Path, str, str, Exception, str], None] | None = None,
+    activity_logger: ActivityLogger | None = None,
+    run_id: str | None = None,
 ) -> tuple[str | None, str | None, bool, bool]:
     """Execute a single tool call, update state, return ``(preview, error,
     fix_required, waiting)``.
@@ -216,6 +219,17 @@ def process_tool_call(
             "arguments": arguments,
         }
         publish("tool_status", {**tool_event, "status": "running"})
+        if activity_logger is not None:
+            activity_logger.log(
+                "tool_call_start",
+                {
+                    "project": project,
+                    "call_id": call_id,
+                    "tool": name,
+                    "arguments": arguments,
+                },
+                run_id=run_id,
+            )
         if is_cad_build(name, arguments):
             preview_id = None
         raw_result, waiting = dispatch(tools, project, name, arguments, call_id)
@@ -235,6 +249,17 @@ def process_tool_call(
             "tool_status",
             {**tool_event, "status": "completed", "result": result},
         )
+        if activity_logger is not None:
+            activity_logger.log(
+                "tool_call_result",
+                {
+                    "project": project,
+                    "call_id": call_id,
+                    "tool": name,
+                    "result": result,
+                },
+                run_id=run_id,
+            )
     except Exception as error:  # noqa: BLE001 - Tool errors are useful LLM context.
         result, waiting = tool_failure(name, error), False
         if debug_log is not None:
@@ -254,6 +279,18 @@ def process_tool_call(
                 "result": result,
             },
         )
+        if activity_logger is not None:
+            activity_logger.log(
+                "tool_call_result",
+                {
+                    "project": project,
+                    "call_id": call_id,
+                    "tool": name,
+                    "result": result,
+                    "error": True,
+                },
+                run_id=run_id,
+            )
     context_result = compact_for_context(name, result)
     context_content: str | list = context_result
     image_paths: list[Path] = []

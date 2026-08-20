@@ -392,6 +392,11 @@ class ChatCompletionsClient:
         self.stream_callback = None
         self.require_images = False
         self._provider_label = provider_label
+        # Optional activity-log hook. The agent runner wires this when
+        # ``agent.log_tool_activity`` is enabled; ``None`` keeps the wire
+        # path inert for tests and review sub-sessions that do not log.
+        self._activity_logger = None
+        self._run_id: str | None = None
 
     def _endpoint(self) -> str:  # pragma: no cover — overridden by subclass
         raise NotImplementedError
@@ -436,12 +441,34 @@ class ChatCompletionsClient:
             raise RuntimeError(f"{api_key_env(self._provider_label.lower())} is not configured.")
         payload = self._build_payload(messages, tools)
         headers = self._build_headers(api_key)
+        # Capture the request body once; ``payload`` is mutated by the
+        # image-fallback path so we deep-copy the original shape to keep
+        # the log independent of subsequent retry mutations.
+        log_payload = self._activity_logger is not None
+        request_snapshot = (
+            {
+                "url": self._endpoint(),
+                "model": payload.get("model"),
+                "headers": dict(headers),
+                "payload": deepcopy(payload),
+            }
+            if log_payload
+            else None
+        )
 
         image_fallback_used = False
         for attempt in range(3):
             response: requests.Response | None = None
             try:
                 response = self._post(payload, headers)
+            except RequestCancelled:
+                if log_payload:
+                    self._activity_logger.log(
+                        "llm_cancelled",
+                        {"attempt": attempt, "model": payload.get("model")},
+                        run_id=getattr(self, "_run_id", None),
+                    )
+                raise
             except Exception:
                 if attempt == 2:
                     raise
@@ -459,6 +486,12 @@ class ChatCompletionsClient:
                         )
                     if self._try_image_fallback(payload, response):
                         image_fallback_used = True
+                        if log_payload:
+                            self._activity_logger.log(
+                                "llm_visual_fallback",
+                                {"attempt": attempt, "model": payload.get("model")},
+                                run_id=getattr(self, "_run_id", None),
+                            )
                         continue
                     body_preview = ""
                     try:
@@ -469,11 +502,34 @@ class ChatCompletionsClient:
                         raise RuntimeError(f"{self._provider_label} {response.status_code}: {body_preview}")
                 if response.status_code not in {408, 429} and response.status_code < 500:
                     response.raise_for_status()
+                    if log_payload:
+                        self._activity_logger.log(
+                            "llm_request",
+                            {
+                                "attempt": attempt,
+                                "url": request_snapshot["url"],
+                                "model": request_snapshot["model"],
+                                "headers": request_snapshot["headers"],
+                                "payload": request_snapshot["payload"],
+                                "status": response.status_code,
+                            },
+                            run_id=getattr(self, "_run_id", None),
+                        )
                     if hasattr(response, "iter_lines"):
                         return self._stream_response(response)
                     body = response.json()
                     self.last_usage = body.get("usage") if isinstance(body.get("usage"), dict) else None
                     return body
+                if log_payload:
+                    self._activity_logger.log(
+                        "llm_retry",
+                        {
+                            "attempt": attempt,
+                            "status": response.status_code,
+                            "model": payload.get("model"),
+                        },
+                        run_id=getattr(self, "_run_id", None),
+                    )
                 if attempt == 2:
                     response.raise_for_status()
             finally:

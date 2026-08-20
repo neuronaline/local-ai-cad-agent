@@ -687,3 +687,63 @@ def test_supported_providers_routing_is_consistent_with_settings(tmp_path: Path)
         # always be populated regardless of provider).
         assert settings.llm_model
         assert isinstance(settings.llm_model, str)
+
+
+# ---------------------------------------------------------------------------
+# Activity log integration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("kind", _CLIENT_KINDS)
+def test_llm_request_log_preserves_original_payload_after_image_fallback(
+    monkeypatch, tmp_path, kind
+):
+    """The activity-log snapshot is captured before image-fallback mutates
+    the payload, so ``llm_request`` reflects the *original* request even
+    when the retry ships a stripped payload to the provider.
+    """
+    from agent.activity_log import ActivityLogger
+
+    monkeypatch.setenv("OPENAI_API_KEY" if kind == "openai" else "OPENROUTER_API_KEY", "test")
+    payloads: list[dict[str, Any]] = []
+
+    def post(*_a, **kwargs):
+        payloads.append(kwargs["json"])
+        return _ImageRejectedResponse() if len(payloads) == 1 else _StreamingResponse()
+
+    _patch_post_for(monkeypatch, kind, post)
+    settings = _settings(
+        tmp_path, kind,
+        openrouter_model="text-only-model",
+        openai_model="text-only-model",
+    )
+    logger = ActivityLogger(tmp_path)
+    client = _client_for(kind, settings)
+    client._activity_logger = logger
+    client._run_id = "run-snapshot"
+
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Review this render."},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+        ],
+    }]
+
+    client.chat(messages)
+
+    request_entries = [
+        entry for entry in logger.tail(limit=10) if entry["event"] == "llm_request"
+    ]
+    assert len(request_entries) == 1
+    logged_payload = request_entries[0]["data"]["payload"]
+    # The original content (text + image) must survive in the log even
+    # though the second ``requests.post`` call shipped only the text part.
+    logged_content = logged_payload["messages"][0]["content"]
+    assert isinstance(logged_content, list)
+    assert {"type": "text", "text": "Review this render."} in logged_content
+    image_parts = [part for part in logged_content if part.get("type") == "image_url"]
+    assert image_parts, "activity log dropped the original image_url part"
+    assert payloads[1]["messages"][0]["content"] == [
+        {"type": "text", "text": "Review this render."}
+    ]

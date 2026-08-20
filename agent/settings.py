@@ -40,6 +40,12 @@ class Settings:
     agent_tool_call_limit: int = 12
     revision_retention_count: int = 0  # 0 = unlimited, >0 = keep at most N revisions
     agent_debug_log_tool_errors: bool = False
+    # When True, every agent run writes a redacted, append-only JSONL
+    # trace of the tool loop (LLM requests, SSE chunks, tool calls, sandbox
+    # subprocess I/O) to ``<project>/.cad-agent/activity.jsonl``. Off by
+    # default; only enable when debugging model behaviour or wire-level
+    # provider errors because the log can grow quickly.
+    agent_log_tool_activity: bool = False
     # ── Review rendering settings (used by cad_build_and_verify, cad_screenshot) ──
     # ``review_enabled`` is preserved for the existing ``cad_build_and_verify``
     # contract: when False the build skips the canonical eight-view rasteriser
@@ -207,6 +213,9 @@ def load_settings(project_root: Path | None = None) -> Settings:
         revision_retention_count=_non_negative_int(agent.get("revision_retention_count", 0), "agent.revision_retention_count"),
         agent_debug_log_tool_errors=_strict_bool(
             agent.get("debug_log_tool_errors", False), "agent.debug_log_tool_errors"
+        ),
+        agent_log_tool_activity=_strict_bool(
+            agent.get("log_tool_activity", False), "agent.log_tool_activity"
         ),
         review_enabled=_strict_bool(review.get("enabled", True), "review.enabled"),
         review_render_workers=_positive_int(

@@ -114,6 +114,7 @@ per-user configuration file.
 | `agent.tool_call_limit` | `30` | Maximum tool rounds per task |
 | `agent.revision_retention_count` | `0` | Model revisions to retain (`0` keeps all) |
 | `agent.debug_log_tool_errors` | `false` | Write detailed recoverable tool failures to `<project>/debug-errors.jsonl` |
+| `agent.log_tool_activity` | `false` | Write a redacted, append-only JSONL trace of the tool loop (LLM requests, SSE deltas, tool calls) to `<project>/.cad-agent/activity.jsonl` |
 | `openrouter.model` | `google/gemini-3.6-flash` | OpenRouter model slug |
 | `openrouter.timeout_seconds` | `60` | Request timeout for OpenRouter |
 | `openrouter.reasoning_effort` | `medium` | `minimal`, `low`, `medium`, or `high` (when supported by the model) |

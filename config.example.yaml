@@ -5,6 +5,7 @@ agent:
   tool_call_limit: 30
   revision_retention_count: 0  # 0 keeps all model revisions
   debug_log_tool_errors: false  # Writes recoverable failures to <project>/debug-errors.jsonl
+  log_tool_activity: false  # Writes raw tool-loop trace to <project>/.cad-agent/activity.jsonl
 
 # LLM provider selection. Set ``provider`` to either ``openrouter`` or
 # ``openai``; the matching namespace below supplies its model + endpoint.

@@ -17,6 +17,8 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
+from agent.activity_log import ActivityLogger, get_logger
+from agent.activity_log import is_enabled as activity_logging_enabled
 from agent.conversation import (
     ConversationStore,
     shared_history_lock,
@@ -132,6 +134,12 @@ class AgentRunner:
         self._thread: threading.Thread | None = None
         self._active_tools: ProjectTools | None = None
         self._active_project: str | None = None
+        # Per-run activity-log handles. ``_run()`` assigns these when the
+        # operator enabled ``agent.log_tool_activity`` and clears them in
+        # its ``finally`` block; initialising to ``None`` keeps ``getattr``
+        # out of the hot path for tests and disabled runs.
+        self._active_activity_logger: ActivityLogger | None = None
+        self._active_run_id: str | None = None
         self._lock = threading.Lock()
         self._history_lock: threading.Lock = history_lock or threading.Lock()
         self._waiting_questions: dict[str, dict[str, object]] = {}
@@ -295,6 +303,31 @@ class AgentRunner:
                 else self.settings.llm_provider
             )
             client.session_id = f"{session_prefix}:{project}"
+            # Wire the activity logger when the operator enabled
+            # ``agent.log_tool_activity``. The logger is opt-in so default
+            # runs keep the same on-disk footprint; tests and reviewers
+            # leave it ``None`` and the wire path becomes a no-op.
+            activity_logger: ActivityLogger | None = None
+            run_id = uuid.uuid4().hex
+            if activity_logging_enabled(self.settings):
+                activity_logger = get_logger(project_dir)
+                client._activity_logger = activity_logger
+                client._run_id = run_id
+                # Stash on the runner so the per-call dispatcher wrapper
+                # can read the logger without re-deriving it. Both
+                # attributes are reset in ``finally`` to keep a stale
+                # logger from leaking across runs.
+                self._active_activity_logger = activity_logger
+                self._active_run_id = run_id
+                activity_logger.log(
+                    "run_start",
+                    {
+                        "project": project,
+                        "model": self.settings.llm_model,
+                        "provider": self.settings.llm_provider,
+                    },
+                    run_id=run_id,
+                )
             for _ in range(self.settings.agent_tool_call_limit):
                 if self._stop_event.is_set():
                     self.publish(
@@ -317,6 +350,16 @@ class AgentRunner:
                         f"agent_{event_type}_delta",
                         {"project": project, "message_id": current_message_id, **event},
                     )
+                    if activity_logger is not None:
+                        # Record the raw delta so the activity log mirrors
+                        # the SSE stream the UI consumes. Payloads are tiny
+                        # text fragments; the redact step is a no-op here
+                        # but kept consistent with the rest of the logger.
+                        activity_logger.log(
+                            f"agent_{event_type}_delta",
+                            {"message_id": current_message_id, **event},
+                            run_id=run_id,
+                        )
 
                 client.stream_callback = publish_stream
                 response = client.chat(messages, TOOL_SCHEMAS)
@@ -492,6 +535,14 @@ class AgentRunner:
                 # subsequent start/answer() never observes a stale _thread.
                 self._thread = None
                 self._run_complete.set()
+            self._active_activity_logger = None
+            self._active_run_id = None
+            if activity_logger is not None:
+                activity_logger.log(
+                    "run_end",
+                    {"project": project, "cancelled": self._stop_event.is_set()},
+                    run_id=run_id,
+                )
 
     # ------------------------------------------------------------------ context
 
@@ -643,6 +694,8 @@ class AgentRunner:
             register_preview=self._register_preview,
             append_message=self._append_message,
             debug_log=self._debug_tool_error,
+            activity_logger=self._active_activity_logger,
+            run_id=self._active_run_id,
         )
 
     @classmethod

@@ -992,6 +992,106 @@ def test_debug_error_log_records_recoverable_tool_failures(tmp_path: Path):
     assert record["classification"]["code"] == "VALIDATION_ERROR"
 
 
+def test_activity_log_records_tool_call_start_and_result(tmp_path: Path):
+    """Enabling ``agent_log_tool_activity`` writes tool-call events to the
+    per-project activity log when ``_process_tool_call`` runs."""
+    from agent.activity_log import ActivityLogger
+
+    project_root = tmp_path / "projects"
+    project = project_root / "demo"
+    project.mkdir(parents=True)
+    settings = Settings(
+        project_root,
+        "https://example.test",
+        "test",
+        1,
+        "127.0.0.1",
+        5000,
+        agent_log_tool_activity=True,
+    )
+    runner = AgentRunner(settings, lambda *_, **__: None)
+    tools = ProjectTools(project, lambda *_, **__: None, settings)
+    logger = ActivityLogger(project)
+    runner._active_activity_logger = logger
+    runner._active_run_id = "run-test"
+    call = {
+        "id": "call-1",
+        "function": {
+            "name": "read_file",
+            "arguments": json.dumps({"filename": "model.py"}),
+        },
+    }
+    messages: list[dict] = []
+
+    # ``read_file`` may legitimately fail because model.py does not exist
+    # yet — the activity logger still has to record *both* start and
+    # result events regardless of success/failure, so we discard any
+    # exception from the dispatcher.
+    runner._process_tool_call(
+        tools,
+        "demo",
+        project,
+        call,
+        cad_fix_required=True,
+        prev_preview_id=None,
+        cad_error=None,
+        messages=messages,
+    )
+
+    entries = (project / ".cad-agent" / "activity.jsonl").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    events = [json.loads(line) for line in entries]
+    kinds = [entry["event"] for entry in events]
+    assert "tool_call_start" in kinds
+    assert "tool_call_result" in kinds
+    for entry in events:
+        assert entry["run_id"] == "run-test"
+    start = next(e for e in events if e["event"] == "tool_call_start")
+    assert start["data"]["tool"] == "read_file"
+    assert start["data"]["call_id"] == "call-1"
+
+
+def test_activity_log_disabled_by_default_does_not_write(tmp_path: Path):
+    """Without the flag, no activity.jsonl is created."""
+    project_root = tmp_path / "projects"
+    project = project_root / "demo"
+    project.mkdir(parents=True)
+    settings = Settings(
+        project_root,
+        "https://example.test",
+        "test",
+        1,
+        "127.0.0.1",
+        5000,
+    )
+    runner = AgentRunner(settings, lambda *_, **__: None)
+    tools = ProjectTools(project, lambda *_, **__: None, settings)
+    call = {
+        "id": "call-1",
+        "function": {
+            "name": "read_file",
+            "arguments": json.dumps({"filename": "model.py"}),
+        },
+    }
+    messages: list[dict] = []
+
+    # Dispatcher may raise because model.py is absent; the contract we test
+    # is that the absence of the flag suppresses *all* logging.
+    runner._process_tool_call(
+        tools,
+        "demo",
+        project,
+        call,
+        cad_fix_required=True,
+        prev_preview_id=None,
+        cad_error=None,
+        messages=messages,
+    )
+
+    assert not (project / ".cad-agent" / "activity.jsonl").exists()
+
+
 # --------------------------------------------------------------------------- #
 # Review gate integration
 # --------------------------------------------------------------------------- #
