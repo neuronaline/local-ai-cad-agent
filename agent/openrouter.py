@@ -126,6 +126,8 @@ class OpenRouterClient(ChatCompletionsClient):
         }
         if tools:
             payload["tools"] = tools
+        if self.settings.llm_max_completion_tokens:
+            payload["max_completion_tokens"] = self.settings.llm_max_completion_tokens
         self._apply_provider_payload(payload)
         self._apply_gemini_cache_breakpoint(payload)
         return payload

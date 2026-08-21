@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
+
+from PIL import Image, UnidentifiedImageError
 
 from agent.images import as_chat_image
 from agent.revisions import RevisionIntegrityError
@@ -79,7 +82,10 @@ def compact_for_context(tool: str, result: str) -> str:
 
 
 def build_cad_build_multimodal_content(
-    text_result: str, project_dir: Path
+    raw_result: str,
+    project_dir: Path,
+    *,
+    context_result: str | None = None,
 ) -> dict[str, Any] | None:
     """Build a multimodal tool-result payload for a successful ``cad_build_and_verify``.
 
@@ -95,7 +101,7 @@ def build_cad_build_multimodal_content(
     the prose-conversation log can redact them on subsequent loads.
     """
     try:
-        payload = json.loads(text_result)
+        payload = json.loads(raw_result)
     except (TypeError, json.JSONDecodeError):
         return None
     if not isinstance(payload, dict) or payload.get("ok") is not True:
@@ -106,28 +112,77 @@ def build_cad_build_multimodal_content(
     render_rel = data.get("render")
     if not isinstance(render_rel, str) or not render_rel:
         return None
-    preferred = [
-        project_dir / "render.png",
-        project_dir / "preview.stl",
-    ]
-    image_paths: list[Path] = []
-    for candidate in preferred:
-        if candidate.is_file() and candidate.stat().st_size > 0:
-            image_paths.append(candidate)
-    if not image_paths:
+    # Prefer the canonical contact sheet because it contains every rendered
+    # view. Fall back to the single isometric PNG. Never pass preview.stl to
+    # ``as_chat_image``: an STL byte stream labelled ``image/png`` is invalid.
+    candidates: list[tuple[Path, str | None]] = []
+    review_dir = data.get("review")
+    if isinstance(review_dir, str) and review_dir and Path(review_dir).name == review_dir:
+        review_root = project_dir / ".cad-agent" / "reviews" / review_dir
+        candidates.append(
+            (
+                review_root / "review-sheet.png",
+                _manifest_hash(review_root / "manifest.json", "contact_sheet"),
+            )
+        )
+    render_path = Path(render_rel)
+    if render_path.name == render_rel:
+        candidates.append(
+            (
+                project_dir / render_path,
+                _metrics_render_hash(project_dir / ".cad_metrics.json"),
+            )
+        )
+    image_path = next(
+        (path for path, expected in candidates if _is_png(path, expected)), None
+    )
+    if image_path is None:
         return None
     parts: list[dict[str, Any]] = [
-        {"type": "text", "text": text_result},
+        {
+            "type": "text",
+            "text": context_result or compact_for_context("cad_build_and_verify", raw_result),
+        },
     ]
-    for image_path in image_paths:
-        try:
-            parts.append(as_chat_image(image_path))
-        except OSError:
-            continue
-    if len(parts) == 1:
-        # No image attachment survived the read; degrade to plain text.
+    try:
+        parts.append(as_chat_image(image_path))
+    except OSError:
         return None
-    return {"content": parts, "image_paths": image_paths}
+    return {"content": parts, "image_paths": [image_path]}
+
+
+def _is_png(path: Path, expected_sha256: str | None = None) -> bool:
+    """Fully decode PNG evidence and verify its manifest hash when available."""
+    try:
+        raw = path.read_bytes()
+        if expected_sha256 and hashlib.sha256(raw).hexdigest() != expected_sha256:
+            return False
+        with Image.open(path, formats=["PNG"]) as image:
+            image.verify()
+            return image.format == "PNG" and image.width > 0 and image.height > 0
+    except (OSError, UnidentifiedImageError, SyntaxError):
+        return False
+
+
+def _manifest_hash(path: Path, artifact: str) -> str | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    entry = payload.get(artifact) if isinstance(payload, dict) else None
+    value = entry.get("image_sha256") if isinstance(entry, dict) else None
+    return value if isinstance(value, str) and len(value) == 64 else None
+
+
+def _metrics_render_hash(path: Path) -> str | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    manifest = payload.get("review_manifest") if isinstance(payload, dict) else None
+    entry = manifest.get("single_render") if isinstance(manifest, dict) else None
+    value = entry.get("image_sha256") if isinstance(entry, dict) else None
+    return value if isinstance(value, str) and len(value) == 64 else None
 
 
 def _summarize_feature_summary(fs: dict[str, Any]) -> dict[str, Any]:

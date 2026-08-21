@@ -111,6 +111,30 @@ TOOL_SCHEMAS = [
         ["filename", "old_string", "new_string"],
     ),
     _tool(
+        "insert_file",
+        "Insert a new block immediately before or after one exact, uniquely matching short anchor. Use this for substantial feature additions so you do not repeat a large existing block in edit_file.old_string.",
+        {
+            "filename": _FILENAME,
+            "anchor": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Short exact anchor copied from read_file; it must occur once.",
+            },
+            "content": {
+                "type": "string",
+                "minLength": 1,
+                "description": "New content to insert, including intentional newlines.",
+            },
+            "position": {"type": "string", "enum": ["before", "after"]},
+            "expected_sha256": {
+                "type": "string",
+                "minLength": 64,
+                "maxLength": 64,
+            },
+        },
+        ["filename", "anchor", "content", "position"],
+    ),
+    _tool(
         "cad_build_and_verify",
         "Build the latest model.py revision, validate basic geometry, export preview.stl, and (when render=true) rasterise the canonical eight views plus a labelled contact sheet. Does NOT trigger review automatically — call cad_review separately if you want a verdict. Default is render=false: returns only metrics + preview.stl + model_sha256 + preview_sha256 (cheap, cache-friendly). Pass render=true only for the final verification before declaring the task ready.",
         {
@@ -118,6 +142,28 @@ TOOL_SCHEMAS = [
                 "type": "boolean",
                 "default": False,
                 "description": "Generate canonical eight-view rasterisation + contact sheet (true) or skip rendering and return only metrics + preview.stl (false, default). Use false during early iterations; final verification must use true.",
+            },
+            "parameter_checks": {
+                "type": "array",
+                "maxItems": 20,
+                "description": "Final-build checks for explicit numeric parameters defined in model.py. Use these for every user-stated dimension, angle, clearance, or count represented by a named parameter.",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "name": {"type": "string", "minLength": 1},
+                        "minimum": {"type": "number"},
+                        "maximum": {"type": "number"},
+                        "equals": {"type": "number"},
+                        "tolerance": {"type": "number", "minimum": 0},
+                    },
+                    "required": ["name"],
+                    "anyOf": [
+                        {"required": ["minimum"]},
+                        {"required": ["maximum"]},
+                        {"required": ["equals"]},
+                    ],
+                },
             },
         },
         [],

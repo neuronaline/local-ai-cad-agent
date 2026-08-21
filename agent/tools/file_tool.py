@@ -421,3 +421,35 @@ class FileTool:
             f"(replaced lines {start_line}-{end_line} with lines "
             f"{start_line}-{new_end_line})."
         )
+
+    def insert_file(
+        self,
+        filename: str,
+        anchor: str,
+        content: str,
+        position: str,
+        expected_sha256: str | None = None,
+    ) -> str:
+        """Insert content next to one short, exact anchor without replacing it."""
+        if not anchor:
+            raise ValueError("anchor must not be empty.")
+        if not content:
+            raise ValueError("content must not be empty.")
+        if position not in {"before", "after"}:
+            raise ValueError("position must be 'before' or 'after'.")
+        path = self._path(filename)
+        with _file_lock(path):
+            if not path.exists():
+                raise ValueError(f"{filename} does not exist; use write_file to create it.")
+            current = path.read_text(encoding="utf-8")
+            self._validate_expected_sha(filename, current, expected_sha256)
+            matches = current.count(anchor)
+            if matches != 1:
+                raise ValueError(
+                    f"Expected one exact anchor, found {matches}; file was not changed."
+                )
+            replacement = content + anchor if position == "before" else anchor + content
+            updated = current.replace(anchor, replacement, 1)
+            line = current[: current.find(anchor)].count("\n") + 1
+            base = self._write_model(updated, "insert_file")
+        return f"{base} (inserted {position} anchor at line {line})."

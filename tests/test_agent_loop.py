@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import ClassVar
 
 import pytest
+from PIL import Image
 
 from agent.core import AgentRunner, ProjectTools
 from agent.settings import Settings
@@ -531,11 +532,7 @@ def test_tool_schemas_document_side_effects_and_reject_extra_arguments():
     )
 
 
-def test_tool_schemas_expose_only_three_file_tools():
-    """The migration exposes exactly ``read_file``, ``write_file``, and
-    ``edit_file``. Legacy names must no longer appear in the live schema
-    surface the model receives.
-    """
+def test_tool_schemas_expose_safe_file_tools():
     file_tools = {
         schema["function"]["name"]
         for schema in TOOL_SCHEMAS
@@ -545,7 +542,14 @@ def test_tool_schemas_expose_only_three_file_tools():
     assert file_tools == set()
 
     names = {schema["function"]["name"] for schema in TOOL_SCHEMAS}
-    assert {"read_file", "write_file", "edit_file"} <= names
+    assert {"read_file", "write_file", "edit_file", "insert_file"} <= names
+
+    build = next(
+        schema for schema in TOOL_SCHEMAS
+        if schema["function"]["name"] == "cad_build_and_verify"
+    )
+    checks = build["function"]["parameters"]["properties"]["parameter_checks"]
+    assert checks["items"]["additionalProperties"] is False
 
 
 def test_agent_loop_runs_read_file_then_edit_file(tmp_path: Path):
@@ -1116,13 +1120,13 @@ def _seed_pass_build(project: Path) -> dict[str, object]:
     project.mkdir(parents=True, exist_ok=True)
     (project / "model.py").write_text("result = 1\n", encoding="utf-8")
     (project / "preview.stl").write_bytes(b"solid demo\n")
-    render_bytes = b"\x89PNG\r\n\x1a\n render"
-    (project / "render.png").write_bytes(render_bytes)
+    Image.new("RGB", (2, 2), "white").save(project / "render.png")
+    render_bytes = (project / "render.png").read_bytes()
     (project / "conversation.jsonl").write_text("", encoding="utf-8")
     review_root = project / ".cad-agent" / "reviews" / ("a" * 64)
     review_root.mkdir(parents=True)
-    sheet_bytes = b"\x89PNG\r\n\x1a\n sheet"
-    (review_root / "review-sheet.png").write_bytes(sheet_bytes)
+    Image.new("RGB", (4, 2), "white").save(review_root / "review-sheet.png")
+    sheet_bytes = (review_root / "review-sheet.png").read_bytes()
     return {
         "metrics": {"solid_count": 1, "is_valid": True, "dimensions_mm": {"x": 1, "y": 1, "z": 1}},
         "feature_summary": {"through_hole_count": 0},
@@ -1371,6 +1375,31 @@ def test_review_gate_respects_cycle_limit(tmp_path: Path, monkeypatch):
     assert review_client.call_count == 0
 
 
+def test_history_truncation_never_starts_with_an_orphan_tool_message():
+    from agent.conversation import ConversationStore
+
+    history = [
+        {"role": "user", "content": "old"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+    ] + [{"role": "user", "content": "latest"}] * 99
+
+    truncated = ConversationStore._truncate(history)
+
+    assert len(truncated) < ConversationStore.MAX_HISTORY
+    assert truncated[0]["role"] != "tool"
+
+
 def test_review_gate_disabled_skips_review_call(tmp_path: Path, monkeypatch):
     """``review_enabled=False`` still skips the canonical eight-view render.
 
@@ -1413,3 +1442,472 @@ def test_review_gate_disabled_skips_review_call(tmp_path: Path, monkeypatch):
     assert error is None
     assert fix_required is False
     assert called["count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Final-verification gate: cad_fix_required is cleared by a successful
+# render=true build whose multimodal content actually attached an image,
+# and stays True otherwise.
+# ---------------------------------------------------------------------------
+
+
+def test_final_verification_clears_when_render_attaches_image(tmp_path: Path):
+    """Happy path: render=true with a real on-disk PNG clears ``cad_fix_required``."""
+    project = tmp_path / "projects" / "demo"
+    payload = _seed_pass_build(project)
+    settings = Settings(
+        tmp_path / "projects", "https://example.test", "test", 1, "127.0.0.1", 5000
+    )
+    runner = AgentRunner(settings, lambda *_, **__: None)
+    tools = ProjectTools(project, lambda *_, **__: None)
+    tools.cad.build_and_verify = lambda render=True, **__: payload
+
+    messages: list[dict] = []
+    # ``cad_fix_required=True`` (as if the model was just edited); a render=true
+    # build with an attached image must reset it to False.
+    preview_id, error, fix_required, _waiting = runner._process_tool_call(
+        tools,
+        "demo",
+        project,
+        {
+            "id": "run-1",
+            "function": {
+                "name": "cad_build_and_verify",
+                "arguments": json.dumps({"render": True}),
+            },
+        },
+        True,
+        None,
+        None,
+        messages,
+    )
+
+    assert preview_id is not None
+    assert error is None
+    assert fix_required is False
+
+
+def test_final_verification_stays_required_when_render_image_missing(tmp_path: Path):
+    """render=true with no decodable PNG must keep ``cad_fix_required=True``.
+
+    The agent must be unable to claim success without inline image evidence.
+    A render that produced no readable artifact (cache miss, corrupt PNG,
+    contact-sheet build failure) is functionally the same as a render=false
+    build from the verification-gate's perspective.
+    """
+    project = tmp_path / "projects" / "demo"
+    project.mkdir(parents=True)
+    (project / "model.py").write_text("result = 1\n", encoding="utf-8")
+    (project / "preview.stl").write_bytes(b"solid demo\n")
+    # Note: no render.png and no .cad-agent/reviews/* — multimodal content
+    # is None, so the verification gate must remain armed.
+    settings = Settings(
+        tmp_path / "projects", "https://example.test", "test", 1, "127.0.0.1", 5000
+    )
+    runner = AgentRunner(settings, lambda *_, **__: None)
+    tools = ProjectTools(project, lambda *_, **__: None)
+    tools.cad.build_and_verify = lambda render=True, **__: {
+        "metrics": {"solid_count": 1, "is_valid": True, "dimensions_mm": {"x": 1, "y": 1, "z": 1}},
+        "feature_summary": {"through_hole_count": 0},
+        "preview": "preview.stl",
+        "render": "render.png" if True else None,
+        "validation_results": [],
+    }
+
+    messages: list[dict] = []
+    preview_id, error, fix_required, _waiting = runner._process_tool_call(
+        tools,
+        "demo",
+        project,
+        {
+            "id": "run-1",
+            "function": {
+                "name": "cad_build_and_verify",
+                "arguments": json.dumps({"render": True}),
+            },
+        },
+        True,
+        None,
+        None,
+        messages,
+    )
+
+    assert preview_id is not None
+    assert error is None
+    assert fix_required is True, (
+        "render=true with no attached image must leave cad_fix_required=True"
+    )
+
+
+def test_final_verification_gate_nudges_then_stops(tmp_path: Path, monkeypatch):
+    """End-to-end: render=true that never attaches an image triggers one
+    nudge, then the agent stops with the documented ``agent_error`` message.
+
+    The agent sees a model.py that needs verification. It calls
+    ``cad_build_and_verify(render=true)``, gets a build that fails to attach
+    any image, and tries to deliver a final answer. The loop nudges once;
+    on the next final-answer attempt, the gate hard-stops.
+    """
+    import agent.core
+    from agent.tools.cad_tool import CadTool
+
+    project_root = tmp_path / "projects"
+    project = project_root / "demo"
+    project.mkdir(parents=True)
+    (project / "model.py").write_text("result = 1\n", encoding="utf-8")
+    (project / "preview.stl").write_bytes(b"solid demo\n")
+    # No render.png on disk and no review dir — multimodal content is None.
+    (project / "conversation.jsonl").write_text("", encoding="utf-8")
+
+    # Replace CadTool.build_and_verify at the class level so the runner's
+    # internal ProjectTools() instance also sees the no-image stub.
+    no_image_payload = {
+        "metrics": {"solid_count": 1, "is_valid": True, "dimensions_mm": {"x": 1, "y": 1, "z": 1}},
+        "feature_summary": {"through_hole_count": 0},
+        "preview": "preview.stl",
+        "render": "render.png",  # claimed, but the file is absent
+        "validation_results": [],
+    }
+
+    def no_image_build_and_verify(self, render=True, parameter_checks=None, **__):
+        return no_image_payload
+
+    monkeypatch.setattr(CadTool, "build_and_verify", no_image_build_and_verify)
+
+    class AlwaysRenderNoImage:
+        """Calls cad_build_and_verify(render=true) twice, then finalises.
+
+        Every cad_build call returns a build that fails to attach an image
+        (no render.png on disk), so the verification gate must keep
+        flagging the model as unverified.
+        """
+
+        def __init__(self, _settings):
+            self.calls = 0
+
+        def chat(self, _messages, _tools):
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "tool_calls": [
+                                    {
+                                        "id": "cad-1",
+                                        "function": {
+                                            "name": "cad_build_and_verify",
+                                            "arguments": json.dumps({"render": True}),
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+            if self.calls == 2:
+                # After the nudge, call cad_build_and_verify(render=true)
+                # again — still no image, gate stays armed.
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "tool_calls": [
+                                    {
+                                        "id": "cad-2",
+                                        "function": {
+                                            "name": "cad_build_and_verify",
+                                            "arguments": json.dumps({"render": True}),
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+            # Third call: the agent finally produces a final message.
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "Final answer.",
+                        }
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(
+        agent.core, "create_llm_client", lambda _settings, _ignored=None: AlwaysRenderNoImage(_settings)
+    )
+    events = []
+    runner = AgentRunner(
+        Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000),
+        lambda *args, **_: events.append((args[0], args[1])),
+    )
+    runner._run("demo", "Build a bracket")
+
+    # No agent_message was published (the agent stopped with an error).
+    assert not any(kind == "agent_message" for kind, _data in events)
+    # The terminal agent_error must reference the final-verification gate.
+    assert any(
+        kind == "agent_error"
+        and "final visual verification is still missing" in data["message"]
+        for kind, data in events
+    ), events
+    # A nudge user-message was appended to the conversation log.
+    history = (project / "conversation.jsonl").read_text(encoding="utf-8")
+    assert "has not passed final visual verification" in history
+
+
+def test_build_failure_stop_after_six_consecutive_failures(
+    tmp_path: Path, monkeypatch
+):
+    """Six consecutive ``cad_build_and_verify`` failures trip the stop-loop.
+
+    The agent should NOT be allowed to loop on a build that is structurally
+    broken; the contract is "stop after 6 cumulative failures" so the
+    operator sees a clear error and can intervene.
+    """
+    import agent.core
+    from agent.tools.cad_tool import CadTool
+
+    project_root = tmp_path / "projects"
+    project = project_root / "demo"
+    project.mkdir(parents=True)
+    (project / "model.py").write_text("result = 1\n", encoding="utf-8")
+    (project / "preview.stl").write_bytes(b"solid demo\n")
+    (project / "conversation.jsonl").write_text("", encoding="utf-8")
+
+    def failing_build(self, render=False, parameter_checks=None, **__):
+        raise RuntimeError("NameError: name 'x' is not defined")
+
+    monkeypatch.setattr(CadTool, "build_and_verify", failing_build)
+
+    class AlwaysFailBuild:
+        """Calls cad_build_and_verify until the loop stops."""
+
+        def __init__(self, _settings):
+            self.calls = 0
+
+        def chat(self, _messages, _tools):
+            self.calls += 1
+            if self.calls <= 6:
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "tool_calls": [
+                                    {
+                                        "id": f"cad-{self.calls}",
+                                        "function": {
+                                            "name": "cad_build_and_verify",
+                                            "arguments": "{}",
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+            return {
+                "choices": [
+                    {"message": {"role": "assistant", "content": "Should not reach."}}
+                ]
+            }
+
+    monkeypatch.setattr(
+        agent.core, "create_llm_client", lambda _settings, _ignored=None: AlwaysFailBuild(_settings)
+    )
+    events = []
+    runner = AgentRunner(
+        Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000),
+        lambda *args, **_: events.append((args[0], args[1])),
+    )
+    runner._run("demo", "Build something")
+
+    assert not any(kind == "agent_message" for kind, _data in events)
+    assert any(
+        kind == "agent_error" and "repeated CAD build failures" in data["message"]
+        for kind, data in events
+    ), events
+
+
+def test_build_failure_stop_after_duplicate_signature(tmp_path: Path, monkeypatch):
+    """Two identical-signature failures stop the loop early.
+
+    Six distinct failures are a hard limit, but two of the same kind should
+    stop the agent faster: there is no point retrying a failure the agent
+    cannot distinguish.
+    """
+    import agent.core
+    from agent.tools.cad_tool import CadTool
+
+    project_root = tmp_path / "projects"
+    project = project_root / "demo"
+    project.mkdir(parents=True)
+    (project / "model.py").write_text("result = 1\n", encoding="utf-8")
+    (project / "preview.stl").write_bytes(b"solid demo\n")
+    (project / "conversation.jsonl").write_text("", encoding="utf-8")
+
+    # Two identical-signature RuntimeErrors (line numbers differ in the
+    # raw message, but the signature normalises them).
+    line_counter = {"n": 0}
+
+    def duplicate_failing_build(self, render=False, parameter_checks=None, **__):
+        line_counter["n"] += 1
+        raise RuntimeError(
+            f"NameError: name 'x' is not defined (model.py, line {line_counter['n']})"
+        )
+
+    monkeypatch.setattr(CadTool, "build_and_verify", duplicate_failing_build)
+
+    class DuplicateFailBuild:
+        def __init__(self, _settings):
+            self.calls = 0
+
+        def chat(self, _messages, _tools):
+            self.calls += 1
+            if self.calls <= 2:
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "tool_calls": [
+                                    {
+                                        "id": f"cad-{self.calls}",
+                                        "function": {
+                                            "name": "cad_build_and_verify",
+                                            "arguments": "{}",
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+            return {
+                "choices": [
+                    {"message": {"role": "assistant", "content": "Should not reach."}}
+                ]
+            }
+
+    monkeypatch.setattr(
+        agent.core, "create_llm_client", lambda _settings, _ignored=None: DuplicateFailBuild(_settings)
+    )
+    events = []
+    runner = AgentRunner(
+        Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000),
+        lambda *args, **_: events.append((args[0], args[1])),
+    )
+    runner._run("demo", "Build something")
+
+    # Two identical signatures must trip the stop; the 6-count limit
+    # is a fallback, not the primary trigger.
+    assert not any(kind == "agent_message" for kind, _data in events)
+    assert any(
+        kind == "agent_error" and "repeated CAD build failures" in data["message"]
+        for kind, data in events
+    ), events
+    assert line_counter["n"] <= 2, (
+        f"duplicate-signature stop should fire after 2 attempts, got {line_counter['n']}"
+    )
+
+
+def test_image_fallback_keeps_cad_fix_required_true(tmp_path: Path, monkeypatch):
+    """When the provider rejects the trailing inline render, the verification
+    gate must keep ``cad_fix_required=True`` so the agent nudges/repairs.
+
+    The test directly exercises the loop's gate-keeping branch
+    (``awaiting_tool_render`` AND ``client.last_image_fallback_used``) by
+    running the full loop with a fake LLM client that mimics a successful
+    cad build followed by a final-answer attempt where the image fallback
+    has fired. The loop must NOT publish an ``agent_message`` because the
+    verification gate is still armed.
+    """
+    import agent.core
+    from agent.tools.cad_tool import CadTool
+
+    project_root = tmp_path / "projects"
+    project = project_root / "demo"
+    project.mkdir(parents=True)
+    (project / "model.py").write_text("result = 1\n", encoding="utf-8")
+    (project / "preview.stl").write_bytes(b"solid demo\n")
+    Image.new("RGB", (2, 2), "white").save(project / "render.png")
+    (project / "conversation.jsonl").write_text("", encoding="utf-8")
+
+    # Successful cad build with an attached image so the gate is initially
+    # clearable. The trailing render then triggers a fallback on the next
+    # LLM call.
+    payload = _seed_pass_build(project)
+
+    def passing_build(self, render=True, parameter_checks=None, **__):
+        return payload
+
+    monkeypatch.setattr(CadTool, "build_and_verify", passing_build)
+
+    class FallbackClient:
+        """Mimics a successful build followed by an image-fallback LLM call."""
+
+        def __init__(self, _settings):
+            self.last_image_fallback_used = True  # set by image-fallback path
+            self.calls = 0
+
+        def chat(self, _messages, _tools):
+            self.calls += 1
+            if self.calls == 1:
+                # First turn: agent calls cad_build_and_verify(render=true).
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "tool_calls": [
+                                    {
+                                        "id": "cad-1",
+                                        "function": {
+                                            "name": "cad_build_and_verify",
+                                            "arguments": json.dumps({"render": True}),
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+            # Second turn: agent finalises. The loop's image-fallback
+            # branch must keep cad_fix_required armed, so the agent
+            # cannot deliver an agent_message and must instead nudge or
+            # stop with an agent_error.
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "Final answer.",
+                        }
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(
+        agent.core, "create_llm_client", lambda _settings, _ignored=None: FallbackClient(_settings)
+    )
+    events = []
+    runner = AgentRunner(
+        Settings(project_root, "https://example.test", "test", 1, "127.0.0.1", 5000),
+        lambda *args, **_: events.append((args[0], args[1])),
+    )
+    runner._run("demo", "Build a bracket")
+
+    # The image-fallback path flips cad_fix_required=True and assigns a
+    # cad_error message. The agent delivers a final answer without a
+    # verified render → the gate nudges once or stops. Either way, no
+    # agent_message is published because the verification is incomplete.
+    assert not any(
+        kind == "agent_message" for kind, _data in events
+    ), "no agent_message should be emitted when verification is incomplete"

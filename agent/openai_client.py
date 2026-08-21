@@ -49,6 +49,8 @@ class OpenAIClient(ChatCompletionsClient):
         }
         if tools:
             payload["tools"] = tools
+        if self.settings.llm_max_completion_tokens:
+            payload["max_completion_tokens"] = self.settings.llm_max_completion_tokens
         if self.settings.openai_reasoning_effort:
             payload["reasoning_effort"] = self.settings.openai_reasoning_effort
         return payload

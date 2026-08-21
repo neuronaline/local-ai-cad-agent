@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -92,6 +94,7 @@ class _ClientErrorResponse(_FakeResponse):
 
 class _ImageRejectedResponse(_FakeResponse):
     status_code: int = 404
+    text: str = '{"error":{"message":"Model does not support image inputs."}}'
 
     def close(self) -> None:
         return None
@@ -394,6 +397,148 @@ def test_relocate_tool_images_handles_image_only_tool_messages():
     assert relocated[1]["content"][1] == image
 
 
+def test_relocate_tool_images_only_sends_the_latest_render():
+    from agent.llm_base import relocate_tool_images
+
+    old_image = {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,OLD"},
+    }
+    new_image = {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,NEW"},
+    }
+    messages = [
+        {
+            "role": "tool",
+            "tool_call_id": "old",
+            "content": [{"type": "text", "text": "old build"}, old_image],
+        },
+        {"role": "assistant", "content": "adjusting"},
+        {
+            "role": "tool",
+            "tool_call_id": "new",
+            "content": [{"type": "text", "text": "new build"}, new_image],
+        },
+    ]
+
+    relocated = relocate_tool_images(messages)
+
+    image_messages = [
+        message
+        for message in relocated
+        if message.get("role") == "user" and isinstance(message.get("content"), list)
+    ]
+    assert len(image_messages) == 1
+    assert image_messages[0]["content"][1] == new_image
+    assert relocated[0]["content"] == [{"type": "text", "text": "old build"}]
+
+
+def test_image_fallback_removes_synthetic_render_instruction():
+    from agent.llm_base import TOOL_IMAGE_PROMPT, without_images
+
+    messages = [
+        {"role": "tool", "tool_call_id": "c1", "content": "build ok"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": TOOL_IMAGE_PROMPT},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,AAA"},
+                },
+            ],
+        },
+    ]
+
+    stripped, removed = without_images(messages)
+
+    assert removed is True
+    assert stripped == [messages[0]]
+
+
+@pytest.mark.parametrize("kind", _CLIENT_KINDS)
+def test_client_does_not_hide_unrelated_400_with_image_fallback(
+    monkeypatch, tmp_path, kind
+):
+    monkeypatch.setenv(
+        "OPENAI_API_KEY" if kind == "openai" else "OPENROUTER_API_KEY", "test"
+    )
+    calls = []
+
+    def post(*_args, **kwargs):
+        calls.append(kwargs["json"])
+        return _ClientErrorResponse()
+
+    _patch_post_for(monkeypatch, kind, post)
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Inspect."},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,AA=="},
+                },
+            ],
+        }
+    ]
+
+    with pytest.raises(requests.HTTPError):
+        _client_for(kind, _settings(tmp_path, kind)).chat(messages)
+
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("kind", _CLIENT_KINDS)
+def test_tool_render_fallback_does_not_leave_a_false_user_instruction(
+    monkeypatch, tmp_path, kind
+):
+    monkeypatch.setenv(
+        "OPENAI_API_KEY" if kind == "openai" else "OPENROUTER_API_KEY", "test"
+    )
+    payloads = []
+
+    def post(*_args, **kwargs):
+        payloads.append(deepcopy(kwargs["json"]))
+        return _ImageRejectedResponse() if len(payloads) == 1 else _StreamingResponse()
+
+    _patch_post_for(monkeypatch, kind, post)
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {
+                        "name": "cad_build_and_verify",
+                        "arguments": '{"render":true}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "c1",
+            "content": [
+                {"type": "text", "text": "build ok"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,AA=="},
+                },
+            ],
+        },
+    ]
+
+    _client_for(kind, _settings(tmp_path, kind)).chat(messages)
+
+    assert payloads[0]["messages"][-1]["role"] == "user"
+    assert payloads[1]["messages"][-1]["role"] == "tool"
+    assert all(message.get("role") != "user" for message in payloads[1]["messages"])
+
+
 def test_sanitize_messages_removes_image_url_from_tool_messages(tmp_path, monkeypatch):
     """End-to-end: ``OpenAIClient.chat`` must not POST a payload where any
     ``tool`` message still contains ``image_url`` parts."""
@@ -451,6 +596,88 @@ def test_sanitize_messages_removes_image_url_from_tool_messages(tmp_path, monkey
         isinstance(part, dict) and part.get("type") == "image_url"
         for part in sent[-1]["content"]
     )
+
+
+def test_sanitize_messages_compacts_only_completed_history():
+    from agent.llm_base import sanitize_messages
+
+    old_read = json.dumps(
+        {
+            "ok": True,
+            "tool": "read_file",
+            "data": json.dumps(
+                {
+                    "exists": True,
+                    "content": "x" * 10_000,
+                    "sha256": "a" * 64,
+                    "total_lines": 200,
+                }
+            ),
+        }
+    )
+    latest_read = old_read.replace("x" * 10_000, "latest source")
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "edit-old",
+                    "type": "function",
+                    "function": {
+                        "name": "edit_file",
+                        "arguments": json.dumps(
+                            {
+                                "filename": "model.py",
+                                "old_string": "a" * 5_000,
+                                "new_string": "b" * 5_000,
+                            }
+                        ),
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "edit-old", "content": "edited"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "read-old",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"filename":"model.py"}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "read-old", "content": old_read},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "read-latest",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"filename":"model.py"}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "read-latest", "content": latest_read},
+    ]
+
+    sanitized = sanitize_messages(messages)
+
+    old_args = sanitized[0]["tool_calls"][0]["function"]["arguments"]
+    assert len(old_args) < 300
+    assert "x" * 100 not in sanitized[3]["content"]
+    assert "latest source" in sanitized[5]["content"]
+    assert "x" * 1_000 in old_read
+    assert "a" * 1_000 in messages[0]["tool_calls"][0]["function"]["arguments"]
 
 
 # ---------------------------------------------------------------------------
@@ -573,11 +800,12 @@ def test_openrouter_advances_gemini_cache_breakpoint_to_latest_message(monkeypat
     _capture_post(monkeypatch, "agent.llm_base.requests.post", captured, _FakeResponse)
     settings = _settings(tmp_path, "openrouter", openrouter_model="google/gemini-2.5-flash")
 
-    OpenRouterClient(settings).chat([
+    messages = [
         {"role": "system", "content": "Stable CAD instructions."},
         {"role": "user", "content": "<project_state>dynamic</project_state>"},
         {"role": "user", "content": "Build a bracket."},
-    ])
+    ]
+    OpenRouterClient(settings).chat(messages)
 
     system = captured["json"]["messages"][0]
     assert system == {"role": "system", "content": "Stable CAD instructions."}
@@ -593,6 +821,7 @@ def test_openrouter_advances_gemini_cache_breakpoint_to_latest_message(monkeypat
             "cache_control": {"type": "ephemeral"},
         }],
     }
+    assert messages[-1]["content"] == "Build a bracket."
 
 
 def test_openrouter_caches_through_tool_results_for_gemini(tmp_path):

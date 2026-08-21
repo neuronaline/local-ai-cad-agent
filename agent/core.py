@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import threading
 import uuid
 from collections.abc import Callable
@@ -295,6 +296,9 @@ class AgentRunner:
             cad_fix_required = not self._model_is_built(project_dir)
             any_tool_used = False
             nudged_cad = False
+            nudged_final_verification = False
+            build_failure_count = 0
+            build_failure_signatures: dict[str, int] = {}
             client = create_llm_client(self.settings)
             client.stop_event = self._stop_event
             session_prefix = (
@@ -362,7 +366,26 @@ class AgentRunner:
                         )
 
                 client.stream_callback = publish_stream
+                awaiting_tool_render = self._last_message_has_tool_image(messages)
                 response = client.chat(messages, TOOL_SCHEMAS)
+                if awaiting_tool_render and getattr(
+                    client, "last_image_fallback_used", False
+                ):
+                    # The provider rejected the trailing inline render. The
+                    # agent did nothing wrong, but visual verification is no
+                    # longer possible from this turn. Take ownership of
+                    # ``cad_error`` for the rest of this iteration: the build
+                    # did not produce verifiable evidence, so the
+                    # final-verification gate must treat the model as still
+                    # unverified. The same ``cad_error`` string also feeds
+                    # the build-failure tracker in the tool-dispatch loop,
+                    # so keep the message stable across iterations.
+                    cad_fix_required = True
+                    preview_id = None
+                    cad_error = (
+                        "The model provider rejected the required final render; "
+                        "visual verification could not be completed."
+                    )
                 self._publish_usage(project, getattr(client, "last_usage", None))
                 assistant_message = sanitize_assistant_message(
                     response["choices"][0]["message"]
@@ -423,10 +446,30 @@ class AgentRunner:
                             # No tools were used at all — just a conversation; complete silently.
                             self._complete(project, content)
                         return
-                    # CAD succeeded; the agent turn completes unconditionally.
-                    # The UI loads the preview asynchronously and reports any
-                    # render failure through ``agent_error``; the agent's
-                    # canonical answer does not wait for the browser.
+                    if cad_fix_required:
+                        if not nudged_final_verification:
+                            nudged_final_verification = True
+                            reminder = {
+                                "role": "user",
+                                "content": (
+                                    "The current model revision has not passed final visual "
+                                    "verification. Call cad_build_and_verify with render=true "
+                                    "and parameter_checks for explicit dimensions before finishing."
+                                ),
+                            }
+                            messages.append(reminder)
+                            self._append_message(project_dir, reminder)
+                            continue
+                        self.publish(
+                            "agent_error",
+                            {
+                                "project": project,
+                                "message": "Task stopped: final visual verification is still missing.",
+                            },
+                        )
+                        self._publish_terminal_failure(project)
+                        return
+                    # CAD succeeded and passed the final-verification gate.
                     self._complete(project, content)
                     return
                 any_tool_used = True
@@ -450,6 +493,32 @@ class AgentRunner:
                         messages,
                     )
                     processed_call_ids.add(call_id)
+                    if call.get("function", {}).get("name") == "cad_build_and_verify":
+                        if cad_error:
+                            build_failure_count += 1
+                            signature = self._failure_signature(cad_error)
+                            build_failure_signatures[signature] = (
+                                build_failure_signatures.get(signature, 0) + 1
+                            )
+                            if (
+                                build_failure_count >= 6
+                                or build_failure_signatures[signature] >= 2
+                            ):
+                                self.publish(
+                                    "agent_error",
+                                    {
+                                        "project": project,
+                                        "message": (
+                                            "Task stopped after repeated CAD build failures. "
+                                            "Review the latest error or continue with a narrower repair."
+                                        ),
+                                    },
+                                )
+                                self._publish_terminal_failure(project)
+                                return
+                        else:
+                            build_failure_count = 0
+                            build_failure_signatures.clear()
                     if waiting:
                         try:
                             q_args = json.loads(call["function"]["arguments"] or "{}")
@@ -587,6 +656,23 @@ class AgentRunner:
         # Keeping mutable workspace state in a later user message lets its
         # explicit system-message cache breakpoint remain reusable.
         return {"role": "user", "content": content}
+
+    @staticmethod
+    def _last_message_has_tool_image(messages: list[dict]) -> bool:
+        if not messages or messages[-1].get("role") != "tool":
+            return False
+        content = messages[-1].get("content")
+        return isinstance(content, list) and any(
+            isinstance(part, dict) and part.get("type") == "image_url"
+            for part in content
+        )
+
+    @staticmethod
+    def _failure_signature(message: str) -> str:
+        """Collapse volatile line numbers so equivalent failures match."""
+        normalized = re.sub(r"\bline \d+\b", "line #", message.lower())
+        normalized = re.sub(r"\b0x[0-9a-f]+\b", "0x#", normalized)
+        return normalized[-1000:]
 
     @staticmethod
     def _strip_image_parts(item: dict) -> dict:

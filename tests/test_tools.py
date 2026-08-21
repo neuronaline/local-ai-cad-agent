@@ -973,7 +973,7 @@ def test_prune_prior_read_file_skips_already_compact_entries():
 
 
 def test_build_cad_build_multimodal_content_attaches_render(tmp_path: Path):
-    """A successful render=true build must attach PNG/STL as inline image
+    """A successful render=true build must attach one valid PNG as inline image
     content so the agent evaluates the build in-band instead of asking the
     subordinate visual reviewer to start a fresh session."""
     from agent.tool_results import build_cad_build_multimodal_content
@@ -988,7 +988,7 @@ def test_build_cad_build_multimodal_content_attaches_render(tmp_path: Path):
             "summary": "Solid 1 (valid); with render.",
         },
     }
-    (tmp_path / "render.png").write_bytes(b"\x89PNG\r\n\x1a\n fake")
+    Image.new("RGB", (2, 2), "white").save(tmp_path / "render.png")
     (tmp_path / "preview.stl").write_bytes(b"solid demo\n")
 
     raw = json.dumps(render_payload, ensure_ascii=False)
@@ -998,7 +998,9 @@ def test_build_cad_build_multimodal_content_attaches_render(tmp_path: Path):
     parts = multimodal["content"]
     # text part first, then image_url parts.
     assert parts[0]["type"] == "text"
-    assert parts[0]["text"] == raw
+    compacted = json.loads(parts[0]["text"])
+    assert "preview" not in compacted["data"]
+    assert "render" not in compacted["data"]
     image_parts = [p for p in parts if p["type"] == "image_url"]
     assert len(image_parts) >= 1
     assert all(
@@ -1058,7 +1060,7 @@ def test_cad_build_tool_message_carries_inline_images(tmp_path: Path):
 
     project = tmp_path / "demo"
     project.mkdir(parents=True)
-    (project / "render.png").write_bytes(b"\x89PNG\r\n\x1a\n fake")
+    Image.new("RGB", (2, 2), "white").save(project / "render.png")
     (project / "preview.stl").write_bytes(b"solid demo\n")
     (project / "model.py").write_text("result = 1\n", encoding="utf-8")
 
@@ -1119,4 +1121,191 @@ def test_cad_build_tool_message_carries_inline_images(tmp_path: Path):
     index_path = project / ".agent_tool_images.json"
     assert index_path.is_file()
     payload = json.loads(index_path.read_text(encoding="utf-8"))
-    assert payload["call-1"] == ["render.png", "preview.stl"]
+    assert payload["call-1"] == ["render.png"]
+
+
+def test_build_cad_build_multimodal_content_never_encodes_stl_as_png(
+    tmp_path: Path,
+):
+    from agent.tool_results import build_cad_build_multimodal_content
+
+    payload = {
+        "ok": True,
+        "tool": "cad_build_and_verify",
+        "data": {"render": "render.png", "summary": "with render"},
+    }
+    (tmp_path / "render.png").write_bytes(b"not a png")
+    (tmp_path / "preview.stl").write_bytes(b"solid demo\n")
+
+    assert build_cad_build_multimodal_content(json.dumps(payload), tmp_path) is None
+
+
+def test_parameter_checks_report_passes_and_blocking_failures():
+    from agent.tools.cad_scripts.runner import _validate_parameters
+
+    results = _validate_parameters(
+        {"width": 40, "hole_diameter": 5},
+        [
+            {"name": "width", "equals": 40},
+            {"name": "hole_diameter", "minimum": 6},
+            {"name": "missing", "equals": 2},
+        ],
+    )
+
+    assert [result["status"] for result in results] == ["pass", "fail", "fail"]
+    assert results[1]["severity"] == "blocking"
+    assert "missing or non-numeric" in results[2]["message"]
+
+
+def test_through_hole_evidence_ignores_rounded_outer_faces():
+    from agent.tools.cad_scripts.runner import (
+        _candidate_cut_axes,
+        _through_hole_evidence,
+    )
+
+    class Vector:
+        X, Y, Z = 0, 0, 1
+
+    class CircleEdge:
+        geom_type = type("Geom", (), {"name": "CIRCLE"})()
+
+        def __init__(self, closed: bool):
+            self.is_closed = closed
+
+    class CylinderFace:
+        geom_type = type("Geom", (), {"name": "CYLINDER"})()
+        radius = 3
+        area = 20
+        axis_of_rotation = type("Axis", (), {"direction": Vector()})()
+
+        def __init__(self, circular_boundaries: int):
+            self.circular_boundaries = circular_boundaries
+
+        def edges(self):
+            return [CircleEdge(True) for _ in range(self.circular_boundaries)]
+
+        def center(self):
+            return Vector()
+
+    class Shape:
+        def bounding_box(self):
+            size = type("Size", (), {"X": 40, "Y": 30, "Z": 5})()
+            return type("Box", (), {"size": size})()
+
+        def faces(self):
+            return [CylinderFace(2), CylinderFace(0), CylinderFace(0)]
+
+    candidates = _candidate_cut_axes(Shape())
+
+    assert _through_hole_evidence(None, candidates) == 1
+    assert [item["is_through_hole"] for item in candidates] == [True, False, False]
+
+
+def test_insert_file_requires_unique_anchor_and_commits_revision(tmp_path: Path):
+    model = tmp_path / "model.py"
+    model.write_text("# parameters\nresult = 1\n", encoding="utf-8")
+    tool = FileTool(tmp_path)
+    digest = hashlib.sha256(model.read_bytes()).hexdigest()
+
+    result = tool.insert_file(
+        "model.py", "# parameters\n", "width = 40\n", "after", digest
+    )
+
+    assert model.read_text(encoding="utf-8") == (
+        "# parameters\nwidth = 40\nresult = 1\n"
+    )
+    assert "revision" in result
+    assert RevisionStore(tmp_path).list()
+
+
+def test_multimodal_content_rejects_render_hash_mismatch(tmp_path: Path):
+    from agent.tool_results import build_cad_build_multimodal_content
+
+    Image.new("RGB", (2, 2), "white").save(tmp_path / "render.png")
+    (tmp_path / ".cad_metrics.json").write_text(
+        json.dumps(
+            {
+                "review_manifest": {
+                    "single_render": {"image_sha256": "0" * 64}
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    payload = {
+        "ok": True,
+        "tool": "cad_build_and_verify",
+        "data": {"render": "render.png"},
+    }
+
+    assert build_cad_build_multimodal_content(json.dumps(payload), tmp_path) is None
+
+
+def test_insert_file_rejects_ambiguous_anchor(tmp_path: Path):
+    """``insert_file`` must refuse to write when the anchor matches more than once.
+
+    The contract is "exact anchor, one match, never replace": if the agent
+    sends a non-unique anchor the file must remain untouched. A successful
+    write would corrupt the project and the revision history.
+    """
+    model = tmp_path / "model.py"
+    model.write_text("a = 1\n# marker\nb = 2\n# marker\nc = 3\n", encoding="utf-8")
+    tool = FileTool(tmp_path)
+    digest = hashlib.sha256(model.read_bytes()).hexdigest()
+    original = model.read_text(encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Expected one exact anchor, found 2"):
+        tool.insert_file("model.py", "# marker\n", "x = 99\n", "after", digest)
+
+    assert model.read_text(encoding="utf-8") == original
+    # No revision was committed for a rejected insert.
+    assert not RevisionStore(tmp_path).list()
+
+
+def test_insert_file_rejects_stale_sha256(tmp_path: Path):
+    """``expected_sha256`` mismatch must abort before mutating the file."""
+    model = tmp_path / "model.py"
+    model.write_text("# anchor\nresult = 1\n", encoding="utf-8")
+    tool = FileTool(tmp_path)
+    stale = "0" * 64
+    original = model.read_text(encoding="utf-8")
+
+    with pytest.raises(ValueError, match="changed since it was read"):
+        tool.insert_file("model.py", "# anchor\n", "width = 40\n", "after", stale)
+
+    assert model.read_text(encoding="utf-8") == original
+    assert not RevisionStore(tmp_path).list()
+
+
+def test_insert_file_rejects_empty_anchor_and_content(tmp_path: Path):
+    """An empty anchor or content is a programming error and must be rejected."""
+    model = tmp_path / "model.py"
+    model.write_text("result = 1\n", encoding="utf-8")
+    tool = FileTool(tmp_path)
+
+    with pytest.raises(ValueError, match="anchor must not be empty"):
+        tool.insert_file("model.py", "", "x = 1\n", "before")
+    with pytest.raises(ValueError, match="content must not be empty"):
+        tool.insert_file("model.py", "result = 1\n", "", "before")
+    with pytest.raises(ValueError, match="position must be"):
+        tool.insert_file("model.py", "result = 1\n", "x = 1\n", "beside")
+
+
+def test_failure_signature_collapses_volatile_markers():
+    """Equivalent failures differing only in line numbers / hex addresses match.
+
+    The build-failure stop-loop uses this signature to count duplicates; if
+    two failures with identical causes produce different signatures the
+    duplicate-stop never trips and the agent loops until the 6-count hard
+    limit. The signature is a public, stable contract — pin it.
+    """
+    from agent.core import AgentRunner
+
+    sig_a = AgentRunner._failure_signature("NameError at line 12 in model.py")
+    sig_b = AgentRunner._failure_signature("NameError at line 99 in model.py")
+    sig_c = AgentRunner._failure_signature("NameError at 0xdeadbeef in model.py")
+    sig_d = AgentRunner._failure_signature("NameError at 0xcafebabe in model.py")
+
+    assert sig_a == sig_b
+    assert sig_c == sig_d
+    assert sig_a != sig_c

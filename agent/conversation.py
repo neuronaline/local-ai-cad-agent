@@ -135,7 +135,13 @@ class ConversationStore:
     def _truncate(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if len(history) <= ConversationStore.MAX_HISTORY:
             return history
-        return history[-ConversationStore.MAX_HISTORY:]
+        truncated = history[-ConversationStore.MAX_HISTORY:]
+        # A raw tail cut can start between an assistant tool call and its tool
+        # result. Leading tool messages are invalid without their supplying
+        # assistant message, so advance to the next coherent boundary.
+        while truncated and truncated[0].get("role") == "tool":
+            truncated.pop(0)
+        return truncated
 
     @staticmethod
     def _strip_image_parts(

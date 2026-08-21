@@ -59,6 +59,7 @@ class Settings:
     # is the cell count per side. Defaults match the previous hard-coded grid.
     viewer_grid_size: float = 200.0
     viewer_grid_divisions: int = 20
+    llm_max_completion_tokens: int | None = 8192
 
     @property
     def llm_model(self) -> str:
@@ -88,6 +89,14 @@ def _strict_bool(value: Any, name: str) -> bool:
     if value is True or value is False:
         return value
     raise TypeError(f"{name} must be true or false, got {value!r} (quoted booleans like \"false\" are not supported).")
+
+
+def _reject_unknown(mapping: Any, allowed: set[str], namespace: str) -> None:
+    if not isinstance(mapping, dict):
+        raise TypeError(f"{namespace} must be a mapping.")
+    unknown = sorted(set(mapping) - allowed)
+    if unknown:
+        raise ValueError(f"Unknown {namespace} setting(s): {', '.join(unknown)}")
 
 
 def _validate_port(value: Any, name: str) -> int:
@@ -173,6 +182,19 @@ def load_settings(project_root: Path | None = None) -> Settings:
     review = config.get("review", {})
     viewer = config.get("viewer", {})
     viewer_grid = viewer.get("grid", {}) if isinstance(viewer, dict) else {}
+    _reject_unknown(
+        agent,
+        {
+            "tool_call_limit",
+            "revision_retention_count",
+            "debug_log_tool_errors",
+            "log_tool_activity",
+        },
+        "agent",
+    )
+    _reject_unknown(
+        review, {"enabled", "render_workers", "required_views", "max_cycles"}, "review"
+    )
 
     # llm.provider selects which adapter AgentRunner should use. Settings
     # for the inactive provider are still loaded so users can switch without
@@ -226,6 +248,9 @@ def load_settings(project_root: Path | None = None) -> Settings:
         ),
         viewer_grid_size=grid_size,
         viewer_grid_divisions=grid_divisions,
+        llm_max_completion_tokens=_optional_positive_int(
+            llm.get("max_completion_tokens", 8192), "llm.max_completion_tokens"
+        ),
     )
 
 
@@ -259,3 +284,9 @@ def _non_negative_int(value: Any, name: str) -> int:
     if number < 0:
         raise ValueError(f"{name} must be a non-negative integer.")
     return number
+
+
+def _optional_positive_int(value: Any, name: str) -> int | None:
+    if value is None:
+        return None
+    return _positive_int(value, name)

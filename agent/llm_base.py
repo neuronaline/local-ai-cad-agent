@@ -19,6 +19,10 @@ import requests
 from agent.settings import Settings
 
 PROVIDER_LABELS = {"openrouter": "OpenRouter", "openai": "OpenAI"}
+TOOL_IMAGE_PROMPT = (
+    "The attached image is the visual artifact returned by the latest tool "
+    "call. Inspect it and continue the task."
+)
 
 
 class RequestCancelled(RuntimeError):
@@ -62,7 +66,11 @@ def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     system_messages: list[dict[str, Any]] = []
     non_system: list[dict[str, Any]] = []
-    for item in messages:
+    for original in messages:
+        # Provider adapters add cache hints to message content. Always detach
+        # the wire payload from the agent's canonical in-memory transcript so
+        # those hints cannot accumulate across tool-loop iterations.
+        item = deepcopy(original)
         if item.get("role") == "system" and isinstance(item.get("content"), str):
             system_messages.append(item)
         else:
@@ -77,7 +85,126 @@ def sanitize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if message.get("role") != "assistant":
             continue
         sanitized[index] = sanitize_assistant_message(message)
+    _compact_completed_history(sanitized)
     return relocate_tool_images(sanitized)
+
+
+def _compact_completed_history(messages: list[dict[str, Any]]) -> None:
+    """Shrink old file bodies and edit arguments in the API-only copy.
+
+    The latest tool result remains verbatim because it drives the model's next
+    action. Older read bodies and completed edit arguments are recoverable from
+    the current ``model.py`` and otherwise dominate long repair-loop prompts.
+    """
+    tool_result_ids = {
+        message.get("tool_call_id")
+        for message in messages
+        if message.get("role") == "tool"
+        and isinstance(message.get("tool_call_id"), str)
+    }
+    completed_assistants = [
+        index
+        for index, message in enumerate(messages)
+        if message.get("role") == "assistant"
+        and any(
+            isinstance(call, dict) and call.get("id") in tool_result_ids
+            for call in message.get("tool_calls") or []
+        )
+    ]
+    keep_assistant = completed_assistants[-1] if completed_assistants else -1
+    for index, message in enumerate(messages):
+        if message.get("role") == "tool" and index != len(messages) - 1:
+            message["content"] = _compact_tool_content(message.get("content"))
+        if message.get("role") != "assistant" or index == keep_assistant:
+            continue
+        for call in message.get("tool_calls") or []:
+            if not isinstance(call, dict) or call.get("id") not in tool_result_ids:
+                continue
+            function = call.get("function")
+            if not isinstance(function, dict):
+                continue
+            name = function.get("name")
+            if name == "edit_file":
+                function["arguments"] = json.dumps(
+                    {
+                        "filename": "model.py",
+                        "old_string": "[omitted from completed call]",
+                        "new_string": "[omitted from completed call]",
+                    }
+                )
+            elif name == "write_file":
+                function["arguments"] = json.dumps(
+                    {
+                        "filename": "model.py",
+                        "content": "[omitted from completed call]",
+                    }
+                )
+            elif name == "insert_file":
+                function["arguments"] = json.dumps(
+                    {
+                        "filename": "model.py",
+                        "anchor": "[omitted from completed call]",
+                        "content": "[omitted from completed call]",
+                        "position": "before",
+                    }
+                )
+
+
+def _compact_tool_content(content: Any) -> Any:
+    if isinstance(content, str):
+        return _compact_tool_text(content)
+    if not isinstance(content, list):
+        return content
+    compacted = deepcopy(content)
+    for part in compacted:
+        if (
+            isinstance(part, dict)
+            and part.get("type") == "text"
+            and isinstance(part.get("text"), str)
+        ):
+            part["text"] = _compact_tool_text(part["text"])
+    return compacted
+
+
+def _compact_tool_text(text: str) -> str:
+    try:
+        payload = json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        return text
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        return text
+    tool = payload.get("tool")
+    if tool == "cad_build_and_verify":
+        from agent.tool_results import compact_for_context
+
+        return compact_for_context(tool, text)
+    if tool != "read_file":
+        return text
+    data = payload.get("data")
+    if not isinstance(data, str):
+        return text
+    try:
+        read_data = json.loads(data)
+    except json.JSONDecodeError:
+        return text
+    if not isinstance(read_data, dict) or "content" not in read_data:
+        return text
+    payload["data"] = json.dumps(
+        {
+            key: read_data[key]
+            for key in (
+                "exists",
+                "sha256",
+                "total_lines",
+                "offset",
+                "returned_lines",
+                "next_offset",
+            )
+            if key in read_data
+        },
+        ensure_ascii=False,
+    )
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def relocate_tool_images(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -93,16 +220,15 @@ def relocate_tool_images(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
     * Google Vertex (Gemini): ``Requests ending with a model turn are not
       supported.`` when the trailing tool message contains image parts.
 
-    ``cad_build_and_verify`` previously attached the rendered PNG/STL to the
-    tool message so the agent could inspect the build in-band. To preserve
-    that contract we relocate the image parts into a trailing user message
-    that re-states the tool result; the conversation still ends on a user
-    turn, the model still sees the visuals, and the persisted JSONL form is
-    untouched (the history redactor already collapses inline images to
-    placeholders on subsequent loads).
+    ``cad_build_and_verify`` attaches its rendered PNG to the tool message so
+    the agent can inspect the build in-band. Only a render on the final
+    message is current enough to relocate. Older images are removed rather
+    than repeatedly re-sent as stale, expensive base64 payloads.
     """
+    latest_index = len(messages) - 1
     relocated: list[dict[str, Any]] = []
-    for message in messages:
+    latest_images: list[dict[str, Any]] = []
+    for index, message in enumerate(messages):
         role = message.get("role")
         content = message.get("content")
         if (
@@ -128,6 +254,9 @@ def relocate_tool_images(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
         tool_copy = deepcopy(message)
         tool_copy["content"] = text_parts or "An attached image was unavailable."
         relocated.append(tool_copy)
+        if index == latest_index:
+            latest_images = [deepcopy(part) for part in image_parts]
+    if latest_images:
         relocated.append(
             {
                 "role": "user",
@@ -135,14 +264,10 @@ def relocate_tool_images(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
                     [
                         {
                             "type": "text",
-                            "text": (
-                                "The image(s) above are the artifacts returned "
-                                "by your most recent tool call. Inspect them and "
-                                "continue the task."
-                            ),
+                            "text": TOOL_IMAGE_PROMPT,
                         }
                     ]
-                    + [deepcopy(part) for part in image_parts]
+                    + latest_images
                 ),
             }
         )
@@ -151,11 +276,13 @@ def relocate_tool_images(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
 
 def without_images(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
     """Remove image parts while retaining their accompanying text."""
-    stripped = deepcopy(messages)
+    stripped: list[dict[str, Any]] = []
     removed = False
-    for message in stripped:
+    for original in messages:
+        message = deepcopy(original)
         content = message.get("content")
         if not isinstance(content, list):
+            stripped.append(message)
             continue
         text_parts = [
             part for part in content
@@ -163,8 +290,49 @@ def without_images(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
         ]
         if len(text_parts) != len(content):
             removed = True
+            if (
+                message.get("role") == "user"
+                and len(text_parts) == 1
+                and text_parts[0].get("type") == "text"
+                and text_parts[0].get("text") == TOOL_IMAGE_PROMPT
+            ):
+                # This user turn exists only to carry a tool render. If the
+                # provider rejects images, keep the preceding tool result as
+                # the final turn instead of leaving a false instruction to
+                # inspect an attachment that no longer exists.
+                continue
             message["content"] = text_parts or "An attached image was unavailable."
+        stripped.append(message)
     return stripped, removed
+
+
+def _response_text(response: requests.Response) -> str:
+    """Return an error body from real and test response objects."""
+    try:
+        value = response.text
+        if callable(value):
+            value = value()
+        return value if isinstance(value, str) else ""
+    except Exception:  # noqa: BLE001 - Error reporting must not mask the HTTP error.
+        return ""
+
+
+def _is_image_rejection(response: requests.Response) -> bool:
+    """Whether a client error specifically rejects visual input."""
+    if response.status_code not in {400, 404}:
+        return False
+    body = _response_text(response).lower()
+    return any(
+        marker in body
+        for marker in (
+            "image_url",
+            "image input",
+            "image inputs",
+            "image content",
+            "vision",
+            "multimodal",
+        )
+    )
 
 
 def retry_delay(response: requests.Response | None, attempt: int) -> float:
@@ -389,6 +557,7 @@ class ChatCompletionsClient:
         # reused, so the cache prefix stays stable.
         self.agent_role: str | None = None
         self.last_usage: dict[str, Any] | None = None
+        self.last_image_fallback_used = False
         self.stream_callback = None
         self.require_images = False
         self._provider_label = provider_label
@@ -436,6 +605,7 @@ class ChatCompletionsClient:
 
     def chat(self, messages, tools=None):
         self.last_usage = None
+        self.last_image_fallback_used = False
         api_key = self._api_key()
         if not api_key:
             raise RuntimeError(f"{api_key_env(self._provider_label.lower())} is not configured.")
@@ -473,7 +643,8 @@ class ChatCompletionsClient:
                 if attempt == 2:
                     raise
             else:
-                if response.status_code in {400, 404} and not image_fallback_used:
+                image_rejection = _is_image_rejection(response)
+                if image_rejection and not image_fallback_used:
                     # Review calls require images: a refusal that traces back
                     # to ``image_url`` parts is treated as an inconclusive
                     # review and surfaces to the caller instead of retrying
@@ -486,6 +657,7 @@ class ChatCompletionsClient:
                         )
                     if self._try_image_fallback(payload, response):
                         image_fallback_used = True
+                        self.last_image_fallback_used = True
                         if log_payload:
                             self._activity_logger.log(
                                 "llm_visual_fallback",
@@ -493,11 +665,7 @@ class ChatCompletionsClient:
                                 run_id=getattr(self, "_run_id", None),
                             )
                         continue
-                    body_preview = ""
-                    try:
-                        body_preview = response.text[:500]
-                    except Exception:  # noqa: BLE001,S110
-                        pass
+                    body_preview = _response_text(response)[:500]
                     if body_preview:
                         raise RuntimeError(f"{self._provider_label} {response.status_code}: {body_preview}")
                 if response.status_code not in {408, 429} and response.status_code < 500:

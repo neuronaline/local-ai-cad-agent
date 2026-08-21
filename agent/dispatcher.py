@@ -24,7 +24,7 @@ def is_model_mutation(name: str, arguments: dict) -> bool:
     """True for tool calls that change ``model.py`` and so invalidate the
     current preview/review state."""
     return (
-        name in {"write_file", "edit_file"}
+        name in {"write_file", "edit_file", "insert_file"}
         and arguments.get("filename") == "model.py"
     )
 
@@ -54,9 +54,11 @@ def dispatch(
     if name == "cad_build_and_verify":
         # ``render`` defaults to False, matching both the schema and
         # ``CadTool.build_and_verify``. Final verification opts in explicitly.
-        return tools.cad.with_call_id(call_id).build_and_verify(
-            args.get("render", False)
-        ), False
+        cad = tools.cad.with_call_id(call_id)
+        checks = args.get("parameter_checks") or []
+        if checks:
+            return cad.build_and_verify(args.get("render", False), checks), False
+        return cad.build_and_verify(args.get("render", False)), False
     if name == "cad_screenshot":
         tool = (
             tools.screenshot.with_call_id(call_id)
@@ -106,6 +108,18 @@ def dispatch(
                 args["old_string"],
                 args.get("new_string", ""),
                 args.get("expected_sha256"),
+            ),
+            False,
+        )
+    if name == "insert_file":
+        tool = tools.file.with_call_id(call_id) if call_id else tools.file
+        return (
+            tool.insert_file(
+                filename=args["filename"],
+                anchor=args["anchor"],
+                content=args["content"],
+                position=args["position"],
+                expected_sha256=args.get("expected_sha256"),
             ),
             False,
         )
@@ -204,6 +218,7 @@ def process_tool_call(
         name = "unknown_tool"
     preview_id = prev_preview_id
     waiting = False
+    build_succeeded = False
     arguments: dict = {}
     try:
         argument_text = (
@@ -241,6 +256,8 @@ def process_tool_call(
             publish("revision_updated", {"project": project})
         if is_cad_build(name, arguments):
             preview_id = register_preview(project, project_dir)
+            cad_error = None
+            build_succeeded = True
             publish(
                 "preview_updated",
                 {"project": project, "preview_id": preview_id},
@@ -295,7 +312,7 @@ def process_tool_call(
     context_content: str | list = context_result
     image_paths: list[Path] = []
     if name == "cad_build_and_verify":
-        # A successful build with render=true can attach the rendered PNG/STL
+        # A successful build with render=true can attach the rendered PNG
         # directly to the tool message so the agent evaluates it in-band
         # instead of calling the subordinate visual reviewer. This avoids the
         # isolated sub-session that previously re-derived the design rationale
@@ -303,10 +320,20 @@ def process_tool_call(
         # because ``compact_for_context`` strips ``render`` to shrink the
         # prompt — the render flag is still the cheapest signal that
         # inline-image evidence is available.
-        multimodal = build_cad_build_multimodal_content(result, project_dir)
+        multimodal = build_cad_build_multimodal_content(
+            result, project_dir, context_result=context_result
+        )
         if multimodal is not None:
             context_content = multimodal["content"]
             image_paths = list(multimodal.get("image_paths") or [])
+        # ``is True`` (not truthy) is intentional: the schema default is
+        # ``False`` and the agent must pass the JSON literal ``true`` to opt
+        # into rendering. Treating any truthy value as "render" would also
+        # accept the strings ``"true"`` or ``"1"`` (which JSON converts
+        # to non-bool types) and silently clear the verification gate for
+        # builds the agent did not actually render.
+        if build_succeeded and arguments.get("render") is True and image_paths:
+            cad_fix_required = False
     if name == "read_file":
         _prune_prior_read_file(messages, arguments, context_result)
     tool_message = {"role": "tool", "tool_call_id": call_id, "content": context_content}

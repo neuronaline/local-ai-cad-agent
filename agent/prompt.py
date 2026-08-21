@@ -29,6 +29,8 @@ _OPERATIONAL_RULES = """\
   lines of new content). Reserve write_file for deliberate full rewrites and
   the initial creation of model.py. Do not rewrite the whole file to change a
   single parameter; that wastes tokens and breaks the revision history.
+- Use insert_file with a short unique anchor for substantial new feature blocks;
+  do not send a huge edit_file.old_string merely to append code next to it.
 - read_file is only required when you do not already know the current content
   (e.g. after a tool error, an external edit, or before a precise edit_file
   when you cannot predict the exact target block).
@@ -39,9 +41,13 @@ _OPERATIONAL_RULES = """\
   ready. The tool returns a one-line ``summary`` plus the full structured
   payload; rely on ``summary`` for the first read and consult the full
   ``metrics`` only when the summary flags an issue.
-- When you call cad_build_and_verify(render=true), the rendered PNG and
-  STL preview are attached directly to the tool message as inline image
-  content. Inspect them in-band (the same conversation turn) and either
+- On the final render=true build, pass parameter_checks for every explicit
+  user-stated dimension, angle, clearance, or count represented by a numeric
+  model.py parameter. A parameter-check failure is a build failure; repair the
+  model instead of omitting the check.
+- When you call cad_build_and_verify(render=true), the rendered contact sheet
+  (or the isometric PNG fallback) is attached as inline image content. Inspect
+  it in-band (the same conversation turn) and either
   accept the build or iterate from one coherent place. Do not re-run
   cad_build_and_verify with unchanged source to produce a fresh render —
   the renderer is already invoked exactly once per call. Do not invoke
@@ -83,10 +89,10 @@ _OPERATIONAL_RULES = """\
 - In a single question batch, ask at most one required=true question; mark
   every other clarifying detail with required=false so the user can answer
   the blocking one and skip the rest. Keep the batch to ≤3 questions total.
-- Do not claim success from source inspection alone. A task is ready only
-  after the latest model.py revision passes cad_build_and_verify(render=true),
-  and the inline render attached to that tool message confirms the design.
-  For small, contained changes, the render=false build is sufficient. Use
+- Do not claim success from source inspection alone. A geometry-changing task
+  is ready only after the latest model.py revision passes
+  cad_build_and_verify(render=true), and the inline render attached to that
+  tool message confirms the design. Use
   cad_review only when the complexity or risk criteria above make additional
   visual evidence worthwhile.
 - When the design is ready, deliver a concise final answer in chat that

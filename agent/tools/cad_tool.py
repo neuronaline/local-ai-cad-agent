@@ -116,7 +116,9 @@ class CadTool:
 
     # ------------------------------------------------------------------ build
 
-    def _runner_settings(self, render: bool) -> dict[str, Any]:
+    def _runner_settings(
+        self, render: bool, parameter_checks: list[dict[str, Any]] | None = None
+    ) -> dict[str, Any]:
         """JSON-kwarg payload forwarded to ``runner.main`` as ``argv[1]``.
 
         Replaces the legacy module-level globals (``_RENDER_VIEWS``,
@@ -130,15 +132,22 @@ class CadTool:
                 "write_isometric": True,
                 "render_workers": self._review_render_workers,
                 "required_views": self._review_required_views,
+                "parameter_checks": parameter_checks or [],
             }
         return {
             "render_views": False,
             "write_isometric": False,
             "render_workers": self._review_render_workers,
             "required_views": self._review_required_views,
+            "parameter_checks": parameter_checks or [],
         }
 
-    def _execute(self, render: bool = False, call_id: str = "") -> dict[str, Any]:
+    def _execute(
+        self,
+        render: bool = False,
+        call_id: str = "",
+        parameter_checks: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         model_path = self.project_dir / "model.py"
         if not model_path.exists():
             raise ValueError("model.py does not exist yet.")
@@ -149,7 +158,9 @@ class CadTool:
         # settings as a JSON kwargs payload on ``argv[1]`` instead of mutating
         # module-level globals; this restores a real module boundary between
         # the host and the sandbox.
-        settings_payload = json.dumps(self._runner_settings(render))
+        settings_payload = json.dumps(
+            self._runner_settings(render, parameter_checks)
+        )
 
         with tempfile.TemporaryDirectory(prefix="cad-agent-") as temporary:
             workspace = Path(temporary)
@@ -628,7 +639,11 @@ class CadTool:
             f"{volume_text}; {feature_count} features; {render_state}."
         )
 
-    def build_and_verify(self, render: bool = False) -> dict[str, Any]:
+    def build_and_verify(
+        self,
+        render: bool = False,
+        parameter_checks: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         """Build once, validate metrics, and (optionally) produce preview + review.
 
         ``render=False`` (default) skips the legacy ``render.png`` artifact and
@@ -642,6 +657,8 @@ class CadTool:
         remains trustworthy for early iteration.
         """
         execute_args: dict[str, Any] = {"render": bool(render)}
+        if parameter_checks:
+            execute_args["parameter_checks"] = parameter_checks
         if self._call_id:
             execute_args["call_id"] = self._call_id
         payload = self._execute(**execute_args)
@@ -661,6 +678,7 @@ class CadTool:
             "preview": "preview.stl",
             "render": "render.png" if render else None,
             "feature_summary": payload.get("feature_summary") or {},
+            "validation_results": payload.get("validation_results") or [],
         }
         if model_sha:
             result["model_sha256"] = model_sha

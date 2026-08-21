@@ -122,9 +122,15 @@ def _candidate_cut_axes(shape) -> list[dict[str, object]]:
         except Exception:  # noqa: BLE001
             center = None
         try:
-            axis = _unit(face.normal_at(0.5, 0.5))
+            axis = _unit(face.axis_of_rotation.direction)
         except Exception:  # noqa: BLE001, S112 - malformed faces are skipped
             continue
+        closed_circles = sum(
+            1
+            for edge in face.edges()
+            if getattr(edge.geom_type, "name", str(edge.geom_type)) == "CIRCLE"
+            and bool(edge.is_closed)
+        )
         candidates.append(
             {
                 "diameter_mm": round(2.0 * radius, 3),
@@ -135,24 +141,77 @@ def _candidate_cut_axes(shape) -> list[dict[str, object]]:
                     if center is not None
                     else None
                 ),
+                "is_through_hole": closed_circles >= 2,
             }
         )
     return candidates
 
 
 def _through_hole_evidence(shape, candidates: list[dict[str, object]]) -> int:
-    """Count cylindrical candidates whose diameter is small enough to be a hole."""
-    bbox_diag = _bbox_diag(shape.bounding_box())
-    return sum(
-        1
-        for candidate in candidates
-        if candidate["diameter_mm"] < 0.5 * bbox_diag
-    )
+    """Count cylindrical cut faces bounded by two complete circular edges."""
+    return sum(1 for candidate in candidates if candidate.get("is_through_hole"))
 
 
 def _count_disconnected_solids(shape) -> int:
-    """Use the raw Solid count as a disconnected-solid signal."""
-    return sum(1 for _ in shape.solids())
+    """Return only solids beyond the first connected component."""
+    return max(0, sum(1 for _ in shape.solids()) - 1)
+
+
+def _validate_parameters(
+    namespace: dict[str, object], checks: object
+) -> list[dict[str, object]]:
+    """Validate explicit model parameters against user-facing bounds."""
+    if not isinstance(checks, list):
+        return []
+    results: list[dict[str, object]] = []
+    for check in checks[:20]:
+        if not isinstance(check, dict):
+            continue
+        name = check.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        raw = namespace.get(name)
+        try:
+            actual = float(raw)
+        except (TypeError, ValueError):
+            results.append(
+                {
+                    "requirement_id": name,
+                    "verifier": "parameter",
+                    "status": "fail",
+                    "severity": "blocking",
+                    "message": f"Parameter {name!r} is missing or non-numeric.",
+                }
+            )
+            continue
+        tolerance = max(0.0, float(check.get("tolerance", 1e-6) or 0.0))
+        failures: list[str] = []
+        if "equals" in check and not math.isclose(
+            actual,
+            float(check["equals"]),
+            rel_tol=0.0,
+            abs_tol=tolerance,
+        ):
+            failures.append(f"expected {float(check['equals']):g}±{tolerance:g}")
+        if "minimum" in check and actual + tolerance < float(check["minimum"]):
+            failures.append(f"minimum {float(check['minimum']):g}")
+        if "maximum" in check and actual - tolerance > float(check["maximum"]):
+            failures.append(f"maximum {float(check['maximum']):g}")
+        passed = not failures and math.isfinite(actual)
+        results.append(
+            {
+                "requirement_id": name,
+                "verifier": "parameter",
+                "status": "pass" if passed else "fail",
+                "severity": "info" if passed else "blocking",
+                "message": (
+                    f"{name}={actual:g}"
+                    if passed
+                    else f"{name}={actual:g}; " + ", ".join(failures)
+                ),
+            }
+        )
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +285,9 @@ def _run_model(
         raise ValueError("The generated CAD shape has no renderable 3D dimensions.")
 
     # --- Phase 2: deterministic verifiers (if a spec is on disk) -----------------
-    validation_results: list[dict] = []
+    validation_results: list[dict] = _validate_parameters(
+        namespace, settings.get("parameter_checks")
+    )
     spec_version = 0
     spec_path = Path("spec.json")
     if spec_path.is_file():
@@ -241,11 +302,16 @@ def _run_model(
                 spec_version = int(spec_payload.get("version", 0) or 0)
                 requirements = spec_payload.get("requirements") or []
                 if isinstance(requirements, list) and requirements:
-                    validation_results = _run_verifiers(
+                    # ``extend`` (not ``=``) keeps the
+                    # ``_validate_parameters`` results from the prior block;
+                    # the previous assignment-form overwrote them whenever a
+                    # spec was present, which silently dropped
+                    # parameter-check failures once a spec landed on disk.
+                    validation_results.extend(_run_verifiers(
                         requirements, shape, attempt_id=""
-                    )
+                    ))
         except Exception as error:  # noqa: BLE001 - verifier errors must not block the build
-            validation_results = [
+            validation_results.append(
                 {
                     "requirement_id": "",
                     "verifier": "spec.parse",
@@ -255,7 +321,19 @@ def _run_model(
                         f"Spec could not be evaluated: {type(error).__name__}: {error}"
                     ),
                 }
-            ]
+            )
+
+    blocking_validation = [
+        result
+        for result in validation_results
+        if result.get("status") == "fail"
+        and result.get("severity") in {"blocking", "major"}
+    ]
+    if blocking_validation:
+        raise ValueError(
+            "Parameter validation failed: "
+            + "; ".join(str(result.get("message", "failed")) for result in blocking_validation)
+        )
 
     # --- Phase 3: deterministic feature evidence --------------------------------
     cut_candidates = _candidate_cut_axes(shape)
@@ -382,6 +460,7 @@ def _run_model(
         "feature_summary": metrics["feature_summary"],
         "spec_version": spec_version,
         "validation_count": len(validation_results),
+        "validation_results": validation_results,
         "review_manifest": review_manifest_payload,
     }
     metrics_path = Path(".cad_metrics.json")
