@@ -405,6 +405,7 @@ def parse_chat_stream(
     saw_done = False
     finish_reason: str | None = None
     last_usage: dict[str, Any] | None = None
+    reasoning_text = ""
 
     for raw_line in response.iter_lines():
         if stop_event and stop_event.is_set():
@@ -454,8 +455,10 @@ def parse_chat_stream(
                 for detail in details or []
                 if isinstance(detail, dict) and isinstance(detail.get("text"), str)
             )
-        if reasoning and stream_callback:
-            stream_callback({"type": "reasoning", "delta": reasoning})
+        if reasoning:
+            reasoning_text += reasoning
+            if stream_callback:
+                stream_callback({"type": "reasoning", "delta": reasoning})
         for call_delta in delta.get("tool_calls") or []:
             index = int(call_delta.get("index", 0))
             call = tool_calls.setdefault(
@@ -482,8 +485,20 @@ def parse_chat_stream(
 
     if not saw_done:
         raise RuntimeError(f"{provider_label} stream ended before the completion marker.")
+    # Some reasoning-first models (Anthropic extended thinking, OpenAI o-series,
+    # Gemini thinking) emit reasoning deltas with no text content and finish
+    # cleanly. Surface the reasoning as the assistant's substantive response so
+    # the caller can still complete its turn instead of crashing the loop on
+    # an opaque "empty completion" error.
     if not content and not tool_calls:
-        raise RuntimeError(f"{provider_label} returned an empty completion.")
+        if reasoning_text.strip() and finish_reason in (None, "stop"):
+            content = reasoning_text.strip()
+        else:
+            reason = finish_reason or "unknown"
+            raise RuntimeError(
+                f"{provider_label} returned an empty completion "
+                f"(finish_reason={reason!r})."
+            )
     message: dict[str, Any] = {"role": role, "content": content or None}
     if tool_calls:
         message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
@@ -669,6 +684,15 @@ class ChatCompletionsClient:
                     if body_preview:
                         raise RuntimeError(f"{self._provider_label} {response.status_code}: {body_preview}")
                 if response.status_code not in {408, 429} and response.status_code < 500:
+                    # Surface the upstream body so the caller sees the real
+                    # reason (e.g. OpenRouter's "No endpoints found that can
+                    # handle the requested parameters" 404) instead of just
+                    # ``requests``' generic ``HTTPError``.
+                    body_preview = _response_text(response)[:500]
+                    if 400 <= response.status_code < 500 and body_preview:
+                        raise RuntimeError(
+                            f"{self._provider_label} {response.status_code}: {body_preview}"
+                        )
                     response.raise_for_status()
                     if log_payload:
                         self._activity_logger.log(

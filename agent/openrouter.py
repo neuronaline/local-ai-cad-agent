@@ -127,7 +127,16 @@ class OpenRouterClient(ChatCompletionsClient):
         if tools:
             payload["tools"] = tools
         if self.settings.llm_max_completion_tokens:
-            payload["max_completion_tokens"] = self.settings.llm_max_completion_tokens
+            # OpenRouter normalises the legacy ``max_tokens`` across every
+            # upstream provider, whereas the newer ``max_completion_tokens``
+            # (OpenAI-specific) is not advertised by providers such as
+            # ``google-vertex/global``. When callers pin a provider with
+            # ``force_provider`` + ``require_parameters``, OpenRouter rejects
+            # any parameter that no endpoint handles, surfacing as a 404 with
+            # the message "No endpoints found that can handle the requested
+            # parameters". Using ``max_tokens`` keeps the budget applied while
+            # staying compatible with every supported provider.
+            payload["max_tokens"] = self.settings.llm_max_completion_tokens
         self._apply_provider_payload(payload)
         self._apply_gemini_cache_breakpoint(payload)
         return payload

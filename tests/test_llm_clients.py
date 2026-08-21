@@ -85,6 +85,44 @@ class _TruncatedStreamingResponse(_FakeResponse):
         return iter([b'data: {"choices":[{"delta":{"content":"partial"}}]}'])
 
 
+class _ReasoningOnlyStopResponse(_FakeResponse):
+    """Reasoning-first model with finish_reason='stop' and no text content."""
+
+    def iter_lines(self):
+        return iter(
+            [
+                b'data: {"choices":[{"delta":{"role":"assistant","reasoning":"Thinking through geometry."}}]}',
+                b'data: {"choices":[{"finish_reason":"stop","delta":{}}]}',
+                b'data: [DONE]',
+            ]
+        )
+
+
+class _ReasoningOnlyLengthResponse(_FakeResponse):
+    """Reasoning-first model that ran out of tokens before producing content."""
+
+    def iter_lines(self):
+        return iter(
+            [
+                b'data: {"choices":[{"delta":{"role":"assistant","reasoning":"Trying to plan."}}]}',
+                b'data: {"choices":[{"finish_reason":"length","delta":{}}]}',
+                b'data: [DONE]',
+            ]
+        )
+
+
+class _EmptyLengthResponse(_FakeResponse):
+    """No content, no reasoning, finish_reason='length'."""
+
+    def iter_lines(self):
+        return iter(
+            [
+                b'data: {"choices":[{"finish_reason":"length","delta":{}}]}',
+                b'data: [DONE]',
+            ]
+        )
+
+
 class _ClientErrorResponse(_FakeResponse):
     status_code: int = 400
 
@@ -225,6 +263,61 @@ def test_client_rejects_failed_or_truncated_stream(
     monkeypatch.setattr(target, lambda *_a, **_kw: response)
 
     with pytest.raises(RuntimeError, match=message):
+        _client_for(kind, _settings(tmp_path, kind)).chat(
+            [{"role": "user", "content": "build"}]
+        )
+
+
+@pytest.mark.parametrize("kind", _CLIENT_KINDS)
+def test_client_surfaces_reasoning_when_completion_has_no_text(
+    monkeypatch, tmp_path, kind
+):
+    """Reasoning-first models (Anthropic extended thinking, OpenAI o-series,
+    Gemini thinking) can finish cleanly without emitting text. The reasoning
+    text is the only assistant payload; surface it as the message content
+    instead of crashing with a generic empty-completion error."""
+    monkeypatch.setenv("OPENAI_API_KEY" if kind == "openai" else "OPENROUTER_API_KEY", "test")
+    target = "agent.llm_base.requests.post"
+    monkeypatch.setattr(target, lambda *_a, **_kw: _ReasoningOnlyStopResponse())
+
+    response = _client_for(kind, _settings(tmp_path, kind)).chat(
+        [{"role": "user", "content": "build"}]
+    )
+
+    message = response["choices"][0]["message"]
+    assert message["content"] == "Thinking through geometry."
+    assert "tool_calls" not in message
+
+
+@pytest.mark.parametrize("kind", _CLIENT_KINDS)
+def test_client_reports_finish_reason_when_completion_is_truly_empty(
+    monkeypatch, tmp_path, kind
+):
+    """A response with finish_reason='length' and no content/tool calls is a
+    token-budget exhaustion. The error must call out 'length' so the operator
+    can raise max_completion_tokens; reasoning is *not* substituted."""
+    monkeypatch.setenv("OPENAI_API_KEY" if kind == "openai" else "OPENROUTER_API_KEY", "test")
+    target = "agent.llm_base.requests.post"
+    monkeypatch.setattr(target, lambda *_a, **_kw: _EmptyLengthResponse())
+
+    with pytest.raises(RuntimeError, match=r"finish_reason='length'"):
+        _client_for(kind, _settings(tmp_path, kind)).chat(
+            [{"role": "user", "content": "build"}]
+        )
+
+
+@pytest.mark.parametrize("kind", _CLIENT_KINDS)
+def test_client_does_not_substitute_reasoning_when_truncated(
+    monkeypatch, tmp_path, kind
+):
+    """Reasoning streamed but finish_reason='length' (output truncated before
+    any visible content) is still an error — substituting reasoning for the
+    missing answer would mask the real problem."""
+    monkeypatch.setenv("OPENAI_API_KEY" if kind == "openai" else "OPENROUTER_API_KEY", "test")
+    target = "agent.llm_base.requests.post"
+    monkeypatch.setattr(target, lambda *_a, **_kw: _ReasoningOnlyLengthResponse())
+
+    with pytest.raises(RuntimeError, match=r"finish_reason='length'"):
         _client_for(kind, _settings(tmp_path, kind)).chat(
             [{"role": "user", "content": "build"}]
         )

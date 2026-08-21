@@ -146,7 +146,7 @@ TOOL_SCHEMAS = [
             "parameter_checks": {
                 "type": "array",
                 "maxItems": 20,
-                "description": "Final-build checks for explicit numeric parameters defined in model.py. Use these for every user-stated dimension, angle, clearance, or count represented by a named parameter.",
+                "description": "Final-build checks for explicit numeric parameters defined in model.py. Use these for every user-stated dimension, angle, clearance, or count represented by a named parameter. Each check must include at least one bound: equals, minimum, or maximum (the runner silently treats a bare name as a no-op pass, so always include a bound).",
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
@@ -158,11 +158,6 @@ TOOL_SCHEMAS = [
                         "tolerance": {"type": "number", "minimum": 0},
                     },
                     "required": ["name"],
-                    "anyOf": [
-                        {"required": ["minimum"]},
-                        {"required": ["maximum"]},
-                        {"required": ["equals"]},
-                    ],
                 },
             },
         },
