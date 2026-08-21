@@ -31,13 +31,25 @@ _BINARY_OPERATORS = {
     ast.Div: operator.truediv,
     ast.Pow: operator.pow,
 }
-_FILE_LOCKS: dict[Path, threading.RLock] = {}
-_FILE_LOCKS_GUARD = threading.Lock()
+# Only ``model.py`` is editable (see ``EDITABLE_FILES``), so every path
+# that reaches ``_file_lock`` resolves to that single file. A single
+# module-level RLock is enough to serialise concurrent writes against
+# ``model.py`` across projects; the previous dictionary keying grew
+# without eviction (audit_270).
+_MODEL_FILE_LOCK: threading.RLock = threading.RLock()
 
 
 def _file_lock(path: Path) -> threading.RLock:
-    with _FILE_LOCKS_GUARD:
-        return _FILE_LOCKS.setdefault(path, threading.RLock())
+    """Return the lock used to serialise writes to ``model.py``.
+
+    The argument is ignored for backwards compatibility with call sites
+    that pass the resolved path. New callers may pass any value (the
+    editable-file check upstream guarantees ``model.py``); the shared
+    lock ensures consistent cross-project serialisation without any
+    per-path bookkeeping.
+    """
+    del path  # explicit: the path no longer keys the lock.
+    return _MODEL_FILE_LOCK
 
 
 class ModelPreflight(ast.NodeVisitor):

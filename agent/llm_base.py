@@ -485,6 +485,11 @@ def parse_chat_stream(
 
     if not saw_done:
         raise RuntimeError(f"{provider_label} stream ended before the completion marker.")
+    if finish_reason == "length":
+        raise RuntimeError(
+            f"{provider_label} completion was truncated (finish_reason='length'); "
+            "no tool calls were executed."
+        )
     # Some reasoning-first models (Anthropic extended thinking, OpenAI o-series,
     # Gemini thinking) emit reasoning deltas with no text content and finish
     # cleanly. Surface the reasoning as the assistant's substantive response so
@@ -566,10 +571,12 @@ class ChatCompletionsClient:
         self.settings = settings
         self.stop_event = None
         self.session_id: str | None = None
-        # ``agent_role`` lets sub-tools (e.g. the visual reviewer) tag the
-        # call so provider-side telemetry distinguishes the parent agent loop
-        # from its subordinate evaluators. The same underlying base prompt is
-        # reused, so the cache prefix stays stable.
+        # Subordinate evaluator hook. Currently the only supported role string is
+        # ``"reviewer"`` (set by :func:`agent.cad_review.review_cad`); the base
+        # agent loop leaves this ``None``. The field is preserved on the base
+        # client so the OpenRouter adapter can tag the ``trace.span_name`` of
+        # subordinate requests without changing the cache prefix. OpenAI's
+        # adapter does not consume it today.
         self.agent_role: str | None = None
         self.last_usage: dict[str, Any] | None = None
         self.last_image_fallback_used = False
@@ -711,6 +718,12 @@ class ChatCompletionsClient:
                         return self._stream_response(response)
                     body = response.json()
                     self.last_usage = body.get("usage") if isinstance(body.get("usage"), dict) else None
+                    choices = body.get("choices") if isinstance(body, dict) else None
+                    if choices and choices[0].get("finish_reason") == "length":
+                        raise RuntimeError(
+                            f"{self._provider_label} completion was truncated "
+                            "(finish_reason='length'); no tool calls were executed."
+                        )
                     return body
                 if log_payload:
                     self._activity_logger.log(

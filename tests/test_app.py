@@ -931,20 +931,29 @@ def test_restore_422_for_corrupt_revision(tmp_path: Path):
 
 
 def test_restore_rebuilds_and_registers_preview(tmp_path: Path, monkeypatch):
-    """Restore rebuilds the model and exposes a preview_id for the UI; the
-    preview no longer needs an explicit browser ACK to consider the task
-    done."""
+    """Restore rebuilds every visual artifact and registers the preview."""
     _settings, _app, client, project_dir, _revisions = _setup_project_with_revisions(tmp_path, 0)
     store = RevisionStore(project_dir)
     old = store.commit("result = 'old'\n", RevisionOrigin(kind="agent_edit"))
     store.commit("result = 'new'\n", RevisionOrigin(kind="agent_edit"))
 
-    def fake_run(self):
+    build_calls = []
+
+    def fake_build_and_verify(self, render=False):
+        build_calls.append(render)
         (self.project_dir / "preview.stl").write_bytes(b"solid preview\nendsolid preview\n")
-        return {"dimensions_mm": {"x": 10.0, "y": 20.0, "z": 30.0}}
+        return {
+            "metrics": {"dimensions_mm": {"x": 10.0, "y": 20.0, "z": 30.0}},
+            "render": "render.png",
+            "review": old.model_sha256,
+        }
 
     import agent.tools.cad_tool
-    monkeypatch.setattr(agent.tools.cad_tool.CadTool, "run", fake_run)
+    monkeypatch.setattr(
+        agent.tools.cad_tool.CadTool,
+        "build_and_verify",
+        fake_build_and_verify,
+    )
 
     response = client.post(f"/api/projects/demo/revisions/{old.id}/restore")
     data = response.get_json()
@@ -952,6 +961,7 @@ def test_restore_rebuilds_and_registers_preview(tmp_path: Path, monkeypatch):
     assert response.status_code == 200
     assert data["build_status"] == "succeeded"
     assert data["metrics"]["dimensions_mm"] == {"x": 10.0, "y": 20.0, "z": 30.0}
+    assert build_calls == [True]
     # The browser no longer ACKs display; the preview_id is still surfaced
     # so the SSE consumer can correlate, but a follow-up POST to the
     # legacy endpoint is no longer required.
@@ -960,6 +970,52 @@ def test_restore_rebuilds_and_registers_preview(tmp_path: Path, monkeypatch):
         "/api/projects/demo/preview/displayed",
         json={"preview_id": data["preview_id"]},
     ).status_code == 404
+
+
+def test_render_rejects_artifact_from_a_different_model(tmp_path: Path):
+    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    client = create_app(settings).test_client()
+    client.post("/api/projects/new", json={"name": "demo"})
+    project = settings.workspace_root / "demo"
+    (project / "model.py").write_text("result = 'restored'\n", encoding="utf-8")
+    (project / "render.png").write_bytes(b"old render")
+    (project / ".cad_metrics.json").write_text(
+        json.dumps({"model_sha256": "0" * 64, "review_manifest": {}}),
+        encoding="utf-8",
+    )
+
+    response = client.get("/api/projects/demo/render")
+
+    assert response.status_code == 404
+    assert "current model" in response.get_json()["error"]
+
+
+def test_render_serves_artifact_bound_to_current_model(tmp_path: Path):
+    settings = Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    client = create_app(settings).test_client()
+    client.post("/api/projects/new", json={"name": "demo"})
+    project = settings.workspace_root / "demo"
+    model = b"result = 'current'\n"
+    render = b"current render"
+    model_sha = hashlib.sha256(model).hexdigest()
+    render_sha = hashlib.sha256(render).hexdigest()
+    (project / "model.py").write_bytes(model)
+    (project / "render.png").write_bytes(render)
+    (project / ".cad_metrics.json").write_text(
+        json.dumps({
+            "model_sha256": model_sha,
+            "review_manifest": {
+                "model_sha256": model_sha,
+                "single_render": {"image_sha256": render_sha},
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    response = client.get("/api/projects/demo/render")
+
+    assert response.status_code == 200
+    assert response.data == render
 
 
 def test_revision_list_rejects_non_integer_limit(tmp_path: Path):

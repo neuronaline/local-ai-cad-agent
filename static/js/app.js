@@ -1058,7 +1058,7 @@ function discardEmptyStreamingCard(messageId) {
   if (!card) return;
   streamingMessages.delete(messageId);
   if (pendingFinalCard === card) pendingFinalCard = null;
-  if (!card.dataset.raw) card.remove();
+  card.remove();
 }
 
 async function syncAfterStreamReset() {

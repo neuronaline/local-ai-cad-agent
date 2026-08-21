@@ -972,6 +972,44 @@ def test_prune_prior_read_file_skips_already_compact_entries():
 # --------------------------------------------------------------------------- #
 
 
+def test_dispatch_rejects_parameter_check_without_a_bound():
+    from agent.dispatcher import dispatch
+
+    cad = type("Cad", (), {"with_call_id": lambda self, _call_id: self})()
+    tools = type("Tools", (), {"cad": cad})()
+
+    with pytest.raises(ValueError, match=r"parameter_checks\[0\]"):
+        dispatch(
+            tools,
+            "demo",
+            "cad_build_and_verify",
+            {"parameter_checks": [{"name": "width"}]},
+        )
+
+
+def test_screenshot_is_blocked_after_failed_build(tmp_path: Path):
+    from agent.dispatcher import process_tool_call
+
+    screenshot = type("Screenshot", (), {"execute": lambda self, _args: {}})()
+    tools = type("Tools", (), {"screenshot": screenshot})()
+    messages: list[dict] = []
+    process_tool_call(
+        tools,
+        "demo",
+        tmp_path,
+        {"id": "shot-1", "function": {"name": "cad_screenshot", "arguments": "{}"}},
+        True,
+        None,
+        "build failed",
+        messages,
+        publish=lambda *_args, **_kwargs: None,
+        register_preview=lambda *_args: "preview-1",
+        append_message=lambda *_args: None,
+    )
+
+    assert json.loads(messages[-1]["content"])["ok"] is False
+
+
 def test_build_cad_build_multimodal_content_attaches_render(tmp_path: Path):
     """A successful render=true build must attach one valid PNG as inline image
     content so the agent evaluates the build in-band instead of asking the

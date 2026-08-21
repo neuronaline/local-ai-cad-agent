@@ -66,7 +66,3 @@ def as_chat_image(path: Path) -> dict[str, object]:
     """
     encoded = base64.b64encode(path.read_bytes()).decode("ascii")
     return {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}}
-
-
-# Backward-compat alias for callers and tests still importing the old name.
-as_openrouter_image = as_chat_image

@@ -10,15 +10,20 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import tempfile
 import threading
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 from typing import ParamSpec, TypeVar
+
+from agent.io import (
+    atomic_write_bytes,
+    atomic_write_json,
+    atomic_write_text,
+    utc_now_iso,
+)
 
 SCHEMA_VERSION = 1
 _MAX_SOURCE_BYTES = 2 * 1024 * 1024  # 2 MB
@@ -155,12 +160,10 @@ class BuildRecord:
         )
 
 
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _sha256(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+# Local aliases retained for backwards-compatible in-module references.
+# New callers should prefer the canonical helpers from :mod:`agent.io`.
+_utc_now = utc_now_iso
+_sha256 = lambda data: hashlib.sha256(data).hexdigest()
 
 
 class RevisionStore:
@@ -596,16 +599,9 @@ class RevisionStore:
         lines = [line for line in text.splitlines() if line]
         while lines and (sum(len(line.encode("utf-8")) + 1 for line in lines) > _BUILDS_MAX_BYTES):
             lines.pop(0)
-        with tempfile.NamedTemporaryFile(
-            mode="w", dir=log_path.parent, encoding="utf-8", delete=False
-        ) as temporary:
-            tmp_path = Path(temporary.name)
-            tmp_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
-        try:
-            tmp_path.replace(log_path)
-        except BaseException:
-            tmp_path.unlink(missing_ok=True)
-            raise
+        atomic_write_text(
+            log_path, "\n".join(lines) + ("\n" if lines else "")
+        )
 
     @_synchronized
     def last_known_good(self) -> Revision | None:
@@ -744,16 +740,7 @@ class RevisionStore:
         if not removed:
             return
         payload = "\n".join(kept) + ("\n" if kept else "")
-        with tempfile.NamedTemporaryFile(
-            mode="w", dir=log_path.parent, encoding="utf-8", delete=False
-        ) as temporary:
-            tmp_path = Path(temporary.name)
-            tmp_path.write_text(payload, encoding="utf-8")
-        try:
-            tmp_path.replace(log_path)
-        except BaseException:
-            tmp_path.unlink(missing_ok=True)
-            raise
+        atomic_write_text(log_path, payload)
 
     def _verify_active_model(self, revision: Revision) -> None:
         """Confirm the active model.py digest matches the revision."""
@@ -875,44 +862,19 @@ class RevisionStore:
             raise RevisionIntegrityError(f"Invalid JSON structure in {path.name}.")
         return data
 
-    @staticmethod
-    def _atomic_write_json(path: Path, data: dict) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            mode="w", dir=path.parent, encoding="utf-8", delete=False, suffix=".tmp"
-        ) as temporary:
-            temporary_path = Path(temporary.name)
-            json.dump(data, temporary, ensure_ascii=False, indent=2)
-        try:
-            temporary_path.replace(path)
-        except BaseException:
-            temporary_path.unlink(missing_ok=True)
-            raise
-
+    # ------------------------------------------------------------------
+    # Atomic write helpers — thin delegations to the canonical helpers in
+    # :mod:`agent.io`. Kept as static methods so existing call sites
+    # (``self._atomic_write_text(...)`` etc.) continue to work.
+    # ------------------------------------------------------------------
     @staticmethod
     def _atomic_write_text(path: Path, content: str) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            mode="w", dir=path.parent, encoding="utf-8", delete=False, suffix=".tmp"
-        ) as temporary:
-            temporary_path = Path(temporary.name)
-            temporary.write(content)
-        try:
-            temporary_path.replace(path)
-        except BaseException:
-            temporary_path.unlink(missing_ok=True)
-            raise
+        atomic_write_text(path, content)
 
     @staticmethod
     def _atomic_write_bytes(path: Path, data: bytes) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            dir=path.parent, delete=False, suffix=".tmp"
-        ) as temporary:
-            temporary_path = Path(temporary.name)
-            temporary.write(data)
-        try:
-            temporary_path.replace(path)
-        except BaseException:
-            temporary_path.unlink(missing_ok=True)
-            raise
+        atomic_write_bytes(path, data)
+
+    @staticmethod
+    def _atomic_write_json(path: Path, data: dict) -> None:
+        atomic_write_json(path, data)

@@ -1,12 +1,16 @@
 """Configuration loading for the local CAD agent."""
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+_LOG = logging.getLogger(__name__)
+_WARNED_KEYS: set[str] = set()
 
 REASONING_EFFORTS = {"minimal", "low", "medium", "high"}
 LLM_PROVIDERS = {"openrouter", "openai"}
@@ -97,6 +101,31 @@ def _reject_unknown(mapping: Any, allowed: set[str], namespace: str) -> None:
     unknown = sorted(set(mapping) - allowed)
     if unknown:
         raise ValueError(f"Unknown {namespace} setting(s): {', '.join(unknown)}")
+
+
+# Settings that are still accepted for backwards compatibility but are no
+# longer consulted by the agent. Each key is logged once per process so a
+# user adding the legacy key to ``config.yaml`` notices the warning in the
+# server log instead of assuming the setting does something.
+_DEPRECATED_KEYS: dict[str, tuple[str, str]] = {
+    "review.max_cycles": (
+        "review",
+        "the structured review (cad_review) is opt-in; remove max_cycles from config.yaml.",
+    ),
+}
+
+
+def _warn_deprecated(namespace: str, key: str) -> None:
+    full_key = f"{namespace}.{key}"
+    if full_key in _WARNED_KEYS:
+        return
+    _WARNED_KEYS.add(full_key)
+    note = _DEPRECATED_KEYS.get(full_key, ("", "no longer used; remove from config.yaml."))[1]
+    _LOG.warning(
+        "Ignored deprecated setting %s: %s",
+        full_key,
+        note,
+    )
 
 
 def _validate_port(value: Any, name: str) -> int:
@@ -193,8 +222,16 @@ def load_settings(project_root: Path | None = None) -> Settings:
         "agent",
     )
     _reject_unknown(
-        review, {"enabled", "render_workers", "required_views", "max_cycles"}, "review"
+        review,
+        {"enabled", "render_workers", "required_views", "max_cycles"},
+        "review",
     )
+    # ``review.max_cycles`` is accepted for backward compatibility (legacy
+    # configs keep loading) but ignored — the structured review verdict
+    # (cad_review) is opt-in, not auto-cycled. Emit a one-time warning so
+    # users notice the dead key in the server log.
+    if isinstance(review, dict) and "max_cycles" in review:
+        _warn_deprecated("review", "max_cycles")
 
     # llm.provider selects which adapter AgentRunner should use. Settings
     # for the inactive provider are still loaded so users can switch without

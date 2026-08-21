@@ -45,17 +45,26 @@ def dispatch(
     ``waiting`` is True only for the question tool (the LLM is parked
     until the user replies).
 
-    Tool instances expose both a per-call ``with_call_id`` method (used to
-    bind a publish call_id) and a generic ``execute(args)`` entry. The
-    dispatcher selects the right one based on name; tools without the
-    explicit prefix (e.g. ``terminal_run``, ``experience_search``) fall
-    through to ``getattr(tools, name).execute(args)``.
+    The dispatcher knows only the seven tool names published by
+    :mod:`agent.tool_schemas`: ``cad_build_and_verify``, ``cad_screenshot``,
+    ``cad_review``, ``read_file``, ``write_file``, ``edit_file``,
+    ``insert_file``, ``regex_replace`` (parity), and ``question``. Tool
+    instances expose a per-call ``with_call_id`` method plus a generic
+    ``execute(args)`` entry; the dispatcher selects the right one based on
+    name.
     """
     if name == "cad_build_and_verify":
         # ``render`` defaults to False, matching both the schema and
         # ``CadTool.build_and_verify``. Final verification opts in explicitly.
         cad = tools.cad.with_call_id(call_id)
         checks = args.get("parameter_checks") or []
+        for index, check in enumerate(checks):
+            if not isinstance(check, dict) or not any(
+                key in check for key in ("equals", "minimum", "maximum")
+            ):
+                raise ValueError(
+                    f"parameter_checks[{index}] requires equals, minimum, or maximum."
+                )
         if checks:
             return cad.build_and_verify(args.get("render", False), checks), False
         return cad.build_and_verify(args.get("render", False)), False
@@ -124,9 +133,11 @@ def dispatch(
             False,
         )
     if name == "regex_replace":
-        # Reserved for parity with the file_tool surface; not exposed in
-        # TOOL_SCHEMAS yet but the dispatcher passes through so future
-        # schema additions work without touching agent.core.
+        # ``regex_replace`` is implemented on ``FileTool`` for parity with
+        # the read/write/edit/insert surface. It is intentionally not
+        # surfaced in :mod:`agent.tool_schemas` so it cannot be invoked
+        # by the LLM. The dispatcher still routes the call for any
+        # internal caller that holds a ``FileTool`` reference.
         tool = (
             tools.file.with_call_id(call_id) if call_id else tools.file
         )
@@ -247,6 +258,10 @@ def process_tool_call(
             )
         if is_cad_build(name, arguments):
             preview_id = None
+        if cad_fix_required and name in {"cad_screenshot", "cad_review"}:
+            raise ValueError(
+                f"{name} requires a successful build of the current revision."
+            )
         raw_result, waiting = dispatch(tools, project, name, arguments, call_id)
         result = tool_success(name, raw_result)
         if is_model_mutation(name, arguments):

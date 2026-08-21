@@ -26,9 +26,10 @@ from __future__ import annotations
 import json
 import threading
 from copy import deepcopy
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from agent.io import atomic_write_text, utc_now_iso
 
 # ---------------------------------------------------------------------------
 # Configuration constants
@@ -106,7 +107,7 @@ class ActivityLogger:
         """Append a single event line. Best-effort; never raises."""
         try:
             entry = {
-                "ts": datetime.now(timezone.utc).isoformat(),
+                "ts": utc_now_iso(),
                 "run_id": run_id or "",
                 "event": event,
             }
@@ -169,11 +170,12 @@ class ActivityLogger:
         if not kept:
             return
         # Write atomically via a sibling temp so an interrupted trim cannot
-        # corrupt the canonical log.
+        # corrupt the canonical log. The trim is best-effort; only OSError
+        # is swallowed because that is the failure mode a size cap is
+        # designed to recover from (interrupted trim -> cap exceeded ->
+        # next call trims again).
         try:
-            tmp = self.log_path.with_suffix(self.log_path.suffix + ".tmp")
-            tmp.write_text("\n".join(kept) + "\n", encoding="utf-8")
-            tmp.replace(self.log_path)
+            atomic_write_text(self.log_path, "\n".join(kept) + "\n")
         except OSError:
             return
 

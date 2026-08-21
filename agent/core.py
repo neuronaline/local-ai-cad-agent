@@ -30,8 +30,6 @@ from agent.conversation import (
 from agent.dispatcher import (
     cancel_remaining_tool_calls,
     dispatch,
-    is_cad_build,
-    is_model_mutation,
     normalize_tool_calls,
     process_tool_call,
 )
@@ -397,18 +395,24 @@ class AgentRunner:
                     assistant_message["tool_calls"] = tool_calls
                 else:
                     assistant_message.pop("tool_calls", None)
+                invalid_final = (
+                    not tool_calls
+                    and any_tool_used
+                    and (not preview_id or cad_fix_required)
+                )
                 self.publish(
                     "agent_stream_end",
                     {
                         "project": project,
                         "message_id": message_id,
-                        "message": assistant_message.get("content") or "",
+                        "message": ""
+                        if invalid_final
+                        else assistant_message.get("content") or "",
                     },
                 )
-                messages.append(assistant_message)
-                # Persist every assistant turn (intermediate tool-call turns and
-                # final user-facing turns) as the single canonical history entry.
-                self._append_message(project_dir, assistant_message)
+                if not invalid_final:
+                    messages.append(assistant_message)
+                    self._append_message(project_dir, assistant_message)
                 if not tool_calls:
                     content = assistant_message.get("content") or "Task completed."
                     if not preview_id:
@@ -577,6 +581,11 @@ class AgentRunner:
             detail = str(error)
             err_type = type(error).__name__
             traceback.print_exc()
+            if "message_id" in locals():
+                self.publish(
+                    "agent_stream_end",
+                    {"project": project, "message_id": message_id, "message": ""},
+                )
             if self._stop_event.is_set():
                 self.publish(
                     "agent_status",
@@ -674,20 +683,6 @@ class AgentRunner:
         normalized = re.sub(r"\b0x[0-9a-f]+\b", "0x#", normalized)
         return normalized[-1000:]
 
-    @staticmethod
-    def _strip_image_parts(item: dict) -> dict:
-        """Replace inline image parts with placeholders when loading history.
-
-        Thin wrapper around :meth:`ConversationStore._strip_image_parts`;
-        kept as a classmethod so existing call sites and tests that import
-        it continue to work.
-        """
-        return ConversationStore._strip_image_parts(item)
-
-    @classmethod
-    def _truncate_history(cls, history: list[dict]) -> list[dict]:
-        return ConversationStore._truncate(history)
-
     @classmethod
     def _load_history(cls, project_dir: Path) -> list[dict]:
         """Load the canonical conversation.jsonl for ``project_dir``."""
@@ -746,14 +741,6 @@ class AgentRunner:
     def _normalize_tool_calls(raw_calls: object) -> list[dict]:
         """Backwards-compatible alias for :func:`dispatcher.normalize_tool_calls`."""
         return normalize_tool_calls(raw_calls)
-
-    @staticmethod
-    def _is_model_mutation(name: str, arguments: dict) -> bool:
-        return is_model_mutation(name, arguments)
-
-    @staticmethod
-    def _is_cad_build(name: str, arguments: dict) -> bool:
-        return is_cad_build(name, arguments)
 
     def _process_tool_call(
         self,

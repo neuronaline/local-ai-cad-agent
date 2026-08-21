@@ -10,12 +10,7 @@ import hashlib
 import os
 from typing import Any
 
-from agent.llm_base import (
-    ChatCompletionsClient,
-    post_with_cancel,
-    sanitize_assistant_message,  # noqa: F401 - backward-compatible public re-export.
-    sanitize_messages,
-)
+from agent.llm_base import ChatCompletionsClient, post_with_cancel, sanitize_messages
 from agent.settings import Settings
 
 
@@ -49,8 +44,11 @@ class OpenRouterClient(ChatCompletionsClient):
         if self.session_id:
             payload["session_id"] = hashlib.sha256(self.session_id.encode()).hexdigest()[:64]
         # Tag subordinate evaluators through OpenRouter's documented tracing
-        # surface so the request remains valid and observability can distinguish
-        # reviewer spans from the parent agent loop.
+        # surface so the request remains valid and observability can
+        # distinguish reviewer spans from the parent agent loop. Only the
+        # role strings produced by the agent — currently ``"reviewer"``
+        # from :func:`agent.cad_review.review_cad` — are forwarded; the
+        # default ``None`` skips the field entirely.
         if self.agent_role:
             trace = payload.setdefault("trace", {})
             if isinstance(trace, dict):

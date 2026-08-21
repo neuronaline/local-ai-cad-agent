@@ -123,6 +123,17 @@ class _EmptyLengthResponse(_FakeResponse):
         )
 
 
+class _ToolCallLengthResponse(_FakeResponse):
+    def iter_lines(self):
+        return iter(
+            [
+                b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"cad_build_and_verify","arguments":"{}"}}]}}]}',
+                b'data: {"choices":[{"finish_reason":"length","delta":{}}]}',
+                b'data: [DONE]',
+            ]
+        )
+
+
 class _ClientErrorResponse(_FakeResponse):
     status_code: int = 400
 
@@ -318,6 +329,23 @@ def test_client_does_not_substitute_reasoning_when_truncated(
     monkeypatch.setattr(target, lambda *_a, **_kw: _ReasoningOnlyLengthResponse())
 
     with pytest.raises(RuntimeError, match=r"finish_reason='length'"):
+        _client_for(kind, _settings(tmp_path, kind)).chat(
+            [{"role": "user", "content": "build"}]
+        )
+
+
+@pytest.mark.parametrize("kind", _CLIENT_KINDS)
+def test_client_rejects_tool_call_from_truncated_completion(
+    monkeypatch, tmp_path, kind
+):
+    monkeypatch.setenv(
+        "OPENAI_API_KEY" if kind == "openai" else "OPENROUTER_API_KEY", "test"
+    )
+    monkeypatch.setattr(
+        "agent.llm_base.requests.post", lambda *_a, **_kw: _ToolCallLengthResponse()
+    )
+
+    with pytest.raises(RuntimeError, match="no tool calls were executed"):
         _client_for(kind, _settings(tmp_path, kind)).chat(
             [{"role": "user", "content": "build"}]
         )

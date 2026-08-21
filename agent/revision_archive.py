@@ -14,10 +14,9 @@ on. Production callers should treat this module as internal.
 from __future__ import annotations
 
 import json
-import tempfile
-from datetime import datetime, timezone
 from pathlib import Path
 
+from agent.io import atomic_write_json, utc_now_iso
 from agent.revisions import (
     _REVISION_ID_RE,
     _SHA256_RE,
@@ -26,10 +25,6 @@ from agent.revisions import (
     Revision,
     RevisionIntegrityError,
 )
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 def export_history(store, target_dir: Path) -> Path:
@@ -58,26 +53,13 @@ def export_history(store, target_dir: Path) -> Path:
             revisions_data.append(rev_data)
         archive = {
             "schema_version": SCHEMA_VERSION,
-            "exported_at": _utc_now(),
+            "exported_at": utc_now_iso(),
             "head": head_data,
             "revisions": revisions_data,
             "blobs": blobs,
         }
         archive_path = target_dir / "cad-agent-history.json"
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            dir=target_dir,
-            encoding="utf-8",
-            delete=False,
-            suffix=".tmp",
-        ) as temporary:
-            tmp_path = Path(temporary.name)
-            json.dump(archive, temporary, ensure_ascii=False, indent=2)
-        try:
-            tmp_path.replace(archive_path)
-        except BaseException:
-            tmp_path.unlink(missing_ok=True)
-            raise
+        atomic_write_json(archive_path, archive)
         return archive_path
 
 

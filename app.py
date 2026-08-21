@@ -33,6 +33,7 @@ from werkzeug.exceptions import RequestEntityTooLarge
 
 from agent.core import AgentRunner, _history_lock_slot
 from agent.images import store_images
+from agent.io import utc_now_iso
 from agent.revisions import RevisionIntegrityError, RevisionStore
 from agent.sandbox import _BWRAP, seccomp_filter_fd
 from agent.settings import Settings, load_settings
@@ -138,8 +139,9 @@ class EventBus:
                 self._subscribers.remove(subscriber)
 
 
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+# Local alias retained for backwards-compatible in-module references.
+# New callers should prefer the canonical helper from :mod:`agent.io`.
+_utc_now = utc_now_iso
 
 
 def _project_path(settings: Settings, project_name: str) -> Path:
@@ -753,11 +755,29 @@ def create_app(settings: Settings | None = None) -> Flask:
     @app.get("/api/projects/<project_name>/render")
     def project_render(project_name: str):
         try:
-            render_path = _project_path(app.config["SETTINGS"], project_name) / "render.png"
+            project_dir = _project_path(app.config["SETTINGS"], project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
+        render_path = project_dir / "render.png"
         if not render_path.is_file() or render_path.stat().st_size == 0:
             return jsonify({"error": "No render has been generated."}), 404
+        try:
+            build = json.loads(
+                (project_dir / ".cad_metrics.json").read_text(encoding="utf-8")
+            )
+            manifest = build["review_manifest"]
+            expected_sha = manifest["single_render"]["image_sha256"]
+            current_model_sha = hashlib.sha256(
+                (project_dir / "model.py").read_bytes()
+            ).hexdigest()
+        except (OSError, KeyError, TypeError, json.JSONDecodeError):
+            return jsonify({"error": "No render exists for the current model."}), 404
+        if (
+            build.get("model_sha256") != current_model_sha
+            or manifest.get("model_sha256") != current_model_sha
+            or hashlib.sha256(render_path.read_bytes()).hexdigest() != expected_sha
+        ):
+            return jsonify({"error": "No render exists for the current model."}), 404
         return send_file(render_path, mimetype="image/png", max_age=0)
 
     @app.get("/api/projects/<project_name>/preview")
@@ -1101,7 +1121,8 @@ def create_app(settings: Settings | None = None) -> Flask:
             from agent.tools.cad_tool import CadTool
             cad = CadTool(project_dir, bus.publish, store)
             try:
-                metrics = cad.run()
+                build = cad.build_and_verify(render=True)
+                metrics = build.get("metrics") or {}
             except (RuntimeError, ValueError, TypeError) as error:
                 bus.publish("agent_error", {
                     "project": project_name,

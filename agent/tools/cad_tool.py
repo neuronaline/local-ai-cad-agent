@@ -13,6 +13,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from agent.io import atomic_write_bytes
 from agent.revisions import RevisionIntegrityError, RevisionStore
 from agent.sandbox import command as sandbox_command
 from agent.tools.file_tool import FileTool
@@ -382,14 +383,10 @@ class CadTool:
 
     @staticmethod
     def _atomic_copy(source: Path, target: Path) -> None:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as temporary:
-            temporary_path = Path(temporary.name)
-        try:
-            shutil.copyfile(source, temporary_path)
-            temporary_path.replace(target)
-        finally:
-            temporary_path.unlink(missing_ok=True)
+        # Read the source into memory and delegate to the canonical byte
+        # helper so the temp-cleanup + replace semantics match every other
+        # atomic write in the agent (audit_272).
+        atomic_write_bytes(target, source.read_bytes())
 
     # ------------------------------------------------------------------ review promotion
 

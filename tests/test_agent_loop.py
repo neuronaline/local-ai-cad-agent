@@ -811,9 +811,7 @@ def test_protocol_history_is_append_only_and_preserves_tool_call_content(
         "user",
         "assistant",
         "tool",
-        "assistant",
         "user",
-        "assistant",
         "user",
     ]
     assert (

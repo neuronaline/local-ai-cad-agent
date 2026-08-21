@@ -37,6 +37,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from agent.io import utc_now_iso
 from agent.sandbox import command as sandbox_command
 from agent.tools.cad_scripts import screenshot as screenshot_script
 from agent.tools.file_tool import FileTool
@@ -546,7 +547,7 @@ class CadScreenshotTool:
                     review_dir.name
                 )
             merged["rendered_at"] = (
-                merged.get("rendered_at") or _utc_now()
+                merged.get("rendered_at") or utc_now_iso()
             )
             (staging_tmp / "manifest.json").write_text(
                 json.dumps(merged, ensure_ascii=False, indent=2),
@@ -569,8 +570,3 @@ class CadScreenshotTool:
                 shutil.rmtree(staging_tmp, ignore_errors=True)
             shutil.rmtree(staging, ignore_errors=True)
 
-
-def _utc_now() -> str:
-    from datetime import datetime, timezone
-
-    return datetime.now(timezone.utc).isoformat()
