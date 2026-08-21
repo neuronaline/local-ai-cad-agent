@@ -180,9 +180,13 @@ def get_system_prompt() -> str:
     return _PROMPT_CACHE.get()
 
 
-def get_prompt_cache_key() -> str:
-    """Return the stable routing key for requests sharing this prompt prefix."""
-    return f"local-ai-cad-agent:{_PROMPT_CACHE.hash()[:16]}"
+def get_prompt_cache_key(namespace: str | None = None) -> str:
+    """Return a stable, bounded routing key for one prompt/session pair."""
+    key = f"local-ai-cad-agent:{_PROMPT_CACHE.hash()[:16]}"
+    if namespace:
+        session_hash = hashlib.sha256(namespace.encode("utf-8")).hexdigest()[:16]
+        key = f"{key}:{session_hash}"
+    return key
 
 
 def get_build123d_playbook() -> str:

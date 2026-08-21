@@ -349,8 +349,6 @@ def process_tool_call(
         # builds the agent did not actually render.
         if build_succeeded and arguments.get("render") is True and image_paths:
             cad_fix_required = False
-    if name == "read_file":
-        _prune_prior_read_file(messages, arguments, context_result)
     tool_message = {"role": "tool", "tool_call_id": call_id, "content": context_content}
     messages.append(tool_message)
     append_message(project_dir, tool_message)
@@ -396,82 +394,6 @@ def _remember_inline_tool_images(
         )
     except OSError:
         return
-
-
-def _prune_prior_read_file(
-    messages: list[dict], arguments: dict, new_result: str
-) -> None:
-    """Drop the file body from earlier ``read_file`` tool results.
-
-    The first ``read_file`` call in the current run still ships the file body
-    so the agent can build ``edit_file`` ``old_string`` arguments from it.
-    Once the agent has seen the body once, every subsequent read returns just
-    the SHA — keeping the duplicate file body in every older turn inflates the
-    prompt by ~4-5 KB per turn with no information gain.
-
-    The new tool result itself is left untouched so the agent always has the
-    latest body available; only older read_file entries are compacted.
-    """
-    filename = arguments.get("filename")
-    if not isinstance(filename, str) or not filename:
-        return
-    try:
-        new_payload = json.loads(new_result)
-    except (TypeError, json.JSONDecodeError):
-        return
-    if not isinstance(new_payload, dict) or new_payload.get("ok") is not True:
-        return
-    new_data = new_payload.get("data")
-    new_sha: str | None = None
-    if isinstance(new_data, str):
-        try:
-            parsed = json.loads(new_data)
-        except json.JSONDecodeError:
-            parsed = None
-        if isinstance(parsed, dict):
-            sha = parsed.get("sha256")
-            if isinstance(sha, str):
-                new_sha = sha
-    if not new_sha:
-        return
-    for entry in messages:
-        if entry.get("role") != "tool":
-            continue
-        prior_result = entry.get("content")
-        if not isinstance(prior_result, str):
-            continue
-        try:
-            prior_payload = json.loads(prior_result)
-        except (TypeError, json.JSONDecodeError):
-            continue
-        if (
-            not isinstance(prior_payload, dict)
-            or prior_payload.get("tool") != "read_file"
-            or prior_payload.get("ok") is not True
-        ):
-            continue
-        prior_data = prior_payload.get("data")
-        if not isinstance(prior_data, str):
-            continue
-        try:
-            prior_parsed = json.loads(prior_data)
-        except json.JSONDecodeError:
-            continue
-        if (
-            not isinstance(prior_parsed, dict)
-            or prior_parsed.get("exists") is not True
-        ):
-            continue
-        if prior_parsed.get("content") is None:
-            continue
-        compacted = {
-            "exists": True,
-            "unchanged": True,
-            "sha256": prior_parsed.get("sha256") or new_sha,
-            "total_lines": prior_parsed.get("total_lines"),
-        }
-        prior_payload["data"] = json.dumps(compacted, ensure_ascii=False)
-        entry["content"] = json.dumps(prior_payload, ensure_ascii=False)
 
 
 def cancel_remaining_tool_calls(

@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from PIL import Image
 
 from agent.tool_schemas import TOOL_SCHEMAS
 from agent.tools.cad_screenshot_tool import CadScreenshotTool
@@ -279,7 +280,7 @@ def test_execute_returns_cache_hit_without_subprocess(tmp_path: Path):
     for view_id in views:
         png = review_dir / "views" / f"{view_id}.png"
         png.parent.mkdir(parents=True, exist_ok=True)
-        png.write_bytes(b"\x89PNG\r\n\x1a\n fake")
+        Image.new("RGB", (8, 8), (20, 30, 40)).save(png, "PNG")
         view_shas[view_id] = hashlib.sha256(png.read_bytes()).hexdigest()
     manifest = {
         "model_sha256": model_sha,
@@ -316,6 +317,28 @@ def test_execute_returns_cache_hit_without_subprocess(tmp_path: Path):
     assert view_ids == list(views)
     assert any(kind == "preview_updated" for kind, _ in published)
     assert any(kind == "screenshot_updated" for kind, _ in published)
+
+
+def test_cache_variants_do_not_overwrite_canonical_review(tmp_path: Path):
+    project = tmp_path / "demo"
+    project.mkdir()
+    tool = CadScreenshotTool(project)
+    model_sha = "a" * 64
+
+    canonical = tool._cache_dir(
+        model_sha, tool.SUBSET_VIEWS, "standard", True
+    )
+    subset = tool._cache_dir(
+        model_sha, ("x_positive",), "standard", True
+    )
+    high = tool._cache_dir(
+        model_sha, tool.SUBSET_VIEWS, "high", True
+    )
+
+    assert canonical == tool._review_dir(model_sha)
+    assert subset != canonical
+    assert high != canonical
+    assert subset != high
 
 
 def test_execute_rejects_unknown_view_before_sandbox(tmp_path: Path):

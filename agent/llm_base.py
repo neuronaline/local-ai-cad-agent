@@ -90,11 +90,13 @@ def sanitize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _compact_completed_history(messages: list[dict[str, Any]]) -> None:
-    """Shrink old file bodies and edit arguments in the API-only copy.
+    """Compact completed mutations without rewriting an already-sent prefix.
 
-    The latest tool result remains verbatim because it drives the model's next
-    action. Older read bodies and completed edit arguments are recoverable from
-    the current ``model.py`` and otherwise dominate long repair-loop prompts.
+    A message must have the same wire representation from the first request
+    that contains it onward. Age-based compaction breaks prompt caching because
+    the previous "latest" message changes as soon as another message is
+    appended. Completed mutation arguments are safe to compact immediately;
+    read results remain verbatim because the model may need their source body.
     """
     tool_result_ids = {
         message.get("tool_call_id")
@@ -102,20 +104,10 @@ def _compact_completed_history(messages: list[dict[str, Any]]) -> None:
         if message.get("role") == "tool"
         and isinstance(message.get("tool_call_id"), str)
     }
-    completed_assistants = [
-        index
-        for index, message in enumerate(messages)
-        if message.get("role") == "assistant"
-        and any(
-            isinstance(call, dict) and call.get("id") in tool_result_ids
-            for call in message.get("tool_calls") or []
-        )
-    ]
-    keep_assistant = completed_assistants[-1] if completed_assistants else -1
-    for index, message in enumerate(messages):
-        if message.get("role") == "tool" and index != len(messages) - 1:
+    for message in messages:
+        if message.get("role") == "tool":
             message["content"] = _compact_tool_content(message.get("content"))
-        if message.get("role") != "assistant" or index == keep_assistant:
+        if message.get("role") != "assistant":
             continue
         for call in message.get("tool_calls") or []:
             if not isinstance(call, dict) or call.get("id") not in tool_result_ids:
@@ -178,33 +170,7 @@ def _compact_tool_text(text: str) -> str:
         from agent.tool_results import compact_for_context
 
         return compact_for_context(tool, text)
-    if tool != "read_file":
-        return text
-    data = payload.get("data")
-    if not isinstance(data, str):
-        return text
-    try:
-        read_data = json.loads(data)
-    except json.JSONDecodeError:
-        return text
-    if not isinstance(read_data, dict) or "content" not in read_data:
-        return text
-    payload["data"] = json.dumps(
-        {
-            key: read_data[key]
-            for key in (
-                "exists",
-                "sha256",
-                "total_lines",
-                "offset",
-                "returned_lines",
-                "next_offset",
-            )
-            if key in read_data
-        },
-        ensure_ascii=False,
-    )
-    return json.dumps(payload, ensure_ascii=False)
+    return text
 
 
 def relocate_tool_images(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -252,7 +218,13 @@ def relocate_tool_images(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
             if isinstance(part, dict) and part.get("type") == "image_url"
         ]
         tool_copy = deepcopy(message)
-        tool_copy["content"] = text_parts or "An attached image was unavailable."
+        if len(text_parts) == 1 and isinstance(text_parts[0], dict):
+            text = text_parts[0].get("text")
+            tool_copy["content"] = (
+                text if isinstance(text, str) else text_parts
+            )
+        else:
+            tool_copy["content"] = text_parts or "An attached image was unavailable."
         relocated.append(tool_copy)
         if index == latest_index:
             latest_images = [deepcopy(part) for part in image_parts]
@@ -633,24 +605,15 @@ class ChatCompletionsClient:
             raise RuntimeError(f"{api_key_env(self._provider_label.lower())} is not configured.")
         payload = self._build_payload(messages, tools)
         headers = self._build_headers(api_key)
-        # Capture the request body once; ``payload`` is mutated by the
-        # image-fallback path so we deep-copy the original shape to keep
-        # the log independent of subsequent retry mutations.
         log_payload = self._activity_logger is not None
-        request_snapshot = (
-            {
-                "url": self._endpoint(),
-                "model": payload.get("model"),
-                "headers": dict(headers),
-                "payload": deepcopy(payload),
-            }
-            if log_payload
-            else None
-        )
 
         image_fallback_used = False
         for attempt in range(3):
             response: requests.Response | None = None
+            # Image fallback mutates the payload between attempts. Record the
+            # body actually sent on this attempt so cache diagnostics do not
+            # compare a rejected image request with a successful text request.
+            attempt_payload = deepcopy(payload) if log_payload else None
             try:
                 response = self._post(payload, headers)
             except RequestCancelled:
@@ -706,10 +669,10 @@ class ChatCompletionsClient:
                             "llm_request",
                             {
                                 "attempt": attempt,
-                                "url": request_snapshot["url"],
-                                "model": request_snapshot["model"],
-                                "headers": request_snapshot["headers"],
-                                "payload": request_snapshot["payload"],
+                                "url": self._endpoint(),
+                                "model": payload.get("model"),
+                                "headers": dict(headers),
+                                "payload": attempt_payload,
                                 "status": response.status_code,
                             },
                             run_id=getattr(self, "_run_id", None),

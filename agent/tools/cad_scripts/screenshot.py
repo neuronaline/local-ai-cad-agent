@@ -36,12 +36,9 @@ try:
         rasterize_view,
     )
 except ModuleNotFoundError:
-    # Host-side import (only ``SUBSET_VIEWS`` / ``QUALITY_TOLERANCES`` are
-    # consumed by the orchestrator). The subset rasteriser is not callable
-    # in this mode; ``render_subset`` raises a clear error when invoked.
-    VIEWS = None  # type: ignore[assignment]
-    _tessellate = None  # type: ignore[assignment]
-    rasterize_view = None  # type: ignore[assignment]
+    # Package import on the host. Inside the sandbox the sibling import above
+    # succeeds because both scripts are copied into one workspace.
+    from .renderer import VIEWS, _tessellate, rasterize_view
 
 # ---------------------------------------------------------------------------
 # Subset + quality configuration

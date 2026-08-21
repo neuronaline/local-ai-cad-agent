@@ -20,7 +20,7 @@ A local-first web app that lets you **chat with an AI agent to create parametric
 - **Sandboxed execution** — All generated code runs in a Bubblewrap container with blocked network and resource limits
 - **Verified builds** — Each model is built, checked for a valid solid, and rendered before the agent reports completion
 - **Selective visual review** — For complex, high-risk, visually ambiguous, or fit-critical work, the agent can call `cad_review` to cross-check renders, geometry, dimensions, and features. Routine small edits use the normal build verification alone.
-- **Targeted screenshots** — For visually ambiguous or complex work, the agent can call `cad_screenshot` to re-rasterise one or more canonical views from the latest revision without re-running build123d; a `(model_sha, views, quality)` cache keeps repeated lookups instant
+- **Targeted screenshots** — For visually ambiguous or complex work, the agent can call `cad_screenshot` to re-rasterise one or more canonical views from the latest revision without re-running build123d; a `(model_sha, views, quality, contact_sheet)` cache keeps repeated lookups instant without overwriting canonical review evidence
 - **Project management** — Create, rename, and switch between multiple CAD projects with persisted conversation history
 - **Model history** — Inspect source diffs, track successful builds, and restore any retained `model.py` revision
 - **Dark theme UI** — Compact, responsive interface with Markdown rendering and syntax highlighting

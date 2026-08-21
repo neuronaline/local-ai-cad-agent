@@ -479,7 +479,7 @@ def test_relocate_tool_images_moves_image_url_parts_to_user_message():
     tool = relocated[2]
     assert tool["role"] == "tool"
     assert tool["tool_call_id"] == "c1"
-    assert tool["content"] == [{"type": "text", "text": "build ok"}]
+    assert tool["content"] == "build ok"
     # The trailing user turn carries the relocated image.
     follow_up = relocated[3]
     assert follow_up["role"] == "user"
@@ -552,7 +552,7 @@ def test_relocate_tool_images_only_sends_the_latest_render():
     ]
     assert len(image_messages) == 1
     assert image_messages[0]["content"][1] == new_image
-    assert relocated[0]["content"] == [{"type": "text", "text": "old build"}]
+    assert relocated[0]["content"] == "old build"
 
 
 def test_image_fallback_removes_synthetic_render_instruction():
@@ -719,7 +719,7 @@ def test_sanitize_messages_removes_image_url_from_tool_messages(tmp_path, monkey
     )
 
 
-def test_sanitize_messages_compacts_only_completed_history():
+def test_sanitize_messages_compacts_mutations_but_preserves_read_results():
     from agent.llm_base import sanitize_messages
 
     old_read = json.dumps(
@@ -795,7 +795,7 @@ def test_sanitize_messages_compacts_only_completed_history():
 
     old_args = sanitized[0]["tool_calls"][0]["function"]["arguments"]
     assert len(old_args) < 300
-    assert "x" * 100 not in sanitized[3]["content"]
+    assert "x" * 100 in sanitized[3]["content"]
     assert "latest source" in sanitized[5]["content"]
     assert "x" * 1_000 in old_read
     assert "a" * 1_000 in messages[0]["tool_calls"][0]["function"]["arguments"]
@@ -915,7 +915,7 @@ def test_openrouter_agent_role_default_is_absent(tmp_path):
     )
     assert "trace" not in payload
 
-def test_openrouter_advances_gemini_cache_breakpoint_to_latest_message(monkeypatch, tmp_path):
+def test_openrouter_marks_gemini_messages_without_rewriting_old_prefix(monkeypatch, tmp_path):
     captured: dict[str, Any] = {}
     monkeypatch.setenv("OPENROUTER_API_KEY", "test")
     _capture_post(monkeypatch, "agent.llm_base.requests.post", captured, _FakeResponse)
@@ -929,10 +929,21 @@ def test_openrouter_advances_gemini_cache_breakpoint_to_latest_message(monkeypat
     OpenRouterClient(settings).chat(messages)
 
     system = captured["json"]["messages"][0]
-    assert system == {"role": "system", "content": "Stable CAD instructions."}
+    assert system == {
+        "role": "system",
+        "content": [{
+            "type": "text",
+            "text": "Stable CAD instructions.",
+            "cache_control": {"type": "ephemeral"},
+        }],
+    }
     assert captured["json"]["messages"][1] == {
         "role": "user",
-        "content": "<project_state>dynamic</project_state>",
+        "content": [{
+            "type": "text",
+            "text": "<project_state>dynamic</project_state>",
+            "cache_control": {"type": "ephemeral"},
+        }],
     }
     assert captured["json"]["messages"][2] == {
         "role": "user",
@@ -943,6 +954,15 @@ def test_openrouter_advances_gemini_cache_breakpoint_to_latest_message(monkeypat
         }],
     }
     assert messages[-1]["content"] == "Build a bracket."
+
+    client = OpenRouterClient(settings)
+    first_wire = client._build_payload(messages, None)["messages"]
+    extended = messages + [
+        {"role": "assistant", "content": "I will inspect it."},
+        {"role": "user", "content": "Continue."},
+    ]
+    second_wire = client._build_payload(extended, None)["messages"]
+    assert second_wire[:len(first_wire)] == first_wire
 
 
 def test_openrouter_caches_through_tool_results_for_gemini(tmp_path):
@@ -967,7 +987,11 @@ def test_openrouter_caches_through_tool_results_for_gemini(tmp_path):
         TOOL_SCHEMAS[:1],
     )
 
-    assert payload["messages"][1]["content"] == "Build a bracket."
+    assert payload["messages"][1]["content"] == [{
+        "type": "text",
+        "text": "Build a bracket.",
+        "cache_control": {"type": "ephemeral"},
+    }]
     assert payload["messages"][3]["content"] == [{
         "type": "text",
         "text": "Wrote model.py.",
@@ -1045,13 +1069,10 @@ def test_supported_providers_routing_is_consistent_with_settings(tmp_path: Path)
 
 
 @pytest.mark.parametrize("kind", _CLIENT_KINDS)
-def test_llm_request_log_preserves_original_payload_after_image_fallback(
+def test_llm_request_log_records_successful_payload_after_image_fallback(
     monkeypatch, tmp_path, kind
 ):
-    """The activity-log snapshot is captured before image-fallback mutates
-    the payload, so ``llm_request`` reflects the *original* request even
-    when the retry ships a stripped payload to the provider.
-    """
+    """Cache diagnostics record the successful retry, not a rejected body."""
     from agent.activity_log import ActivityLogger
 
     monkeypatch.setenv("OPENAI_API_KEY" if kind == "openai" else "OPENROUTER_API_KEY", "test")
@@ -1087,13 +1108,100 @@ def test_llm_request_log_preserves_original_payload_after_image_fallback(
     ]
     assert len(request_entries) == 1
     logged_payload = request_entries[0]["data"]["payload"]
-    # The original content (text + image) must survive in the log even
-    # though the second ``requests.post`` call shipped only the text part.
     logged_content = logged_payload["messages"][0]["content"]
     assert isinstance(logged_content, list)
     assert {"type": "text", "text": "Review this render."} in logged_content
     image_parts = [part for part in logged_content if part.get("type") == "image_url"]
-    assert image_parts, "activity log dropped the original image_url part"
+    assert not image_parts
     assert payloads[1]["messages"][0]["content"] == [
         {"type": "text", "text": "Review this render."}
     ]
+
+
+def test_wire_history_is_append_only_after_completed_tools(tmp_path):
+    from agent.llm_base import sanitize_messages
+
+    read_result = json.dumps({
+        "ok": True,
+        "tool": "read_file",
+        "data": json.dumps({
+            "exists": True,
+            "content": "result = Box(10, 20, 30)\n",
+            "sha256": "a" * 64,
+        }),
+    })
+    first = [
+        {"role": "system", "content": "stable"},
+        {"role": "user", "content": "inspect"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "read-1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": '{"filename":"model.py"}'},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "read-1", "content": read_result},
+    ]
+    second = first + [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "edit-1",
+                "type": "function",
+                "function": {
+                    "name": "edit_file",
+                    "arguments": json.dumps({
+                        "filename": "model.py",
+                        "old_string": "Box(10, 20, 30)",
+                        "new_string": "Box(20, 20, 30)",
+                    }),
+                },
+            }],
+        },
+        {"role": "tool", "tool_call_id": "edit-1", "content": "edited"},
+    ]
+
+    first_wire = sanitize_messages(first)
+    second_wire = sanitize_messages(second)
+
+    assert second_wire[:len(first_wire)] == first_wire
+    assert "result = Box" in first_wire[-1]["content"]
+
+
+def test_openai_56_marks_stable_system_and_namespaces_cache_key(tmp_path):
+    client = OpenAIClient(_settings(tmp_path, "openai", openai_model="gpt-5.6-terra"))
+    client.session_id = "openai:demo"
+
+    payload = client._build_payload([
+        {"role": "system", "content": "Stable CAD instructions."},
+        {"role": "user", "content": "Build a bracket."},
+    ], None)
+
+    assert payload["prompt_cache_key"] == get_prompt_cache_key("openai:demo")
+    assert payload["messages"][0]["content"] == [{
+        "type": "text",
+        "text": "Stable CAD instructions.",
+        "prompt_cache_breakpoint": {"mode": "explicit"},
+    }]
+
+
+def test_anthropic_vertex_uses_portable_explicit_cache_marker(tmp_path):
+    settings = _settings(
+        tmp_path,
+        "openrouter",
+        openrouter_model="anthropic/claude-sonnet-4",
+        openrouter_provider="google-vertex/global",
+        openrouter_force_provider=True,
+    )
+    payload = OpenRouterClient(settings)._build_payload([
+        {"role": "system", "content": "Stable CAD instructions."},
+        {"role": "user", "content": "Build a bracket."},
+    ], None)
+
+    assert "cache_control" not in payload
+    assert payload["messages"][0]["content"][0]["cache_control"] == {
+        "type": "ephemeral"
+    }

@@ -40,13 +40,16 @@ class OpenAIClient(ChatCompletionsClient):
         }
 
     def _build_payload(self, messages, tools):
+        wire_messages = self.sanitize_messages(messages)
         payload: dict[str, Any] = {
             "model": self.settings.openai_model,
-            "messages": self.sanitize_messages(messages),
-            "prompt_cache_key": get_prompt_cache_key(),
+            "messages": wire_messages,
+            "prompt_cache_key": get_prompt_cache_key(self.session_id),
             "stream": True,
             "stream_options": {"include_usage": True},
         }
+        if self.settings.openai_model.startswith("gpt-5.6"):
+            self._mark_stable_system_prefix(wire_messages)
         if tools:
             payload["tools"] = tools
         if self.settings.llm_max_completion_tokens:
@@ -54,6 +57,29 @@ class OpenAIClient(ChatCompletionsClient):
         if self.settings.openai_reasoning_effort:
             payload["reasoning_effort"] = self.settings.openai_reasoning_effort
         return payload
+
+    @staticmethod
+    def _mark_stable_system_prefix(messages: list[dict[str, Any]]) -> None:
+        """Add the GPT-5.6 explicit breakpoint after static instructions."""
+        for message in messages:
+            if message.get("role") != "system":
+                continue
+            content = message.get("content")
+            marker = {"mode": "explicit"}
+            if isinstance(content, str):
+                message["content"] = [
+                    {
+                        "type": "text",
+                        "text": content,
+                        "prompt_cache_breakpoint": marker,
+                    }
+                ]
+                return
+            if isinstance(content, list):
+                for part in reversed(content):
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        part["prompt_cache_breakpoint"] = marker
+                        return
 
     def _post(self, payload, headers):
         return post_with_cancel(

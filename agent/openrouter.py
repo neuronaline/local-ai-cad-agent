@@ -57,7 +57,20 @@ class OpenRouterClient(ChatCompletionsClient):
             self.settings.openrouter_enable_anthropic_cache
             and self.settings.openrouter_model.startswith("anthropic/")
         ):
-            payload["cache_control"] = {"type": "ephemeral"}
+            direct_anthropic = (
+                not self.settings.openrouter_provider
+                or self.settings.openrouter_provider == "anthropic"
+            )
+            if direct_anthropic:
+                # OpenRouter's automatic breakpoint advances without changing
+                # historical message bytes, but it only routes to Anthropic's
+                # own endpoint.
+                payload["cache_control"] = {"type": "ephemeral"}
+            else:
+                # Bedrock and Vertex reject the top-level automatic control.
+                # An explicit stable-system breakpoint works across all
+                # Anthropic-compatible endpoints.
+                self._mark_first_system_message(payload)
         if self.settings.openrouter_reasoning_effort:
             payload["reasoning"] = {
                 "effort": self.settings.openrouter_reasoning_effort,
@@ -79,20 +92,20 @@ class OpenRouterClient(ChatCompletionsClient):
             payload["provider"] = provider
 
     def _apply_gemini_cache_breakpoint(self, payload: dict[str, Any]) -> None:
-        """Advance Gemini's sole cache breakpoint through the conversation.
+        """Mark text deterministically so old Gemini wire messages never change.
 
-        OpenRouter uses only the final explicit breakpoint for Gemini. Keeping
-        it on the system prompt caches the instructions but leaves every tool
-        call and tool result as an uncached suffix. Marking the last textual
-        message instead makes the next tool-calling request reuse the complete
-        preceding agent transcript.
+        OpenRouter uses the final explicit breakpoint for Gemini, but permits
+        multiple markers. Marking only the latest text moves the marker on the
+        next request and rewrites the previous prefix. Applying the same
+        transform to every text block keeps the old prefix byte-stable while
+        still making the final marker advance as the conversation grows.
         """
         if (
             not self.settings.openrouter_enable_gemini_cache
             or not self.settings.openrouter_model.startswith("google/gemini-")
         ):
             return
-        for message in reversed(payload["messages"]):
+        for message in payload["messages"]:
             content = message.get("content")
             if isinstance(content, str):
                 message["content"] = [
@@ -102,10 +115,10 @@ class OpenRouterClient(ChatCompletionsClient):
                         "cache_control": {"type": "ephemeral"},
                     }
                 ]
-                return
+                continue
             if not isinstance(content, list):
                 continue
-            for part in reversed(content):
+            for part in content:
                 if not (
                     isinstance(part, dict)
                     and part.get("type") == "text"
@@ -113,7 +126,24 @@ class OpenRouterClient(ChatCompletionsClient):
                 ):
                     continue
                 part["cache_control"] = {"type": "ephemeral"}
+
+    @staticmethod
+    def _mark_first_system_message(payload: dict[str, Any]) -> None:
+        for message in payload.get("messages", []):
+            if message.get("role") != "system":
+                continue
+            content = message.get("content")
+            marker = {"type": "ephemeral"}
+            if isinstance(content, str):
+                message["content"] = [
+                    {"type": "text", "text": content, "cache_control": marker}
+                ]
                 return
+            if isinstance(content, list):
+                for part in reversed(content):
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        part["cache_control"] = marker
+                        return
 
     def _build_payload(self, messages, tools):
         payload: dict[str, Any] = {

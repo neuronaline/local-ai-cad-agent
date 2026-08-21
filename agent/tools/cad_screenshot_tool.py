@@ -4,19 +4,20 @@ Re-rasterises a subset of the canonical eight views without re-running
 build123d, sharing the artifact cache produced by ``CadTool.build_and_verify``.
 The orchestrator reads ``model.py``, validates the AST, runs
 ``renderer.py + screenshot.py`` inside the bubblewrap sandbox, validates
-the produced PNGs + manifest hashes, and promotes the result into
-``<project>/.cad-agent/reviews/<model_sha256>/``.
+the produced PNGs + manifest hashes, and promotes canonical review evidence
+or an isolated screenshot variant into ``<project>/.cad-agent/``.
 
-Cache strategy (matches the plan):
+Cache strategy:
 
-  cache_key = (model_sha256, tuple(sorted(views)) | None, quality)
+  cache_key = (model_sha256, canonical views, quality, contact_sheet)
 
 - When ``cad_build_and_verify(render=true)`` has already populated the full
   canonical eight at ``standard`` quality, a matching ``cad_screenshot``
   call hits the cache without spawning the sandbox.
-- ``cad_screenshot(views=[subset])`` re-renders only the requested subset.
-  Its manifest and contact sheet are replaced together so they always
-  describe the same evidence set.
+- Screenshot variants live outside the canonical review directory, so a
+  subset or a different quality tier cannot destroy final-review evidence.
+- A verified standard-quality review superset can seed a narrower screenshot
+  variant without spawning the sandbox.
 
 The orchestrator publishes ``preview_updated`` (with a ``source``
 discriminator) and ``screenshot_updated`` events so the UI activity panel
@@ -118,6 +119,35 @@ class CadScreenshotTool:
 
     def _review_dir(self, model_sha: str) -> Path:
         return self.project_dir / ".cad-agent" / "reviews" / model_sha
+
+    def _cache_dir(
+        self,
+        model_sha: str,
+        views: tuple[str, ...],
+        quality: str,
+        contact_sheet: bool,
+    ) -> Path:
+        """Return the exact variant directory without colliding with review data."""
+        if quality == "standard" and views == self.SUBSET_VIEWS and contact_sheet:
+            return self._review_dir(model_sha)
+        key = json.dumps(
+            {
+                "views": [view for view in self.SUBSET_VIEWS if view in views],
+                "quality": quality,
+                "contact_sheet": contact_sheet,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        variant = hashlib.sha256(key.encode("utf-8")).hexdigest()[:20]
+        return (
+            self.project_dir
+            / ".cad-agent"
+            / "screenshots"
+            / model_sha
+            / quality
+            / variant
+        )
 
     def _preview_sha_for_model(self, model_sha: str) -> str:
         """Return the preview digest only when it was built from this model."""
@@ -226,7 +256,10 @@ class CadScreenshotTool:
             expected_sha = entry.get("image_sha256")
             if not isinstance(expected_sha, str) or len(expected_sha) != 64:
                 return False
-            actual_sha = hashlib.sha256(view_path.read_bytes()).hexdigest()
+            try:
+                actual_sha = hashlib.sha256(view_path.read_bytes()).hexdigest()
+            except OSError:
+                return False
             if actual_sha != expected_sha:
                 return False
         if contact_sheet:
@@ -237,7 +270,11 @@ class CadScreenshotTool:
             expected_sha = sheet.get("image_sha256")
             if not isinstance(expected_sha, str) or len(expected_sha) != 64:
                 return False
-            if hashlib.sha256(sheet_path.read_bytes()).hexdigest() != expected_sha:
+            try:
+                actual_sheet_sha = hashlib.sha256(sheet_path.read_bytes()).hexdigest()
+            except OSError:
+                return False
+            if actual_sheet_sha != expected_sha:
                 return False
         return True
 
@@ -249,6 +286,133 @@ class CadScreenshotTool:
             return json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
+
+    def _cache_has_views(
+        self,
+        cache_dir: Path,
+        model_sha: str,
+        requested_views: tuple[str, ...],
+        quality: str,
+    ) -> bool:
+        """Validate a cached superset while ignoring its contact-sheet selection."""
+        manifest = self._read_manifest(cache_dir)
+        if not isinstance(manifest, dict):
+            return False
+        if manifest.get("model_sha256") != model_sha:
+            return False
+        if manifest.get("quality", "standard") != quality:
+            return False
+        entries = {
+            entry.get("view_id"): entry
+            for entry in manifest.get("views") or []
+            if isinstance(entry, dict) and isinstance(entry.get("view_id"), str)
+        }
+        for view_id in requested_views:
+            entry = entries.get(view_id)
+            path = cache_dir / "views" / f"{view_id}.png"
+            expected = entry.get("image_sha256") if isinstance(entry, dict) else None
+            if not path.is_file() or not isinstance(expected, str) or len(expected) != 64:
+                return False
+            try:
+                if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+                    return False
+            except OSError:
+                return False
+        return True
+
+    def _find_cached_superset(
+        self,
+        model_sha: str,
+        requested_views: tuple[str, ...],
+        quality: str,
+        *,
+        exclude: Path,
+    ) -> Path | None:
+        """Find verified cached views that can seed an exact variant."""
+        candidates: list[Path] = []
+        if quality == "standard":
+            candidates.append(self._review_dir(model_sha))
+        variants = (
+            self.project_dir
+            / ".cad-agent"
+            / "screenshots"
+            / model_sha
+            / quality
+        )
+        if variants.is_dir():
+            candidates.extend(sorted(path for path in variants.iterdir() if path.is_dir()))
+        return next(
+            (
+                candidate
+                for candidate in candidates
+                if candidate != exclude
+                and self._cache_has_views(
+                    candidate, model_sha, requested_views, quality
+                )
+            ),
+            None,
+        )
+
+    def _seed_variant_from_superset(
+        self,
+        source_dir: Path,
+        target_dir: Path,
+        model_sha: str,
+        views: tuple[str, ...],
+        quality: str,
+        contact_sheet: bool,
+    ) -> None:
+        """Materialize an exact variant from already-verified cached PNGs."""
+        source = self._read_manifest(source_dir)
+        if not isinstance(source, dict):
+            raise RuntimeError("Screenshot source manifest is missing.")
+        entries = {
+            entry.get("view_id"): entry
+            for entry in source.get("views") or []
+            if isinstance(entry, dict) and isinstance(entry.get("view_id"), str)
+        }
+        staging = Path(tempfile.mkdtemp(prefix="cad-screenshot-seed-"))
+        try:
+            staging_views = staging / "views"
+            staging_views.mkdir()
+            selected: list[dict[str, Any]] = []
+            for view_id in views:
+                entry = entries.get(view_id)
+                if not isinstance(entry, dict):
+                    raise RuntimeError(f"Cached view {view_id} is missing.")
+                shutil.copyfile(
+                    source_dir / "views" / f"{view_id}.png",
+                    staging_views / f"{view_id}.png",
+                )
+                selected.append(dict(entry))
+            sheet_info = None
+            if contact_sheet:
+                sheet_info = screenshot_script.build_contact_sheet_subset(
+                    staging_views, staging / "review-sheet.png", views
+                )
+            single = next(
+                (entry for entry in selected if entry.get("view_id") == "isometric_positive"),
+                selected[0],
+            )
+            manifest = {
+                "_staging_dir": str(staging),
+                "model_sha256": model_sha,
+                "preview_sha256": source.get("preview_sha256", ""),
+                "requested_views": list(views),
+                "views": selected,
+                "view_count": len(selected),
+                "quality": quality,
+                "contact_sheet": sheet_info,
+                "single_render": {
+                    "path": f"views/{single['view_id']}.png",
+                    "image_sha256": single.get("image_sha256"),
+                },
+                "rendered_at": source.get("rendered_at") or utc_now_iso(),
+            }
+            self._promote_to_cache(target_dir, manifest, model_sha=model_sha)
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
 
     def _emit_status(self, status: str, message: str) -> None:
         publish_tool_phase(
@@ -279,10 +443,34 @@ class CadScreenshotTool:
         model_sha = self._model_sha256(self.project_dir)
         if not model_sha:
             raise RuntimeError("Could not hash model.py for cache lookup.")
-        review_dir = self._review_dir(model_sha)
+        review_dir = self._cache_dir(model_sha, views, quality, contact_sheet)
         cache_hit = self._cache_matches(
             review_dir, model_sha, views, quality, contact_sheet
         )
+        cached_superset = (
+            None
+            if cache_hit
+            else self._find_cached_superset(
+                model_sha, views, quality, exclude=review_dir
+            )
+        )
+        if cached_superset is not None:
+            try:
+                self._seed_variant_from_superset(
+                    cached_superset,
+                    review_dir,
+                    model_sha,
+                    views,
+                    quality,
+                    contact_sheet,
+                )
+            except Exception:  # noqa: BLE001 - corrupt cache falls back to render.
+                _LOG.warning(
+                    "cached screenshot superset could not seed variant; re-rendering",
+                    exc_info=_LOG.isEnabledFor(logging.DEBUG),
+                )
+            else:
+                cache_hit = True
         if not cache_hit:
             self._emit_status(
                 "rendering_subset",
@@ -295,7 +483,9 @@ class CadScreenshotTool:
                 contact_sheet=contact_sheet,
                 timeout_seconds=timeout,
             )
-            self._promote_to_cache(review_dir, manifest_payload)
+            self._promote_to_cache(
+                review_dir, manifest_payload, model_sha=model_sha
+            )
         manifest = self._read_manifest(review_dir)
         if not isinstance(manifest, dict):
             raise RuntimeError("Screenshot manifest is missing or malformed.")
@@ -509,9 +699,13 @@ class CadScreenshotTool:
             return payload
 
     def _promote_to_cache(
-        self, review_dir: Path, manifest_payload: dict[str, Any]
+        self,
+        review_dir: Path,
+        manifest_payload: dict[str, Any],
+        *,
+        model_sha: str | None = None,
     ) -> None:
-        """Move the staged subset into ``.cad-agent/reviews/<sha>/`` atomically."""
+        """Move a staged screenshot/review variant into its cache atomically."""
         staging = Path(manifest_payload.pop("_staging_dir", ""))
         if not staging or not staging.is_dir():
             raise RuntimeError("cad_screenshot staging directory is missing.")
@@ -540,11 +734,17 @@ class CadScreenshotTool:
             if staging_sheet.is_file():
                 shutil.copyfile(staging_sheet, staging_tmp / "review-sheet.png")
             merged = dict(manifest_payload)
+            model_sha = model_sha or str(merged.get("model_sha256") or "")
             if not isinstance(merged.get("artifact_dir"), str):
-                merged["artifact_dir"] = review_dir.name
+                try:
+                    merged["artifact_dir"] = str(
+                        review_dir.relative_to(self.project_dir / ".cad-agent")
+                    )
+                except ValueError:
+                    merged["artifact_dir"] = review_dir.name
             if not merged.get("preview_sha256"):
                 merged["preview_sha256"] = self._preview_sha_for_model(
-                    review_dir.name
+                    model_sha
                 )
             merged["rendered_at"] = (
                 merged.get("rendered_at") or utc_now_iso()
@@ -569,4 +769,3 @@ class CadScreenshotTool:
             if staging_tmp.exists():
                 shutil.rmtree(staging_tmp, ignore_errors=True)
             shutil.rmtree(staging, ignore_errors=True)
-
