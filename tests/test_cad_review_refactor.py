@@ -468,14 +468,15 @@ def test_review_tool_uses_current_model_evidence_and_screenshot_isometric(tmp_pa
     (review_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     tool = CadReviewTool(project)
 
-    resolved, sheet_path, render_path, _ = tool._resolve_evidence()
+    evidence = tool._resolve_evidence()
 
-    assert resolved == manifest
-    assert sheet_path == sheet
-    assert render_path == render
+    assert evidence is not None
+    assert evidence.manifest == manifest
+    assert evidence.sheet_path == sheet
+    assert evidence.render_path == render
 
     (project / "model.py").write_text("result = 2\n", encoding="utf-8")
-    assert tool._resolve_evidence()[:3] == (None, None, None)
+    assert tool._resolve_evidence() is None
 
 
 def test_review_tool_rejects_metrics_from_an_older_model(tmp_path: Path):

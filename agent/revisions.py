@@ -160,10 +160,21 @@ class BuildRecord:
         )
 
 
-# Local aliases retained for backwards-compatible in-module references.
-# New callers should prefer the canonical helpers from :mod:`agent.io`.
-_utc_now = utc_now_iso
-_sha256 = lambda data: hashlib.sha256(data).hexdigest()
+def compute_model_sha256(project_dir: Path) -> str | None:
+    """Return the SHA-256 of ``<project_dir>/model.py`` or ``None`` when absent.
+
+    Centralised so the orchestrators (``CadScreenshotTool``, ``AgentRunner``)
+    and :meth:`RevisionStore.active_model_digest` agree on the exact same
+    digest semantics instead of each re-rolling an ``is_file`` + ``read_bytes``
+    + ``OSError`` dance.
+    """
+    model_path = project_dir / "model.py"
+    try:
+        if not model_path.is_file():
+            return None
+        return hashlib.sha256(model_path.read_bytes()).hexdigest()
+    except OSError:
+        return None
 
 
 class RevisionStore:
@@ -195,7 +206,7 @@ class RevisionStore:
         """
         model_path = self.project_dir / "model.py"
         model_digest = (
-            _sha256(model_path.read_bytes()) if model_path.is_file() else None
+            hashlib.sha256(model_path.read_bytes()).hexdigest() if model_path.is_file() else None
         )
 
         head_data = self._read_json_safe(self._head_path)
@@ -349,7 +360,7 @@ class RevisionStore:
                 f"Source blob for revision {revision_id} is missing."
             )
         source_bytes = blob_path.read_bytes()
-        if _sha256(source_bytes) != revision.model_sha256:
+        if hashlib.sha256(source_bytes).hexdigest() != revision.model_sha256:
             raise RevisionIntegrityError(
                 "Source blob digest does not match the revision manifest."
             )
@@ -368,7 +379,7 @@ class RevisionStore:
         blob_path = self._blobs_dir / f"{revision.model_sha256}.py"
         if not blob_path.is_file():
             return False
-        return _sha256(blob_path.read_bytes()) == revision.model_sha256
+        return hashlib.sha256(blob_path.read_bytes()).hexdigest() == revision.model_sha256
 
     @_synchronized
     def has_manifest(self, revision_id: str) -> bool:
@@ -392,7 +403,7 @@ class RevisionStore:
 
         self.reconcile()
 
-        source_digest = _sha256(source_bytes)
+        source_digest = hashlib.sha256(source_bytes).hexdigest()
 
         # No-op: identical to active head.
         head = self.head()
@@ -407,7 +418,7 @@ class RevisionStore:
             id=str(uuid.uuid4()),
             parent_id=head.id if head else None,
             model_sha256=source_digest,
-            created_at=_utc_now(),
+            created_at=utc_now_iso(),
             origin=origin,
         )
         # Write the manifest and update head.json *before* rewriting model.py
@@ -445,7 +456,7 @@ class RevisionStore:
 
         # Verify blob integrity.
         source_bytes = source.encode("utf-8")
-        actual_digest = _sha256(source_bytes)
+        actual_digest = hashlib.sha256(source_bytes).hexdigest()
         if actual_digest != target.model_sha256:
             raise RevisionIntegrityError(
                 "Source blob digest does not match the revision manifest."
@@ -461,7 +472,7 @@ class RevisionStore:
             id=str(uuid.uuid4()),
             parent_id=head.id if head else None,
             model_sha256=target.model_sha256,
-            created_at=_utc_now(),
+            created_at=utc_now_iso(),
             origin=RevisionOrigin(kind="restore"),
             restored_from=revision_id,
         )
@@ -489,7 +500,7 @@ class RevisionStore:
         self._verify_active_model(revision)
 
         preview_digest = (
-            _sha256(preview.read_bytes()) if preview.is_file() else None
+            hashlib.sha256(preview.read_bytes()).hexdigest() if preview.is_file() else None
         )
 
         self._append_build(
@@ -497,7 +508,7 @@ class RevisionStore:
                 revision_id=revision_id,
                 model_sha256=revision.model_sha256,
                 status="succeeded",
-                attempted_at=_utc_now(),
+                attempted_at=utc_now_iso(),
                 metrics=metrics,
                 preview_sha256=preview_digest,
             )
@@ -517,7 +528,7 @@ class RevisionStore:
                 revision_id=revision_id,
                 model_sha256=revision.model_sha256,
                 status="failed",
-                attempted_at=_utc_now(),
+                attempted_at=utc_now_iso(),
                 error=bounded_error,
             )
         )
@@ -681,11 +692,13 @@ class RevisionStore:
         return _import(self, archive_path)
 
     def active_model_digest(self) -> str | None:
-        """Return the SHA-256 of the active model.py, or None if absent."""
-        model_path = self.project_dir / "model.py"
-        if not model_path.is_file():
-            return None
-        return _sha256(model_path.read_bytes())
+        """Return the SHA-256 of the active model.py, or None if absent.
+
+        Thin wrapper over :func:`compute_model_sha256` so callers that
+        already hold a :class:`RevisionStore` do not need to repeat the
+        project_dir plumbing.
+        """
+        return compute_model_sha256(self.project_dir)
 
     # ------------------------------------------------------------------ #
     #  Private helpers
@@ -758,7 +771,7 @@ class RevisionStore:
             id=str(uuid.uuid4()),
             parent_id=None,
             model_sha256=model_digest,
-            created_at=_utc_now(),
+            created_at=utc_now_iso(),
             origin=RevisionOrigin(kind="import"),
         )
         self._write_blob_bytes(source.encode("utf-8"), model_digest)
@@ -783,14 +796,14 @@ class RevisionStore:
             return
         preview_path = self.project_dir / "preview.stl"
         preview_digest = (
-            _sha256(preview_path.read_bytes()) if preview_path.is_file() else None
+            hashlib.sha256(preview_path.read_bytes()).hexdigest() if preview_path.is_file() else None
         )
         self._append_build(
             BuildRecord(
                 revision_id=revision.id,
                 model_sha256=revision.model_sha256,
                 status="succeeded",
-                attempted_at=_utc_now(),
+                attempted_at=utc_now_iso(),
                 metrics=metrics,
                 preview_sha256=preview_digest,
             )
@@ -805,7 +818,7 @@ class RevisionStore:
             id=str(uuid.uuid4()),
             parent_id=parent_id,
             model_sha256=model_digest,
-            created_at=_utc_now(),
+            created_at=utc_now_iso(),
             origin=RevisionOrigin(kind="recovery"),
         )
         self._write_blob_bytes(source.encode("utf-8"), model_digest)
@@ -816,13 +829,13 @@ class RevisionStore:
     def _write_blob_bytes(self, source_bytes: bytes, sha256: str) -> None:
         blob_path = self._blobs_dir / f"{sha256}.py"
         if blob_path.exists():
-            if _sha256(blob_path.read_bytes()) != sha256:
+            if hashlib.sha256(blob_path.read_bytes()).hexdigest() != sha256:
                 raise RevisionIntegrityError(
                     "Existing source blob does not match its content digest."
                 )
             return  # Content-addressed and already verified.
         self._blobs_dir.mkdir(parents=True, exist_ok=True)
-        if _sha256(source_bytes) != sha256:
+        if hashlib.sha256(source_bytes).hexdigest() != sha256:
             raise RevisionIntegrityError("Source digest mismatch during blob write.")
         self._atomic_write_bytes(blob_path, source_bytes)
 

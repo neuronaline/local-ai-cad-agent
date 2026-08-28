@@ -366,8 +366,12 @@ def render_views(
         # the renderer is invoked from the sandbox runner that already
         # imports build123d before reaching this block, so any fork-
         # related hazards would already affect the parent process.
-        ctx_method = "fork" if "fork" in mp_get_start_methods() else None
-        ctx = mp_get_context(ctx_method) if ctx_method else None
+        import multiprocessing
+
+        ctx_method = (
+            "fork" if "fork" in multiprocessing.get_all_start_methods() else None
+        )
+        ctx = multiprocessing.get_context(ctx_method) if ctx_method else None
         executor = ProcessPoolExecutor(
             max_workers=workers, mp_context=ctx
         ) if ctx else ProcessPoolExecutor(max_workers=workers)
@@ -484,25 +488,6 @@ def build_contact_sheet(view_dir: Path, output_path: Path) -> dict[str, object]:
         "image_sha256": hashlib.sha256(output_path.read_bytes()).hexdigest(),
         "image_bytes": output_path.stat().st_size,
     }
-
-
-# ---------------------------------------------------------------------------
-# multiprocessing context helper (avoid hard import shadowing in sandbox)
-# ---------------------------------------------------------------------------
-
-
-def mp_get_start_methods() -> tuple[str, ...]:
-    import multiprocessing
-
-    return tuple(multiprocessing.get_all_start_methods())
-
-
-def mp_get_context(method: str | None):
-    import multiprocessing
-
-    if method is None:
-        return multiprocessing.get_context()
-    return multiprocessing.get_context(method)
 
 
 # ---------------------------------------------------------------------------

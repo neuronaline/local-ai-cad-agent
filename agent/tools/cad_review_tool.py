@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -27,17 +28,37 @@ from agent.cad_review import (
     review_cad,
     write_review_result,
 )
+from agent.review_paths import review_dir as review_path_for
 from agent.tools.cad_screenshot_tool import CadScreenshotTool
+from agent.tools.process_runner import MAX_SANDBOX_TIMEOUT_SECONDS
 from agent.tools.tool_events import publish_tool_phase
 
 _LOG = logging.getLogger(__name__)
 
 
+@dataclass
+class Evidence:
+    """Verified visual + manifest evidence for the current ``model.py``.
+
+    All four fields are required and mutually consistent: the manifest
+    must point at ``sheet_path`` and ``render_path`` and the
+    ``preview_sha`` is the digest the manifest declared for the
+    accompanying ``preview.stl``. Callers that fail to find complete
+    evidence should return ``None`` from :meth:`_resolve_evidence`
+    instead of constructing a partial :class:`Evidence`.
+    """
+
+    manifest: dict[str, Any]
+    sheet_path: Path
+    render_path: Path
+    preview_sha: str
+
+
 class CadReviewTool:
     """Compose deterministic + visual findings for the active build."""
 
-    # Sandbox timeout cap matches the schema's ``maximum: 120`` ceiling.
-    _MAX_TIMEOUT = 120
+    # Sandbox timeout cap matches the schema's ``maximum`` ceiling.
+    _MAX_TIMEOUT = MAX_SANDBOX_TIMEOUT_SECONDS
 
     def __init__(
         self,
@@ -62,8 +83,22 @@ class CadReviewTool:
         self._screenshot = CadScreenshotTool(project_dir, publish=publish)
 
     def with_call_id(self, call_id: str) -> CadReviewTool:
-        self._call_id = call_id
-        return self
+        """Return a copy of this tool bound to a specific tool-call ID.
+
+        Mirrors :meth:`FileTool.with_call_id` so concurrent tool calls
+        cannot clobber each other's IDs. The clone shares ``project_dir``,
+        ``_publish``, ``_settings`` and ``_stop_event``; the new
+        ``_call_id`` is set on the fresh instance and the original is
+        left untouched.
+        """
+        clone = CadReviewTool(
+            self.project_dir,
+            publish=self._publish,
+            settings=self._settings,
+            stop_event=self._stop_event,
+        )
+        clone._call_id = call_id
+        return clone
 
     def stop(self) -> None:
         """Stop any in-flight screenshot subprocess (best-effort)."""
@@ -83,12 +118,8 @@ class CadReviewTool:
             self._MAX_TIMEOUT,
         )
         metrics, feature_summary, validation_results = self._load_inputs()
-        review_manifest, sheet_path, render_path, preview_sha = self._resolve_evidence()
-        if (
-            review_manifest is None
-            or sheet_path is None
-            or render_path is None
-        ):
+        evidence = self._resolve_evidence()
+        if evidence is None:
             self._emit_status(
                 "screenshot_auto",
                 "No visual evidence found; rendering canonical eight views before review.",
@@ -110,15 +141,15 @@ class CadReviewTool:
                 raise RuntimeError(
                     f"cad_review auto-screenshot failed: {type(error).__name__}: {error}"
                 ) from error
-            review_manifest, sheet_path, render_path, preview_sha = self._resolve_evidence()
-            if (
-                review_manifest is None
-                or sheet_path is None
-                or render_path is None
-            ):
+            evidence = self._resolve_evidence()
+            if evidence is None:
                 raise RuntimeError(
                     "cad_review could not locate visual evidence after auto-screenshot."
                 )
+        review_manifest = evidence.manifest
+        sheet_path = evidence.sheet_path
+        render_path = evidence.render_path
+        preview_sha = evidence.preview_sha
         request_text = self._latest_user_request()
         model_source = self._load_model_source()
         # Filter the visual manifest to the agent's narrowed subset when the
@@ -159,14 +190,14 @@ class CadReviewTool:
             if isinstance(review_manifest, dict)
             else ""
         )
-        review_dir = self.project_dir / ".cad-agent" / "reviews" / model_sha
+        review_dir_path = review_path_for(self.project_dir, model_sha)
         if model_sha:
             try:
-                write_review_result(review_dir, result)
+                write_review_result(review_dir_path, result)
             except OSError as error:
                 _LOG.warning(
                     "cad_review could not persist result.json (%s): %s",
-                    review_dir,
+                    review_dir_path,
                     error,
                 )
         # Update preview_sha in the payload (use the cached hash we already
@@ -269,40 +300,63 @@ class CadReviewTool:
 
     def _resolve_evidence(
         self,
-    ) -> tuple[dict[str, Any] | None, Path | None, Path | None, str]:
-        """Locate evidence for the current model, never a prior revision."""
+    ) -> Evidence | None:
+        """Locate evidence for the current model, never a prior revision.
+
+        Returns ``None`` when no usable evidence exists yet (the caller
+        then triggers the auto-screenshot fallback). A partial manifest —
+        e.g. parseable but missing the contact sheet or single render —
+        also returns ``None``; the auto-screenshot path repopulates the
+        artifacts before ``Evidence`` is reconstructed.
+        """
         model_path = self.project_dir / "model.py"
         try:
             model_sha = hashlib.sha256(model_path.read_bytes()).hexdigest()
         except OSError:
-            return None, None, None, ""
-        review_dir = self.project_dir / ".cad-agent" / "reviews" / model_sha
-        manifest_path = review_dir / "manifest.json"
-        if not manifest_path.is_file():
-            return None, None, None, ""
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None, None, None, ""
-        if not isinstance(manifest, dict) or manifest.get("model_sha256") != model_sha:
-            return None, None, None, ""
-        sheet_path = review_dir / "review-sheet.png"
-        single_render = manifest.get("single_render")
-        if not isinstance(single_render, dict):
-            return None, None, None, ""
-        artifact_path = str(single_render.get("path") or "")
-        if artifact_path == "render.png":
-            render_path = self.project_dir / artifact_path
-        else:
-            render_path = (review_dir / artifact_path).resolve()
-            if review_dir not in render_path.parents:
-                return None, None, None, ""
-        preview_sha = (
-            str(manifest.get("preview_sha256") or "") if isinstance(manifest, dict) else ""
-        )
-        if not sheet_path.is_file() or not render_path.is_file():
-            return None, None, None, preview_sha
-        return manifest, sheet_path, render_path, preview_sha
+            return None
+        review_dir_path = review_path_for(self.project_dir, model_sha)
+        manifest_path = review_dir_path / "manifest.json"
+        preview_sha = ""
+        if manifest_path.is_file():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                manifest = None
+            if isinstance(manifest, dict) and manifest.get("model_sha256") == model_sha:
+                preview_sha = str(manifest.get("preview_sha256") or "")
+                sheet_path = review_dir_path / "review-sheet.png"
+                single_render = manifest.get("single_render")
+                if isinstance(single_render, dict):
+                    artifact_path = str(single_render.get("path") or "")
+                    if artifact_path == "render.png":
+                        # Legacy build path: the single render lives at the
+                        # project root, not inside the review directory.
+                        # No traversal check is needed here because the
+                        # literal string is whitelisted above.
+                        render_path = self.project_dir / artifact_path
+                    else:
+                        # Reject any ``single_render.path`` that escapes
+                        # the review directory via ``..`` segments or
+                        # symlinks. ``Path.resolve()`` follows symlinks,
+                        # and the membership test below pins the artifact
+                        # to this review's directory.
+                        candidate = (review_dir_path / artifact_path).resolve()
+                        if review_dir_path in candidate.parents:
+                            render_path = candidate
+                        else:
+                            render_path = None
+                    if (
+                        isinstance(render_path, Path)
+                        and sheet_path.is_file()
+                        and render_path.is_file()
+                    ):
+                        return Evidence(
+                            manifest=manifest,
+                            sheet_path=sheet_path,
+                            render_path=render_path,
+                            preview_sha=preview_sha,
+                        )
+        return None
 
     @staticmethod
     def _verify_artifact_hashes(

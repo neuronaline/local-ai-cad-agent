@@ -768,9 +768,14 @@ def test_cad_screenshot_tool_exposes_required_surface():
 
     assert len(CadScreenshotTool.SUBSET_VIEWS) == 8
     assert set(CadScreenshotTool.QUALITY_TIERS) == {"low", "standard", "high"}
-    # ``with_call_id`` returns the tool for fluent chaining.
+    # ``with_call_id`` returns a *copy* so concurrent tool calls cannot
+    # clobber each other's ``_call_id`` on a shared instance. The clone
+    # carries the new id; the original stays untouched.
     tool = CadScreenshotTool(Path("/tmp/project"), publish=None)
-    assert tool.with_call_id("test") is tool
+    clone = tool.with_call_id("test")
+    assert clone is not tool
+    assert clone._call_id == "test"
+    assert tool._call_id == ""
 
 
 def test_cad_review_tool_exposes_required_surface():
@@ -778,7 +783,10 @@ def test_cad_review_tool_exposes_required_surface():
     from agent.tools.cad_review_tool import CadReviewTool
 
     tool = CadReviewTool(Path("/tmp/project"), publish=None)
-    assert tool.with_call_id("test") is tool
+    clone = tool.with_call_id("test")
+    assert clone is not tool
+    assert clone._call_id == "test"
+    assert tool._call_id == ""
 
 
 def test_review_enabled_only_disables_multiview_rasterisation(tmp_path: Path):

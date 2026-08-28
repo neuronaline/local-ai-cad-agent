@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 from PIL import Image, UnidentifiedImageError
 
 from agent.images import as_chat_image
+from agent.review_paths import review_dir as review_dir_path
 from agent.revisions import RevisionIntegrityError
+
+_LOG = logging.getLogger(__name__)
 
 
 def success(tool: str, data: Any) -> str:
@@ -118,7 +122,7 @@ def build_cad_build_multimodal_content(
     candidates: list[tuple[Path, str | None]] = []
     review_dir = data.get("review")
     if isinstance(review_dir, str) and review_dir and Path(review_dir).name == review_dir:
-        review_root = project_dir / ".cad-agent" / "reviews" / review_dir
+        review_root = review_dir_path(project_dir, review_dir)
         candidates.append(
             (
                 review_root / "review-sheet.png",
@@ -146,7 +150,14 @@ def build_cad_build_multimodal_content(
     ]
     try:
         parts.append(as_chat_image(image_path))
-    except OSError:
+    except OSError as error:
+        # ``as_chat_image`` reads the file; an ``OSError`` here is almost
+        # always a transient I/O race (e.g. another process truncating
+        # the file mid-build). Fall back to text-only and log at DEBUG
+        # so debug sessions can correlate with the activity log.
+        _LOG.debug(
+            "multimodal content failed for %s: %s", image_path, error, exc_info=True
+        )
         return None
     return {"content": parts, "image_paths": [image_path]}
 

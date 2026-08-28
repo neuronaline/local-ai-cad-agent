@@ -24,12 +24,15 @@ Wire model:
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 from agent.io import atomic_write_text, utc_now_iso
+
+_LOG = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Configuration constants
@@ -121,8 +124,15 @@ class ActivityLogger:
                     handle.write(line)
                     handle.write("\n")
                 self._maybe_trim()
-        except (OSError, TypeError, ValueError):
-            # Activity logging must never break the agent loop.
+        except (OSError, TypeError, ValueError) as error:
+            # Activity logging must never break the agent loop. Surface
+            # the failure at DEBUG so persistent issues (e.g. disk full
+            # or a non-writable project dir) are visible to operators
+            # running with debug logging without spamming the default
+            # log level for transient races.
+            _LOG.debug(
+                "activity log write failed: %s", error, exc_info=True
+            )
             return
 
     def tail(self, limit: int = 100) -> list[dict[str, Any]]:

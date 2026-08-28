@@ -6,7 +6,6 @@ import json
 import math
 import os
 import shutil
-import signal
 import subprocess
 import tempfile
 import threading
@@ -14,10 +13,14 @@ from pathlib import Path
 from typing import Any
 
 from agent.io import atomic_write_bytes
+from agent.review_paths import review_dir
 from agent.revisions import RevisionIntegrityError, RevisionStore
 from agent.sandbox import command as sandbox_command
 from agent.tools.file_tool import FileTool
-from agent.tools.process_runner import _stream_with_limit, _TimedOut
+from agent.tools.process_runner import (
+    MAX_SANDBOX_TIMEOUT_SECONDS,
+    run_sandbox_subprocess,
+)
 from agent.tools.tool_events import publish_tool_phase
 
 # Sandbox-side script files. The host copies these into the bubblewrap
@@ -40,22 +43,6 @@ _MIN_VOLUME_MM3 = 0.0
 _REVIEW_MANIFEST_NAME = "manifest.json"
 _REVIEW_VIEWS_DIR = "views"
 _REVIEW_SHEET_NAME = "review-sheet.png"
-
-
-def _kill_process_group(process: subprocess.Popen[str], *, force: bool) -> None:
-    """Send a signal to the sandbox process group so descendant pythons exit.
-
-    The bubblewrap subprocess is launched with ``start_new_session=True`` and
-    in turn spawns a python interpreter inside its namespace. ``Popen.terminate``
-    only signals the direct child (bwrap); without killing the process group
-    the inner python keeps running and holding memory/file handles.
-    """
-    if process.poll() is not None:
-        return
-    try:
-        os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
-    except ProcessLookupError:
-        pass
 
 
 def _project_name(project_dir: Path) -> str:
@@ -93,7 +80,7 @@ class CadTool:
         return self
 
     def _review_dir(self, model_sha256: str) -> Path:
-        return self.project_dir / ".cad-agent" / "reviews" / model_sha256
+        return review_dir(self.project_dir, model_sha256)
 
     def _publish_status(
         self, status: str, message: str, call_id: str = ""
@@ -178,54 +165,28 @@ class CadTool:
                 workspace,
                 [_RUNNER_FILENAME, settings_payload],
                 writable=True,
-                timeout_seconds=120,
+                timeout_seconds=MAX_SANDBOX_TIMEOUT_SECONDS,
             )
-            process: subprocess.Popen[str] | None = None
             try:
-                with self._lock:
-                    self._process = subprocess.Popen(
-                        command,
-                        text=True,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        pass_fds=(seccomp_fd,),
-                        start_new_session=True,
-                    )
-                    process = self._process
-                try:
-                    stdout, stderr = _stream_with_limit(process, timeout=120)
-                except _TimedOut as error:
-                    self._record_build_failure(
-                        "CAD operation timed out after 120 seconds."
-                    )
-                    raise RuntimeError(
-                        "CAD operation timed out after 120 seconds."
-                    ) from error
-                except RuntimeError as error:
-                    detail = f"CAD subprocess failed: {error}"
-                    self._record_build_failure(detail)
-                    raise RuntimeError(detail) from error
-                if process.returncode:
-                    detail = self._failure_detail(stderr or stdout)
-                    self._record_build_failure(detail)
-                    raise RuntimeError(f"CAD execution failed:\n{detail}")
-            finally:
-                os.close(seccomp_fd)
-                with self._lock:
-                    self._process = None
-                # If ``_stream_with_limit`` raised (timeout, memory-limit
-                # overflow, or any other exception), ``process`` is still
-                # alive and would otherwise be leaked: the outer reference
-                # on ``self._process`` has already been cleared, so
-                # ``stop()`` becomes a no-op for this child. Force-kill the
-                # whole process group so the bubblewrap namespace and any
-                # spawned python interpreter exit cleanly.
-                if process is not None:
-                    _kill_process_group(process, force=True)
-                    try:
-                        process.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        pass
+                stdout, stderr, returncode = run_sandbox_subprocess(
+                    argv=command,
+                    seccomp_fd=seccomp_fd,
+                    timeout_seconds=MAX_SANDBOX_TIMEOUT_SECONDS,
+                    lock=self._lock,
+                    process_slot=[self._process],
+                    timeout_message=(
+                        f"CAD operation timed out after {MAX_SANDBOX_TIMEOUT_SECONDS} seconds."
+                    ),
+                )
+            except RuntimeError as error:
+                detail = f"CAD subprocess failed: {error}"
+                self._record_build_failure(detail)
+                raise RuntimeError(detail) from error
+            if returncode:
+                detail = self._failure_detail(stderr or stdout)
+                final = f"CAD execution failed:\n{detail}"
+                self._record_build_failure(final)
+                raise RuntimeError(final)
 
             metrics_path = workspace / ".cad_metrics.json"
             preview_path = workspace / "preview.stl"
@@ -706,8 +667,8 @@ class CadTool:
             process = self._process
         if process is None:
             return
-        _kill_process_group(process, force=False)
+        terminate(process, force=False)
         try:
             process.wait(timeout=2)
         except subprocess.TimeoutExpired:
-            _kill_process_group(process, force=True)
+            terminate(process, force=True)

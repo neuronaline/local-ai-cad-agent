@@ -14,6 +14,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from agent.activity_log import ActivityLogger
+from agent.io import atomic_write_json
 from agent.tool_results import build_cad_build_multimodal_content, compact_for_context
 from agent.tool_results import failure as tool_failure
 from agent.tool_results import success as tool_success
@@ -156,14 +157,10 @@ def dispatch(
             "questions": questions,
         }
         state_path = tools.project_dir / ".agent_state.json"
-        temporary_state = tools.project_dir / ".agent_state.json.tmp"
-        temporary_state.write_text(
-            json.dumps(
-                {"status": "WAITING_FOR_USER", "waiting_question": question_state}
-            ),
-            encoding="utf-8",
+        atomic_write_json(
+            state_path,
+            {"status": "WAITING_FOR_USER", "waiting_question": question_state},
         )
-        temporary_state.replace(state_path)
         return result, True
     tool = getattr(tools, name)
     return tool.execute(args), False

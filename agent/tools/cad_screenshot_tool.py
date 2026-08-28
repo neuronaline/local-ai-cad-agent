@@ -31,7 +31,6 @@ import json
 import logging
 import os
 import shutil
-import signal
 import subprocess
 import tempfile
 import threading
@@ -39,23 +38,18 @@ from pathlib import Path
 from typing import Any
 
 from agent.io import utc_now_iso
+from agent.review_paths import review_dir
+from agent.revisions import compute_model_sha256
 from agent.sandbox import command as sandbox_command
 from agent.tools.cad_scripts import screenshot as screenshot_script
 from agent.tools.file_tool import FileTool
-from agent.tools.process_runner import _stream_with_limit, _TimedOut
+from agent.tools.process_runner import (
+    MAX_SANDBOX_TIMEOUT_SECONDS,
+    run_sandbox_subprocess,
+)
 from agent.tools.tool_events import publish_tool_phase
 
 _LOG = logging.getLogger(__name__)
-
-
-def _kill_process_group(process: subprocess.Popen[str], *, force: bool) -> None:
-    """Send a signal to the sandbox process group so descendant pythons exit."""
-    if process.poll() is not None:
-        return
-    try:
-        os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
-    except ProcessLookupError:
-        pass
 
 
 class CadScreenshotTool:
@@ -70,8 +64,8 @@ class CadScreenshotTool:
         sorted(screenshot_script.QUALITY_TOLERANCES.keys())
     )
 
-    # Sandbox timeout cap matches the schema's ``maximum: 120`` ceiling.
-    _MAX_TIMEOUT = 120
+    # Sandbox timeout cap matches the schema's ``maximum`` ceiling.
+    _MAX_TIMEOUT = MAX_SANDBOX_TIMEOUT_SECONDS
 
     def __init__(
         self,
@@ -88,8 +82,18 @@ class CadScreenshotTool:
     # ------------------------------------------------------------------ surface
 
     def with_call_id(self, call_id: str) -> CadScreenshotTool:
-        self._call_id = call_id
-        return self
+        """Return a copy of this tool bound to a specific tool-call ID.
+
+        The copy shares ``project_dir`` and ``_publish`` so the
+        orchestrator reuses the same subprocess lifecycle, but each
+        tool call gets its own ``_call_id`` — a new attribute is set on
+        the fresh instance and the original is left untouched. Mirrors
+        :meth:`FileTool.with_call_id` so concurrent tool calls cannot
+        clobber each other's IDs.
+        """
+        clone = CadScreenshotTool(self.project_dir, self._publish)
+        clone._call_id = call_id
+        return clone
 
     def stop(self) -> None:
         """Terminate any in-flight sandbox subprocess (used by AgentRunner)."""
@@ -97,28 +101,21 @@ class CadScreenshotTool:
             process = self._process
         if process is None:
             return
-        _kill_process_group(process, force=False)
+        terminate(process, force=False)
         try:
             process.wait(timeout=2)
         except subprocess.TimeoutExpired:
-            _kill_process_group(process, force=True)
+            terminate(process, force=True)
 
     # ------------------------------------------------------------------ helpers
 
     @staticmethod
     def _model_sha256(project_dir: Path) -> str | None:
-        model_path = project_dir / "model.py"
-        try:
-            return (
-                hashlib.sha256(model_path.read_bytes()).hexdigest()
-                if model_path.is_file()
-                else None
-            )
-        except OSError:
-            return None
+        """Delegate to :func:`agent.revisions.compute_model_sha256`."""
+        return compute_model_sha256(project_dir)
 
     def _review_dir(self, model_sha: str) -> Path:
-        return self.project_dir / ".cad-agent" / "reviews" / model_sha
+        return review_dir(self.project_dir, model_sha)
 
     def _cache_dir(
         self,
@@ -202,6 +199,41 @@ class CadScreenshotTool:
 
     # ------------------------------------------------------------------ cache lookup
 
+    @staticmethod
+    def _validated_view_entry(
+        manifest: dict[str, Any],
+        cache_dir: Path,
+        view_id: str,
+    ) -> dict[str, Any] | None:
+        """Return the manifest entry for ``view_id`` if its PNG validates.
+
+        Walks the manifest's ``views`` array, locates the entry for
+        ``view_id``, and verifies that the on-disk ``views/<id>.png``
+        matches ``entry["image_sha256"]`` exactly. Returns ``None`` for
+        any mismatch so the calling cache-lookup helper can short-circuit
+        on a stale or tampered artifact. Centralising the per-view check
+        keeps :meth:`_cache_matches` and :meth:`_cache_has_views` from
+        drifting in their acceptance criteria.
+        """
+        for entry in manifest.get("views") or []:
+            if (
+                isinstance(entry, dict)
+                and entry.get("view_id") == view_id
+                and isinstance(entry.get("image_sha256"), str)
+                and len(entry["image_sha256"]) == 64
+            ):
+                view_path = cache_dir / "views" / f"{view_id}.png"
+                if not view_path.is_file():
+                    return None
+                try:
+                    actual = hashlib.sha256(view_path.read_bytes()).hexdigest()
+                except OSError:
+                    return None
+                if actual == entry["image_sha256"]:
+                    return entry
+                return None
+        return None
+
     def _cache_matches(
         self,
         review_dir: Path,
@@ -240,27 +272,7 @@ class CadScreenshotTool:
             return False
         # Verify each PNG actually exists with the manifest hash.
         for view_id in requested_views:
-            view_path = review_dir / "views" / f"{view_id}.png"
-            if not view_path.is_file():
-                return False
-            entry = next(
-                (
-                    e
-                    for e in manifest.get("views", [])
-                    if isinstance(e, dict) and e.get("view_id") == view_id
-                ),
-                None,
-            )
-            if not entry:
-                return False
-            expected_sha = entry.get("image_sha256")
-            if not isinstance(expected_sha, str) or len(expected_sha) != 64:
-                return False
-            try:
-                actual_sha = hashlib.sha256(view_path.read_bytes()).hexdigest()
-            except OSError:
-                return False
-            if actual_sha != expected_sha:
+            if self._validated_view_entry(manifest, review_dir, view_id) is None:
                 return False
         if contact_sheet:
             sheet = manifest.get("contact_sheet")
@@ -302,21 +314,8 @@ class CadScreenshotTool:
             return False
         if manifest.get("quality", "standard") != quality:
             return False
-        entries = {
-            entry.get("view_id"): entry
-            for entry in manifest.get("views") or []
-            if isinstance(entry, dict) and isinstance(entry.get("view_id"), str)
-        }
         for view_id in requested_views:
-            entry = entries.get(view_id)
-            path = cache_dir / "views" / f"{view_id}.png"
-            expected = entry.get("image_sha256") if isinstance(entry, dict) else None
-            if not path.is_file() or not isinstance(expected, str) or len(expected) != 64:
-                return False
-            try:
-                if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
-                    return False
-            except OSError:
+            if self._validated_view_entry(manifest, cache_dir, view_id) is None:
                 return False
         return True
 
@@ -598,43 +597,26 @@ class CadScreenshotTool:
                 writable=True,
                 timeout_seconds=timeout_seconds,
             )
-            process: subprocess.Popen[str] | None = None
             try:
-                with self._lock:
-                    self._process = subprocess.Popen(
-                        command,
-                        text=True,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        pass_fds=(seccomp_fd,),
-                        start_new_session=True,
-                    )
-                    process = self._process
-                try:
-                    stdout, stderr = _stream_with_limit(process, timeout=timeout_seconds)
-                except _TimedOut as error:
-                    raise RuntimeError(
+                stdout, stderr, returncode = run_sandbox_subprocess(
+                    argv=command,
+                    seccomp_fd=seccomp_fd,
+                    timeout_seconds=timeout_seconds,
+                    lock=self._lock,
+                    process_slot=[self._process],
+                    timeout_message=(
                         f"cad_screenshot timed out after {timeout_seconds} seconds."
-                    ) from error
-                except RuntimeError as error:
-                    raise RuntimeError(
-                        f"cad_screenshot subprocess failed: {error}"
-                    ) from error
-                if process.returncode:
-                    raise RuntimeError(
-                        f"cad_screenshot execution failed:\n"
-                        f"{stderr or stdout or 'unknown error'}"
-                    )
-            finally:
-                os.close(seccomp_fd)
-                with self._lock:
-                    self._process = None
-                if process is not None:
-                    _kill_process_group(process, force=True)
-                    try:
-                        process.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        pass
+                    ),
+                )
+            except RuntimeError as error:
+                raise RuntimeError(
+                    f"cad_screenshot subprocess failed: {error}"
+                ) from error
+            if returncode:
+                raise RuntimeError(
+                    f"cad_screenshot execution failed:\n"
+                    f"{stderr or stdout or 'unknown error'}"
+                )
             manifest_path = staging / ".screenshot_manifest.json"
             if not manifest_path.is_file():
                 raise RuntimeError(

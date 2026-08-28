@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from agent.tools.file_tool import MAX_READ_LINES
+from agent.tools.process_runner import MAX_SANDBOX_TIMEOUT_SECONDS
+
 
 def _tool(
     name: str, description: str, properties: dict[str, Any], required: list[str]
@@ -31,8 +34,8 @@ _FILENAME = {
 _TIMEOUT = {
     "type": "integer",
     "minimum": 1,
-    "maximum": 120,
-    "description": "Maximum runtime in seconds (1-120).",
+    "maximum": MAX_SANDBOX_TIMEOUT_SECONDS,
+    "description": f"Maximum runtime in seconds (1-{MAX_SANDBOX_TIMEOUT_SECONDS}).",
 }
 
 TOOL_SCHEMAS = [
@@ -52,8 +55,8 @@ TOOL_SCHEMAS = [
             "limit": {
                 "type": "integer",
                 "minimum": 1,
-                "maximum": 2000,
-                "description": "Maximum lines to return. Omit for the complete file.",
+                "maximum": MAX_READ_LINES,
+                "description": f"Maximum lines to return. Omit for the complete file (capped at {MAX_READ_LINES}).",
             },
             "known_sha256": {
                 "type": "string",
@@ -200,9 +203,9 @@ TOOL_SCHEMAS = [
             "timeout_seconds": {
                 "type": "integer",
                 "minimum": 1,
-                "maximum": 120,
+                "maximum": MAX_SANDBOX_TIMEOUT_SECONDS,
                 "default": 30,
-                "description": "Maximum runtime in seconds for the sandbox subprocess (1-120).",
+                "description": f"Maximum runtime in seconds for the sandbox subprocess (1-{MAX_SANDBOX_TIMEOUT_SECONDS}).",
             },
         },
         [],
@@ -231,9 +234,9 @@ TOOL_SCHEMAS = [
             "timeout_seconds": {
                 "type": "integer",
                 "minimum": 1,
-                "maximum": 120,
+                "maximum": MAX_SANDBOX_TIMEOUT_SECONDS,
                 "default": 60,
-                "description": "Maximum runtime in seconds for the visual reviewer (1-120).",
+                "description": f"Maximum runtime in seconds for the visual reviewer (1-{MAX_SANDBOX_TIMEOUT_SECONDS}).",
             },
         },
         [],

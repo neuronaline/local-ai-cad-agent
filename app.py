@@ -34,6 +34,7 @@ from werkzeug.exceptions import RequestEntityTooLarge
 from agent.core import AgentRunner, _history_lock_slot
 from agent.images import store_images
 from agent.io import utc_now_iso
+from agent.review_paths import review_dir
 from agent.revisions import RevisionIntegrityError, RevisionStore
 from agent.sandbox import _BWRAP, seccomp_filter_fd
 from agent.settings import Settings, load_settings
@@ -103,7 +104,7 @@ class EventBus:
                     with self._history_lock:
                         _append_conversation(
                             project_dir,
-                            {"timestamp": _utc_now(), "type": event_type, "data": data},
+                            {"timestamp": utc_now_iso(), "type": event_type, "data": data},
                         )
         event = {"type": event_type, "data": data}
         with self._lock:
@@ -137,11 +138,6 @@ class EventBus:
         with self._lock:
             if subscriber in self._subscribers:
                 self._subscribers.remove(subscriber)
-
-
-# Local alias retained for backwards-compatible in-module references.
-# New callers should prefer the canonical helper from :mod:`agent.io`.
-_utc_now = utc_now_iso
 
 
 def _project_path(settings: Settings, project_name: str) -> Path:
@@ -506,7 +502,7 @@ def create_app(settings: Settings | None = None) -> Flask:
             with tempfile.TemporaryDirectory(prefix=".new-project-", dir=workspace_root) as temporary:
                 staging = Path(temporary)
                 (staging / "inputs").mkdir()
-                _write_project_metadata(staging, {"name": name, "created_at": _utc_now()})
+                _write_project_metadata(staging, {"name": name, "created_at": utc_now_iso()})
                 staging.rename(project_dir)
         bus.publish("project_created", {"project": name})
         return jsonify({"project": name}), 201
@@ -590,7 +586,7 @@ def create_app(settings: Settings | None = None) -> Flask:
                 return jsonify({"error": "Cannot rename a project with active agent state."}), 409
             metadata = _read_project_metadata(project_dir)
             metadata["name"] = new_name
-            metadata["created_at"] = metadata.get("created_at") or _utc_now()
+            metadata["created_at"] = metadata.get("created_at") or utc_now_iso()
             with tempfile.NamedTemporaryFile(
                 mode="w", dir=project_dir, encoding="utf-8", delete=False
             ) as temporary:
@@ -863,10 +859,10 @@ def create_app(settings: Settings | None = None) -> Flask:
         """
         if not model_sha256:
             return None
-        review_dir = project_dir / ".cad-agent" / "reviews" / model_sha256
-        if not review_dir.is_dir():
+        review_path = review_dir(project_dir, model_sha256)
+        if not review_path.is_dir():
             return None
-        return review_dir
+        return review_path
 
     @app.get("/api/projects/<project_name>/review/manifest")
     def review_manifest(project_name: str):

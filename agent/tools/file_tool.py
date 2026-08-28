@@ -24,6 +24,10 @@ BLOCKED_CALLS = {"__import__", "breakpoint", "compile", "eval", "exec", "input",
 EDITABLE_FILES = {"model.py"}
 MAX_FILE_BYTES = 1 * 1024 * 1024
 DEFAULT_READ_LIMIT = 400
+# Maximum number of lines a single ``read_file`` call may return. Mirrors
+# the JSON schema's ``maximum`` so the runtime guard and the model-facing
+# limit cannot drift.
+MAX_READ_LINES = 2000
 _BINARY_OPERATORS = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
@@ -316,8 +320,8 @@ class FileTool:
                 )
         if limit is None:
             limit = None if offset == 1 else DEFAULT_READ_LIMIT
-        if limit is not None and (limit < 1 or limit > 2000):
-            raise ValueError("limit must be between 1 and 2000 lines.")
+        if limit is not None and (limit < 1 or limit > MAX_READ_LINES):
+            raise ValueError(f"limit must be between 1 and {MAX_READ_LINES} lines.")
         lines = content.splitlines(keepends=True)
         if offset > len(lines) + 1:
             raise ValueError(

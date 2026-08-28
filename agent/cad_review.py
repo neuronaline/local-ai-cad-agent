@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from agent.images import as_chat_image
+from agent.io import atomic_write_json
 from agent.prompt import get_system_prompt
 
 
@@ -757,9 +758,5 @@ def _build_prompt(
 def write_review_result(review_dir: Path, result: ReviewResult) -> Path:
     """Persist the bounded review verdict into ``review_dir/result.json``."""
     target = review_dir / "result.json"
-    payload = asdict(result)
-    tmp = target.with_suffix(target.suffix + ".tmp")
-    tmp.parent.mkdir(parents=True, exist_ok=True)
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(target)
+    atomic_write_json(target, asdict(result))
     return target

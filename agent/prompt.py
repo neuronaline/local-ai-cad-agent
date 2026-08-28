@@ -90,9 +90,6 @@ _BUILD123D_RULES = """\
 - After every fillet, chamfer, or boolean, discard any cached edge/face indices;
   reselect targets by geometry type, position range, and measurable properties."""
 
-BUILD123D_RULES = _BUILD123D_RULES
-OPERATIONAL_RULES = _OPERATIONAL_RULES
-
 # Ordered list of (section_tag, body) pairs. Adding or reordering a section is a
 # one-line change here; the render loop below produces the final prompt.
 _PROMPT_SECTIONS: list[tuple[str, str]] = [
@@ -177,8 +174,3 @@ def get_prompt_cache_key(namespace: str | None = None) -> str:
         session_hash = hashlib.sha256(namespace.encode("utf-8")).hexdigest()[:16]
         key = f"{key}:{session_hash}"
     return key
-
-
-def get_build123d_playbook() -> str:
-    """Return the playbook content, re-reading from disk when it changes."""
-    return _PROMPT_CACHE.get_playbook()

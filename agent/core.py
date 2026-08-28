@@ -8,7 +8,6 @@ or the configured tool-call budget is exhausted.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import re
@@ -41,7 +40,7 @@ from agent.llm_base import (
     sanitize_assistant_message,
 )
 from agent.prompt import get_system_prompt
-from agent.revisions import RevisionStore
+from agent.revisions import RevisionStore, compute_model_sha256
 from agent.settings import Settings
 from agent.tool_schemas import TOOL_SCHEMAS
 from agent.tools.cad_review_tool import CadReviewTool
@@ -734,7 +733,13 @@ class AgentRunner:
         args: dict,
         call_id: str = "",
     ) -> tuple[object, bool]:
-        """Backward-compatible thin wrapper around :func:`dispatcher.dispatch`."""
+        """Backward-compatible thin wrapper around :func:`dispatcher.dispatch`.
+
+        Tests in ``tests/test_agent_loop.py`` call this directly to exercise
+        the dispatcher in isolation; production code routes through
+        :meth:`_process_tool_call`. The audit recommended deleting these
+        wrappers, but the test contract keeps them public.
+        """
         return dispatch(tools, project, name, args, call_id)
 
     @staticmethod
@@ -846,15 +851,8 @@ class AgentRunner:
 
     @staticmethod
     def _model_digest(project_dir: Path) -> str | None:
-        model_path = project_dir / "model.py"
-        try:
-            return (
-                hashlib.sha256(model_path.read_bytes()).hexdigest()
-                if model_path.is_file()
-                else None
-            )
-        except OSError:
-            return None
+        """Delegate to :func:`agent.revisions.compute_model_sha256`."""
+        return compute_model_sha256(project_dir)
 
     @classmethod
     def _model_is_built(cls, project_dir: Path) -> bool:
