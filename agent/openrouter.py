@@ -10,17 +10,15 @@ import hashlib
 import os
 from typing import Any
 
-from agent.llm_base import ChatCompletionsClient, post_with_cancel, sanitize_messages
+from agent.llm_base import ChatCompletionsClient, post_with_cancel
 from agent.settings import Settings
 
 
 class OpenRouterClient(ChatCompletionsClient):
+    preserve_reasoning = True
+
     def __init__(self, settings: Settings) -> None:
         super().__init__(settings, provider_label="OpenRouter")
-
-    @classmethod
-    def sanitize_messages(cls, messages):
-        return sanitize_messages(messages)
 
     @staticmethod
     def _api_key() -> str:

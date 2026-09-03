@@ -509,6 +509,15 @@ def test_project_state_tells_agent_to_create_a_missing_model(tmp_path: Path):
     assert "read_file" in state["content"]
 
 
+def test_system_prompt_treats_successful_mutations_as_authoritative():
+    from agent.prompt import get_system_prompt
+
+    prompt = get_system_prompt()
+    assert "<!-- StaticBundle:v4.3 -->" in prompt
+    assert "returns `ok=true`, its content was applied successfully" in prompt
+    assert "do not repeat it" in prompt
+
+
 def test_tool_schemas_document_side_effects_and_reject_extra_arguments():
     schemas = {schema["function"]["name"]: schema for schema in TOOL_SCHEMAS}
 

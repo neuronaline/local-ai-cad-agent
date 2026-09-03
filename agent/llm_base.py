@@ -29,11 +29,14 @@ class RequestCancelled(RuntimeError):
     """Raised when the local agent stops an in-flight LLM request."""
 
 
-def sanitize_assistant_message(message: dict[str, Any]) -> dict[str, Any]:
-    """Copy a model response while retaining standard content and tool fields.
+def sanitize_assistant_message(
+    message: dict[str, Any], *, preserve_reasoning: bool = False
+) -> dict[str, Any]:
+    """Copy a model response while retaining supported continuation fields.
 
-    Only the canonical Chat Completions fields are kept so the persisted
-    record round-trips cleanly. Anything else the provider returns
+    OpenRouter reasoning is retained only for tool-call turns, where it is
+    required to continue the interrupted model response. Anything else the
+    provider returns
     (``audio``, ``function_call``, ``refusal``, ``annotations``, ``logprobs``,
     ``name``, vendor-specific blobs, …) is dropped; otherwise the persisted
     record cannot be compared with the canonical ``{"role", "content"}``
@@ -42,8 +45,10 @@ def sanitize_assistant_message(message: dict[str, Any]) -> dict[str, Any]:
     emitted on the next history load.
     """
     sanitized = deepcopy(message)
-    sanitized.pop("reasoning", None)
-    sanitized.pop("reasoning_details", None)
+    has_tool_calls = bool(sanitized.get("tool_calls"))
+    if not preserve_reasoning or not has_tool_calls:
+        sanitized.pop("reasoning", None)
+        sanitized.pop("reasoning_details", None)
     for key in list(sanitized):
         if key.startswith("_"):
             sanitized.pop(key, None)
@@ -51,6 +56,8 @@ def sanitize_assistant_message(message: dict[str, Any]) -> dict[str, Any]:
     # provider-specific metadata that the canonical assistant record
     # (and the LLM context) does not carry.
     allowed = {"role", "content", "tool_calls"}
+    if preserve_reasoning and has_tool_calls:
+        allowed.update({"reasoning", "reasoning_details"})
     for key in list(sanitized):
         if key not in allowed:
             sanitized.pop(key, None)
@@ -78,68 +85,95 @@ def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return system_messages + non_system
 
 
-def sanitize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Strip only unsupported assistant metadata, retaining content and tools."""
+def sanitize_messages(
+    messages: list[dict[str, Any]], *, preserve_reasoning: bool = False
+) -> list[dict[str, Any]]:
+    """Strip only unsupported assistant metadata, retaining content and tools.
+
+    When ``preserve_reasoning`` is set, ``reasoning`` / ``reasoning_details`` are
+    only retained on the most recent assistant message — the one the provider
+    needs back in order to continue the interrupted tool-call response. Older
+    assistant turns are reduced to the canonical
+    ``{role, content, tool_calls}`` shape so a growing tool loop does not also
+    re-send every previous reasoning chain on every iteration.
+    """
     sanitized = normalize_messages(messages)
+    last_assistant_index = max(
+        (index for index, message in enumerate(sanitized) if message.get("role") == "assistant"),
+        default=-1,
+    )
     for index, message in enumerate(sanitized):
         if message.get("role") != "assistant":
             continue
-        sanitized[index] = sanitize_assistant_message(message)
+        sanitized[index] = sanitize_assistant_message(
+            message,
+            preserve_reasoning=preserve_reasoning and index == last_assistant_index,
+        )
     _compact_completed_history(sanitized)
     return relocate_tool_images(sanitized)
 
 
 def _compact_completed_history(messages: list[dict[str, Any]]) -> None:
-    """Compact completed mutations without rewriting an already-sent prefix.
+    """Compact bulky results while preserving the current model mutation.
 
     A message must have the same wire representation from the first request
     that contains it onward. Age-based compaction breaks prompt caching because
-    the previous "latest" message changes as soon as another message is
-    appended. Completed mutation arguments are safe to compact immediately;
-    read results remain verbatim because the model may need their source body.
+    the previous "latest" message changes as soon as another message is appended.
+    Keep the newest mutation exact so the model sees the source it actually wrote;
+    summarize only mutations superseded by a newer one.
     """
-    tool_result_ids = {
+    completed_ids = {
         message.get("tool_call_id")
         for message in messages
         if message.get("role") == "tool"
-        and isinstance(message.get("tool_call_id"), str)
     }
+    mutation_names = {"edit_file", "write_file", "insert_file"}
+    all_mutation_calls = [
+        call
+        for message in messages
+        if message.get("role") == "assistant"
+        for call in message.get("tool_calls") or []
+        if isinstance(call, dict)
+        and isinstance(call.get("function"), dict)
+        and call["function"].get("name") in mutation_names
+    ]
+    # ``latest_mutation_id`` must consider in-flight mutations too: if the most
+    # recent edit is still waiting on a tool response, dropping its arguments on
+    # the next request would shorten the wire payload mid-turn and break
+    # prompt-cache stability. Whichever mutation is chronologically last in the
+    # conversation must keep its full arguments; every earlier mutation that has
+    # already received a tool response may be summarised.
+    latest_mutation_id = all_mutation_calls[-1].get("id") if all_mutation_calls else None
     for message in messages:
         if message.get("role") == "tool":
             message["content"] = _compact_tool_content(message.get("content"))
         if message.get("role") != "assistant":
             continue
         for call in message.get("tool_calls") or []:
-            if not isinstance(call, dict) or call.get("id") not in tool_result_ids:
+            if not isinstance(call, dict) or call.get("id") == latest_mutation_id:
                 continue
             function = call.get("function")
-            if not isinstance(function, dict):
+            if call.get("id") not in completed_ids or not isinstance(function, dict):
                 continue
             name = function.get("name")
-            if name == "edit_file":
-                function["arguments"] = json.dumps(
-                    {
-                        "filename": "model.py",
-                        "old_string": "[omitted from completed call]",
-                        "new_string": "[omitted from completed call]",
-                    }
-                )
-            elif name == "write_file":
-                function["arguments"] = json.dumps(
-                    {
-                        "filename": "model.py",
-                        "content": "[omitted from completed call]",
-                    }
-                )
+            if name == "write_file":
+                function["arguments"] = json.dumps({
+                    "filename": "model.py",
+                    "content": "# Historical successful write; superseded by a later mutation.",
+                })
+            elif name == "edit_file":
+                function["arguments"] = json.dumps({
+                    "filename": "model.py",
+                    "old_string": "[historical successful edit; superseded]",
+                    "new_string": "[historical successful edit; superseded]",
+                })
             elif name == "insert_file":
-                function["arguments"] = json.dumps(
-                    {
-                        "filename": "model.py",
-                        "anchor": "[omitted from completed call]",
-                        "content": "[omitted from completed call]",
-                        "position": "before",
-                    }
-                )
+                function["arguments"] = json.dumps({
+                    "filename": "model.py",
+                    "anchor": "[historical successful insertion; superseded]",
+                    "content": "# Historical successful insertion; superseded.",
+                    "position": "before",
+                })
 
 
 def _compact_tool_content(content: Any) -> Any:
@@ -378,6 +412,7 @@ def parse_chat_stream(
     finish_reason: str | None = None
     last_usage: dict[str, Any] | None = None
     reasoning_text = ""
+    reasoning_details: list[dict[str, Any]] = []
 
     for raw_line in response.iter_lines():
         if stop_event and stop_event.is_set():
@@ -420,17 +455,26 @@ def parse_chat_stream(
             if stream_callback:
                 stream_callback({"type": "content", "delta": text})
         reasoning = delta.get("reasoning") or delta.get("reasoning_content")
-        if not isinstance(reasoning, str):
-            details = delta.get("reasoning_details")
-            reasoning = "".join(
-                detail.get("text", "")
-                for detail in details or []
-                if isinstance(detail, dict) and isinstance(detail.get("text"), str)
+        details = delta.get("reasoning_details")
+        if isinstance(details, list):
+            reasoning_details.extend(
+                deepcopy(detail) for detail in details if isinstance(detail, dict)
             )
-        if reasoning:
-            reasoning_text += reasoning
+            # ``reasoning_details`` is the authoritative source for structured
+            # thinking content. Do not also accumulate ``.text`` into
+            # ``reasoning_text`` — that path is reserved for providers that emit
+            # only a plain ``reasoning`` string per delta and would otherwise
+            # double-count the same text into both the structured list and the
+            # fallback string.
+            reasoning_delta_text: str | None = None
+        elif isinstance(reasoning, str) and reasoning:
+            reasoning_delta_text = reasoning
+        else:
+            reasoning_delta_text = None
+        if reasoning_delta_text:
+            reasoning_text += reasoning_delta_text
             if stream_callback:
-                stream_callback({"type": "reasoning", "delta": reasoning})
+                stream_callback({"type": "reasoning", "delta": reasoning_delta_text})
         for call_delta in delta.get("tool_calls") or []:
             index = int(call_delta.get("index", 0))
             call = tool_calls.setdefault(
@@ -479,6 +523,10 @@ def parse_chat_stream(
     message: dict[str, Any] = {"role": role, "content": content or None}
     if tool_calls:
         message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
+        if reasoning_details:
+            message["reasoning_details"] = reasoning_details
+        elif reasoning_text:
+            message["reasoning"] = reasoning_text
     return {"choices": [{"message": message}], "usage": last_usage}
 
 
@@ -539,6 +587,17 @@ class ChatCompletionsClient:
     are fully shared here.
     """
 
+    # Whether this provider needs the latest assistant turn's reasoning
+    # payloads (``reasoning`` / ``reasoning_details``) on the wire so it can
+    # continue an interrupted tool-call response. OpenRouter-compatible
+    # providers (Anthropic extended thinking, xai reasoning, Gemini thinking)
+    # require this; OpenAI rejects unknown reasoning fields and never sets
+    # the flag. Both the wire-payload sanitizer and the agent runner's
+    # per-message sanitizer read this attribute, so there is a single source
+    # of truth for "should we keep reasoning?" rather than two parallel
+    # implementations that can drift.
+    preserve_reasoning: bool = False
+
     def __init__(self, settings: Settings, provider_label: str) -> None:
         self.settings = settings
         self.stop_event = None
@@ -577,7 +636,7 @@ class ChatCompletionsClient:
         raise NotImplementedError
 
     def sanitize_messages(self, messages):
-        return sanitize_messages(messages)
+        return sanitize_messages(messages, preserve_reasoning=self.preserve_reasoning)
 
     def _stream_response(self, response):
         result = parse_chat_stream(

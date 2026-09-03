@@ -61,6 +61,18 @@ class _StreamingResponse(_FakeResponse):
         return iter(self._lines)
 
 
+class _ReasoningDetailsToolResponse(_FakeResponse):
+    def iter_lines(self):
+        return iter(
+            [
+                b'data: {"choices":[{"delta":{"role":"assistant","reasoning_details":[{"type":"reasoning.text","text":"Inspecting ","id":"test-rd-1","format":"xai-responses-v1","index":0}]}}]}',
+                b'data: {"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"the model.","id":"test-rd-2","format":"xai-responses-v1","index":1}],"tool_calls":[{"index":0,"id":"call-1","function":{"name":"write_file","arguments":"{}"}}]}}]}',
+                b'data: {"choices":[{"finish_reason":"tool_calls","delta":{}}]}',
+                b"data: [DONE]",
+            ]
+        )
+
+
 class _EmptyResponse(_FakeResponse):
     def json(self) -> dict[str, Any]:
         return {
@@ -719,7 +731,7 @@ def test_sanitize_messages_removes_image_url_from_tool_messages(tmp_path, monkey
     )
 
 
-def test_sanitize_messages_compacts_mutations_but_preserves_read_results():
+def test_sanitize_messages_preserves_latest_mutation_and_read_results():
     from agent.llm_base import sanitize_messages
 
     old_read = json.dumps(
@@ -794,11 +806,86 @@ def test_sanitize_messages_compacts_mutations_but_preserves_read_results():
     sanitized = sanitize_messages(messages)
 
     old_args = sanitized[0]["tool_calls"][0]["function"]["arguments"]
-    assert len(old_args) < 300
+    assert "a" * 1_000 in old_args
     assert "x" * 100 in sanitized[3]["content"]
     assert "latest source" in sanitized[5]["content"]
     assert "x" * 1_000 in old_read
     assert "a" * 1_000 in messages[0]["tool_calls"][0]["function"]["arguments"]
+
+
+def test_sanitize_messages_compacts_superseded_mutations_truthfully():
+    from agent.llm_base import sanitize_messages
+
+    messages = []
+    for index, content in enumerate(("a" * 5_000, "b" * 5_000), 1):
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": f"write-{index}",
+                        "type": "function",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": json.dumps({"filename": "model.py", "content": content}),
+                        },
+                    }],
+                },
+                {"role": "tool", "tool_call_id": f"write-{index}", "content": "written"},
+            ]
+        )
+
+    sanitized = sanitize_messages(messages)
+    first_args = sanitized[0]["tool_calls"][0]["function"]["arguments"]
+    latest_args = sanitized[2]["tool_calls"][0]["function"]["arguments"]
+    assert len(first_args) < 300
+    assert "Historical successful write" in first_args
+    assert "omitted" not in first_args
+    assert "b" * 1_000 in latest_args
+
+
+def test_sanitize_messages_preserves_inflight_latest_mutation():
+    """An in-flight mutation (no tool response yet) must keep its full args.
+
+    ``_compact_completed_history`` previously computed ``latest_mutation_id``
+    over completed mutations only; an in-flight edit would be excluded from
+    the preserved set and overwritten with the historical-success placeholder
+    before the tool response arrived, shifting the wire payload mid-turn.
+    """
+    from agent.llm_base import sanitize_messages
+
+    earlier_args = json.dumps({"filename": "model.py", "content": "earlier"})
+    latest_args = json.dumps({"filename": "model.py", "content": "latest"})
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "edit-old",
+                "type": "function",
+                "function": {"name": "edit_file", "arguments": earlier_args},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "edit-old", "content": "edited"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "edit-latest",
+                "type": "function",
+                "function": {"name": "edit_file", "arguments": latest_args},
+            }],
+        },
+    ]
+
+    sanitized = sanitize_messages(messages)
+
+    old_args = sanitized[0]["tool_calls"][0]["function"]["arguments"]
+    new_args = sanitized[2]["tool_calls"][0]["function"]["arguments"]
+    assert "earlier" not in old_args
+    assert "superseded" in old_args
+    assert latest_args in new_args
 
 
 # ---------------------------------------------------------------------------
@@ -858,8 +945,13 @@ def test_openrouter_builds_cache_safe_sticky_payload_and_keeps_tool_content(monk
             "role": "assistant",
             "content": "I will inspect it.",
             "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "cad", "arguments": "{}"}}],
-            "reasoning": "internal",
-            "reasoning_details": {"x": 1},
+            "reasoning_details": [{
+                "type": "reasoning.text",
+                "text": "internal",
+                "id": "reasoning-1",
+                "format": "xai-responses-v1",
+                "index": 0,
+            }],
             "_provider_debug": True,
         },
     ])
@@ -867,12 +959,241 @@ def test_openrouter_builds_cache_safe_sticky_payload_and_keeps_tool_content(monk
     assistant = captured["json"]["messages"][1]
     assert assistant["content"] == "I will inspect it."
     assert "tool_calls" in assistant
-    assert "reasoning" not in assistant and "reasoning_details" not in assistant
+    assert assistant["reasoning_details"][0]["text"] == "internal"
+    assert "reasoning" not in assistant
     assert "_provider_debug" not in assistant
     assert captured["json"]["session_id"] == hashlib.sha256(b"project:demo").hexdigest()[:64]
     assert captured["json"]["cache_control"] == {"type": "ephemeral"}
     assert captured["headers"]["X-OpenRouter-Title"] == "CAD Test"
     assert captured["headers"]["HTTP-Referer"] == "https://cad.example"
+
+
+def test_openrouter_stream_preserves_reasoning_details_for_tool_continuation(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test")
+    monkeypatch.setattr(
+        "agent.llm_base.requests.post",
+        lambda *_args, **_kwargs: _ReasoningDetailsToolResponse(),
+    )
+    client = OpenRouterClient(_settings(tmp_path, "openrouter"))
+
+    response = client.chat([{"role": "user", "content": "build"}])
+    assistant = response["choices"][0]["message"]
+    assert [item["text"] for item in assistant["reasoning_details"]] == [
+        "Inspecting ",
+        "the model.",
+    ]
+
+    payload = client._build_payload(
+        [
+            {"role": "user", "content": "build"},
+            assistant,
+            {"role": "tool", "tool_call_id": "call-1", "content": "written"},
+        ],
+        TOOL_SCHEMAS[:1],
+    )
+    assert payload["messages"][1]["reasoning_details"] == assistant["reasoning_details"]
+    # ``reasoning_text`` must NOT be a duplicate of the structured list;
+    # ``parse_chat_stream`` should keep one source of truth.
+    assert "reasoning" not in payload["messages"][1]
+
+
+def test_openrouter_wire_payload_drops_reasoning_on_historical_assistant_turns(tmp_path):
+    """Historical assistant turns must not carry ``reasoning_details`` on the wire.
+
+    The provider only needs the latest assistant turn's reasoning chain to
+    continue an interrupted tool-call response. Re-sending every previous
+    turn's reasoning would grow the wire payload linearly with the iteration
+    count. ``sanitize_messages(..., preserve_reasoning=True)`` therefore
+    preserves reasoning only on the last assistant message.
+    """
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setenv("OPENROUTER_API_KEY", "test")
+        messages = [
+            {"role": "system", "content": "stable"},
+            {"role": "user", "content": "build a bracket"},
+            {
+                "role": "assistant",
+                "content": "First plan.",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "write_file", "arguments": "{}"},
+                }],
+                "reasoning_details": [{
+                    "type": "reasoning.text",
+                    "text": "first",
+                    "id": "rd-1",
+                    "format": "xai-responses-v1",
+                    "index": 0,
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "ok"},
+            {
+                "role": "assistant",
+                "content": "Second plan.",
+                "tool_calls": [{
+                    "id": "call-2",
+                    "type": "function",
+                    "function": {"name": "edit_file", "arguments": "{}"},
+                }],
+                "reasoning_details": [{
+                    "type": "reasoning.text",
+                    "text": "second",
+                    "id": "rd-2",
+                    "format": "xai-responses-v1",
+                    "index": 0,
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call-2", "content": "ok"},
+            {
+                "role": "assistant",
+                "content": "Third plan.",
+                "tool_calls": [{
+                    "id": "call-3",
+                    "type": "function",
+                    "function": {"name": "edit_file", "arguments": "{}"},
+                }],
+                "reasoning_details": [{
+                    "type": "reasoning.text",
+                    "text": "third",
+                    "id": "rd-3",
+                    "format": "xai-responses-v1",
+                    "index": 0,
+                }],
+            },
+        ]
+        client = OpenRouterClient(_settings(tmp_path, "openrouter"))
+        wire = client._build_payload(messages, None)["messages"]
+        assistant_indices = [
+            index for index, message in enumerate(wire)
+            if message.get("role") == "assistant"
+        ]
+        last_index = assistant_indices[-1]
+        for index in assistant_indices:
+            if index == last_index:
+                assert wire[index].get("reasoning_details"), (
+                    "Latest assistant turn must keep reasoning_details for "
+                    "provider tool-call continuation."
+                )
+            else:
+                assert "reasoning_details" not in wire[index], (
+                    f"Historical assistant turn at index {index} must not carry "
+                    "reasoning_details on the wire."
+                )
+                assert "reasoning" not in wire[index]
+    finally:
+        monkeypatch.undo()
+
+
+def test_openrouter_preserve_reasoning_attribute_replaces_override(tmp_path):
+    """The shared ``preserve_reasoning`` class attribute replaces the override.
+
+    The override used to live on ``OpenRouterClient.sanitize_messages``; that
+    hook has been removed in favour of a single class attribute that the base
+    ``sanitize_messages`` reads. Both the wire-payload sanitizer and the agent
+    runner's per-message sanitizer now read ``client.preserve_reasoning``.
+    """
+    assert OpenRouterClient.preserve_reasoning is True
+    # Inherited default keeps OpenAI from leaking reasoning fields.
+    from agent.llm_base import ChatCompletionsClient
+    assert ChatCompletionsClient.preserve_reasoning is False
+    assert OpenAIClient.preserve_reasoning is False
+
+    # Sanity: the override hook is gone from the public surface.
+    assert "sanitize_messages" not in vars(OpenRouterClient)
+    assert "sanitize_messages" not in vars(OpenAIClient)
+
+
+def test_parse_chat_stream_reasoning_only_detail_deltas_emit_no_duplicate_text(monkeypatch):
+    """``reasoning_details`` deltas with no parallel ``reasoning`` string.
+
+    Verifies the rebuilt message carries the structured details and does not
+    also stuff ``.text`` into a plain ``reasoning`` field — those are two
+    representations of the same content, and double-counting would let the
+    ``empty content with no tool_calls`` fallback copy the duplicated text into
+    ``content``.
+    """
+    from agent.llm_base import parse_chat_stream
+
+    response = _ReasoningDetailsToolResponse()
+    result = parse_chat_stream(
+        response,
+        provider_label="OpenRouter",
+        stop_event=None,
+        stream_callback=None,
+    )
+    message = result["choices"][0]["message"]
+    assert "reasoning_details" in message
+    assert "reasoning" not in message
+
+
+def test_parse_chat_stream_plain_reasoning_string_still_falls_back(monkeypatch):
+    """When the provider emits only ``reasoning`` strings, still accumulate."""
+    from agent.llm_base import parse_chat_stream
+
+    response = _StreamingResponse()
+    result = parse_chat_stream(
+        response,
+        provider_label="OpenRouter",
+        stop_event=None,
+        stream_callback=None,
+    )
+    # ``_StreamingResponse`` carries ``reasoning`` first, then content + tool;
+    # the rebuilt message has tool_calls so ``reasoning`` is attached.
+    message = result["choices"][0]["message"]
+    assert message["reasoning"] == "Checking geometry. "
+
+
+def test_openai_drops_openrouter_reasoning_details(tmp_path):
+    client = OpenAIClient(_settings(tmp_path, "openai"))
+    payload = client._build_payload(
+        [{
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "write_file", "arguments": "{}"},
+            }],
+            "reasoning_details": [{"type": "reasoning.text", "text": "private"}],
+        }],
+        None,
+    )
+    assert "reasoning_details" not in payload["messages"][0]
+
+
+def test_openai_strips_plain_reasoning_string_defensively(tmp_path):
+    """Defensive strip on the OpenAI client catches every assistant message.
+
+    ``sanitize_messages`` already drops these on the default path, but the
+    defensive strip in :meth:`OpenAIClient._build_payload` is the only layer
+    that protects against a future caller flipping ``preserve_reasoning=True``
+    or bypassing the sanitizer. Confirm both keys are absent on the wire.
+    """
+    from agent.llm_base import sanitize_messages
+
+    sanitized = sanitize_messages([{
+        "role": "assistant",
+        "content": "decided",
+        "tool_calls": [{
+            "id": "call-1",
+            "type": "function",
+            "function": {"name": "noop", "arguments": "{}"},
+        }],
+        "reasoning_details": [{"type": "reasoning.text", "text": "private"}],
+        "reasoning": "private string",
+    }])
+    settings = _settings(tmp_path, "openai")
+    # Force the message past ``sanitize_messages`` with reasoning preserved so
+    # the defensive strip has something to drop.
+    sanitized[0]["reasoning"] = "private string"
+    payload = OpenAIClient(settings)._build_payload(sanitized, None)
+    assistant = payload["messages"][0]
+    assert "reasoning" not in assistant
+    assert "reasoning_details" not in assistant
 
 
 def test_openrouter_forced_provider_keeps_sticky_routing_eligible(tmp_path):

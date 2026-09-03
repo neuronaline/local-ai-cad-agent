@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from agent.llm_base import ChatCompletionsClient, post_with_cancel, sanitize_messages
+from agent.llm_base import ChatCompletionsClient, post_with_cancel
 from agent.prompt import get_prompt_cache_key
 from agent.settings import Settings
 
@@ -20,10 +20,6 @@ API_KEY_ENV = "OPENAI_API_KEY"
 class OpenAIClient(ChatCompletionsClient):
     def __init__(self, settings: Settings) -> None:
         super().__init__(settings, provider_label="OpenAI")
-
-    @classmethod
-    def sanitize_messages(cls, messages):
-        return sanitize_messages(messages)
 
     @staticmethod
     def _api_key() -> str:
@@ -41,6 +37,15 @@ class OpenAIClient(ChatCompletionsClient):
 
     def _build_payload(self, messages, tools):
         wire_messages = self.sanitize_messages(messages)
+        # Belt-and-braces: ``sanitize_messages`` already drops these on the
+        # default OpenAI path, but a future caller (or a third-party
+        # ``chat()`` route that builds a payload by hand) might bypass it.
+        # OpenAI rejects unknown ``reasoning`` / ``reasoning_details`` fields,
+        # and the cost of one extra pass is negligible.
+        for message in wire_messages:
+            if isinstance(message, dict) and message.get("role") == "assistant":
+                message.pop("reasoning", None)
+                message.pop("reasoning_details", None)
         payload: dict[str, Any] = {
             "model": self.settings.openai_model,
             "messages": wire_messages,

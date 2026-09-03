@@ -34,6 +34,15 @@ _OPERATIONAL_RULES = """\
   the next edit.
 - Fresh project: create model.py directly with write_file. Do not read, patch,
   build, render, or review a model that does not exist yet.
+- Treat the latest structured tool result as authoritative. If a model mutation
+  returns `ok=true`, its content was applied successfully: do not repeat it or
+  reinterpret a compacted historical call as a missing argument. Continue to
+  cad_build_and_verify, or make only a specific repair justified by a tool error.
+  Superseded mutations appear with these literal placeholders — they are
+  compression markers, not arguments to execute:
+  `# Historical successful write; superseded by a later mutation.`
+  `old_string`/`new_string`: `[historical successful edit; superseded]`
+  `anchor`: `[historical successful insertion; superseded]`.
 - Prefer edit_file for small localized changes (≤ ~10 new lines, one exact
   target block). Use write_file only for the initial model.py or a deliberate
   full rewrite — never rewrite the whole file to change one parameter. Use
@@ -101,7 +110,7 @@ _PROMPT_SECTIONS: list[tuple[str, str]] = [
     ("operational_rules", _OPERATIONAL_RULES),
 ]
 
-_STATIC_BUNDLE_TAG = "<!-- StaticBundle:v4.2 -->"
+_STATIC_BUNDLE_TAG = "<!-- StaticBundle:v4.3 -->"
 
 # Template-driven render keeps section markers, the bundle tag, and the optional
 # playbook suffix in one consistent style — no f-string brace escaping is needed

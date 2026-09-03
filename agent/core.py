@@ -385,7 +385,8 @@ class AgentRunner:
                     )
                 self._publish_usage(project, getattr(client, "last_usage", None))
                 assistant_message = sanitize_assistant_message(
-                    response["choices"][0]["message"]
+                    response["choices"][0]["message"],
+                    preserve_reasoning=getattr(client, "preserve_reasoning", False),
                 )
                 tool_calls = self._normalize_tool_calls(
                     assistant_message.get("tool_calls")
