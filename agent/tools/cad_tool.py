@@ -20,6 +20,7 @@ from agent.tools.file_tool import FileTool
 from agent.tools.process_runner import (
     MAX_SANDBOX_TIMEOUT_SECONDS,
     run_sandbox_subprocess,
+    terminate,
 )
 from agent.tools.tool_events import publish_tool_phase
 
@@ -211,7 +212,7 @@ class CadTool:
                 if render and self._review_enabled
                 else None
             )
-            if render and self._review_enabled:
+            if render:
                 render_path = workspace / "render.png"
                 if not render_path.is_file() or render_path.stat().st_size == 0:
                     error_msg = "CAD execution did not produce a render."
@@ -227,7 +228,7 @@ class CadTool:
             # verifies each view's SHA against the manifest entry.
             staging_views_dir: str | None = None
             staging_sheet_path: str | None = None
-            if render:
+            if render and self._review_enabled:
                 # Surface the multi-view rasterisation phase so the UI can
                 # label the activity drawer ("rendering_views"). The event is
                 # only published when render=True because the cheap
@@ -599,22 +600,34 @@ class CadTool:
 
     def build_and_verify(
         self,
-        render: bool = False,
+        mode: str | bool = "check",
         parameter_checks: list[dict[str, Any]] | None = None,
+        *,
+        render: bool | None = None,
     ) -> dict[str, Any]:
         """Build once, validate metrics, and (optionally) produce preview + review.
 
-        ``render=False`` (default) skips the legacy ``render.png`` artifact and
-        the multi-view review sheet, returning only ``metrics`` + ``preview.stl``
-        + ``model_sha256`` + ``preview_sha256``. This is the fast, cache-friendly
-        path for early iteration — the agent should switch to ``render=True``
-        only for the final verification before declaring the task ready.
+        ``mode="check"`` (default) is the fast, cache-friendly path: it skips
+        ``render.png`` and the multi-view review sheet, returning only
+        ``metrics`` + ``preview.stl`` + ``model_sha256`` + ``preview_sha256``.
+        Use it for every iteration.
 
-        The metrics still include the canonical geometry sanity checks
-        (bounding box, volume, solid count, is_valid) so a render-less build
-        remains trustworthy for early iteration.
+        ``mode="final"`` produces the canonical eight-view rasterisation +
+        contact sheet + single render; ``parameter_checks`` is optional but
+        recommended to verify explicit user-stated dimensions, angles,
+        clearances, or counts against named model.py parameters.
+
+        ``render=`` and a positional bool remain accepted for older callers;
+        both are translated to the canonical mode before execution.
         """
-        execute_args: dict[str, Any] = {"render": bool(render)}
+        if render is not None:
+            mode = "final" if render else "check"
+        elif isinstance(mode, bool):
+            mode = "final" if mode else "check"
+        if mode not in {"check", "final"}:
+            raise ValueError(f"build_and_verify mode must be 'check' or 'final', got {mode!r}.")
+        render = mode == "final"
+        execute_args: dict[str, Any] = {"render": render}
         if parameter_checks:
             execute_args["parameter_checks"] = parameter_checks
         if self._call_id:
@@ -632,6 +645,7 @@ class CadTool:
             payload.get("preview_sha256") if isinstance(payload, dict) else None
         )
         result: dict[str, Any] = {
+            "mode": mode,
             "metrics": metrics,
             "preview": "preview.stl",
             "render": "render.png" if render else None,

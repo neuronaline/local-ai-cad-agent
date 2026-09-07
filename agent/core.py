@@ -457,7 +457,7 @@ class AgentRunner:
                                 "role": "user",
                                 "content": (
                                     "The current model revision has not passed final visual "
-                                    "verification. Call cad_build_and_verify with render=true "
+                                    "verification. Call cad_build_and_verify with mode=\"final\" "
                                     "and parameter_checks for explicit dimensions before finishing."
                                 ),
                             }

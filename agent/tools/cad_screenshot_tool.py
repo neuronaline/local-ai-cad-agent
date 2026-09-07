@@ -46,6 +46,7 @@ from agent.tools.file_tool import FileTool
 from agent.tools.process_runner import (
     MAX_SANDBOX_TIMEOUT_SECONDS,
     run_sandbox_subprocess,
+    terminate,
 )
 from agent.tools.tool_events import publish_tool_phase
 
@@ -196,6 +197,55 @@ class CadScreenshotTool:
                 f"Expected one of {list(screenshot_script.QUALITY_TOLERANCES)}."
             )
         return quality
+
+    def _collect_inline_images(
+        self,
+        cache_dir: Path,
+        requested_views: tuple[str, ...],
+        contact_sheet: bool,
+    ) -> list[dict[str, str]]:
+        """Return host-relative paths + per-view SHA-256 for the requested views.
+
+        These paths are the contract the dispatcher (and
+        :func:`agent.tool_results.build_cad_screenshot_multimodal_content`)
+        use to attach inline images directly to the tool message — the
+        reviewer can inspect the rendering without a separate read step.
+        """
+        images: list[dict[str, str]] = []
+        views_dir = cache_dir / "views"
+        for view_id in requested_views:
+            png_path = views_dir / f"{view_id}.png"
+            if not png_path.is_file():
+                continue
+            try:
+                raw = png_path.read_bytes()
+            except OSError:
+                continue
+            if not raw:
+                continue
+            digest = hashlib.sha256(raw).hexdigest()
+            try:
+                rel = str(png_path.relative_to(self.project_dir))
+            except ValueError:
+                rel = str(png_path)
+            images.append({"view_id": view_id, "path": rel, "sha256": digest})
+        if contact_sheet:
+            sheet_path = cache_dir / "review-sheet.png"
+            if sheet_path.is_file():
+                try:
+                    raw = sheet_path.read_bytes()
+                except OSError:
+                    raw = b""
+                if raw:
+                    digest = hashlib.sha256(raw).hexdigest()
+                    try:
+                        rel = str(sheet_path.relative_to(self.project_dir))
+                    except ValueError:
+                        rel = str(sheet_path)
+                    images.append(
+                        {"view_id": "contact_sheet", "path": rel, "sha256": digest}
+                    )
+        return images
 
     # ------------------------------------------------------------------ cache lookup
 
@@ -512,6 +562,9 @@ class CadScreenshotTool:
                 f"Rendered {len(views_subset)}/{len(self.SUBSET_VIEWS)} view(s) "
                 f"at {quality} quality; "
                 f"contact sheet {'included' if contact_sheet else 'skipped'}."
+            ),
+            "inline_images": self._collect_inline_images(
+                review_dir, views, contact_sheet
             ),
         }
         try:

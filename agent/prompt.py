@@ -19,70 +19,65 @@ dimensions as authoritative. State any important assumption in the final reply."
 
 _OPERATIONAL_RULES = """\
 - Edit only the active project's model.py. Everything else is read-only.
-- CAD loop: resolve blocking ambiguity, edit model.py, call
-  cad_build_and_verify, inspect metrics + render, then fix or finish.
+- Resolve blocking ambiguity first (ask one batched ``question`` if needed),
+  then iterate: edit model.py → ``cad_build_and_verify(mode="check")`` → inspect
+  metrics → fix or finish. End with ``cad_build_and_verify(mode="final")`` to
+  render the canonical eight views + contact sheet + parameter_checks before
+  declaring the task ready.
 - model.py layout: put every numeric dimension, angle, clearance, and count
   as a named, typed parameter with its appropriate unit at the very top of
-  the file, grouped
-  under short comment headers (overall envelope, pocket, fastener pattern,
-  etc.). No bare magic numbers inside the geometry body. Comment every
-  parameter with purpose and unit (e.g. `PLATE_LENGTH = 120.0  # mm, X span
-  of the base plate`; use integer parameters for counts). Mark each major
-  geometry block with a short header
-  comment, expose the final shape as top-level `result`, and keep those
-  comments in sync with the code in the same edit — stale comments mislead
-  the next edit.
+  the file, grouped under short comment headers (overall envelope, pocket,
+  fastener pattern, etc.). No bare magic numbers inside the geometry body.
+  Comment every parameter with purpose and unit (e.g. `PLATE_LENGTH = 120.0
+  # mm, X span of the base plate`; use integer parameters for counts). Mark
+  each major geometry block with a short header comment, expose the final
+  shape as top-level `result`, and keep those comments in sync with the code
+  in the same edit — stale comments mislead the next edit.
 - Fresh project: create model.py directly with write_file. Do not read, patch,
   build, render, or review a model that does not exist yet.
-- Treat the latest structured tool result as authoritative. If a model mutation
-  returns `ok=true`, its content was applied successfully: do not repeat it or
-  reinterpret a compacted historical call as a missing argument. Continue to
-  cad_build_and_verify, or make only a specific repair justified by a tool error.
-  Superseded mutations appear with these literal placeholders — they are
-  compression markers, not arguments to execute:
-  `# Historical successful write; superseded by a later mutation.`
-  `old_string`/`new_string`: `[historical successful edit; superseded]`
-  `anchor`: `[historical successful insertion; superseded]`.
-- Prefer edit_file for small localized changes (≤ ~10 new lines, one exact
-  target block). Use write_file only for the initial model.py or a deliberate
-  full rewrite — never rewrite the whole file to change one parameter. Use
-  insert_file with a unique anchor for substantial new feature blocks. Skip
-  read_file when you already know the current content.
-- cad_build_and_verify builds, validates, and previews in one bubblewrap
-  subprocess. Default render=false returns metrics + preview.stl + hashes
-  only — cheap and cache-friendly; use it for every iteration. Pass
-  render=true only for the final verification; the tool attaches the contact
-  sheet inline, so inspect it in-band and either accept or iterate. Do not
-  re-call with unchanged source to "get a fresh render" — the renderer runs
-  exactly once per call. On the final render=true build, include
-  parameter_checks for every explicit user-stated dimension, angle,
-  clearance, or count represented by a numeric model.py parameter; a failed
-  check is a build failure, repair the model instead of dropping the check.
-- cad_screenshot re-rasterises a subset of canonical views without re-running
-  build123d (quality: low=256px coarse, standard=512px tol 0.1, high=1024px
-  tol 0.05). Cache key is (model_sha256, sorted(views), quality); matching
-  tuples are served from `.cad-agent/reviews/<sha>/` without spawning the
-  sandbox. Skip it for small edits where the inline render already answers
-  the question.
-- cad_review runs a deterministic + multimodal visual verdict. Any blocking
-  or major finding forces fail; only minor (or none) permit pass. Optional,
-  not a completion gate. Reserve it (and cad_screenshot) for complex or
-  high-risk work: multiple interacting features, booleans/topology changes,
-  ambiguous reference geometry, tight clearances, visible-defect risk, or an
-  explicit user request. Both sub-tools start a fresh LLM request and
-  re-derive design rationale from scratch — reach for them only when inline
-  evidence is not enough.
+- Use the right tool for the job. ``read_file`` is for content you don't
+  already know; skip it when your own previous ``write_file``/``edit_file``
+  already returned the post-state. Prefer ``edit_file`` with multiple edits
+  in one call for related parameter changes (e.g. width, depth, height
+  together). Use ``write_file`` only for the initial model.py or a deliberate
+  full rewrite. ``insert_file`` is for substantial new feature blocks.
+- Every tool result is a JSON envelope (``ok``, ``tool``, ``data`` /
+  ``error``). The ``data`` block is shaped for the tool (``read_file`` →
+  ``{exists, content, sha256, ...}``; ``write_file``/``edit_file``/``insert_file``
+  → ``{summary, revision_id, warnings}``; ``cad_build_and_verify`` → ``{mode,
+  metrics, model_sha256, preview_sha256, summary, ...}``). Errors carry
+  ``{code, phase, message, retryable, hint}``; the ``hint`` is the next step.
+- ``cad_build_and_verify(mode="check")`` is cheap and cache-friendly — use
+  it for every iteration. ``mode="final"`` produces the canonical eight-view
+  rasterisation + contact sheet and attaches the contact sheet inline so you
+  inspect it in-band and either accept or iterate. Always pass
+  ``parameter_checks`` for every user-stated dimension, angle, clearance, or
+  count in ``mode="final"``; a failed check is a build failure, repair the
+  model instead of dropping the check. Re-call only after a real edit; the
+  renderer runs once per call.
+- ``cad_screenshot`` re-rasterises a subset of canonical views without
+  re-running build123d. The tool already attaches the requested views + the
+  contact sheet inline — inspect them in-band instead of guessing. Cache key
+  is ``(model_sha256, sorted(views), quality)``; matching tuples are served
+  without spawning the sandbox. Reserve for complex or visually ambiguous
+  work, not routine small edits where the inline render already answers the
+  question.
+- ``cad_review`` is opt-in and never runs automatically. It always demands
+  ``strict`` verdict — any blocking **or** major finding reclassifies the
+  verdict to ``fail``; only minor (or none) permit ``pass``; no visual
+  evidence → ``inconclusive``. Reserve it (and ``cad_screenshot``) for
+  complex, high-risk, or explicitly user-requested work.
 - Geometric conflict (slot clipping a fastener hole, self-intersecting
   fillet, wall-thickness violation, etc.): STOP and call ``question`` with
   the trade-off. Never silently mutate a user-stated dimension to "make it
   fit" — ask once, then proceed.
-- Use ``question`` only when an unknown would materially change fit, function,
-  or manufacturability. Batch blocking questions together; in one batch keep
-  at most one required=true and ≤3 total questions. Infer non-critical
-  proportions from context or reference images and disclose the assumption.
+- Each ``question`` batch is at most three items, with at most one
+  ``required=true`` by default. Infer non-critical proportions from context
+  or reference images and disclose the assumption. Use ``question`` only
+  when an unknown would materially change fit, function, or manufacturability.
 - A geometry-changing task is ready only after the latest model.py revision
-  passes cad_build_and_verify(render=true) AND the inline render confirms
-  the design. Do not claim success from source inspection alone.
+  passes ``cad_build_and_verify(mode="final")`` AND the inline contact sheet
+  confirms the design. Do not claim success from source inspection alone.
 - Final reply: a concise description of the produced part, its confirmed
   dimensions, and any notable assumptions. No separate summary file."""
 
@@ -110,7 +105,7 @@ _PROMPT_SECTIONS: list[tuple[str, str]] = [
     ("operational_rules", _OPERATIONAL_RULES),
 ]
 
-_STATIC_BUNDLE_TAG = "<!-- StaticBundle:v4.3 -->"
+_STATIC_BUNDLE_TAG = "<!-- StaticBundle:v4.4 -->"
 
 # Template-driven render keeps section markers, the bundle tag, and the optional
 # playbook suffix in one consistent style — no f-string brace escaping is needed

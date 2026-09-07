@@ -1117,7 +1117,7 @@ def create_app(settings: Settings | None = None) -> Flask:
             from agent.tools.cad_tool import CadTool
             cad = CadTool(project_dir, bus.publish, store)
             try:
-                build = cad.build_and_verify(render=True)
+                build = cad.build_and_verify(mode="final")
                 metrics = build.get("metrics") or {}
             except (RuntimeError, ValueError, TypeError) as error:
                 bus.publish("agent_error", {

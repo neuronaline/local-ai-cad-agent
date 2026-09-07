@@ -29,7 +29,35 @@ from typing import Any
 
 from agent.images import as_chat_image
 from agent.io import atomic_write_json
-from agent.prompt import get_system_prompt
+
+# A small, focused system prompt for the visual reviewer. Keeping the
+# reviewer isolated from the parent agent's playbook + design-principles
+# sections means the reviewer focuses on its single job: produce a strict,
+# evidence-backed verdict via ``submit_review``.
+REVIEWER_SYSTEM_PROMPT = """\
+You are the visual reviewer for a build123d CAD model. Your only job is to
+produce a strict verdict via the ``submit_review`` tool against the geometry
+evidence attached to this message (single isometric render + multi-view
+contact sheet, the latest ``metrics`` + ``feature_summary``, and the model
+source).
+
+Hard rules:
+- Read the user request carefully and compare it to every attached view.
+- ``status: pass`` only when every visible feature matches the request AND no
+  blocking OR major finding is reported.
+- ``status: fail`` when ANY blocking OR major finding is reported.
+- ``status: inconclusive`` when visual evidence is missing, ambiguous, or
+  the hashes disagree with the manifest.
+- Each ``finding.severity`` must be ``blocking``, ``major``, or ``minor``.
+- Each ``finding.category`` must be one of the documented enum values
+  (``missing_feature``, ``dimensions``, ``alignment``, ``geometry``,
+  ``manufacturability``).
+- Each finding's ``view`` is the contact-sheet view id that best shows the
+  issue.
+- Quote the observation in ``message``; put the concrete fix in ``repair_hint``.
+- Do not edit files, ask the user follow-up questions, or call any tool other
+  than ``submit_review``.
+"""
 
 
 def _default_create_client(settings: Any) -> Any:
@@ -410,16 +438,12 @@ def _visual_review(
         review_manifest=review_manifest,
         stop_instruction=stop_instruction,
     )
-    # Reuse the parent agent's system prompt so the provider-side prefix cache
-    # key stays stable across both call sites. The base prompt is shared with
-    # the parent agent loop; the review-specific instructions are folded into
-    # the user message below.
+    # The reviewer uses a dedicated, narrow system prompt focused only on
+    # producing a strict ``submit_review`` verdict. Sharing the parent agent's
+    # design-principles + operational-rules prompt would dilute that focus and
+    # waste prompt-cache space on instructions the reviewer cannot act on.
     messages: list[dict[str, Any]] = [
-        {
-            "role": "system",
-            "content": get_system_prompt()
-            + "\n\n<role>\nYou are the visual reviewer. Focus on the geometry evidence; produce a structured verdict via submit_review.\n</role>",
-        },
+        {"role": "system", "content": REVIEWER_SYSTEM_PROMPT},
         {
             "role": "user",
             "content": [
@@ -738,10 +762,10 @@ def _build_prompt(
         "## Verdict policy",
         (
             "- ``status: pass`` only when every visible feature in the sheet "
-            "and the single render matches the request and no blocking finding is reported.\n"
+            "and the single render matches the request and no blocking or major finding is reported.\n"
             "- Cross-check the single render against the multi-view sheet; use the "
             "labelled contact-sheet tile when assigning a finding's ``view``.\n"
-            "- ``status: fail`` when at least one blocking finding is reported.\n"
+            "- ``status: fail`` when at least one blocking or major finding is reported.\n"
             "- ``status: inconclusive`` when visual evidence is missing or "
             "ambiguous.\n"
             "- Each finding's `category` must be one of the documented enum "

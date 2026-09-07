@@ -43,6 +43,8 @@ class QuestionTool:
         """Validate a list of question descriptors. Raises ValueError on the first failure."""
         if not isinstance(questions, list) or not questions:
             raise ValueError("At least one question is required.")
+        if len(questions) > 3:
+            raise ValueError("At most three questions may be asked in one batch.")
         seen: set[str] = set()
         for i, item in enumerate(questions):
             if not isinstance(item, dict):

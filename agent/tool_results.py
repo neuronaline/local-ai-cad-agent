@@ -162,6 +162,97 @@ def build_cad_build_multimodal_content(
     return {"content": parts, "image_paths": [image_path]}
 
 
+def build_cad_screenshot_multimodal_content(
+    raw_result: str,
+    project_dir: Path,
+    *,
+    context_result: str | None = None,
+    max_images: int = 4,
+) -> dict[str, Any] | None:
+    """Multimodal payload for a successful ``cad_screenshot`` call.
+
+    The orchestrator publishes ``inline_images`` in the tool data; this helper
+    reads them and attaches the requested views (plus the contact sheet when
+    present) directly to the tool message so the model can inspect the
+    rendered output in-band instead of chasing file paths.
+
+    Returns ``None`` when no inline image is available, when the JSON envelope
+    is malformed, or when every attached image fails to decode.
+    """
+    try:
+        payload = json.loads(raw_result)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        return None
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return None
+    inline = data.get("inline_images")
+    if not isinstance(inline, list) or not inline:
+        return None
+    if max_images <= 0:
+        return None
+    image_paths: list[Path] = []
+    parts: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": context_result or compact_for_context("cad_screenshot", raw_result),
+        }
+    ]
+    # The orchestrator publishes the requested views first then the contact
+    # sheet; ``max_images`` would otherwise drop the contact sheet for a
+    # default call (eight views + contact sheet → only four views attached).
+    # Prioritise the contact sheet so the canonical compact evidence is
+    # always inline, then fill the remaining budget with views in the
+    # orchestrator's declared order.
+    inline_paths: list[Path] = []
+    inline_view_ids: list[str] = []
+    for entry in inline:
+        if not isinstance(entry, dict):
+            continue
+        rel = entry.get("path")
+        view_id = entry.get("view_id") or ""
+        expected_sha = entry.get("sha256")
+        if not isinstance(rel, str) or not rel:
+            continue
+        candidate = project_dir / rel
+        if not _is_png(candidate, expected_sha if isinstance(expected_sha, str) else None):
+            continue
+        inline_paths.append(candidate)
+        inline_view_ids.append(view_id)
+    contact_sheet_idx = next(
+        (idx for idx, view_id in enumerate(inline_view_ids) if view_id == "contact_sheet"),
+        None,
+    )
+    selected: list[tuple[Path, str]] = []
+    if contact_sheet_idx is not None:
+        selected.append((inline_paths[contact_sheet_idx], inline_view_ids[contact_sheet_idx]))
+    remaining_budget = max(0, max_images - len(selected))
+    for path, view_id in zip(inline_paths, inline_view_ids):
+        if view_id == "contact_sheet":
+            continue
+        if remaining_budget <= 0:
+            break
+        selected.append((path, view_id))
+        remaining_budget -= 1
+    for candidate, _view_id in selected:
+        try:
+            parts.append(as_chat_image(candidate))
+            image_paths.append(candidate)
+        except OSError as error:
+            _LOG.debug(
+                "screenshot multimodal failed for %s: %s",
+                candidate,
+                error,
+                exc_info=True,
+            )
+            continue
+    if not image_paths:
+        return None
+    return {"content": parts, "image_paths": image_paths}
+
+
 def _is_png(path: Path, expected_sha256: str | None = None) -> bool:
     """Fully decode PNG evidence and verify its manifest hash when available."""
     try:

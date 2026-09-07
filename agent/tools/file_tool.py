@@ -469,3 +469,98 @@ class FileTool:
             line = current[: current.find(anchor)].count("\n") + 1
             base = self._write_model(updated, "insert_file")
         return f"{base} (inserted {position} anchor at line {line})."
+
+    def edit_file_atomic(
+        self,
+        filename: str,
+        edits: list[dict[str, str]],
+        expected_sha256: str | None = None,
+    ) -> str:
+        """Apply several ``{old_string, new_string}`` replacements atomically.
+
+        Every ``old_string`` is verified against the **original** file contents
+        first; only if all matches resolve uniquely and without overlap do the
+        replacements get applied. Overlap detection rejects two edits whose
+        resolved byte ranges intersect so the caller can never silently mutate
+        text the LLM copied from the pre-edit file. A failed validation aborts
+        the whole batch with no write.
+        """
+        if not edits:
+            raise ValueError("edit_file_atomic requires at least one edit.")
+        normalised: list[tuple[str, str]] = []
+        for index, entry in enumerate(edits):
+            if not isinstance(entry, dict):
+                raise ValueError(f"edits[{index}] must be an object.")
+            old_string = entry.get("old_string")
+            new_string = entry.get("new_string", "")
+            if not isinstance(old_string, str) or not old_string:
+                raise ValueError(f"edits[{index}].old_string must be non-empty.")
+            if not isinstance(new_string, str):
+                raise ValueError(f"edits[{index}].new_string must be a string.")
+            normalised.append((old_string, new_string))
+        path = self._path(filename)
+        with _file_lock(path):
+            if not path.exists():
+                raise ValueError(
+                    f"{filename} does not exist; use write_file to create it."
+                )
+            current = path.read_text(encoding="utf-8")
+            self._validate_expected_sha(filename, current, expected_sha256)
+            # Validate every match against the original buffer (not the running
+            # ``updated`` string) so an edit cannot invalidate another edit's
+            # ``old_string`` after a previous replace has rewritten the region.
+            resolved: list[tuple[tuple[int, int], str, str]] = []
+            for index, (old_string, new_string) in enumerate(normalised):
+                matches = sum(
+                    1
+                    for start in range(len(current))
+                    if current.startswith(old_string, start)
+                )
+                if matches != 1:
+                    raise ValueError(
+                        f"edits[{index}] expected one exact match, found "
+                        f"{matches}; file was not changed."
+                    )
+                start = current.find(old_string)
+                resolved.append(((start, start + len(old_string)), old_string, new_string))
+            # Reject any pair of edits whose resolved byte ranges overlap.
+            ordered = sorted(resolved, key=lambda entry: entry[0][0])
+            previous_end = -1
+            for (start, end), old_string, _new_string in ordered:
+                if start < previous_end:
+                    raise ValueError(
+                        "edit_file_atomic rejected overlapping edits; verify "
+                        "each old_string is copied from the same file state."
+                    )
+                previous_end = end
+            # All validations passed — apply the replacements using the
+            # offsets resolved against the original buffer. Applying in caller
+            # order against the running buffer would let an earlier edit's
+            # ``new_string`` introduce text that the next edit's ``old_string``
+            # then matches, silently leaving the original target untouched.
+            # We rebuild slices from each edit's start/end so the byte ranges
+            # always refer to the original positions the LLM copied from.
+            parts: list[str] = []
+            cursor = 0
+            ranges: list[tuple[int, int, int]] = []
+            ordered_offsets = sorted(
+                ((start, end, old_string, new_string) for (start, end), old_string, new_string in resolved)
+            )
+            for index, (start, end, old_string, new_string) in enumerate(ordered_offsets):
+                parts.append(current[cursor:start])
+                parts.append(new_string)
+                start_line = current[:start].count("\n") + 1
+                old_lines = old_string.count("\n") or 1
+                end_line = start_line + old_lines - 1
+                new_lines = new_string.count("\n") or 1
+                new_end_line = start_line + new_lines - 1
+                ranges.append((start_line, end_line, new_end_line))
+                cursor = end
+            parts.append(current[cursor:])
+            updated = "".join(parts)
+            base = self._write_model(updated, "edit_file")
+        ranges_str = ", ".join(
+            f"lines {start}-{end}→{new_end}"
+            for start, end, new_end in ranges
+        )
+        return f"{base} (replaced {ranges_str})."

@@ -85,3 +85,5 @@ output/
 *.brep
 *.iges
 *.igs
+
+tests/AGENTS.md

@@ -1,4 +1,11 @@
-"""Small, operation-specific schemas exposed to the model."""
+"""Small, operation-specific schemas exposed to the model.
+
+The schemas hide every fixed infrastructure detail (file paths, SHA-256
+digests, sandbox limits) so the model focuses on the operation it is
+trying to perform. Each tool returns a common ``ok`` envelope — see
+:mod:`agent.tool_results` — so the model never has to guess which fields
+a tool produced.
+"""
 
 from __future__ import annotations
 
@@ -26,11 +33,6 @@ def _tool(
     }
 
 
-_FILENAME = {
-    "type": "string",
-    "enum": ["model.py"],
-    "description": "Project file to read or edit.",
-}
 _TIMEOUT = {
     "type": "integer",
     "minimum": 1,
@@ -38,15 +40,30 @@ _TIMEOUT = {
     "description": f"Maximum runtime in seconds (1-{MAX_SANDBOX_TIMEOUT_SECONDS}).",
 }
 
+CANONICAL_VIEWS = (
+    "x_positive",
+    "x_negative",
+    "y_positive",
+    "y_negative",
+    "z_positive",
+    "z_negative",
+    "isometric_positive",
+    "isometric_negative",
+)
+
+_QUALITY_DESCRIPTION = (
+    "low=256x256 + coarse tessellation (0.3 tol); "
+    "standard=512x512 + 0.1 tol (matches cad_build_and_verify default); "
+    "high=1024x1024 + 0.05 tol."
+)
+
 TOOL_SCHEMAS = [
     _tool(
         "read_file",
-        "Read model.py. The response always includes exists and "
-        "the current SHA-256 (when the file exists); pass that digest as "
-        "expected_sha256 to write_file or edit_file. A missing file reports "
-        "exists=false and must be created with write_file.",
+        "Read the current model.py. The response always includes ``exists`` and, "
+        "when the file exists, the current SHA-256. A missing file reports "
+        "``exists=false`` and must be created with write_file.",
         {
-            "filename": _FILENAME,
             "offset": {
                 "type": "integer",
                 "minimum": 1,
@@ -62,10 +79,10 @@ TOOL_SCHEMAS = [
                 "type": "string",
                 "minLength": 64,
                 "maxLength": 64,
-                "description": "Previously returned SHA-256; returns unchanged metadata if it still matches.",
+                "description": "Previously returned SHA-256; returns unchanged metadata when it still matches.",
             },
         },
-        ["filename"],
+        [],
     ),
     _tool(
         "write_file",
@@ -76,7 +93,6 @@ TOOL_SCHEMAS = [
         "tokens and breaking the revision history. ``expected_sha256`` is "
         "optional; omit it unless you want strict conflict detection.",
         {
-            "filename": _FILENAME,
             "content": {"type": "string", "description": "Complete file contents."},
             "expected_sha256": {
                 "type": "string",
@@ -85,24 +101,38 @@ TOOL_SCHEMAS = [
                 "description": "Optional. SHA-256 from a recent read_file; a stale digest is rejected. Omit when you want an unconditional overwrite.",
             },
         },
-        ["filename", "content"],
+        ["content"],
     ),
     _tool(
         "edit_file",
-        "Replace one exact, uniquely matching block in an existing file. Prefer "
-        "this over write_file for any small localized change (single parameter, "
-        "narrow bug fix, ≤ ~10 lines). ``expected_sha256`` is optional; omit it "
-        "unless you are guarding against a concurrent external edit.",
+        "Apply one or more exact, atomic replacements to model.py. Pass an array "
+        "of {old_string, new_string} edits; every match is verified first, then "
+        "the edits are applied together and the final source is re-validated. "
+        "Use the single-pair shape for one fix, the array shape when changing "
+        "several related parameters at once. ``expected_sha256`` is optional; "
+        "omit it unless you are guarding against a concurrent external edit.",
         {
-            "filename": _FILENAME,
-            "old_string": {
-                "type": "string",
-                "minLength": 1,
-                "description": "Exact text to find, copied verbatim from read_file.",
-            },
-            "new_string": {
-                "type": "string",
-                "description": "Replacement text; may be empty to delete the block.",
+            "edits": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 16,
+                "description": "Atomic edit list. Each entry must have old_string and new_string.",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "old_string": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Exact text to find, copied verbatim from read_file. Must occur exactly once across the file.",
+                        },
+                        "new_string": {
+                            "type": "string",
+                            "description": "Replacement text; may be empty to delete the block.",
+                        },
+                    },
+                    "required": ["old_string", "new_string"],
+                },
             },
             "expected_sha256": {
                 "type": "string",
@@ -111,13 +141,12 @@ TOOL_SCHEMAS = [
                 "description": "Optional. Current SHA-256 from read_file; pass only when you want to reject stale edits. Omit for an unconditional edit.",
             },
         },
-        ["filename", "old_string", "new_string"],
+        ["edits"],
     ),
     _tool(
         "insert_file",
-        "Insert a new block immediately before or after one exact, uniquely matching short anchor. Use this for substantial feature additions so you do not repeat a large existing block in edit_file.old_string.",
+        "Insert a new block immediately before or after one exact, uniquely matching short anchor. Use this for substantial feature additions so you do not repeat a large existing block in edit_file.edits[].old_string.",
         {
-            "filename": _FILENAME,
             "anchor": {
                 "type": "string",
                 "minLength": 1,
@@ -135,21 +164,41 @@ TOOL_SCHEMAS = [
                 "maxLength": 64,
             },
         },
-        ["filename", "anchor", "content", "position"],
+        ["anchor", "content", "position"],
     ),
     _tool(
         "cad_build_and_verify",
-        "Build the latest model.py revision, validate basic geometry, export preview.stl, and (when render=true) rasterise the canonical eight views plus a labelled contact sheet. Does NOT trigger review automatically — call cad_review separately if you want a verdict. Default is render=false: returns only metrics + preview.stl + model_sha256 + preview_sha256 (cheap, cache-friendly). Pass render=true only for the final verification before declaring the task ready.",
+        "Build the latest model.py revision, validate basic geometry, and export "
+        "preview.stl. Choose a mode:\n"
+        "- ``check`` (default): fast, cache-friendly. Returns metrics + preview.stl + "
+        "model_sha256 + preview_sha256 only. Use for every iteration.\n"
+        "- ``final``: produces the canonical eight-view rasterisation + contact "
+        "sheet + single render, attaches the contact sheet inline so you can "
+        "inspect it in-band, and accepts ``parameter_checks`` to verify explicit "
+        "user-stated dimensions, angles, clearances, or counts against named "
+        "model.py parameters. Use only for the final verification; the renderer "
+        "runs once per call so do not re-call with unchanged source.\n"
+        "Does NOT trigger review automatically — call cad_review separately if "
+        "you want a verdict.",
         {
-            "render": {
-                "type": "boolean",
-                "default": False,
-                "description": "Generate canonical eight-view rasterisation + contact sheet (true) or skip rendering and return only metrics + preview.stl (false, default). Use false during early iterations; final verification must use true.",
+            "mode": {
+                "type": "string",
+                "enum": ["check", "final"],
+                "default": "check",
+                "description": "``check`` = metrics + preview only (cheap, cache-friendly). ``final`` = canonical views + contact sheet + inline image + parameter_checks.",
             },
             "parameter_checks": {
                 "type": "array",
                 "maxItems": 20,
-                "description": "Final-build checks for explicit numeric parameters defined in model.py. Use these for every user-stated dimension, angle, clearance, or count represented by a named parameter. Each check must include at least one bound: equals, minimum, or maximum (the runner silently treats a bare name as a no-op pass, so always include a bound).",
+                "description": (
+                    "Required when mode=final; optional otherwise. Every "
+                    "user-stated dimension, angle, clearance, or count "
+                    "represented by a named model.py parameter must include "
+                    "at least one of equals, minimum, or maximum. Tolerance "
+                    "narrows the bound (it has no standalone meaning without "
+                    "a target). A failed check is a build failure; repair the "
+                    "model instead of dropping the check."
+                ),
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
@@ -161,6 +210,8 @@ TOOL_SCHEMAS = [
                         "tolerance": {"type": "number", "minimum": 0},
                     },
                     "required": ["name"],
+                    # The dispatcher enforces that at least one comparison
+                    # target (equals/minimum/maximum) is present.
                 },
             },
         },
@@ -168,23 +219,11 @@ TOOL_SCHEMAS = [
     ),
     _tool(
         "cad_screenshot",
-        "Rasterise the latest model.py revision from one or more camera views without re-running build123d. Reuses the artifact cache produced by cad_build_and_verify(render=true) when the (model_sha256, sorted(views), quality) tuple matches; otherwise re-rasterises only the missing subset. Reserve this for complex or visually ambiguous work; do not use it for routine small edits that already pass cad_build_and_verify. Returns file paths and per-image SHA-256 digests; no base64 inline payloads.",
+        "Rasterise the latest model.py revision from one or more camera views without re-running build123d. Reuses the artifact cache produced by cad_build_and_verify(mode=final) when the (model_sha256, sorted(views), quality) tuple matches; otherwise re-rasterises only the missing subset. Attach the requested views inline so you can inspect them in-band; reserve this for complex or visually ambiguous work, not routine small edits that already pass cad_build_and_verify.",
         {
             "views": {
                 "type": "array",
-                "items": {
-                    "type": "string",
-                    "enum": [
-                        "x_positive",
-                        "x_negative",
-                        "y_positive",
-                        "y_negative",
-                        "z_positive",
-                        "z_negative",
-                        "isometric_positive",
-                        "isometric_negative",
-                    ],
-                },
+                "items": {"type": "string", "enum": list(CANONICAL_VIEWS)},
                 "minItems": 1,
                 "maxItems": 8,
                 "description": "Subset of canonical view_ids to rasterise. Empty or omitted = the full canonical eight.",
@@ -198,7 +237,7 @@ TOOL_SCHEMAS = [
                 "type": "string",
                 "enum": ["low", "standard", "high"],
                 "default": "standard",
-                "description": "low=256x256 + coarse tessellation (0.3 tol); standard=512x512 + 0.1 tol (matches cad_build_and_verify default); high=1024x1024 + 0.05 tol.",
+                "description": _QUALITY_DESCRIPTION,
             },
             "timeout_seconds": {
                 "type": "integer",
@@ -216,19 +255,7 @@ TOOL_SCHEMAS = [
         {
             "views": {
                 "type": "array",
-                "items": {
-                    "type": "string",
-                    "enum": [
-                        "x_positive",
-                        "x_negative",
-                        "y_positive",
-                        "y_negative",
-                        "z_positive",
-                        "z_negative",
-                        "isometric_positive",
-                        "isometric_negative",
-                    ],
-                },
+                "items": {"type": "string", "enum": list(CANONICAL_VIEWS)},
                 "description": "Subset of view_ids the multimodal reviewer should focus on. Empty = all canonical views. The deterministic layer always checks every face, so this only narrows the visual scan.",
             },
             "timeout_seconds": {
@@ -243,21 +270,22 @@ TOOL_SCHEMAS = [
     ),
     _tool(
         "question",
-        "Ask all blocking clarification questions together, then stop and wait. Use only when the answer materially affects fit, function, or manufacturability.",
+        "Ask all blocking clarification questions together, then stop and wait. Use only when the answer materially affects fit, function, or manufacturability. Each item's input_type defaults to ``text``; pass ``select`` (single choice) or ``multiselect`` to add an ``options`` array. ``required`` defaults to ``true``; pass ``false`` only for genuinely optional questions.",
         {
             "title": {"type": "string", "description": "Optional short heading."},
             "questions": {
                 "type": "array",
                 "minItems": 1,
-                "maxItems": 5,
-                "description": "Blocking questions to present in one form.",
+                "maxItems": 3,
+                "description": "Blocking questions to present in one form (max 3 per batch).",
                 "items": {
                     "type": "object",
+                    "additionalProperties": False,
                     "properties": {
                         "id": {
                             "type": "string",
                             "minLength": 1,
-                            "description": "Unique short key, such as hole_diameter.",
+                            "description": "Short key, such as hole_diameter.",
                         },
                         "question": {
                             "type": "string",
@@ -281,7 +309,6 @@ TOOL_SCHEMAS = [
                         },
                     },
                     "required": ["id", "question"],
-                    "additionalProperties": False,
                 },
             },
         },

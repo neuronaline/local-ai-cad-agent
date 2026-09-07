@@ -10,7 +10,10 @@ target-version = "py310"
 # surface or sibling-module imports.
 "agent/tools/cad_scripts/runner.py" = ["F401", "S102"]
 "agent/tools/cad_scripts/screenshot.py" = ["F401", "E402", "S102"]
+"agent/cad_review.py" = ["TRY004"]
+"agent/dispatcher.py" = ["TRY004"]
 "agent/tools/cad_review_tool.py" = ["TRY004"]
 "agent/tools/cad_screenshot_tool.py" = ["TRY004"]
+"agent/tools/file_tool.py" = ["TRY004"]
 "agent/tools/process_runner.py" = ["TRY004"]
 "agent/tools/question_tool.py" = ["TRY004"]

@@ -29,7 +29,6 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from build123d import export_step, export_stl
 
 # ``renderer`` is a sibling module in the same sandbox workspace; defer the
 # import so this file stays importable from the host side (it is consumed
@@ -244,6 +243,10 @@ def _run_model(
     duration of the build.
     """
     settings = settings or {}
+    # Keep helper functions importable on the host for lightweight unit tests;
+    # build123d is available only inside the CAD sandbox in normal operation.
+    from build123d import export_stl
+
     should_render = bool(settings.get("render_views", True))
     should_write_iso = bool(settings.get("write_isometric", False))
     render_workers = int(settings.get("render_workers", 4) or 4)
