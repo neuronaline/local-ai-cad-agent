@@ -102,13 +102,13 @@ def _candidate_cut_axes(shape) -> list[dict[str, object]]:
             continue
         try:
             radius = float(face.radius)
-        except (AttributeError, ValueError):
+        except (AttributeError, TypeError, ValueError):
             continue
         if radius <= 0:
             continue
         try:
             area = float(face.area)
-        except (AttributeError, ValueError):
+        except (AttributeError, TypeError, ValueError):
             continue
         # The lateral area of a cylindrical face scales with the radius and
         # the depth of the cut; a small relative area means the feature is

@@ -23,6 +23,15 @@ result = body - hole
 """
 
 
+def test_cylindrical_feature_extraction_skips_unknown_radius():
+    """A missing optional face radius must not prevent a valid CAD build."""
+    from build123d import Cylinder
+
+    from agent.tools.cad_scripts.runner import _candidate_cut_axes
+
+    assert _candidate_cut_axes(Cylinder(5, 10)) == []
+
+
 class QuestionClient:
     def chat(self, _messages, _tools):
         return {
