@@ -156,14 +156,45 @@ class CadReviewTool:
         # agent asked for one; the deterministic layer keeps checking the full
         # model so narrowed views do not hide a real defect.
         if view_filter:
+            existing_views = review_manifest.get("views") or []
             narrowed_views = [
                 entry
-                for entry in review_manifest.get("views", []) or []
+                for entry in existing_views
                 if isinstance(entry, dict) and entry.get("view_id") in view_filter
             ]
-            if narrowed_views:
-                review_manifest = dict(review_manifest)
-                review_manifest["views"] = narrowed_views
+            # An empty narrowed set means the requested view ids were not
+            # present in the manifest. Silently widening the scan to all
+            # views (the previous behaviour) inverted the caller's intent;
+            # fail the call so the agent learns its filter matched nothing.
+            if not narrowed_views:
+                available = sorted(
+                    {
+                        entry.get("view_id")
+                        for entry in existing_views
+                        if isinstance(entry, dict)
+                        and isinstance(entry.get("view_id"), str)
+                    }
+                )
+                raise RuntimeError(
+                    "cad_review view filter matched no views: "
+                    f"requested={sorted(view_filter)!r}, available={available!r}."
+                )
+            review_manifest = dict(review_manifest)
+            review_manifest["views"] = narrowed_views
+            # Keep the prompt's tile ordering consistent with the narrowed
+            # ``allowed_view_ids`` enforced by ``_coerce_finding``; otherwise
+            # the reviewer can attribute findings to a tile that the visual
+            # layer then silently strips via ``view_id = None``.
+            contact_sheet = review_manifest.get("contact_sheet")
+            if isinstance(contact_sheet, dict):
+                contact_sheet = dict(contact_sheet)
+                contact_sheet["view_order"] = [
+                    entry.get("view_id")
+                    for entry in narrowed_views
+                    if isinstance(entry, dict)
+                    and isinstance(entry.get("view_id"), str)
+                ]
+                review_manifest["contact_sheet"] = contact_sheet
         # Pre-flight the manifest itself: the contact sheet + single render
         # must hash-match so the reviewer can't be tricked into visualising
         # a tampered file.
@@ -262,7 +293,16 @@ class CadReviewTool:
         )
 
     def _load_inputs(self) -> tuple[Any, Any, list[dict[str, Any]] | None]:
-        """Read deterministic evidence only when it matches ``model.py``."""
+        """Read deterministic evidence only when it matches ``model.py``.
+
+        Validation results live inside the sha-gated ``.cad_metrics.json``
+        payload (``metrics.validation_results``), so there is a single
+        source of truth: a previous ``.cad_validation.json`` sidecar read
+        here was unverified (the runner writes it inside the sandbox but
+        the host never copies it out), so a stale on-disk file could have
+        flowed attacker/model-controlled ``severity`` strings into
+        findings. The runner-written sidecar is intentionally ignored.
+        """
         model_path = self.project_dir / "model.py"
         try:
             model_sha = hashlib.sha256(model_path.read_bytes()).hexdigest()
@@ -284,18 +324,13 @@ class CadReviewTool:
             metrics.get("feature_summary", {})
         )
         validation: list[dict[str, Any]] | None = None
-        validation_path = self.project_dir / ".cad_validation.json"
-        if validation_path.is_file():
-            try:
-                payload = json.loads(validation_path.read_text(encoding="utf-8"))
-                if isinstance(payload, dict) and isinstance(payload.get("results"), list):
-                    validation = [
-                        entry
-                        for entry in payload["results"]
-                        if isinstance(entry, dict)
-                    ]
-            except (OSError, json.JSONDecodeError):
-                validation = None
+        raw_validation = metrics.get("validation_results")
+        if isinstance(raw_validation, list):
+            validation = [
+                entry
+                for entry in raw_validation
+                if isinstance(entry, dict)
+            ]
         return geometry_metrics, feature_summary, validation
 
     def _resolve_evidence(
@@ -317,6 +352,7 @@ class CadReviewTool:
         review_dir_path = review_path_for(self.project_dir, model_sha)
         manifest_path = review_dir_path / "manifest.json"
         preview_sha = ""
+        preview_stl_path = self.project_dir / "preview.stl"
         if manifest_path.is_file():
             try:
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -324,6 +360,24 @@ class CadReviewTool:
                 manifest = None
             if isinstance(manifest, dict) and manifest.get("model_sha256") == model_sha:
                 preview_sha = str(manifest.get("preview_sha256") or "")
+                # The manifest's preview_sha is the digest the runner declared
+                # for the preview.stl it produced alongside this build. The
+                # project-root preview.stl is overwritten by every
+                # ``cad_build_and_verify(render=true)`` — different model
+                # sha — so an on-disk mismatch means the manifest is stale
+                # or the file was tampered with. Returning ``None`` here
+                # routes the caller through the auto-screenshot fallback
+                # instead of letting the reviewer visualise stale geometry.
+                if (
+                    preview_sha
+                    and len(preview_sha) == 64
+                    and preview_stl_path.is_file()
+                ):
+                    actual_preview_sha = hashlib.sha256(
+                        preview_stl_path.read_bytes()
+                    ).hexdigest()
+                    if actual_preview_sha != preview_sha:
+                        return None
                 sheet_path = review_dir_path / "review-sheet.png"
                 single_render = manifest.get("single_render")
                 if isinstance(single_render, dict):
@@ -362,33 +416,40 @@ class CadReviewTool:
     def _verify_artifact_hashes(
         manifest: dict[str, Any], sheet_path: Path, render_path: Path
     ) -> None:
-        """Reject a manifest whose hashes do not match the on-disk artifacts."""
+        """Reject a manifest whose hashes do not match the on-disk artifacts.
+
+        Mirrors the strict contract used by ``_verify_image_artifact`` in the
+        visual layer: an existing artifact whose manifest hash is missing or
+        not a 64-char SHA-256 is treated as evidence corruption and rejected
+        with ``RuntimeError``. The visual layer would otherwise downgrade the
+        same situation to ``inconclusive``; failing here keeps the two
+        pre-flight checks aligned so a single corruption class always
+        produces a single failure mode.
+        """
         contact = manifest.get("contact_sheet") or {}
         single = manifest.get("single_render") or {}
-        if isinstance(contact, dict):
+        if isinstance(contact, dict) and sheet_path.is_file():
             expected = contact.get("image_sha256")
-            if (
-                isinstance(expected, str)
-                and len(expected) == 64
-                and sheet_path.is_file()
-            ):
-                actual = hashlib.sha256(sheet_path.read_bytes()).hexdigest()
-                if actual != expected:
-                    raise RuntimeError(
-                        "cad_review: contact sheet hash does not match the manifest."
-                    )
-        if isinstance(single, dict):
+            if not isinstance(expected, str) or len(expected) != 64:
+                raise RuntimeError(
+                    "cad_review: contact sheet manifest has no valid hash."
+                )
+            actual = hashlib.sha256(sheet_path.read_bytes()).hexdigest()
+            if actual != expected:
+                raise RuntimeError(
+                    "cad_review: contact sheet hash does not match the manifest."
+                )
+        if isinstance(single, dict) and render_path.is_file():
             expected = single.get("image_sha256")
-            if (
-                isinstance(expected, str)
-                and len(expected) == 64
-                and render_path.is_file()
-            ):
-                actual = hashlib.sha256(render_path.read_bytes()).hexdigest()
-                if actual != expected:
-                    raise RuntimeError(
-                        "cad_review: single render hash does not match the manifest."
-                    )
+            if not isinstance(expected, str) or len(expected) != 64:
+                raise RuntimeError(
+                    "cad_review: single render manifest has no valid hash."
+                )
+            actual = hashlib.sha256(render_path.read_bytes()).hexdigest()
+            if actual != expected:
+                raise RuntimeError(
+                    "cad_review: single render hash does not match the manifest."
+                )
 
     def _load_model_source(self) -> str:
         model_path = self.project_dir / "model.py"
@@ -411,6 +472,11 @@ class CadReviewTool:
             except json.JSONDecodeError:
                 continue
             if not isinstance(entry, dict) or entry.get("role") != "user":
+                continue
+            # Skip agent-generated nudges (e.g. "Call cad_build_and_verify
+            # now.") — they are persisted with ``role: user`` for the
+            # in-context loop but are not user-authored design intent.
+            if entry.get("synthetic") is True:
                 continue
             content = entry.get("content")
             if isinstance(content, str):

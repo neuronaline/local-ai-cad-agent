@@ -111,6 +111,20 @@ class ProjectTools:
 _history_lock_slot = _conversation_history_lock_slot
 
 
+def _synthetic_user(content: str) -> dict[str, object]:
+    """Build a ``role: user`` message flagged as agent-generated.
+
+    The agent loop appends ``role: user`` reminders to nudge the LLM (e.g.
+    "Call cad_build_and_verify now."). Without a marker, downstream code
+    reconstructing the user's design intent — notably
+    ``CadReviewTool._latest_user_request`` — cannot distinguish a real
+    user-authored request from a system nudge, so a review can be judged
+    against the wrong requirement. The ``synthetic`` flag is a single,
+    explicit marker consumed by that reader.
+    """
+    return {"role": "user", "content": content, "synthetic": True}
+
+
 def _shared_history_lock() -> threading.Lock:
     """Return the active history lock (configurable by the Flask app)."""
     return shared_history_lock()
@@ -428,13 +442,10 @@ class AgentRunner:
                         elif any_tool_used:
                             if not nudged_cad and (project_dir / "model.py").is_file():
                                 nudged_cad = True
-                                reminder = {
-                                    "role": "user",
-                                    "content": (
-                                        "model.py exists but it has not been verified. "
-                                        "Call cad_build_and_verify now."
-                                    ),
-                                }
+                                reminder = _synthetic_user(
+                                    "model.py exists but it has not been verified. "
+                                    "Call cad_build_and_verify now."
+                                )
                                 messages.append(reminder)
                                 self._append_message(project_dir, reminder)
                                 continue
@@ -453,14 +464,11 @@ class AgentRunner:
                     if cad_fix_required:
                         if not nudged_final_verification:
                             nudged_final_verification = True
-                            reminder = {
-                                "role": "user",
-                                "content": (
-                                    "The current model revision has not passed final visual "
-                                    "verification. Call cad_build_and_verify with mode=\"final\" "
-                                    "and parameter_checks for explicit dimensions before finishing."
-                                ),
-                            }
+                            reminder = _synthetic_user(
+                                "The current model revision has not passed final visual "
+                                "verification. Call cad_build_and_verify with mode=\"final\" "
+                                "and parameter_checks for explicit dimensions before finishing."
+                            )
                             messages.append(reminder)
                             self._append_message(project_dir, reminder)
                             continue

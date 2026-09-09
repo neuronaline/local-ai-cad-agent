@@ -62,7 +62,12 @@ class ModelPreflight(ast.NodeVisitor):
     def __init__(self) -> None:
         self.values: dict[str, object] = {}
         self.edge_points: dict[str, tuple[tuple[float, ...], tuple[float, ...]]] = {}
-        self._topology_changed = False
+        # Topology-change tracking is a depth counter rather than a one-way
+        # boolean so the warning fires only for assignments nested inside the
+        # fillet/chamfer expression chain. A boolean latch persisted across
+        # every later statement and produced false positives for unrelated
+        # parts (audit_024).
+        self._topology_depth: int = 0
         self.warnings: list[str] = []
         self.blocked_errors: list[str] = []
 
@@ -91,7 +96,13 @@ class ModelPreflight(ast.NodeVisitor):
             points = self._line_points(node.value)
             if points is not None:
                 self.edge_points[name] = points
-            if self._topology_changed and self._contains_fixed_selector_index(
+            # ``_topology_depth > 0`` means this assignment is nested inside
+            # a fillet/chamfer expression chain (depth was bumped in
+            # ``visit_Call`` before ``generic_visit`` walked the args).
+            # Sibling statements after the fillet see ``depth == 0`` and
+            # do not trigger the warning, fixing the unrelated-over-warning
+            # case (audit_024).
+            if self._topology_depth > 0 and self._contains_fixed_selector_index(
                 node.value
             ):
                 self.warnings.append(
@@ -129,23 +140,49 @@ class ModelPreflight(ast.NodeVisitor):
         elif name == "RadiusArc":
             self._validate_radius_arc(node)
         elif name in {"fillet", "chamfer"}:
-            self._topology_changed = True
+            # In-call check: a fixed selector index passed directly to a
+            # topology-changing call resolves against the pre-call geometry
+            # but the returned selector points at a different edge after
+            # the call, so the indexed edge is fragile (audit_024).
+            for arg in node.args:
+                if self._contains_fixed_selector_index(arg):
+                    self.warnings.append(
+                        f"line {node.lineno}: fixed selector index passed to {name}; "
+                        "reselect by geometry, position, radius, or adjacency"
+                    )
+            # Bump the depth counter for the duration of the children walk
+            # so nested visit_Assign calls in the same expression chain see
+            # ``_topology_depth > 0``. Reset on exit so unrelated later
+            # statements are not warned.
+            self._topology_depth += 1
+            try:
+                self.generic_visit(node)
+            finally:
+                self._topology_depth -= 1
+            return
         self.generic_visit(node)
 
     def _validate_radius_arc(self, node: ast.Call) -> None:
         start = self._point(self._argument(node, 0, "start_point"))
         end = self._point(self._argument(node, 1, "end_point"))
         radius = self._number(self._argument(node, 2, "radius"))
-        if radius is not None and radius <= 0:
-            raise ValueError("RadiusArc radius must be positive.")
+        # ``build123d.RadiusArc`` accepts a signed radius: ``radius > 0``
+        # yields the short sagitta on one side of the chord, ``radius < 0``
+        # yields the equivalent arc mirrored to the other side. The
+        # preflight must align with the real API instead of rejecting the
+        # negative convention that the playbook documents.
+        if radius == 0:
+            raise ValueError("RadiusArc radius must be non-zero.")
         if start is None or end is None or radius is None:
             return
         chord = math.dist(start, end)
         minimum = chord / 2
-        if radius + 1e-9 < minimum:
+        # Compare against the magnitude: ``abs(radius)`` is the chord-
+        # distance bound; the sign only flips the arc side.
+        if abs(radius) + 1e-9 < minimum:
             raise ValueError(
                 f"RadiusArc radius {radius:g} is too small for chord {chord:.3f}; "
-                f"minimum radius is {minimum:.3f}."
+                f"minimum magnitude is {minimum:.3f}."
             )
 
     def _line_points(

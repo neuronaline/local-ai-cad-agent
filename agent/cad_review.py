@@ -189,10 +189,6 @@ class ReviewResult:
     def is_pass(self) -> bool:
         return self.status == "pass"
 
-    @property
-    def is_blocking(self) -> bool:
-        return any(finding.severity == "blocking" for finding in self.findings)
-
     def as_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "status": self.status,
@@ -490,7 +486,6 @@ def _visual_review(
 def _deterministic_review(
     *,
     metrics: dict[str, Any] | None,
-    feature_summary: dict[str, Any] | None,
     validation_results: list[dict[str, Any]] | None = None,
 ) -> list[Finding]:
     """Run the deterministic verification suite and return bounded findings.
@@ -502,19 +497,23 @@ def _deterministic_review(
     """
     findings: list[Finding] = []
     metrics = metrics if isinstance(metrics, dict) else {}
-    feature_summary = feature_summary if isinstance(feature_summary, dict) else {}
 
     # Geometry sanity — mirror ``cad_tool._enforce_basic_geometry`` so a
-    # deterministic finding fires before the LLM sees the image.
+    # deterministic finding fires before the LLM sees the image. The
+    # ``except`` clause catches every exception type a malformed metrics
+    # payload can raise here: ``TypeError``/``ValueError`` from
+    # ``int(...)``/``bool(...)``/``float(...)``, and ``AttributeError``
+    # from ``dict.get``-style access on a non-dict ``dimensions_mm``.
     try:
         solid_count = int(metrics.get("solid_count", 0) or 0)
         is_valid = bool(metrics.get("is_valid"))
-        dimensions = metrics.get("dimensions_mm") or {}
+        dimensions_raw = metrics.get("dimensions_mm")
+        if not isinstance(dimensions_raw, dict):
+            dimensions_raw = {}
         volume = float(metrics.get("volume_mm3", 0.0) or 0.0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, AttributeError):
         solid_count = 0
         is_valid = False
-        dimensions = {}
         volume = 0.0
         findings.append(
             Finding(
@@ -542,20 +541,13 @@ def _deterministic_review(
                 source="deterministic",
             )
         )
-    for axis in ("x", "y", "z"):
-        try:
-            value = float(dimensions.get(axis, 0.0))
-        except (TypeError, ValueError):
-            value = 0.0
-        if value <= 0:
-            findings.append(
-                Finding(
-                    severity="major",
-                    category="dimensions",
-                    message=f"CAD dimension {axis} is non-positive ({value} mm).",
-                    source="deterministic",
-                )
-            )
+    # Dimension/volume non-positivity is enforced by the build-time
+    # ``_enforce_basic_geometry`` gate (``cad_tool``) using the canonical
+    # ``_MIN_DIMENSION_MM`` threshold. If a build reaches review, those
+    # values are already plausible; the duplicated ``value <= 0`` loop
+    # that used to live here reported the same condition as ``major``
+    # while the build gate treated it as a hard error — three divergent
+    # thresholds across runner/build/review (audit_027).
     if volume <= 0:
         findings.append(
             Finding(
@@ -629,7 +621,6 @@ def review_cad(
     )
     deterministic_findings = _deterministic_review(
         metrics=metrics if isinstance(metrics, dict) else None,
-        feature_summary=feature_summary if isinstance(feature_summary, dict) else None,
         validation_results=validation_results,
     )
     # Short-circuit: a blocking deterministic finding means the visual
@@ -687,15 +678,21 @@ def review_cad(
         status = "inconclusive"
     else:
         status = visual.status if visual.status in {"pass", "fail", "inconclusive"} else "inconclusive"
-    summary = visual.summary if visual is not None and visual.summary else (
-        "Deterministic checks passed; visual layer skipped."
-        if not has_blocking and not has_major
-        else "Review failed."
-    )
-    if has_blocking or has_major:
-        # Override the summary when the strict rule forced fail so the UI
-        # surfaces the source of the failure.
-        summary = summary or "Review failed."
+    if visual is not None and visual.summary:
+        summary: str = visual.summary
+    elif has_blocking or has_major:
+        # The strict verdict forced ``fail``; surface the source of the
+        # failure so the UI does not show a stale visual summary.
+        summary = "Deterministic verification reported blocking or major failures."
+    else:
+        # Visual layer was skipped; combined still carries (minor-only)
+        # deterministic findings, so the previous "Deterministic checks
+        # passed" wording was a lie. Reflect the actual state.
+        summary = (
+            "Deterministic findings present; visual layer skipped."
+            if combined
+            else "No visual evidence available for review."
+        )
     return ReviewResult(
         status=status,
         summary=_truncate(summary, MAX_SUMMARY_CHARS),

@@ -72,12 +72,34 @@ def _unit(axis) -> tuple[float, float, float]:
     return tuple(float(v) for v in arr / norm)
 
 
+def _axial_extent(bbox, axis: tuple[float, float, float]) -> float:
+    """Return the bounding-box extent along an axis direction.
+
+    ``(max - min)·axis`` projects the bounding-box diagonals onto the axis
+    vector; that projection is the part's full extent along the axis.
+    Returns ``0.0`` for any axis whose magnitude is non-positive (caller
+    must guard against the degenerate case).
+    """
+    size_x = float(bbox.size.X)
+    size_y = float(bbox.size.Y)
+    size_z = float(bbox.size.Z)
+    return abs(size_x * axis[0]) + abs(size_y * axis[1]) + abs(size_z * axis[2])
+
+
 def _candidate_cut_axes(shape) -> list[dict[str, object]]:
     """Detect cylindrical features that look like cuts/holes.
 
     The detection uses build123d's face classification: cylinder/circle faces
     whose area is small relative to the bounding box are good cut candidates.
     For each candidate we emit diameter, axis direction, and centroid.
+
+    ``is_through_hole`` is derived from geometry, not edge topology: the
+    lateral length ``L = area / (2π·radius)`` is compared against the
+    part's bounding-box extent along the axis. A through hole spans the
+    full extent; a blind hole stops short of it. The previous
+    ``closed_circles >= 2`` heuristic misclassified blind holes as
+    through (a flat-bottomed blind hole has both rim and bottom circles)
+    and any through hole whose exit rim was filleted away (audit_026).
     """
     bbox = shape.bounding_box()
     bbox_diag = _bbox_diag(bbox)
@@ -124,12 +146,19 @@ def _candidate_cut_axes(shape) -> list[dict[str, object]]:
             axis = _unit(face.axis_of_rotation.direction)
         except Exception:  # noqa: BLE001, S112 - malformed faces are skipped
             continue
-        closed_circles = sum(
-            1
-            for edge in face.edges()
-            if getattr(edge.geom_type, "name", str(edge.geom_type)) == "CIRCLE"
-            and bool(edge.is_closed)
-        )
+        # A pure CIRCLE face (end-cap) has zero lateral length, so the
+        # ``area / (2π·radius)`` formula below returns ``0``. Through-hole
+        # determination is therefore defined on the cylindrical lateral
+        # surface; end-caps contribute no signal.
+        if geom_type == "CYLINDER":
+            lateral_length = area / (2.0 * math.pi * radius)
+            extent = _axial_extent(bbox, axis)
+            # Tolerance of 5 % of the part extent plus 0.5 mm (catches
+            # near-through holes that chamfer into the opposite face).
+            through_tol = max(0.5, 0.05 * extent)
+            is_through_hole = extent > 0 and lateral_length + through_tol >= extent
+        else:
+            is_through_hole = False
         candidates.append(
             {
                 "diameter_mm": round(2.0 * radius, 3),
@@ -140,7 +169,7 @@ def _candidate_cut_axes(shape) -> list[dict[str, object]]:
                     if center is not None
                     else None
                 ),
-                "is_through_hole": closed_circles >= 2,
+                "is_through_hole": bool(is_through_hole),
             }
         )
     return candidates
@@ -159,7 +188,17 @@ def _count_disconnected_solids(shape) -> int:
 def _validate_parameters(
     namespace: dict[str, object], checks: object
 ) -> list[dict[str, object]]:
-    """Validate explicit model parameters against user-facing bounds."""
+    """Validate explicit model parameters against user-facing bounds.
+
+    Mirrors the dispatcher-level bound-presence rule: a check must carry
+    ``equals``, ``minimum``, or ``maximum`` to be useful (the dispatcher
+    already rejects the empty form, but the runner is the deterministic
+    source of truth and must agree so direct callers/tests cannot bypass
+    the guard). Non-finite (``NaN``/``inf``) values are rejected with a
+    blocking failure before any comparison runs, since ``math.isclose``
+    raises ``ValueError`` on ``NaN`` and ``inf`` comparisons would produce
+    nonsensical results.
+    """
     if not isinstance(checks, list):
         return []
     results: list[dict[str, object]] = []
@@ -168,6 +207,21 @@ def _validate_parameters(
             continue
         name = check.get("name")
         if not isinstance(name, str) or not name:
+            continue
+        has_target = any(key in check for key in ("equals", "minimum", "maximum"))
+        if not has_target:
+            results.append(
+                {
+                    "requirement_id": name,
+                    "verifier": "parameter",
+                    "status": "fail",
+                    "severity": "blocking",
+                    "message": (
+                        f"Parameter {name!r} has no comparison target; "
+                        "requires equals, minimum, or maximum."
+                    ),
+                }
+            )
             continue
         raw = namespace.get(name)
         try:
@@ -180,6 +234,22 @@ def _validate_parameters(
                     "status": "fail",
                     "severity": "blocking",
                     "message": f"Parameter {name!r} is missing or non-numeric.",
+                }
+            )
+            continue
+        # ``math.isclose`` raises ValueError on NaN inputs and the
+        # comparisons silently accept +/-inf as larger/smaller than any
+        # finite bound; reject both before running the bound checks.
+        if not math.isfinite(actual):
+            results.append(
+                {
+                    "requirement_id": name,
+                    "verifier": "parameter",
+                    "status": "fail",
+                    "severity": "blocking",
+                    "message": (
+                        f"Parameter {name!r} is non-finite ({actual})."
+                    ),
                 }
             )
             continue
@@ -196,7 +266,7 @@ def _validate_parameters(
             failures.append(f"minimum {float(check['minimum']):g}")
         if "maximum" in check and actual - tolerance > float(check["maximum"]):
             failures.append(f"maximum {float(check['maximum']):g}")
-        passed = not failures and math.isfinite(actual)
+        passed = not failures
         results.append(
             {
                 "requirement_id": name,
@@ -313,6 +383,14 @@ def _run_model(
                     validation_results.extend(_run_verifiers(
                         requirements, shape, attempt_id=""
                     ))
+        except ImportError:
+            # The ``verifiers`` module is an opt-in runtime addition that is
+            # not yet shipped alongside ``runner.py``. A missing module is a
+            # no-op (the spec branch simply contributes nothing) rather than a
+            # spec-evaluation failure — the ``spec.parse`` minor entry below
+            # is reserved for genuine spec-evaluation problems (malformed
+            # JSON, type errors, verifier exceptions).
+            pass
         except Exception as error:  # noqa: BLE001 - verifier errors must not block the build
             validation_results.append(
                 {

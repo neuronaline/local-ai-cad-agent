@@ -109,102 +109,7 @@ def sanitize_messages(
             message,
             preserve_reasoning=preserve_reasoning and index == last_assistant_index,
         )
-    _compact_completed_history(sanitized)
     return relocate_tool_images(sanitized)
-
-
-def _compact_completed_history(messages: list[dict[str, Any]]) -> None:
-    """Compact bulky results while preserving the current model mutation.
-
-    A message must have the same wire representation from the first request
-    that contains it onward. Age-based compaction breaks prompt caching because
-    the previous "latest" message changes as soon as another message is appended.
-    Keep the newest mutation exact so the model sees the source it actually wrote;
-    summarize only mutations superseded by a newer one.
-    """
-    completed_ids = {
-        message.get("tool_call_id")
-        for message in messages
-        if message.get("role") == "tool"
-    }
-    mutation_names = {"edit_file", "write_file", "insert_file"}
-    all_mutation_calls = [
-        call
-        for message in messages
-        if message.get("role") == "assistant"
-        for call in message.get("tool_calls") or []
-        if isinstance(call, dict)
-        and isinstance(call.get("function"), dict)
-        and call["function"].get("name") in mutation_names
-    ]
-    # ``latest_mutation_id`` must consider in-flight mutations too: if the most
-    # recent edit is still waiting on a tool response, dropping its arguments on
-    # the next request would shorten the wire payload mid-turn and break
-    # prompt-cache stability. Whichever mutation is chronologically last in the
-    # conversation must keep its full arguments; every earlier mutation that has
-    # already received a tool response may be summarised.
-    latest_mutation_id = all_mutation_calls[-1].get("id") if all_mutation_calls else None
-    for message in messages:
-        if message.get("role") == "tool":
-            message["content"] = _compact_tool_content(message.get("content"))
-        if message.get("role") != "assistant":
-            continue
-        for call in message.get("tool_calls") or []:
-            if not isinstance(call, dict) or call.get("id") == latest_mutation_id:
-                continue
-            function = call.get("function")
-            if call.get("id") not in completed_ids or not isinstance(function, dict):
-                continue
-            name = function.get("name")
-            if name == "write_file":
-                function["arguments"] = json.dumps({
-                    "filename": "model.py",
-                    "content": "# Historical successful write; superseded by a later mutation.",
-                })
-            elif name == "edit_file":
-                function["arguments"] = json.dumps({
-                    "filename": "model.py",
-                    "old_string": "[historical successful edit; superseded]",
-                    "new_string": "[historical successful edit; superseded]",
-                })
-            elif name == "insert_file":
-                function["arguments"] = json.dumps({
-                    "filename": "model.py",
-                    "anchor": "[historical successful insertion; superseded]",
-                    "content": "# Historical successful insertion; superseded.",
-                    "position": "before",
-                })
-
-
-def _compact_tool_content(content: Any) -> Any:
-    if isinstance(content, str):
-        return _compact_tool_text(content)
-    if not isinstance(content, list):
-        return content
-    compacted = deepcopy(content)
-    for part in compacted:
-        if (
-            isinstance(part, dict)
-            and part.get("type") == "text"
-            and isinstance(part.get("text"), str)
-        ):
-            part["text"] = _compact_tool_text(part["text"])
-    return compacted
-
-
-def _compact_tool_text(text: str) -> str:
-    try:
-        payload = json.loads(text)
-    except (TypeError, json.JSONDecodeError):
-        return text
-    if not isinstance(payload, dict) or payload.get("ok") is not True:
-        return text
-    tool = payload.get("tool")
-    if tool == "cad_build_and_verify":
-        from agent.tool_results import compact_for_context
-
-        return compact_for_context(tool, text)
-    return text
 
 
 def relocate_tool_images(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -221,14 +126,31 @@ def relocate_tool_images(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
       supported.`` when the trailing tool message contains image parts.
 
     ``cad_build_and_verify`` attaches its rendered PNG to the tool message so
-    the agent can inspect the build in-band. Only a render on the final
-    message is current enough to relocate. Older images are removed rather
-    than repeatedly re-sent as stale, expensive base64 payloads.
+    the agent can inspect the build in-band. Keep each completed tool batch's
+    visual evidence in the subsequent conversation: dropping it after one
+    turn changes the prompt prefix and causes avoidable cache misses (and
+    misleading input-token drops). Images are emitted only after the complete
+    tool-result batch so multi-tool assistant responses retain the required
+    contiguous tool-result protocol.
     """
-    latest_index = len(messages) - 1
     relocated: list[dict[str, Any]] = []
-    latest_images: list[dict[str, Any]] = []
-    for index, message in enumerate(messages):
+    batch_images: list[dict[str, Any]] = []
+
+    def flush_batch_images() -> None:
+        if not batch_images:
+            return
+        relocated.append(
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": TOOL_IMAGE_PROMPT},
+                    *batch_images,
+                ],
+            }
+        )
+        batch_images.clear()
+
+    for message in messages:
         role = message.get("role")
         content = message.get("content")
         if (
@@ -239,6 +161,8 @@ def relocate_tool_images(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
                 for part in content
             )
         ):
+            if role != "tool":
+                flush_batch_images()
             relocated.append(message)
             continue
         text_parts = [
@@ -260,23 +184,8 @@ def relocate_tool_images(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
         else:
             tool_copy["content"] = text_parts or "An attached image was unavailable."
         relocated.append(tool_copy)
-        if index == latest_index:
-            latest_images = [deepcopy(part) for part in image_parts]
-    if latest_images:
-        relocated.append(
-            {
-                "role": "user",
-                "content": (
-                    [
-                        {
-                            "type": "text",
-                            "text": TOOL_IMAGE_PROMPT,
-                        }
-                    ]
-                    + latest_images
-                ),
-            }
-        )
+        batch_images.extend(deepcopy(part) for part in image_parts)
+    flush_batch_images()
     return relocated
 
 

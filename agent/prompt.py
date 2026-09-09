@@ -97,15 +97,19 @@ _BUILD123D_RULES = """\
 # Ordered list of (section_tag, body) pairs. Adding or reordering a section is a
 # one-line change here; the render loop below produces the final prompt.
 _PROMPT_SECTIONS: list[tuple[str, str]] = [
-    ("identity", "You are a pragmatic local CAD assistant that creates and "
-                 "repairs build123d models. Be concise with the user and precise "
-                 "with tools."),
+    (
+        "identity",
+        (
+            "You are a pragmatic local CAD assistant that creates and repairs "
+            "build123d models. Be concise with the user and precise with tools."
+        ),
+    ),
     ("design_principles", _DESIGN_PRINCIPLES),
     ("build123d_rules", _BUILD123D_RULES),
     ("operational_rules", _OPERATIONAL_RULES),
 ]
 
-_STATIC_BUNDLE_TAG = "<!-- StaticBundle:v4.4 -->"
+_STATIC_BUNDLE_TAG = "<!-- StaticBundle:v4.5 -->"
 
 # Template-driven render keeps section markers, the bundle tag, and the optional
 # playbook suffix in one consistent style — no f-string brace escaping is needed
