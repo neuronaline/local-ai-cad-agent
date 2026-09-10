@@ -465,9 +465,9 @@ class AgentRunner:
                         if not nudged_final_verification:
                             nudged_final_verification = True
                             reminder = _synthetic_user(
-                                "The current model revision has not passed final visual "
-                                "verification. Call cad_build_and_verify with mode=\"final\" "
-                                "and parameter_checks for explicit dimensions before finishing."
+                                "The current model revision has not passed rendered visual "
+                                "verification. Call cad_build_and_verify with its default "
+                                "render=true before finishing."
                             )
                             messages.append(reminder)
                             self._append_message(project_dir, reminder)

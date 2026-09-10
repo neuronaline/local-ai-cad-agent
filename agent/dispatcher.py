@@ -36,45 +36,12 @@ def is_cad_build(name: str, arguments: dict) -> bool:
     return name == "cad_build_and_verify"
 
 
-def _require_final_parameter_checks() -> None:
-    """Reject a ``mode="final"`` build that omits ``parameter_checks``.
-
-    The JSON schema describes ``parameter_checks`` as required when
-    ``mode=final`` so every user-stated dimension gets compared against
-    named ``model.py`` parameters before the renderer finalises the
-    design. The dispatcher validates the schema's intent at the boundary
-    rather than letting the runner treat an absent-checks final build
-    as verified. The schema has not been tightened to ``"required":
-    ["mode", "parameter_checks"]`` to preserve optional ``mode=check``
-    usage; the rule below makes the contract explicit at runtime.
-    """
-    raise ValueError(
-        "cad_build_and_verify with mode='final' requires a non-empty "
-        "'parameter_checks' list. Provide one bound per user-stated "
-        "dimension/angle/clearance/count so the runner can verify each "
-        "named model.py parameter."
-    )
-
-
-def _build_mode(arguments: dict) -> str:
-    """Resolve the build mode, validating the enum early.
-
-    Accepts the new ``mode`` enum (``check`` | ``final``) and, for backwards
-    compatibility with transcripts that still use ``render=True`` / ``False``,
-    maps a literal boolean to the corresponding mode. Anything else raises.
-    """
-    raw = arguments.get("mode")
-    if raw is None:
-        if arguments.get("render") is True:
-            return "final"
-        return "check"
-    if isinstance(raw, bool):
-        return "final" if raw else "check"
-    if raw in {"check", "final"}:
-        return raw
-    raise ValueError(
-        f"cad_build_and_verify mode must be 'check' or 'final', got {raw!r}."
-    )
+def _build_render(arguments: dict) -> bool:
+    """Resolve the optional render switch used by CAD build calls."""
+    render = arguments.get("render", True)
+    if not isinstance(render, bool):
+        raise ValueError("cad_build_and_verify render must be a boolean.")
+    return render
 
 
 def dispatch(
@@ -97,50 +64,8 @@ def dispatch(
     name.
     """
     if name == "cad_build_and_verify":
-        # ``mode`` defaults to ``check`` so a missing argument still maps to
-        # the cheap path. The runner accepts the explicit ``final`` mode for
-        # final verification (renders + inline image + parameter_checks).
-        mode = _build_mode(args)
-        checks = args.get("parameter_checks") or []
-        legacy_render = "mode" not in args and args.get("render") is True
-        # Always enforce the bound presence: ``parameter_checks`` is only
-        # useful when it carries an equals / minimum / maximum / tolerance,
-        # and a name without a bound is silently treated as a no-op pass by
-        # the runner. Catching it here keeps the LLM from producing useless
-        # checks on the final render and from accidentally suppressing
-        # critical dimension verification.
-        for index, check in enumerate(checks):
-            if not isinstance(check, dict):
-                raise ValueError(f"parameter_checks[{index}] must be an object.")
-            name_present = isinstance(check.get("name"), str) and check["name"]
-            # ``tolerance`` only narrows a comparison target; the sandbox
-            # runner reads it as ``abs_tol`` for ``equals`` and as a slack
-            # margin for ``minimum``/``maximum``, but it never produces a
-            # comparison of its own. A check carrying only ``tolerance``
-            # would therefore emit a passing result without measuring
-            # anything, so reject it at the boundary.
-            has_target = any(
-                key in check for key in ("equals", "minimum", "maximum")
-            )
-            if not name_present:
-                raise ValueError(
-                    f"parameter_checks[{index}] requires a non-empty 'name'."
-                )
-            if not has_target:
-                raise ValueError(
-                    f"parameter_checks[{index}] requires at least one of "
-                    "equals, minimum, maximum (tolerance alone is not a "
-                    "valid bound)."
-                )
         cad = tools.cad.with_call_id(call_id)
-        if checks:
-            return cad.build_and_verify(mode, checks), False
-        # ``render=true`` was the pre-mode public shape. Keep it compatible
-        # with existing transcripts and clients; new explicit final calls
-        # must carry the parameter checks promised by the schema.
-        if mode == "final" and not legacy_render:
-            _require_final_parameter_checks()
-        return cad.build_and_verify(mode), False
+        return cad.build_and_verify(render=_build_render(args)), False
     if name == "cad_screenshot":
         tool = (
             tools.screenshot.with_call_id(call_id)
@@ -412,27 +337,20 @@ def process_tool_call(
     context_content: str | list = context_result
     image_paths: list[Path] = []
     if name == "cad_build_and_verify":
-        # A successful build with mode=final can attach the rendered PNG
+        # A successful rendered build can attach the rendered PNG
         # directly to the tool message so the agent evaluates it in-band
         # instead of calling the subordinate visual reviewer. This avoids the
         # isolated sub-session that previously re-derived the design rationale
         # from scratch. Drive the multimodal-decision off the *raw* result
         # because ``compact_for_context`` strips ``render`` to shrink the
-        # prompt — the mode flag is still the cheapest signal that inline-
-        # image evidence is available.
+        # prompt while the returned image remains the evidence signal.
         multimodal = build_cad_build_multimodal_content(
             result, project_dir, context_result=context_result
         )
         if multimodal is not None:
             context_content = multimodal["content"]
             image_paths = list(multimodal.get("image_paths") or [])
-        # ``mode`` is the canonical signal that triggers the inline-image
-        # final-build evidence path. The renderer is the actual source of truth
-        # and ``compact_for_context`` strips the raw mode flag. Normalize here
-        # so legacy ``render=true`` callers clear the same final-verification
-        # gate as the new ``mode="final"`` schema.
-        build_is_final = build_succeeded and _build_mode(arguments) == "final"
-        if build_succeeded and build_is_final and image_paths:
+        if build_succeeded and _build_render(arguments) and image_paths:
             cad_fix_required = False
     elif name == "cad_screenshot":
         # Attach the requested views + contact sheet inline so the reviewer

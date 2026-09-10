@@ -132,6 +132,9 @@ result = plate - cutter
 For manual through-cutters, extend both ends slightly beyond the target. Use a
 small clearance such as `EPS = 0.1`, sufficient to guarantee overlap; avoid
 arbitrarily large extensions or coincident cutter/target end faces.
+When attaching tabs, bosses, or ribs to curved surfaces in BuildPart, embed
+them slightly (0.2–0.5 mm overlap) into the parent solid to avoid disconnected
+zero-thickness boundaries.
 For a plate spanning `Z = 0` to `Z = thickness`:
 
 ```python

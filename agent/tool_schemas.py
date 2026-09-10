@@ -169,57 +169,24 @@ TOOL_SCHEMAS = [
     _tool(
         "cad_build_and_verify",
         "Build the latest model.py revision, validate basic geometry, and export "
-        "preview.stl. Choose a mode:\n"
-        "- ``check`` (default): fast, cache-friendly. Returns metrics + preview.stl + "
-        "model_sha256 + preview_sha256 only. Use for every iteration.\n"
-        "- ``final``: produces the canonical eight-view rasterisation + contact "
-        "sheet + single render, attaches the contact sheet inline so you can "
-        "inspect it in-band, and accepts ``parameter_checks`` to verify explicit "
-        "user-stated dimensions, angles, clearances, or counts against named "
-        "model.py parameters. Use only for the final verification; the renderer "
-        "runs once per call so do not re-call with unchanged source.\n"
+        "preview.stl. It renders canonical eight-view evidence by default and "
+        "automatically reports numeric UPPER_CASE parameters read from the "
+        "initial model.py AST block. Set ``render=false`` only for a cheap "
+        "iteration where visual evidence is not needed.\n"
         "Does NOT trigger review automatically — call cad_review separately if "
         "you want a verdict.",
         {
-            "mode": {
-                "type": "string",
-                "enum": ["check", "final"],
-                "default": "check",
-                "description": "``check`` = metrics + preview only (cheap, cache-friendly). ``final`` = canonical views + contact sheet + inline image + parameter_checks.",
-            },
-            "parameter_checks": {
-                "type": "array",
-                "maxItems": 20,
-                "description": (
-                    "Required when mode=final; optional otherwise. Every "
-                    "user-stated dimension, angle, clearance, or count "
-                    "represented by a named model.py parameter must include "
-                    "at least one of equals, minimum, or maximum. Tolerance "
-                    "narrows the bound (it has no standalone meaning without "
-                    "a target). A failed check is a build failure; repair the "
-                    "model instead of dropping the check."
-                ),
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "name": {"type": "string", "minLength": 1},
-                        "minimum": {"type": "number"},
-                        "maximum": {"type": "number"},
-                        "equals": {"type": "number"},
-                        "tolerance": {"type": "number", "minimum": 0},
-                    },
-                    "required": ["name"],
-                    # The dispatcher enforces that at least one comparison
-                    # target (equals/minimum/maximum) is present.
-                },
+            "render": {
+                "type": "boolean",
+                "default": True,
+                "description": "True (default) renders canonical evidence inline after geometry validation. False returns metrics and preview only for a quick iteration.",
             },
         },
         [],
     ),
     _tool(
         "cad_screenshot",
-        "Rasterise the latest model.py revision from one or more camera views without re-running build123d. Reuses the artifact cache produced by cad_build_and_verify(mode=final) when the (model_sha256, sorted(views), quality) tuple matches; otherwise re-rasterises only the missing subset. Attach the requested views inline so you can inspect them in-band; reserve this for complex or visually ambiguous work, not routine small edits that already pass cad_build_and_verify.",
+        "Rasterise the latest model.py revision from one or more camera views without re-running build123d. Reuses the artifact cache produced by a rendered cad_build_and_verify call when the (model_sha256, sorted(views), quality) tuple matches; otherwise re-rasterises only the missing subset. Attach the requested views inline so you can inspect them in-band; reserve this for complex or visually ambiguous work, not routine small edits that already pass cad_build_and_verify.",
         {
             "views": {
                 "type": "array",

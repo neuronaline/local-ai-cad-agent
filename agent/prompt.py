@@ -20,10 +20,9 @@ dimensions as authoritative. State any important assumption in the final reply."
 _OPERATIONAL_RULES = """\
 - Edit only the active project's model.py. Everything else is read-only.
 - Resolve blocking ambiguity first (ask one batched ``question`` if needed),
-  then iterate: edit model.py → ``cad_build_and_verify(mode="check")`` → inspect
-  metrics → fix or finish. End with ``cad_build_and_verify(mode="final")`` to
-  render the canonical eight views + contact sheet + parameter_checks before
-  declaring the task ready.
+  then iterate: edit model.py → ``cad_build_and_verify`` → inspect metrics and
+  inline render → fix or finish. Use ``render=false`` only when a quick,
+  metrics-only iteration is genuinely useful.
 - model.py layout: put every numeric dimension, angle, clearance, and count
   as a named, typed parameter with its appropriate unit at the very top of
   the file, grouped under short comment headers (overall envelope, pocket,
@@ -44,17 +43,15 @@ _OPERATIONAL_RULES = """\
 - Every tool result is a JSON envelope (``ok``, ``tool``, ``data`` /
   ``error``). The ``data`` block is shaped for the tool (``read_file`` →
   ``{exists, content, sha256, ...}``; ``write_file``/``edit_file``/``insert_file``
-  → ``{summary, revision_id, warnings}``; ``cad_build_and_verify`` → ``{mode,
-  metrics, model_sha256, preview_sha256, summary, ...}``). Errors carry
-  ``{code, phase, message, retryable, hint}``; the ``hint`` is the next step.
-- ``cad_build_and_verify(mode="check")`` is cheap and cache-friendly — use
-  it for every iteration. ``mode="final"`` produces the canonical eight-view
-  rasterisation + contact sheet and attaches the contact sheet inline so you
-  inspect it in-band and either accept or iterate. Always pass
-  ``parameter_checks`` for every user-stated dimension, angle, clearance, or
-  count in ``mode="final"``; a failed check is a build failure, repair the
-  model instead of dropping the check. Re-call only after a real edit; the
-  renderer runs once per call.
+  → ``{summary, revision_id, warnings}``; ``cad_build_and_verify`` →
+  ``{rendered, metrics, declared_parameters, model_sha256, preview_sha256,
+  summary, ...}``). Errors carry ``{code, phase, message, retryable, hint}``;
+  the ``hint`` is the next step.
+- ``cad_build_and_verify`` validates geometry, extracts numeric UPPER_CASE
+  parameters from the initial model.py AST block, and produces the canonical
+  eight-view rasterisation + contact sheet in one call. Inspect the inline
+  evidence and either accept or iterate. Use ``render=false`` for a cheap,
+  metrics-only pass; call the default rendered form after the last real edit.
 - ``cad_screenshot`` re-rasterises a subset of canonical views without
   re-running build123d. The tool already attaches the requested views + the
   contact sheet inline — inspect them in-band instead of guessing. Cache key
@@ -76,7 +73,7 @@ _OPERATIONAL_RULES = """\
   or reference images and disclose the assumption. Use ``question`` only
   when an unknown would materially change fit, function, or manufacturability.
 - A geometry-changing task is ready only after the latest model.py revision
-  passes ``cad_build_and_verify(mode="final")`` AND the inline contact sheet
+  passes the default rendered ``cad_build_and_verify`` AND the inline contact sheet
   confirms the design. Do not claim success from source inspection alone.
 - Final reply: a concise description of the produced part, its confirmed
   dimensions, and any notable assumptions. No separate summary file."""
@@ -109,7 +106,7 @@ _PROMPT_SECTIONS: list[tuple[str, str]] = [
     ("operational_rules", _OPERATIONAL_RULES),
 ]
 
-_STATIC_BUNDLE_TAG = "<!-- StaticBundle:v4.5 -->"
+_STATIC_BUNDLE_TAG = "<!-- StaticBundle:v4.6 -->"
 
 # Template-driven render keeps section markers, the bundle tag, and the optional
 # playbook suffix in one consistent style — no f-string brace escaping is needed

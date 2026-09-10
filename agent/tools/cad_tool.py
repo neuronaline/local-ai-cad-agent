@@ -105,9 +105,7 @@ class CadTool:
 
     # ------------------------------------------------------------------ build
 
-    def _runner_settings(
-        self, render: bool, parameter_checks: list[dict[str, Any]] | None = None
-    ) -> dict[str, Any]:
+    def _runner_settings(self, render: bool) -> dict[str, Any]:
         """JSON-kwarg payload forwarded to ``runner.main`` as ``argv[1]``.
 
         Replaces the legacy module-level globals (``_RENDER_VIEWS``,
@@ -121,21 +119,18 @@ class CadTool:
                 "write_isometric": True,
                 "render_workers": self._review_render_workers,
                 "required_views": self._review_required_views,
-                "parameter_checks": parameter_checks or [],
             }
         return {
             "render_views": False,
             "write_isometric": False,
             "render_workers": self._review_render_workers,
             "required_views": self._review_required_views,
-            "parameter_checks": parameter_checks or [],
         }
 
     def _execute(
         self,
         render: bool = False,
         call_id: str = "",
-        parameter_checks: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         model_path = self.project_dir / "model.py"
         if not model_path.exists():
@@ -148,7 +143,7 @@ class CadTool:
         # module-level globals; this restores a real module boundary between
         # the host and the sandbox.
         settings_payload = json.dumps(
-            self._runner_settings(render, parameter_checks)
+            self._runner_settings(render)
         )
 
         with tempfile.TemporaryDirectory(prefix="cad-agent-") as temporary:
@@ -244,6 +239,10 @@ class CadTool:
             return {
                 "metrics": metrics,
                 "feature_summary": cached.get("feature_summary") or {},
+                "declared_parameters": cached.get("declared_parameters") or [],
+                "validation_results": cached.get("validation_results") or [],
+                "model_sha256": cached.get("model_sha256"),
+                "preview_sha256": cached.get("preview_sha256"),
                 "review_manifest": review_manifest,
                 "review_views_dir": staging_views_dir,
                 "review_sheet_path": staging_sheet_path,
@@ -600,36 +599,17 @@ class CadTool:
 
     def build_and_verify(
         self,
-        mode: str | bool = "check",
-        parameter_checks: list[dict[str, Any]] | None = None,
-        *,
-        render: bool | None = None,
+        render: bool = True,
     ) -> dict[str, Any]:
-        """Build once, validate metrics, and (optionally) produce preview + review.
+        """Build, validate, and render in one call unless ``render=False``.
 
-        ``mode="check"`` (default) is the fast, cache-friendly path: it skips
-        ``render.png`` and the multi-view review sheet, returning only
-        ``metrics`` + ``preview.stl`` + ``model_sha256`` + ``preview_sha256``.
-        Use it for every iteration.
-
-        ``mode="final"`` produces the canonical eight-view rasterisation +
-        contact sheet + single render; ``parameter_checks`` is optional but
-        recommended to verify explicit user-stated dimensions, angles,
-        clearances, or counts against named model.py parameters.
-
-        ``render=`` and a positional bool remain accepted for older callers;
-        both are translated to the canonical mode before execution.
+        The normal path renders canonical evidence after the cheap geometry
+        checks pass. ``render=False`` remains available for rapid iterations.
+        Source parameters are extracted from the model AST.
         """
-        if render is not None:
-            mode = "final" if render else "check"
-        elif isinstance(mode, bool):
-            mode = "final" if mode else "check"
-        if mode not in {"check", "final"}:
-            raise ValueError(f"build_and_verify mode must be 'check' or 'final', got {mode!r}.")
-        render = mode == "final"
+        if not isinstance(render, bool):
+            raise ValueError("build_and_verify render must be a boolean.")
         execute_args: dict[str, Any] = {"render": render}
-        if parameter_checks:
-            execute_args["parameter_checks"] = parameter_checks
         if self._call_id:
             execute_args["call_id"] = self._call_id
         payload = self._execute(**execute_args)
@@ -645,11 +625,12 @@ class CadTool:
             payload.get("preview_sha256") if isinstance(payload, dict) else None
         )
         result: dict[str, Any] = {
-            "mode": mode,
+            "rendered": bool(render),
             "metrics": metrics,
             "preview": "preview.stl",
             "render": "render.png" if render else None,
             "feature_summary": payload.get("feature_summary") or {},
+            "declared_parameters": payload.get("declared_parameters") or [],
             "validation_results": payload.get("validation_results") or [],
         }
         if model_sha:

@@ -22,6 +22,7 @@ script so the runtime contract is a real Python function call instead of an
 injected module-level global.
 """
 
+import ast
 import hashlib
 import json
 import math
@@ -185,102 +186,46 @@ def _count_disconnected_solids(shape) -> int:
     return max(0, sum(1 for _ in shape.solids()) - 1)
 
 
-def _validate_parameters(
-    namespace: dict[str, object], checks: object
-) -> list[dict[str, object]]:
-    """Validate explicit model parameters against user-facing bounds.
+def _declared_parameters(model_code: str) -> list[dict[str, object]]:
+    """Read numeric UPPER_CASE constants from the initial parameter block.
 
-    Mirrors the dispatcher-level bound-presence rule: a check must carry
-    ``equals``, ``minimum``, or ``maximum`` to be useful (the dispatcher
-    already rejects the empty form, but the runner is the deterministic
-    source of truth and must agree so direct callers/tests cannot bypass
-    the guard). Non-finite (``NaN``/``inf``) values are rejected with a
-    blocking failure before any comparison runs, since ``math.isclose``
-    raises ``ValueError`` on ``NaN`` and ``inf`` comparisons would produce
-    nonsensical results.
+    This is intentionally source-based rather than namespace-based: a model
+    cannot make a requirement disappear by rebinding a value while it runs.
+    Only simple literal constants at module scope are reported, which makes
+    the result stable and directly traceable to the editable parameter block.
     """
-    if not isinstance(checks, list):
-        return []
-    results: list[dict[str, object]] = []
-    for check in checks[:20]:
-        if not isinstance(check, dict):
+    tree = ast.parse(model_code, filename="model.py")
+    parameters: list[dict[str, object]] = []
+    in_parameter_block = True
+    for statement in tree.body:
+        if isinstance(statement, (ast.Import, ast.ImportFrom)):
             continue
-        name = check.get("name")
-        if not isinstance(name, str) or not name:
-            continue
-        has_target = any(key in check for key in ("equals", "minimum", "maximum"))
-        if not has_target:
-            results.append(
-                {
-                    "requirement_id": name,
-                    "verifier": "parameter",
-                    "status": "fail",
-                    "severity": "blocking",
-                    "message": (
-                        f"Parameter {name!r} has no comparison target; "
-                        "requires equals, minimum, or maximum."
-                    ),
-                }
-            )
-            continue
-        raw = namespace.get(name)
-        try:
-            actual = float(raw)
-        except (TypeError, ValueError):
-            results.append(
-                {
-                    "requirement_id": name,
-                    "verifier": "parameter",
-                    "status": "fail",
-                    "severity": "blocking",
-                    "message": f"Parameter {name!r} is missing or non-numeric.",
-                }
-            )
-            continue
-        # ``math.isclose`` raises ValueError on NaN inputs and the
-        # comparisons silently accept +/-inf as larger/smaller than any
-        # finite bound; reject both before running the bound checks.
-        if not math.isfinite(actual):
-            results.append(
-                {
-                    "requirement_id": name,
-                    "verifier": "parameter",
-                    "status": "fail",
-                    "severity": "blocking",
-                    "message": (
-                        f"Parameter {name!r} is non-finite ({actual})."
-                    ),
-                }
-            )
-            continue
-        tolerance = max(0.0, float(check.get("tolerance", 1e-6) or 0.0))
-        failures: list[str] = []
-        if "equals" in check and not math.isclose(
-            actual,
-            float(check["equals"]),
-            rel_tol=0.0,
-            abs_tol=tolerance,
+        if (
+            isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Constant)
+            and isinstance(statement.value.value, str)
         ):
-            failures.append(f"expected {float(check['equals']):g}±{tolerance:g}")
-        if "minimum" in check and actual + tolerance < float(check["minimum"]):
-            failures.append(f"minimum {float(check['minimum']):g}")
-        if "maximum" in check and actual - tolerance > float(check["maximum"]):
-            failures.append(f"maximum {float(check['maximum']):g}")
-        passed = not failures
-        results.append(
-            {
-                "requirement_id": name,
-                "verifier": "parameter",
-                "status": "pass" if passed else "fail",
-                "severity": "info" if passed else "blocking",
-                "message": (
-                    f"{name}={actual:g}"
-                    if passed
-                    else f"{name}={actual:g}; " + ", ".join(failures)
-                ),
-            }
-        )
-    return results
+            continue
+        target = value = None
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+            target, value = statement.targets[0], statement.value
+        elif isinstance(statement, ast.AnnAssign):
+            target, value = statement.target, statement.value
+        if (
+            in_parameter_block
+            and isinstance(target, ast.Name)
+            and target.id.isupper()
+            and isinstance(value, ast.Constant)
+            and isinstance(value.value, (int, float))
+            and not isinstance(value.value, bool)
+            and math.isfinite(float(value.value))
+        ):
+            parameters.append(
+                {"name": target.id, "value": value.value, "line": statement.lineno}
+            )
+            continue
+        in_parameter_block = False
+    return parameters
 
 
 # ---------------------------------------------------------------------------
@@ -357,10 +302,11 @@ def _run_model(
     if any(value <= 0 for value in metrics["dimensions_mm"].values()):
         raise ValueError("The generated CAD shape has no renderable 3D dimensions.")
 
-    # --- Phase 2: deterministic verifiers (if a spec is on disk) -----------------
-    validation_results: list[dict] = _validate_parameters(
-        namespace, settings.get("parameter_checks")
-    )
+    # --- Phase 2: source-backed parameter evidence + optional verifiers ----------
+    # The parameter list comes from the model AST, not an LLM-authored JSON
+    # mirror. It is returned with the build evidence for direct inspection.
+    declared_parameters = _declared_parameters(model_code)
+    validation_results: list[dict] = []
     spec_version = 0
     spec_path = Path("spec.json")
     if spec_path.is_file():
@@ -450,6 +396,7 @@ def _run_model(
             {
                 "schema_version": 1,
                 "spec_version": spec_version,
+                "declared_parameters": declared_parameters,
                 "results": validation_results,
             },
             ensure_ascii=False,
@@ -540,6 +487,7 @@ def _run_model(
         "metrics": metrics,
         "feature_summary": metrics["feature_summary"],
         "spec_version": spec_version,
+        "declared_parameters": declared_parameters,
         "validation_count": len(validation_results),
         "validation_results": validation_results,
         "review_manifest": review_manifest_payload,
