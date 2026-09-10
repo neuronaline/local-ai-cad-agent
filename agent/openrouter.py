@@ -51,13 +51,19 @@ class OpenRouterClient(ChatCompletionsClient):
             trace = payload.setdefault("trace", {})
             if isinstance(trace, dict):
                 trace.setdefault("span_name", self.agent_role)
+        provider_order = self._provider_order()
         if (
             self.settings.openrouter_enable_anthropic_cache
             and self.settings.openrouter_model.startswith("anthropic/")
         ):
+            # Treat the request as a direct Anthropic routing only when
+            # every entry — or no entry at all — names Anthropic. A
+            # multi-provider list with one Anthropic entry still routes via
+            # a third-party upstream, so Bedrock/Vertex-style explicit
+            # breakpoints are required.
             direct_anthropic = (
-                not self.settings.openrouter_provider
-                or self.settings.openrouter_provider == "anthropic"
+                not provider_order
+                or all(slug == "anthropic" for slug in provider_order)
             )
             if direct_anthropic:
                 # OpenRouter's automatic breakpoint advances without changing
@@ -74,20 +80,38 @@ class OpenRouterClient(ChatCompletionsClient):
                 "effort": self.settings.openrouter_reasoning_effort,
                 "exclude": False,
             }
-        if self.settings.openrouter_provider:
-            provider: dict[str, Any] = {}
+        if provider_order:
             if self.settings.openrouter_force_provider:
-                provider.update(
-                    {
-                        "only": [self.settings.openrouter_provider],
-                        "allow_fallbacks": False,
-                        "require_parameters": True,
-                    }
-                )
+                # Legacy single-provider pinning: stick to one upstream and
+                # skip OpenRouter's own fallback fanout. ``provider_order``
+                # is validated at startup to contain exactly one entry when
+                # ``force_provider`` is on, so this branch always sees a
+                # 1-element list.
+                payload["provider"] = {
+                    "only": list(provider_order),
+                    "allow_fallbacks": False,
+                    "require_parameters": True,
+                }
             else:
-                # Explicit provider order disables OpenRouter's sticky routing.
-                provider["order"] = [self.settings.openrouter_provider]
-            payload["provider"] = provider
+                # Ordered priority list (highest first). OpenRouter walks the
+                # list and falls back to its internal pool if every named
+                # upstream is unavailable. Disabling its sticky routing keeps
+                # the call shape stable across the LLM client base class.
+                payload["provider"] = {"order": list(provider_order)}
+
+    def _provider_order(self) -> tuple[str, ...]:
+        """Resolve the effective OpenRouter provider routing order.
+
+        Prefers the explicit ``openrouter_provider_order`` tuple (highest
+        priority first). Falls back to the legacy single-string
+        ``openrouter_provider`` setting so existing configs keep working
+        until users migrate to ``provider_order``.
+        """
+        order = self.settings.openrouter_provider_order
+        if order:
+            return order
+        legacy = self.settings.openrouter_provider
+        return (legacy,) if legacy else ()
 
     def _apply_gemini_cache_breakpoint(self, payload: dict[str, Any]) -> None:
         """Mark text deterministically so old Gemini wire messages never change.

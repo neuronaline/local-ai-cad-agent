@@ -32,6 +32,13 @@ class Settings:
     openrouter_reasoning_effort: str | None = None
     openrouter_provider: str | None = None
     openrouter_force_provider: bool = False
+    # Ordered list of OpenRouter provider routing slugs (highest priority
+    # first), e.g. ``("z-ai/fp8", "novita/fp8", "deepinfra/fp4")``. When
+    # non-empty this takes precedence over the legacy ``openrouter.provider``
+    # string. OpenRouter walks the list and falls back to its own internal
+    # pool if every entry is unavailable. An empty tuple means "no explicit
+    # routing requested"; OpenRouter then picks automatically.
+    openrouter_provider_order: tuple[str, ...] = ()
     # ── LLM provider selection ──
     llm_provider: str = "openrouter"
     # Optional secondary provider. When set, a transient LLM failure (network,
@@ -263,6 +270,33 @@ def load_settings(project_root: Path | None = None) -> Settings:
         )
     llm_fallback_provider = llm_fallback_provider_raw
 
+    # OpenRouter provider routing: ``provider_order`` is the explicit,
+    # priority-ordered list (highest first). It replaces the legacy
+    # single-string ``provider`` setting so users can pin to multiple
+    # upstreams in priority order instead of letting OpenRouter pick one
+    # fallback internally. Empty list = no explicit routing; the legacy
+    # ``provider`` string is consulted instead.
+    openrouter_provider_order = _parse_provider_order(openrouter.get("provider_order"))
+    if openrouter_provider_order and openrouter.get("provider"):
+        _LOG.warning(
+            "Both openrouter.provider_order and openrouter.provider are set; "
+            "provider_order takes precedence."
+        )
+    # ``force_provider`` only pins to a single upstream; listing more than
+    # one entry under ``provider_order`` is the new "let OpenRouter walk the
+    # list" mechanism and is incompatible with pinning. Fail at startup so a
+    # misconfigured ``config.yaml`` cannot silently degrade into
+    # ``provider.only: [<first entry>]``.
+    if (
+        len(openrouter_provider_order) > 1
+        and bool(openrouter.get("force_provider", False))
+    ):
+        raise ValueError(
+            "openrouter.force_provider=true requires exactly one provider; "
+            "remove force_provider (or shorten provider_order to one entry) "
+            "to use an ordered fallback list."
+        )
+
     # Each provider keeps its own model; ``settings.llm_model`` returns the
     # active one so callers do not need to branch on the provider.
     grid_size, grid_divisions = _parse_grid_extent(viewer_grid)
@@ -282,6 +316,7 @@ def load_settings(project_root: Path | None = None) -> Settings:
         openrouter_reasoning_effort=_optional_effort(openrouter.get("reasoning_effort")),
         openrouter_provider=_optional_string(openrouter.get("provider")),
         openrouter_force_provider=_strict_bool(openrouter.get("force_provider", False), "openrouter.force_provider"),
+        openrouter_provider_order=openrouter_provider_order,
         llm_provider=llm_provider,
         llm_fallback_provider=llm_fallback_provider,
         openai_base_url=str(openai.get("base_url", "https://api.openai.com/v1")).rstrip("/"),
@@ -315,6 +350,48 @@ def load_settings(project_root: Path | None = None) -> Settings:
 def _optional_string(value: Any) -> str | None:
     value = str(value).strip() if value is not None else ""
     return value or None
+
+
+def _parse_provider_order(value: Any) -> tuple[str, ...]:
+    """Validate ``openrouter.provider_order`` from ``config.yaml``.
+
+    Returns an ordered tuple of OpenRouter provider routing slugs (highest
+    priority first). ``None``/missing/empty list → empty tuple, which makes
+    the loader fall back to the legacy ``openrouter.provider`` string.
+    Non-string or whitespace-only entries are rejected so a typo never
+    silently drops a fallback from the list.
+    """
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        # Treat a bare string as a single-element list for forgiveness; an
+        # accidental ``provider_order: z-ai/fp8`` should not break startup.
+        candidates = [value]
+    elif isinstance(value, list):
+        candidates = value
+    else:
+        raise TypeError(
+            "openrouter.provider_order must be a list of provider slugs "
+            "(e.g. ['z-ai/fp8', 'novita/fp8', 'deepinfra/fp4'])."
+        )
+    cleaned: list[str] = []
+    for entry in candidates:
+        if not isinstance(entry, str):
+            raise TypeError(
+                "openrouter.provider_order entries must be strings; "
+                f"got {type(entry).__name__}."
+            )
+        slug = entry.strip()
+        if not slug:
+            raise ValueError(
+                "openrouter.provider_order entries must be non-empty strings."
+            )
+        cleaned.append(slug)
+    if len(set(cleaned)) != len(cleaned):
+        raise ValueError(
+            "openrouter.provider_order must not contain duplicate entries."
+        )
+    return tuple(cleaned)
 
 
 def _optional_effort(value: Any) -> str | None:

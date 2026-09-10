@@ -27,10 +27,20 @@ openrouter:
   app_url: ""
   session_prefix: local-ai-cad-agent
   reasoning_effort: "low"
-  provider: "xai"
-  # ``force_provider: false`` lets OpenRouter route to a less-loaded upstream
-  # when the pinned provider is saturated, instead of failing the agent loop
-  # mid-iteration. ``openrouter.provider`` still seeds the preferred order.
+  # OpenRouter provider routing order, highest priority first. OpenRouter
+  # walks this list and only falls back to its internal pool if every named
+  # upstream is unavailable. Use ``"<provider>/<quantization>"`` slugs such
+  # as ``"z-ai/fp8"`` or ``"novita/fp8"``. Leave empty to fall back to the
+  # legacy ``provider`` string below.
+  provider_order:
+    - z-ai/fp8
+    - novita/fp8
+    - deepinfra/fp4
+  # Legacy single-provider config. Only consulted when ``provider_order`` is
+  # empty. Pair with ``force_provider: true`` to pin to one upstream with no
+  # fallback fanout; otherwise OpenRouter routes to a less-loaded peer if the
+  # pinned provider is saturated.
+  provider: ""
   force_provider: false
   enable_anthropic_cache: true
   enable_gemini_cache: true
