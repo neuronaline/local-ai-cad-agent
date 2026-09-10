@@ -29,6 +29,23 @@ class RequestCancelled(RuntimeError):
     """Raised when the local agent stops an in-flight LLM request."""
 
 
+class StreamResponseError(RuntimeError):
+    """An error event received after a successful streaming HTTP response."""
+
+    def __init__(self, message: str, *, retryable: bool) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
+def _stream_error_detail(error: Any) -> str:
+    """Return a useful, bounded provider error from an SSE error payload."""
+    if isinstance(error, dict):
+        detail = error.get("message") or error.get("detail") or json.dumps(error)
+    else:
+        detail = str(error)
+    return detail[:500]
+
+
 def sanitize_assistant_message(
     message: dict[str, Any], *, preserve_reasoning: bool = False
 ) -> dict[str, Any]:
@@ -342,11 +359,10 @@ def parse_chat_stream(
             ) from error
         stream_error = chunk.get("error")
         if stream_error:
-            if isinstance(stream_error, dict):
-                detail = stream_error.get("message") or json.dumps(stream_error)
-            else:
-                detail = str(stream_error)
-            raise RuntimeError(f"{provider_label} stream failed: {detail}")
+            raise StreamResponseError(
+                f"{provider_label} stream failed: {_stream_error_detail(stream_error)}",
+                retryable=not (content or tool_calls or reasoning_text or reasoning_details),
+            )
         if isinstance(chunk.get("usage"), dict):
             last_usage = chunk["usage"]
         choices = chunk.get("choices") or []
@@ -355,7 +371,17 @@ def parse_chat_stream(
         choice = choices[0]
         finish_reason = choice.get("finish_reason") or finish_reason
         if finish_reason == "error":
-            raise RuntimeError(f"{provider_label} stream ended with an error.")
+            delta = choice.get("delta") or {}
+            stream_error = choice.get("error") or delta.get("error")
+            detail = (
+                _stream_error_detail(stream_error)
+                if stream_error
+                else "upstream completion returned finish_reason='error'"
+            )
+            raise StreamResponseError(
+                f"{provider_label} stream failed: {detail}",
+                retryable=not (content or tool_calls or reasoning_text or reasoning_details),
+            )
         delta = choice.get("delta") or {}
         role = delta.get("role") or role
         text = delta.get("content")
@@ -646,16 +672,31 @@ class ChatCompletionsClient:
                             run_id=getattr(self, "_run_id", None),
                         )
                     if hasattr(response, "iter_lines"):
-                        return self._stream_response(response)
-                    body = response.json()
-                    self.last_usage = body.get("usage") if isinstance(body.get("usage"), dict) else None
-                    choices = body.get("choices") if isinstance(body, dict) else None
-                    if choices and choices[0].get("finish_reason") == "length":
-                        raise RuntimeError(
-                            f"{self._provider_label} completion was truncated "
-                            "(finish_reason='length'); no tool calls were executed."
-                        )
-                    return body
+                        try:
+                            return self._stream_response(response)
+                        except StreamResponseError as error:
+                            if not error.retryable or attempt == 2:
+                                raise
+                            if log_payload:
+                                self._activity_logger.log(
+                                    "llm_stream_retry",
+                                    {
+                                        "attempt": attempt,
+                                        "model": payload.get("model"),
+                                        "error": str(error),
+                                    },
+                                    run_id=getattr(self, "_run_id", None),
+                                )
+                    else:
+                        body = response.json()
+                        self.last_usage = body.get("usage") if isinstance(body.get("usage"), dict) else None
+                        choices = body.get("choices") if isinstance(body, dict) else None
+                        if choices and choices[0].get("finish_reason") == "length":
+                            raise RuntimeError(
+                                f"{self._provider_label} completion was truncated "
+                                "(finish_reason='length'); no tool calls were executed."
+                            )
+                        return body
                 if log_payload:
                     self._activity_logger.log(
                         "llm_retry",
