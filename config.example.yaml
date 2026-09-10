@@ -14,6 +14,10 @@ agent:
 llm:
   provider: openrouter
   max_completion_tokens: 8192
+  # Optional secondary provider that takes over if the primary client
+  # raises a non-cancellation error after its own retry loop is exhausted.
+  # Must differ from ``provider`` above; leave as ``""`` to disable.
+  fallback_provider: ""
 
 openrouter:
   base_url: https://openrouter.ai/api/v1

@@ -435,7 +435,20 @@ def parse_chat_stream(
                 )
 
     if not saw_done:
-        raise RuntimeError(f"{provider_label} stream ended before the completion marker.")
+        # The connection closed before the provider emitted ``[DONE]``.
+        # Treat the error as retryable when no partial content was streamed
+        # so a transient network drop does not fail the agent run mid-tool
+        # loop. The user did not stop, ``stop_event`` is still clear, so
+        # ``RequestCancelled`` (raised on the stop path above) cannot have
+        # fired. When partial state was already streamed (text, reasoning,
+        # or partial tool_calls) retrying would duplicate tool execution,
+        # so we surface the truncation as a non-retryable error instead.
+        had_partial = bool(content or tool_calls or reasoning_text or reasoning_details)
+        message = (
+            f"{provider_label} stream ended before the completion marker"
+            + ("; partial response preserved." if had_partial else ".")
+        )
+        raise StreamResponseError(message, retryable=not had_partial)
     if finish_reason == "length":
         raise RuntimeError(
             f"{provider_label} completion was truncated (finish_reason='length'); "
@@ -492,11 +505,29 @@ def api_key_env(provider: str) -> str:
 def create_llm_client(settings: Settings):
     """Return the chat-completions client selected by ``settings.llm_provider``.
 
+    When ``settings.llm_fallback_provider`` is set, the primary client is
+    wrapped in :class:`FallbackChatClient` so a transient primary failure
+    triggers a single retry against the fallback before the agent surfaces
+    an error. User cancellations never fall back.
+
     Importing the adapters lazily keeps this module importable even when one
     of the optional provider SDKs is not installed (none are required today,
     but this leaves room for future native-Responses adapters).
     """
-    provider = settings.llm_provider
+    primary = _build_provider_client(settings.llm_provider, settings)
+    fallback_label = settings.llm_fallback_provider
+    if not fallback_label:
+        return primary
+    fallback = _build_provider_client(fallback_label, settings)
+    return FallbackChatClient(primary, fallback, fallback_label)
+
+
+def _build_provider_client(provider: str, settings: Settings):
+    """Construct the adapter for a single provider label.
+
+    Extracted from :func:`create_llm_client` so the fallback wrapper can
+    reuse the exact same factory without re-implementing lazy imports.
+    """
     if provider == "openai":
         from agent.openai_client import OpenAIClient
 
@@ -506,6 +537,137 @@ def create_llm_client(settings: Settings):
 
         return OpenRouterClient(settings)
     raise ValueError(f"Unknown LLM provider: {provider!r}")
+
+
+class FallbackChatClient:
+    """Try a primary ``ChatCompletionsClient`` and fall back once on failure.
+
+    The wrapper mirrors the public surface of :class:`ChatCompletionsClient`
+    so :class:`agent.core.AgentRunner` can treat it as a drop-in replacement.
+    Any exception from the primary (after its own retry loop is exhausted)
+    triggers a single attempt against the fallback — except user
+    cancellations, which always propagate so the stop signal is observed
+    cleanly.
+
+    The fallback path is intentionally conservative: one shot, no nested
+    retries, no automatic re-fallback on a fallback failure. Repeated
+    provider outages should be diagnosed, not papered over with deeper
+    retry fanout.
+    """
+
+    # Class default mirrors ``ChatCompletionsClient``; ``_capture_result``
+    # overwrites it with the successful inner client's value so the
+    # runner's response sanitization sees the same ``preserve_reasoning``
+    # flag the inner provider actually needs. OpenRouter requires
+    # ``True`` to keep reasoning on tool-call turns; hard-coding
+    # ``False`` here would silently strip it.
+    preserve_reasoning: bool = False
+
+    def __init__(
+        self,
+        primary: ChatCompletionsClient,
+        fallback: ChatCompletionsClient,
+        fallback_label: str,
+    ) -> None:
+        self._primary = primary
+        self._fallback = fallback
+        self._fallback_label = fallback_label
+        # State mirrored onto both inner clients at the top of every
+        # ``chat()`` call. Initialised with the same defaults as
+        # ``ChatCompletionsClient.__init__`` so a freshly constructed
+        # wrapper is a safe no-op pass-through.
+        self.stop_event: threading.Event | None = None
+        self.session_id: str | None = None
+        self.agent_role: str | None = None
+        self.last_usage: dict[str, Any] | None = None
+        self.last_image_fallback_used = False
+        self.stream_callback = None
+        self.require_images = False
+        self._activity_logger = None
+        self._run_id: str | None = None
+
+    def _sync_state(self) -> None:
+        """Mirror the wrapper's per-call state onto both inner clients.
+
+        ``AgentRunner`` mutates the wrapper's attributes between iterations
+        (``stream_callback``) and once per run (``stop_event``, ``session_id``
+        …). Propagating the values before delegating keeps the inner clients
+        in lock-step without forcing the runner to know about the fallback.
+        """
+        for client in (self._primary, self._fallback):
+            client.stop_event = self.stop_event
+            client.session_id = self.session_id
+            client.agent_role = self.agent_role
+            client.stream_callback = self.stream_callback
+            client.require_images = self.require_images
+            client._activity_logger = self._activity_logger
+            client._run_id = self._run_id
+
+    def _capture_result(self, client: ChatCompletionsClient) -> None:
+        """Copy per-call metrics from the successful inner client.
+
+        The agent runner reads ``last_usage`` / ``last_image_fallback_used``
+        / ``preserve_reasoning`` from the wrapper immediately after
+        ``chat()`` returns, so the successful inner client's values must be
+        visible on the wrapper. ``preserve_reasoning`` differs between
+        providers (e.g. ``OpenRouterClient`` keeps it ``True`` so reasoning
+        survives on tool-call turns); copying it avoids silently stripping
+        reasoning from a response that came back through the fallback path.
+        """
+        self.last_usage = client.last_usage
+        self.last_image_fallback_used = client.last_image_fallback_used
+        self.preserve_reasoning = client.preserve_reasoning
+
+    def _log_fallback(self, primary_error: BaseException) -> None:
+        """Best-effort record of the fallback hop.
+
+        Mirrors the wire-level events the base client already emits so an
+        operator with ``agent.log_tool_activity: true`` can reconstruct the
+        full provider sequence for a single chat completion. The logger is
+        optional; failures inside ``ActivityLogger.log`` never propagate, so
+        guarding with ``is not None`` is sufficient.
+        """
+        if self._activity_logger is None:
+            return
+        self._activity_logger.log(
+            "llm_fallback",
+            {
+                "from_provider": self._primary.settings.llm_provider,
+                "from_model": self._primary.settings.llm_model,
+                "to_provider": self._fallback_label,
+                "to_model": self._fallback.settings.llm_model,
+                "primary_error_type": type(primary_error).__name__,
+                "primary_error": str(primary_error),
+            },
+            run_id=self._run_id,
+        )
+
+    def chat(self, messages, tools=None):
+        self._sync_state()
+        try:
+            result = self._primary.chat(messages, tools)
+        except RequestCancelled:
+            # User pressed stop; the fallback would only delay the cancel.
+            raise
+        except Exception as primary_error:
+            # Stop events raised mid-flight must still win, even if the
+            # primary surfaced a different exception first.
+            if self.stop_event is not None and self.stop_event.is_set():
+                raise
+            self._log_fallback(primary_error)
+            try:
+                result = self._fallback.chat(messages, tools)
+            except RequestCancelled:
+                raise
+            except Exception as fallback_error:
+                # Surface the fallback error so the user sees what really
+                # failed on the last attempt. ``__cause__`` retains the
+                # primary trace for debugging.
+                raise fallback_error from primary_error
+            self._capture_result(self._fallback)
+            return result
+        self._capture_result(self._primary)
+        return result
 
 
 # ---------------------------------------------------------------------------

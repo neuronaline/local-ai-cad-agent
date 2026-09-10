@@ -15,6 +15,7 @@ from pathlib import Path
 
 from agent.activity_log import ActivityLogger
 from agent.io import atomic_write_json
+from agent.revisions import model_is_built as _model_is_built
 from agent.tool_results import (
     build_cad_build_multimodal_content,
     build_cad_screenshot_multimodal_content,
@@ -268,7 +269,19 @@ def process_tool_call(
             )
         if is_cad_build(name, arguments):
             preview_id = None
-        if cad_fix_required and name in {"cad_screenshot", "cad_review"}:
+        # Gate ``cad_screenshot`` / ``cad_review`` on a fresh build of the
+        # current model.py revision, NOT on ``cad_fix_required``. The loop's
+        # ``cad_fix_required`` flag tracks the stricter "rendered visual
+        # verification pending" requirement; coupling the dispatcher to it
+        # forced a wasteful second rendered build after every cheap
+        # ``cad_build_and_verify(render=false)``. ``model_is_built`` reads
+        # ``.cad_metrics.json`` and only requires *any* successful build
+        # of the current revision — the screenshot tool re-runs build123d
+        # in its own sandbox subprocess when needed.
+        if (
+            name in {"cad_screenshot", "cad_review"}
+            and not _model_is_built(project_dir)
+        ):
             raise ValueError(
                 f"{name} requires a successful build of the current revision."
             )

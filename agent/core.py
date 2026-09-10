@@ -40,7 +40,7 @@ from agent.llm_base import (
     sanitize_assistant_message,
 )
 from agent.prompt import get_system_prompt
-from agent.revisions import RevisionStore, compute_model_sha256
+from agent.revisions import RevisionStore, compute_model_sha256, model_is_built
 from agent.settings import Settings
 from agent.tool_schemas import TOOL_SCHEMAS
 from agent.tools.cad_review_tool import CadReviewTool
@@ -865,16 +865,8 @@ class AgentRunner:
 
     @classmethod
     def _model_is_built(cls, project_dir: Path) -> bool:
-        model_digest = cls._model_digest(project_dir)
-        if model_digest is None:
-            return True
-        try:
-            cached = json.loads(
-                (project_dir / ".cad_metrics.json").read_text(encoding="utf-8")
-            )
-        except (FileNotFoundError, OSError, json.JSONDecodeError):
-            return False
-        return isinstance(cached, dict) and cached.get("model_sha256") == model_digest
+        return model_is_built(project_dir)
+
 
     def _publish_terminal_failure(self, project: str) -> None:
         # Mirror _complete's success-side agent_status so the UI clears the

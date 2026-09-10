@@ -177,6 +177,34 @@ def compute_model_sha256(project_dir: Path) -> str | None:
         return None
 
 
+def model_is_built(project_dir: Path) -> bool:
+    """True when ``.cad_metrics.json`` matches the current ``model.py`` sha256.
+
+    Decoupled from the loop's ``cad_fix_required`` flag so the dispatcher
+    can gate visual tools (``cad_screenshot``, ``cad_review``) on a fresh
+    build of the current revision without forcing a wasteful second
+    rendered build after a cheap ``cad_build_and_verify(render=false)``.
+    Both ``agent.core.AgentRunner._model_is_built`` and
+    :func:`agent.dispatcher.process_tool_call` consult this helper; keeping
+    the body here avoids a circular import between ``agent.core`` and
+    ``agent.dispatcher``.
+
+    ``True`` is also returned when ``model.py`` does not exist yet; there
+    is nothing stale to invalidate, so the screenshot/review tools' own
+    validation paths surface the real error.
+    """
+    model_digest = compute_model_sha256(project_dir)
+    if model_digest is None:
+        return True
+    try:
+        cached = json.loads(
+            (project_dir / ".cad_metrics.json").read_text(encoding="utf-8")
+        )
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return False
+    return isinstance(cached, dict) and cached.get("model_sha256") == model_digest
+
+
 class RevisionStore:
     """Owns all paths, validation, and atomic persistence for revision history."""
 

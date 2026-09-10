@@ -34,6 +34,11 @@ class Settings:
     openrouter_force_provider: bool = False
     # ── LLM provider selection ──
     llm_provider: str = "openrouter"
+    # Optional secondary provider. When set, a transient LLM failure (network,
+    # rate limit, server error, …) on the primary client triggers a single
+    # retry against this fallback before the agent surfaces an error. User
+    # cancellations never fall back. Leave as the empty string to disable.
+    llm_fallback_provider: str = ""
     # OpenAI Chat Completions adapter.
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4o-mini"
@@ -242,6 +247,21 @@ def load_settings(project_root: Path | None = None) -> Settings:
             f"llm.provider must be one of {sorted(LLM_PROVIDERS)}, got {llm_provider_raw!r}."
         )
     llm_provider = llm_provider_raw
+    # ``llm.fallback_provider`` is optional. An empty string disables the
+    # fallback path; any other value must still be a registered provider so a
+    # misconfiguration fails at startup instead of mid-run.
+    llm_fallback_provider_raw = _optional_string(llm.get("fallback_provider")) or ""
+    if llm_fallback_provider_raw and llm_fallback_provider_raw not in LLM_PROVIDERS:
+        raise ValueError(
+            f"llm.fallback_provider must be one of {sorted(LLM_PROVIDERS)} "
+            f"or empty, got {llm_fallback_provider_raw!r}."
+        )
+    if llm_fallback_provider_raw and llm_fallback_provider_raw == llm_provider:
+        raise ValueError(
+            "llm.fallback_provider must differ from llm.provider; "
+            "leave it empty to disable fallback."
+        )
+    llm_fallback_provider = llm_fallback_provider_raw
 
     # Each provider keeps its own model; ``settings.llm_model`` returns the
     # active one so callers do not need to branch on the provider.
@@ -263,6 +283,7 @@ def load_settings(project_root: Path | None = None) -> Settings:
         openrouter_provider=_optional_string(openrouter.get("provider")),
         openrouter_force_provider=_strict_bool(openrouter.get("force_provider", False), "openrouter.force_provider"),
         llm_provider=llm_provider,
+        llm_fallback_provider=llm_fallback_provider,
         openai_base_url=str(openai.get("base_url", "https://api.openai.com/v1")).rstrip("/"),
         openai_model=str(openai.get("model", "gpt-4o-mini")),
         openai_timeout_seconds=_validate_timeout_seconds(openai.get("timeout_seconds", 60), "openai.timeout_seconds"),

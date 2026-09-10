@@ -426,7 +426,8 @@ class FileTool:
             ),
         )
         result = (
-            f"Wrote model.py ({len(content)} characters, revision {revision.id[:8]})."
+            f"Wrote model.py ({len(content.splitlines())} lines, "
+            f"{len(content)} chars, revision {revision.id[:8]})."
         )
         if warnings:
             result += "\nPRE-FLIGHT WARNING: " + " | ".join(warnings)

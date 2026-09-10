@@ -153,22 +153,25 @@ const activityLabels = {
   // a distinct label that matches what the backend publishes.
   cad_screenshot: 'Re-rasterising views',
   cad_review: 'Reviewing build',
-  rendering_subset: 'Re-rasterising subset',
+  rendering_subset: 'Re-rasterising a few views',
   screenshot_auto: 'Rendering views for review',
-  // Status / pseudo-tool labels (kept for SSE events and info rows).
+  // Status / pseudo-tool labels (kept for SSE events and info rows). Plain
+  // English so the activity pill stays readable while a run is in progress.
   agent: 'Agent',
   preparing: 'Preparing',
-  running: 'Running',
+  running: 'In progress',
   rendering: 'Rendering',
   rendering_views: 'Rendering review views',
   reviewing: 'Reviewing',
-  started: 'Started',
+  started: 'Starting',
   completed: 'Completed',
   error: 'Error',
   stopped: 'Stopped',
   // Review verdicts surfaced by ``review_updated``. ``activityLabel`` falls
   // back to a generic sanitised string, but listing them explicitly keeps the
-  // pill readable (``Pass`` / ``Fail`` / ``Inconclusive``).
+  // pill readable. The verdict is also promoted onto the matching row's
+  // state label via ``refreshLatestToolRow`` so the drawer reflects the
+  // outcome without expanding the title pill.
   pass: 'Pass',
   fail: 'Fail',
   inconclusive: 'Inconclusive',
@@ -310,13 +313,26 @@ function addToolMessage(data) {
   }
   row.dataset.status = status;
   row.hidden = false;
+  // ``screenshot_updated`` / ``review_updated`` events arrive between
+  // ``tool_status:running`` and ``tool_status:completed`` and set a cosmetic
+  // verdict label (``Cache hit``, ``Pass`` …) via ``refreshLatestToolRow``.
+  // That label must survive the dispatcher's ``tool_status:completed``
+  // rebuild — otherwise the activity row and the title pill flash the
+  // verdict and then snap back to ``Completed`` / ``X step(s) completed``
+  // before the user can read them. Honour ``dataset.decorativeState`` only
+  // on the completion transition; intermediate rebuilds drop a stale value
+  // so the loop's state machine stays the source of truth.
+  const cosmeticState = status === 'completed' ? row.dataset.decorativeState : null;
+  if (!cosmeticState) {
+    delete row.dataset.decorativeState;
+  }
   row.replaceChildren();
   const name = document.createElement('span');
   name.className = 'activity-name';
   name.textContent = activityLabel(item.tool);
   const state = document.createElement('span');
   state.className = 'activity-state';
-  state.textContent = activityLabel(status);
+  state.textContent = cosmeticState || activityLabel(status);
   row.append(name, state);
   if (item.result) {
     const detail = document.createElement('span');
@@ -324,8 +340,62 @@ function addToolMessage(data) {
     detail.textContent = item.result.length > 180 ? `${item.result.slice(0, 177)}…` : item.result;
     row.appendChild(detail);
   }
-  updateActivitySummary();
+  // Suppress the title pill reset when a cosmetic label is showing so the
+  // verdict text (``Re-rasterising views · Cache hit`` /
+  // ``Reviewing build · Pass``) stays visible until the next tool call
+  // takes over the panel.
+  if (!cosmeticState) {
+    updateActivitySummary();
+  }
   return row;
+}
+
+function refreshLatestToolRow(tool, updates = {}) {
+  // Find the most recent row for a tool name and update its visible state.
+  // ``screenshot_updated`` / ``review_updated`` events carry verdict/cache
+  // info that arrives after the matching ``tool_status:completed`` has
+  // already finalised the row, so the dispatcher-side activity machine is
+  // no longer running. The cosmetic label is stashed on the row's dataset
+  // so ``addToolMessage`` can preserve it across the completion rebuild
+  // that the dispatcher will publish immediately afterwards.
+  const rows = activityList.querySelectorAll('.activity-item');
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const row = rows[index];
+    const item = activityItems.get(row.dataset.callId);
+    if (!item || item.tool !== tool) continue;
+    if (updates.state) {
+      // Cosmetic label only — the underlying ``item.status`` stays as the
+      // agent loop set it; only the visible label changes.
+      const state = row.querySelector('.activity-state');
+      if (state) state.textContent = updates.state;
+      row.dataset.decorativeState = updates.state;
+    }
+    if (updates.status) {
+      item.status = updates.status;
+      row.dataset.status = updates.status;
+      const state = row.querySelector('.activity-state');
+      if (state) state.textContent = activityLabel(updates.status);
+      // A full ``updates.status`` supersedes the cosmetic override; the
+      // loop is taking over again, so clear the stash.
+      delete row.dataset.decorativeState;
+      updateActivitySummary();
+    }
+    if (Object.prototype.hasOwnProperty.call(updates, 'result')) {
+      item.result = updates.result;
+      let detail = row.querySelector('.activity-detail');
+      if (!detail) {
+        detail = document.createElement('span');
+        detail.className = 'activity-detail';
+        row.appendChild(detail);
+      }
+      detail.textContent = updates.result
+        ? (updates.result.length > 180 ? `${updates.result.slice(0, 177)}…` : updates.result)
+        : '';
+      if (!updates.result) detail.remove();
+    }
+    return row;
+  }
+  return null;
 }
 
 function setThinking(active) {
@@ -1171,19 +1241,30 @@ function connectStream() {
     // when the screenshot tool produced a new artifact cache tier.
     screenshot_updated: data => {
       if (data.project !== currentProject) return;
-      if (data.cache_hit) {
-        activityTitle.textContent = 'Re-rasterising views · Cache hit';
-        activityPanel.hidden = false;
-      }
+      const cacheLabel = data.cache_hit ? 'Cache hit' : 'Re-rendered';
+      // Mirror the cache outcome onto the activity row's state label so the
+      // drawer shows "Re-rendered" / "Cache hit" instead of the generic
+      // "Completed" the dispatcher set on tool_status. The row's existing
+      // detail text (e.g. "Rendered 3/8 view(s) at standard quality") is
+      // preserved so the user keeps the per-step summary that the dispatcher
+      // already produced.
+      activityTitle.textContent = `Re-rasterising views · ${cacheLabel}`;
+      activityPanel.hidden = false;
+      refreshLatestToolRow('cad_screenshot', {state: cacheLabel});
     },
     review_updated: data => {
       if (data.project !== currentProject) return;
-      const verdict = activityLabel(data.status || 'inconclusive');
+      const verdictKey = data.status || 'inconclusive';
+      const verdict = activityLabel(verdictKey);
       const summary = typeof data.summary === 'string' && data.summary.trim()
         ? ` — ${data.summary.trim().slice(0, 160)}`
         : '';
       activityTitle.textContent = `Reviewing build · ${verdict}${summary}`;
       activityPanel.hidden = false;
+      // Promote the verdict onto the row's state label; the dispatcher's
+      // tool_status:completed already filled the row's detail with the full
+      // review summary, so we leave it untouched.
+      refreshLatestToolRow('cad_review', {state: verdict});
     },
   };
   for (const [eventName, handler] of Object.entries(handlers)) {
