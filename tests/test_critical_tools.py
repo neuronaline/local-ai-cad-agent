@@ -242,8 +242,8 @@ class _StubChatClient:
         self.agent_role = None
         self.stream_callback = None
         self.require_images = False
-        self._activity_logger = None
-        self._run_id = None
+        self.activity_logger = None
+        self.run_id = None
 
     def chat(self, messages, tools=None):
         self.chat_calls.append((messages, tools))

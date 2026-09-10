@@ -476,7 +476,7 @@ class CadScreenshotTool:
     # ------------------------------------------------------------------ main entry
 
     def execute(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        """Public entry point invoked by ``AgentRunner._execute`` dispatch."""
+        """Public entry point invoked by the dispatcher for ``cad_screenshot``."""
         views = self._normalize_views(arguments.get("views"))
         quality = self._normalize_quality(arguments.get("quality", "standard"))
         contact_sheet = bool(arguments.get("contact_sheet", True))

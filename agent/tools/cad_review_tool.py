@@ -110,7 +110,7 @@ class CadReviewTool:
     # ------------------------------------------------------------------ surface
 
     def execute(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        """Public entry point invoked by ``AgentRunner._execute`` dispatch."""
+        """Public entry point invoked by the dispatcher for ``cad_review``."""
         requested_views = CadScreenshotTool._normalize_views(arguments.get("views"))
         view_filter = requested_views if arguments.get("views") else ()
         timeout_seconds = min(

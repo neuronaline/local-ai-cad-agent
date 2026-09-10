@@ -583,8 +583,15 @@ class FallbackChatClient:
         self.last_image_fallback_used = False
         self.stream_callback = None
         self.require_images = False
-        self._activity_logger = None
-        self._run_id: str | None = None
+        # Optional activity-log hook. The agent runner wires this when
+        # ``agent.log_tool_activity`` is enabled; ``None`` keeps the wire
+        # path inert for tests and review sub-sessions that do not log.
+        # Public on purpose: :class:`agent.core.AgentRunner` writes these
+        # from outside the client, so they are part of the wrapper's
+        # documented surface and mirrored onto the inner clients by
+        # :meth:`_sync_state`.
+        self.activity_logger = None
+        self.run_id: str | None = None
 
     def _sync_state(self) -> None:
         """Mirror the wrapper's per-call state onto both inner clients.
@@ -600,8 +607,8 @@ class FallbackChatClient:
             client.agent_role = self.agent_role
             client.stream_callback = self.stream_callback
             client.require_images = self.require_images
-            client._activity_logger = self._activity_logger
-            client._run_id = self._run_id
+            client.activity_logger = self.activity_logger
+            client.run_id = self.run_id
 
     def _capture_result(self, client: ChatCompletionsClient) -> None:
         """Copy per-call metrics from the successful inner client.
@@ -627,9 +634,9 @@ class FallbackChatClient:
         optional; failures inside ``ActivityLogger.log`` never propagate, so
         guarding with ``is not None`` is sufficient.
         """
-        if self._activity_logger is None:
+        if self.activity_logger is None:
             return
-        self._activity_logger.log(
+        self.activity_logger.log(
             "llm_fallback",
             {
                 "from_provider": self._primary.settings.llm_provider,
@@ -639,7 +646,7 @@ class FallbackChatClient:
                 "primary_error_type": type(primary_error).__name__,
                 "primary_error": str(primary_error),
             },
-            run_id=self._run_id,
+            run_id=self.run_id,
         )
 
     def chat(self, messages, tools=None):
@@ -714,8 +721,11 @@ class ChatCompletionsClient:
         # Optional activity-log hook. The agent runner wires this when
         # ``agent.log_tool_activity`` is enabled; ``None`` keeps the wire
         # path inert for tests and review sub-sessions that do not log.
-        self._activity_logger = None
-        self._run_id: str | None = None
+        # Public on purpose: :class:`agent.core.AgentRunner` writes these
+        # from outside the client, so they are part of the documented
+        # surface and consumed by ``chat()`` directly.
+        self.activity_logger = None
+        self.run_id: str | None = None
 
     def _endpoint(self) -> str:  # pragma: no cover — overridden by subclass
         raise NotImplementedError
@@ -761,7 +771,7 @@ class ChatCompletionsClient:
             raise RuntimeError(f"{api_key_env(self._provider_label.lower())} is not configured.")
         payload = self._build_payload(messages, tools)
         headers = self._build_headers(api_key)
-        log_payload = self._activity_logger is not None
+        log_payload = self.activity_logger is not None
 
         image_fallback_used = False
         for attempt in range(3):
@@ -774,10 +784,10 @@ class ChatCompletionsClient:
                 response = self._post(payload, headers)
             except RequestCancelled:
                 if log_payload:
-                    self._activity_logger.log(
+                    self.activity_logger.log(
                         "llm_cancelled",
                         {"attempt": attempt, "model": payload.get("model")},
-                        run_id=getattr(self, "_run_id", None),
+                        run_id=self.run_id,
                     )
                 raise
             except Exception:
@@ -800,10 +810,10 @@ class ChatCompletionsClient:
                         image_fallback_used = True
                         self.last_image_fallback_used = True
                         if log_payload:
-                            self._activity_logger.log(
+                            self.activity_logger.log(
                                 "llm_visual_fallback",
                                 {"attempt": attempt, "model": payload.get("model")},
-                                run_id=getattr(self, "_run_id", None),
+                                run_id=self.run_id,
                             )
                         continue
                     body_preview = _response_text(response)[:500]
@@ -821,7 +831,7 @@ class ChatCompletionsClient:
                         )
                     response.raise_for_status()
                     if log_payload:
-                        self._activity_logger.log(
+                        self.activity_logger.log(
                             "llm_request",
                             {
                                 "attempt": attempt,
@@ -831,7 +841,7 @@ class ChatCompletionsClient:
                                 "payload": attempt_payload,
                                 "status": response.status_code,
                             },
-                            run_id=getattr(self, "_run_id", None),
+                            run_id=self.run_id,
                         )
                     if hasattr(response, "iter_lines"):
                         try:
@@ -840,14 +850,14 @@ class ChatCompletionsClient:
                             if not error.retryable or attempt == 2:
                                 raise
                             if log_payload:
-                                self._activity_logger.log(
+                                self.activity_logger.log(
                                     "llm_stream_retry",
                                     {
                                         "attempt": attempt,
                                         "model": payload.get("model"),
                                         "error": str(error),
                                     },
-                                    run_id=getattr(self, "_run_id", None),
+                                    run_id=self.run_id,
                                 )
                     else:
                         body = response.json()
@@ -860,14 +870,14 @@ class ChatCompletionsClient:
                             )
                         return body
                 if log_payload:
-                    self._activity_logger.log(
+                    self.activity_logger.log(
                         "llm_retry",
                         {
                             "attempt": attempt,
                             "status": response.status_code,
                             "model": payload.get("model"),
                         },
-                        run_id=getattr(self, "_run_id", None),
+                        run_id=self.run_id,
                     )
                 if attempt == 2:
                     response.raise_for_status()

@@ -75,13 +75,18 @@ class QuestionTool:
                         f"Question '{qid}': {input_type} requires at least two non-empty string options."
                     )
 
-    def execute(self, args: dict, project: str = "") -> tuple[str, bool]:
-        """Validate, normalize, and publish questions. Returns (result_msg, waiting=True)."""
+    def execute(self, args: dict, project: str = "") -> tuple[str, bool, list[dict]]:
+        """Validate, normalize, and publish questions.
+
+        Returns ``(result, waiting, normalized_questions)`` so callers
+        (notably :mod:`agent.dispatcher`) can reuse the normalized list for
+        persisted state without re-running ``normalize_questions``.
+        """
         questions = normalize_questions(args)
         self.validate_questions(questions)
         title = args.get("title", "")
         result = self.ask(project, questions, title if isinstance(title, str) else "")
-        return result, True
+        return result, True, questions
 
     def ask(
         self,
@@ -89,8 +94,11 @@ class QuestionTool:
         questions: list[dict],
         title: str = "",
     ) -> str:
-        """Validate, publish an SSE question event, and return a stop instruction."""
-        self.validate_questions(questions)
+        """Publish an SSE question event and return a stop instruction.
+
+        Validation already happened in :meth:`execute`; re-validating here
+        would double-validate the same payload for every dispatch.
+        """
         self.publish(
             "question",
             {

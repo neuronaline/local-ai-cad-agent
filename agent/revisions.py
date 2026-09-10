@@ -697,28 +697,6 @@ class RevisionStore:
 
         return removed
 
-    def export_history(self, target_dir: Path) -> Path:
-        """Backward-compat wrapper around :func:`agent.revision_archive.export_history`.
-
-        Production code should not call this method directly; the round-trip
-        test suite drives it through :mod:`agent.revision_archive`. The
-        helper grabs the per-instance lock itself, so this wrapper does not
-        need a :func:`_synchronized` decorator.
-        """
-        from agent.revision_archive import export_history as _export
-
-        return _export(self, target_dir)
-
-    def import_history(self, archive_path: Path) -> int:
-        """Backward-compat wrapper around :func:`agent.revision_archive.import_history`.
-
-        Production code should not call this method directly; the round-trip
-        test suite drives it through :mod:`agent.revision_archive`.
-        """
-        from agent.revision_archive import import_history as _import
-
-        return _import(self, archive_path)
-
     def active_model_digest(self) -> str | None:
         """Return the SHA-256 of the active model.py, or None if absent.
 

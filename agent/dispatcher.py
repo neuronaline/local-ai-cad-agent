@@ -23,7 +23,6 @@ from agent.tool_results import (
 )
 from agent.tool_results import failure as tool_failure
 from agent.tool_results import success as tool_success
-from agent.tools.question_tool import normalize_questions
 
 
 def is_model_mutation(name: str, arguments: dict) -> bool:
@@ -56,13 +55,12 @@ def dispatch(
     ``waiting`` is True only for the question tool (the LLM is parked
     until the user replies).
 
-    The dispatcher knows only the seven tool names published by
+    The dispatcher knows only the eight tool names published by
     :mod:`agent.tool_schemas`: ``cad_build_and_verify``, ``cad_screenshot``,
     ``cad_review``, ``read_file``, ``write_file``, ``edit_file``,
-    ``insert_file``, ``regex_replace`` (parity), and ``question``. Tool
-    instances expose a per-call ``with_call_id`` method plus a generic
-    ``execute(args)`` entry; the dispatcher selects the right one based on
-    name.
+    ``insert_file``, and ``question``. Tool instances expose a per-call
+    ``with_call_id`` method plus a generic ``execute(args)`` entry; the
+    dispatcher selects the right one based on name.
     """
     if name == "cad_build_and_verify":
         cad = tools.cad.with_call_id(call_id)
@@ -147,24 +145,12 @@ def dispatch(
             ),
             False,
         )
-    if name == "regex_replace":
-        # ``regex_replace`` is implemented on ``FileTool`` for parity with
-        # the read/write/edit/insert surface. It is intentionally not
-        # surfaced in :mod:`agent.tool_schemas` so it cannot be invoked
-        # by the LLM. The dispatcher still routes the call for any
-        # internal caller that holds a ``FileTool`` reference.
-        tool = (
-            tools.file.with_call_id(call_id) if call_id else tools.file
-        )
-        execute = getattr(tool, "regex_replace", None)
-        if not callable(execute):
-            return {"error": f"Tool {name!r} is not registered."}, False
-        return execute(args), False
     if name == "question":
-        # execute() validates, normalizes, and publishes the questions;
-        # the normalized list is also needed for the persisted state.
-        result, _waiting = tools.question.execute(args, project=project)
-        questions = normalize_questions(args)
+        # execute() returns the normalized list as its third element; reuse
+        # it for the persisted state instead of re-running normalize_questions
+        # here. Validation also already ran inside execute(), so ask() can
+        # publish straight away.
+        result, _waiting, questions = tools.question.execute(args, project=project)
         title = args.get("title", "")
         question_state = {
             "title": title.strip() if isinstance(title, str) else "",
@@ -417,9 +403,10 @@ def _remember_inline_tool_images(
             except (OSError, json.JSONDecodeError):
                 index = {}
         index[call_id] = rel
-        index_path.write_text(
-            json.dumps(index, ensure_ascii=False), encoding="utf-8"
-        )
+        # Atomic replace (temp + fsync + rename) so a crash mid-write never
+        # truncates the JSON and the next load's JSONDecodeError path wipes
+        # every prior placeholder.
+        atomic_write_json(index_path, index)
     except OSError:
         return
 

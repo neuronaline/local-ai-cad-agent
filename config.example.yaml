@@ -22,13 +22,16 @@ llm:
 openrouter:
   base_url: https://openrouter.ai/api/v1
   model: x-ai/grok-4.6
-  timeout_seconds: 60
+  timeout_seconds: 90
   app_title: Local AI CAD Agent
   app_url: ""
   session_prefix: local-ai-cad-agent
   reasoning_effort: "low"
   provider: "xai"
-  force_provider: true
+  # ``force_provider: false`` lets OpenRouter route to a less-loaded upstream
+  # when the pinned provider is saturated, instead of failing the agent loop
+  # mid-iteration. ``openrouter.provider`` still seeds the preferred order.
+  force_provider: false
   enable_anthropic_cache: true
   enable_gemini_cache: true
 

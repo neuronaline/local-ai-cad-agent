@@ -33,13 +33,6 @@ def _tool(
     }
 
 
-_TIMEOUT = {
-    "type": "integer",
-    "minimum": 1,
-    "maximum": MAX_SANDBOX_TIMEOUT_SECONDS,
-    "description": f"Maximum runtime in seconds (1-{MAX_SANDBOX_TIMEOUT_SECONDS}).",
-}
-
 CANONICAL_VIEWS = (
     "x_positive",
     "x_negative",

@@ -19,10 +19,16 @@ dimensions as authoritative. State any important assumption in the final reply."
 
 _OPERATIONAL_RULES = """\
 - Edit only the active project's model.py. Everything else is read-only.
+- This app previews a single STL at a time. For multi-variant requests (Front /
+  Rear, Left / Right, cap / body, etc.) build and ship each variant in its own
+  iteration: declare a top-level ``PART_TYPE = 'FRONT'`` (or similar) at the
+  top of model.py as a self-documenting marker, run ``cad_build_and_verify``
+  on that variant, then start a fresh build for the next one. Do not stack
+  variants into one scene — the bounding box, contact sheet, and reviewer
+  all assume a single part.
 - Resolve blocking ambiguity first (ask one batched ``question`` if needed),
   then iterate: edit model.py → ``cad_build_and_verify`` → inspect metrics and
-  inline render → fix or finish. Use ``render=false`` only when a quick,
-  metrics-only iteration is genuinely useful.
+  inline render → fix or finish.
 - model.py layout: put every numeric dimension, angle, clearance, and count
   as a named, typed parameter with its appropriate unit at the very top of
   the file, grouped under short comment headers (overall envelope, pocket,
@@ -32,8 +38,10 @@ _OPERATIONAL_RULES = """\
   each major geometry block with a short header comment, expose the final
   shape as top-level `result`, and keep those comments in sync with the code
   in the same edit — stale comments mislead the next edit.
-- Fresh project: create model.py directly with write_file. Do not read, patch,
-  build, render, or review a model that does not exist yet.
+- Fresh-project workspace state is delivered as a ``<project_state>`` user
+  message after the cacheable system prefix; follow whatever it says about
+  whether ``model.py`` already exists. Do not re-derive the answer from the
+  current directory listing.
 - Use the right tool for the job. ``read_file`` is for content you don't
   already know; skip it when your own previous ``write_file``/``edit_file``
   already returned the post-state. Prefer ``edit_file`` with multiple edits
@@ -50,20 +58,11 @@ _OPERATIONAL_RULES = """\
 - ``cad_build_and_verify`` validates geometry, extracts numeric UPPER_CASE
   parameters from the initial model.py AST block, and produces the canonical
   eight-view rasterisation + contact sheet in one call. Inspect the inline
-  evidence and either accept or iterate. Use ``render=false`` for a cheap,
-  metrics-only pass; call the default rendered form after the last real edit.
-- ``cad_screenshot`` re-rasterises a subset of canonical views without
-  re-running build123d. The tool already attaches the requested views + the
-  contact sheet inline — inspect them in-band instead of guessing. Cache key
-  is ``(model_sha256, sorted(views), quality)``; matching tuples are served
-  without spawning the sandbox. Reserve for complex or visually ambiguous
-  work, not routine small edits where the inline render already answers the
-  question.
-- ``cad_review`` is opt-in and never runs automatically. It always demands
-  ``strict`` verdict — any blocking **or** major finding reclassifies the
-  verdict to ``fail``; only minor (or none) permit ``pass``; no visual
-  evidence → ``inconclusive``. Reserve it (and ``cad_screenshot``) for
-  complex, high-risk, or explicitly user-requested work.
+  evidence and either accept or iterate.
+- ``cad_screenshot`` and ``cad_review`` are heavy, opt-in tools. Reserve
+  them for complex, visually ambiguous, fit-critical, or explicitly
+  user-requested work; the inline evidence from a default-rendered
+  ``cad_build_and_verify`` already answers most small edits.
 - Geometric conflict (slot clipping a fastener hole, self-intersecting
   fillet, wall-thickness violation, etc.): STOP and call ``question`` with
   the trade-off. Never silently mutate a user-stated dimension to "make it
@@ -84,7 +83,12 @@ _BUILD123D_RULES = """\
 - Check returned dimensions, volume, solid count, validity, and render against
   the request. A successful process exit alone is not sufficient.
 - For optional fillets or chamfers: if edge selectors fail repeatedly, drop the
-  finishing operation and deliver the simpler valid solid.
+  finishing operation and deliver the simpler valid solid. Prefer ``fillet2d()``
+  on a 2D sketch (inside ``BuildLine`` or before the extrude) over ``.fillet()``
+  on a 3D solid — OpenCASCADE's 3D edge fillet is brittle on complex topology
+  and is a common source of kernel crashes. Drawing the profile with arcs or
+  ``RadiusArc`` is an equally robust alternative when you only need the
+  rounded junction to read as a fillet at the end.
 - Treat unexpected keyword arguments as API-contract errors. Consult the versioned
   playbook instead of guessing signatures.
 - Before RadiusArc, confirm radius >= half the endpoint chord distance.
@@ -106,7 +110,7 @@ _PROMPT_SECTIONS: list[tuple[str, str]] = [
     ("operational_rules", _OPERATIONAL_RULES),
 ]
 
-_STATIC_BUNDLE_TAG = "<!-- StaticBundle:v4.6 -->"
+_STATIC_BUNDLE_TAG = "<!-- StaticBundle:v4.8 -->"
 
 # Template-driven render keeps section markers, the bundle tag, and the optional
 # playbook suffix in one consistent style — no f-string brace escaping is needed

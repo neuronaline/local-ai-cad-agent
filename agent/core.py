@@ -28,7 +28,6 @@ from agent.conversation import (
 )
 from agent.dispatcher import (
     cancel_remaining_tool_calls,
-    dispatch,
     normalize_tool_calls,
     process_tool_call,
 )
@@ -137,8 +136,6 @@ class AgentRunner:
         self,
         settings: Settings,
         publish: Callable[..., None],
-        *,
-        history_lock: threading.Lock | None = None,
     ) -> None:
         self.settings = settings
         self.publish = publish
@@ -153,7 +150,6 @@ class AgentRunner:
         self._active_activity_logger: ActivityLogger | None = None
         self._active_run_id: str | None = None
         self._lock = threading.Lock()
-        self._history_lock: threading.Lock = history_lock or threading.Lock()
         self._waiting_questions: dict[str, dict[str, object]] = {}
         # Set by the active _run() inside its finally clause so callers can
         # observe completion reliably without polling thread.is_alive().
@@ -326,8 +322,8 @@ class AgentRunner:
             run_id = uuid.uuid4().hex
             if activity_logging_enabled(self.settings):
                 activity_logger = get_logger(project_dir)
-                client._activity_logger = activity_logger
-                client._run_id = run_id
+                client.activity_logger = activity_logger
+                client.run_id = run_id
                 # Stash on the runner so the per-call dispatcher wrapper
                 # can read the logger without re-deriving it. Both
                 # attributes are reset in ``finally`` to keep a stale
@@ -402,7 +398,7 @@ class AgentRunner:
                     response["choices"][0]["message"],
                     preserve_reasoning=getattr(client, "preserve_reasoning", False),
                 )
-                tool_calls = self._normalize_tool_calls(
+                tool_calls = normalize_tool_calls(
                     assistant_message.get("tool_calls")
                 )
                 if tool_calls:
@@ -446,8 +442,14 @@ class AgentRunner:
                                     "model.py exists but it has not been verified. "
                                     "Call cad_build_and_verify now."
                                 )
+                                # Inject in-memory only; persisting the
+                                # synthetic reminder would (a) make the UI
+                                # history drawer render it as if the user
+                                # said it and (b) re-send the user-role
+                                # token on every later turn until
+                                # MAX_HISTORY truncation. The current run
+                                # still receives the nudge.
                                 messages.append(reminder)
-                                self._append_message(project_dir, reminder)
                                 continue
                             self.publish(
                                 "agent_error",
@@ -469,8 +471,10 @@ class AgentRunner:
                                 "verification. Call cad_build_and_verify with its default "
                                 "render=true before finishing."
                             )
+                            # In-memory only — see the nudge_cad branch above
+                            # for why synthetic reminders must not be appended
+                            # to the canonical conversation log.
                             messages.append(reminder)
-                            self._append_message(project_dir, reminder)
                             continue
                         self.publish(
                             "agent_error",
@@ -734,28 +738,6 @@ class AgentRunner:
 
     # ------------------------------------------------------------------ dispatch
 
-    def _execute(
-        self,
-        tools: ProjectTools,
-        project: str,
-        name: str,
-        args: dict,
-        call_id: str = "",
-    ) -> tuple[object, bool]:
-        """Backward-compatible thin wrapper around :func:`dispatcher.dispatch`.
-
-        Tests in ``tests/test_agent_loop.py`` call this directly to exercise
-        the dispatcher in isolation; production code routes through
-        :meth:`_process_tool_call`. The audit recommended deleting these
-        wrappers, but the test contract keeps them public.
-        """
-        return dispatch(tools, project, name, args, call_id)
-
-    @staticmethod
-    def _normalize_tool_calls(raw_calls: object) -> list[dict]:
-        """Backwards-compatible alias for :func:`dispatcher.normalize_tool_calls`."""
-        return normalize_tool_calls(raw_calls)
-
     def _process_tool_call(
         self,
         tools: ProjectTools,
@@ -767,7 +749,11 @@ class AgentRunner:
         cad_error: str | None,
         messages: list[dict],
     ) -> tuple[str | None, str | None, bool, bool]:
-        """Backwards-compatible thin wrapper around :func:`dispatcher.process_tool_call`."""
+        """Per-call wrapper that injects runner callbacks into ``dispatcher.process_tool_call``.
+
+        Centralised here so the agent loop stays focused on lifecycle state
+        and the dispatcher stays unaware of the ``AgentRunner`` instance.
+        """
         return process_tool_call(
             tools,
             project,
@@ -793,7 +779,7 @@ class AgentRunner:
         processed_call_ids: set[str],
         messages: list[dict],
     ) -> None:
-        """Backwards-compatible thin wrapper around the dispatcher's equivalent."""
+        """Per-call wrapper that injects the runner's append callback into the dispatcher."""
         cancel_remaining_tool_calls(
             project_dir,
             tool_calls,
