@@ -21,12 +21,12 @@ llm:
 
 openrouter:
   base_url: https://openrouter.ai/api/v1
-  model: x-ai/grok-4.6
+  model:
   timeout_seconds: 90
   app_title: Local AI CAD Agent
   app_url: ""
   session_prefix: local-ai-cad-agent
-  reasoning_effort: "low"
+  reasoning_effort: "medium"
   # OpenRouter provider routing order, highest priority first. OpenRouter
   # walks this list and only falls back to its internal pool if every named
   # upstream is unavailable. Use ``"<provider>/<quantization>"`` slugs such
@@ -34,8 +34,6 @@ openrouter:
   # legacy ``provider`` string below.
   provider_order:
     - z-ai/fp8
-    - novita/fp8
-    - deepinfra/fp4
   # Legacy single-provider config. Only consulted when ``provider_order`` is
   # empty. Pair with ``force_provider: true`` to pin to one upstream with no
   # fallback fanout; otherwise OpenRouter routes to a less-loaded peer if the
