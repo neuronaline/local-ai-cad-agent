@@ -124,6 +124,45 @@ class ConversationStore:
             log.flush()
 
     @classmethod
+    def append_event(
+        cls,
+        project_dir: Path,
+        event_type: str,
+        data: dict[str, Any],
+        *,
+        timestamp: str | None = None,
+    ) -> None:
+        """Persist an ``{timestamp, type, data}`` envelope event.
+
+        Centralises the ``conversation.jsonl`` writer so the SSE history
+        filters (``_load_history`` / ``_KEPT_ROLES``) and the EventBus
+        status persistence share a single lock and a single lazily-opened
+        append handle. Previously the two writers — ``ConversationStore.append``
+        and ``app._append_conversation`` — shared the lock by reference but
+        each opened its own file handle with an incompatible payload schema,
+        which made a future refactor that swapped the lock slot or split the
+        file silently break either the LLM context or the SSE history view.
+        """
+        cls.invalidate(project_dir)
+        record = {
+            "timestamp": timestamp or cls._now_iso(),
+            "type": event_type,
+            "data": data,
+        }
+        log = cls._get_log_handle(project_dir)
+        with shared_history_lock():
+            log.write(
+                json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+            )
+            log.flush()
+
+    @staticmethod
+    def _now_iso() -> str:
+        from datetime import datetime, timezone
+
+        return datetime.now(timezone.utc).isoformat()
+
+    @classmethod
     def _get_log_handle(cls, project_dir: Path) -> Any:
         """Return a cached append-mode handle for ``project_dir``.
 

@@ -29,8 +29,9 @@ from flask import (
     send_file,
     stream_with_context,
 )
-from werkzeug.exceptions import RequestEntityTooLarge
+from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
 
+from agent.conversation import ConversationStore
 from agent.core import AgentRunner, _history_lock_slot
 from agent.images import store_images
 from agent.io import utc_now_iso
@@ -101,11 +102,14 @@ class EventBus:
             if isinstance(project, str) and project:
                 project_dir = self._workspace_root() / project
                 if project_dir.is_dir():
-                    with self._history_lock:
-                        _append_conversation(
-                            project_dir,
-                            {"timestamp": utc_now_iso(), "type": event_type, "data": data},
-                        )
+                    # Route through the central conversation writer so the
+                    # EventBus status path and ``ConversationStore.append``
+                    # share one lock and one append handle. The split-writer
+                    # risk called out in the audit (file handle schema drift
+                    # silently breaking LLM context vs. SSE history) is gone.
+                    ConversationStore.append_event(
+                        project_dir, event_type, data, timestamp=utc_now_iso()
+                    )
         event = {"type": event_type, "data": data}
         with self._lock:
             subscribers = list(self._subscribers)
@@ -186,11 +190,6 @@ def _redact_history_event(event: dict[str, Any]) -> dict[str, Any]:
     cleaned = dict(event)
     cleaned["content"] = parts
     return cleaned
-
-
-def _append_conversation(project_dir: Path, event: dict[str, Any]) -> None:
-    with (project_dir / "conversation.jsonl").open("a", encoding="utf-8") as log:
-        log.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
 # Module-level lock guarding the idempotency cache dict. The cache is touched
@@ -449,6 +448,36 @@ def create_app(settings: Settings | None = None) -> Flask:
     @app.errorhandler(RequestEntityTooLarge)
     def upload_too_large(_error):
         return jsonify({"error": "The request is too large; upload at most five 10 MB images."}), 413
+
+    @app.errorhandler(HTTPException)
+    def http_exception(error):
+        # Werkzeug HTTPException subclasses carry their own status code and
+        # description (404 for missing project, 405 for wrong method, etc.).
+        # Returning JSON instead of the default HTML page keeps the API
+        # contract consistent for the bundled UI/JS, which expects every
+        # response — including errors — to be JSON-parseable.
+        response = jsonify(
+            {
+                "error": error.description or error.name,
+                "status": error.code,
+            }
+        )
+        return response, error.code or 500
+
+    @app.errorhandler(Exception)
+    def unhandled_exception(error):
+        # Any other exception (KeyError, AttributeError, lock acquisition
+        # failure, serialization bug, …) is rendered as JSON so the
+        # JavaScript client never sees an HTML 500 page. The generic body
+        # hides internals from the user; the full traceback is logged
+        # server-side via Flask's logger for the operator.
+        app.logger.exception("Unhandled exception in Flask route")
+        return jsonify(
+            {
+                "error": "Internal server error.",
+                "type": type(error).__name__,
+            }
+        ), 500
 
     @app.get("/")
     def index() -> str:
@@ -1124,12 +1153,19 @@ def create_app(settings: Settings | None = None) -> Flask:
                     "project": project_name,
                     "message": f"Restore succeeded but CAD rebuild failed: {error}",
                 })
+                # 207 Multi-Status signals a partial-success: ``model.py`` was
+                # restored, but the rebuild that re-derives ``preview.stl`` /
+                # ``render.png`` failed. The explicit ``ok: false`` plus a
+                # top-level ``error`` field lets clients detect the failure
+                # without inspecting ``build_status``; the 207 keeps the
+                # surrounding 2xx semantic that the restore half succeeded.
                 return jsonify({
+                    "ok": False,
                     "restored": True,
                     "revision_id": revision.id,
                     "build_status": "failed",
                     "error": str(error),
-                })
+                }), 207
 
             preview_id = runner._register_preview(project_name, project_dir)
             bus.publish("preview_updated", {
@@ -1142,6 +1178,7 @@ def create_app(settings: Settings | None = None) -> Flask:
                 "message": "Restored model is being displayed…",
             })
             return jsonify({
+                "ok": True,
                 "restored": True,
                 "revision_id": revision.id,
                 "build_status": "succeeded",

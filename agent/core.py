@@ -592,7 +592,21 @@ class AgentRunner:
 
             detail = str(error)
             err_type = type(error).__name__
+            tb_text = traceback.format_exc()
             traceback.print_exc()
+            # Persist a structured record for the operator. ``debug-errors.jsonl``
+            # is opt-in via ``agent.debug_log_tool_errors``; treat agent-loop
+            # faults as recoverable so they share the same audit trail instead
+            # of vanishing into stderr.
+            self._debug_tool_error(
+                project_dir,
+                call_id="",
+                tool="agent_loop",
+                error=error,
+                result="",
+                phase="agent_loop",
+                traceback_text=tb_text,
+            )
             if "message_id" in locals():
                 self.publish(
                     "agent_stream_end",
@@ -612,6 +626,7 @@ class AgentRunner:
                     "agent_error",
                     {
                         "project": project,
+                        "error_type": err_type,
                         "message": self._user_error_message(detail, err_type, provider=self.settings.llm_provider),
                     },
                 )
@@ -690,10 +705,19 @@ class AgentRunner:
 
     @staticmethod
     def _failure_signature(message: str) -> str:
-        """Collapse volatile line numbers so equivalent failures match."""
+        """Collapse volatile line numbers so equivalent failures match.
+
+        Returns a short hash of the *full* normalized text. Hashing the entire
+        message (instead of slicing the trailing 1000 chars) prevents
+        distinct long errors from accidentally colliding when the tail of the
+        text happens to line up — e.g. an OOM traceback that ends in a shared
+        subprocess stderr tail.
+        """
+        import hashlib
+
         normalized = re.sub(r"\bline \d+\b", "line #", message.lower())
         normalized = re.sub(r"\b0x[0-9a-f]+\b", "0x#", normalized)
-        return normalized[-1000:]
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
 
     @classmethod
     def _load_history(cls, project_dir: Path) -> list[dict]:
@@ -799,12 +823,27 @@ class AgentRunner:
             else "https://openrouter.ai/keys"
         )
 
+        # Cancellation takes priority: "cancelled" / "stop" substrings are
+        # common in unrelated error messages, so check ``err_type`` first
+        # (RequestCancelled lives in ``agent.llm_base``) and only fall back
+        # to the substring match for callers that do not pass the type.
+        if err_type == "RequestCancelled" or "task was cancelled" in lower:
+            return "Task was cancelled."
         if "401" in detail or "unauthorized" in lower or "invalid api key" in lower:
             return f"Invalid {provider_name} API key. Check your key at {key_url}."
         if "429" in detail or "rate limit" in lower:
             return f"{provider_name} rate limit reached. Wait a moment and try again."
-        if "model" in lower and (
-            "not found" in lower or "invalid" in lower or "not available" in lower
+        # OpenRouter/OpenAI error bodies phrase missing-model problems as
+        # contiguous tokens (e.g. ``model not found``, ``model not available``,
+        # ``model is invalid``). Decoupled substring matching — ``"model"`` and
+        # ``"not found"`` independently — would misroute unrelated errors that
+        # happen to mention "model" (e.g. ``FileNotFoundError: model.py``),
+        # sending the agent chasing a phantom configuration problem.
+        if (
+            "model not found" in lower
+            or "model not available" in lower
+            or "model is invalid" in lower
+            or "invalid model" in lower
         ):
             return f"The configured model is not available: {detail}"
         if (
@@ -820,12 +859,8 @@ class AgentRunner:
             return f"Connection to {provider_name} timed out. Check your internet connection."
         if "timeout" in lower or "timed out" in lower:
             return "CAD code execution timed out. Try simplifying the design or increasing the timeout."
-        if "export" in lower and ("step" in lower or "stl" in lower):
-            return f"Export failed: {detail}"
         if "permission" in lower or "access denied" in lower or "not writable" in lower:
             return f"Workspace permission error: {detail}"
-        if "cancelled" in lower or "stop" in lower:
-            return "Task was cancelled."
 
         return detail
 
@@ -835,13 +870,23 @@ class AgentRunner:
         """Return a fresh ``preview_id`` correlation token.
 
         The token is published alongside ``preview_updated`` so the UI can
-        decide whether to fetch the new STL. The agent turn no longer parks
-        its completion on a browser ACK; the host's render-failure path
+        decide whether to fetch the new STL. The host's render-failure path
         surfaces any consumer error through ``agent_error`` independently.
         """
         preview_path = project_dir / "preview.stl"
         if not preview_path.is_file() or preview_path.stat().st_size == 0:
-            raise RuntimeError("CAD execution did not save a usable preview.")
+            # The CAD tool already produces a structured RuntimeError with
+            # the actual sandbox/build123d cause (``_failure_detail``). When
+            # that signal is missing we still surface the workspace path and
+            # filesystem state so the operator can see whether the file was
+            # never produced or removed after the build returned.
+            exists = preview_path.is_file()
+            size = preview_path.stat().st_size if exists else 0
+            raise RuntimeError(
+                "CAD execution did not save a usable preview: "
+                f"preview.stl missing or empty at {preview_path} "
+                f"(exists={exists}, size={size})."
+            )
         return uuid.uuid4().hex
 
     @staticmethod
@@ -905,21 +950,46 @@ class AgentRunner:
         tool: str,
         error: Exception,
         result: str,
+        *,
+        phase: str = "tool_call",
+        traceback_text: str | None = None,
     ) -> None:
-        """Append recoverable tool failures to a project-local debug log."""
+        """Append recoverable tool failures to a project-local debug log.
+
+        ``phase`` distinguishes the dispatcher ``tool_call`` records (which
+        carry the ``tool_results.failure`` classification envelope) from
+        internal ``agent_loop`` faults (which carry an optional
+        ``traceback_text``). The shared file format keeps the on-disk
+        footprint stable for downstream tools.
+        """
         if not self.settings.agent_debug_log_tool_errors:
             return
         try:
-            payload = json.loads(result)
-            error_detail = payload.get("error", {}) if isinstance(payload, dict) else {}
-            entry = {
+            entry: dict[str, object] = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "call_id": call_id,
                 "tool": tool,
+                "phase": phase,
                 "error_type": type(error).__name__,
                 "message": str(error),
-                "classification": error_detail,
             }
+            if phase == "tool_call":
+                # Best-effort: decode the existing tool_results.failure
+                # envelope for downstream reconciliation. Skip silently when
+                # the result is not the expected JSON shape.
+                try:
+                    payload = json.loads(result) if isinstance(result, str) else None
+                except (TypeError, ValueError):
+                    payload = None
+                error_detail = (
+                    payload.get("error", {}) if isinstance(payload, dict) else {}
+                )
+                entry["classification"] = error_detail
+            if traceback_text:
+                # Cap traceback size so a runaway loop does not grow the log
+                # without bound; the cap mirrors the dispatcher's
+                # ``_failure_detail`` truncation.
+                entry["traceback"] = traceback_text[-4000:]
             with (
                 _shared_history_lock(),
                 (project_dir / "debug-errors.jsonl").open(
