@@ -13,6 +13,7 @@ on. Production callers should treat this module as internal.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -63,12 +64,50 @@ def export_history(store, target_dir: Path) -> Path:
         return archive_path
 
 
+def _validate_blob_payload(blobs_data: dict) -> dict[str, bytes]:
+    """Return a sha256 → bytes mapping after verifying every payload.
+
+    Each key in the archive must be a 64-char hex SHA-256 and the
+    corresponding value (utf-8 source) must hash to that digest. The
+    previous implementation deferred this check to ``_write_blob_bytes``
+    inside the per-revision write loop, which meant a corrupt blob on
+    revision 20 of 50 left revisions 0..19 written to disk and the
+    project in a zombie state — and the head pointer never advanced.
+    Doing it up front means an archive either imports cleanly or not
+    at all.
+    """
+    validated: dict[str, bytes] = {}
+    for sha, content in blobs_data.items():
+        if not (isinstance(sha, str) and _SHA256_RE.fullmatch(sha)):
+            raise RevisionIntegrityError(
+                f"Archive blob key is not a valid sha256: {sha!r}"
+            )
+        if not isinstance(content, str):
+            raise RevisionIntegrityError(
+                f"Archive blob {sha} payload is not a string."
+            )
+        encoded = content.encode("utf-8")
+        actual = hashlib.sha256(encoded).hexdigest()
+        if actual != sha:
+            raise RevisionIntegrityError(
+                f"Archive blob {sha} content does not match its declared digest "
+                f"(got {actual})."
+            )
+        validated[sha] = encoded
+    return validated
+
+
 def import_history(store, archive_path: Path) -> int:
     """Import revisions from a previously exported archive.
 
     Existing history is preserved; imported revisions that would collide
     with existing IDs are skipped. Build records attached to imported
     revisions are restored. Returns the number of revisions imported.
+
+    The import is transactional: every blob and revision manifest is
+    validated in memory first, and only after the full validation
+    passes do we touch disk. A single corrupt blob therefore leaves the
+    store exactly as it was, instead of leaving a zombie partial import.
     """
     with store._lock:
         try:
@@ -84,7 +123,14 @@ def import_history(store, archive_path: Path) -> int:
         if not isinstance(blobs_data, dict):
             raise RevisionIntegrityError("Archive blobs section is malformed.")
 
-        imported = 0
+        # Phase 1: validate every blob payload in memory. Any failure
+        # aborts the import before a single byte is written.
+        validated_blobs = _validate_blob_payload(blobs_data)
+
+        # Phase 2: pre-parse every revision manifest + build record.
+        # Build the list of pending writes; skip malformed entries
+        # exactly as before, but never half-commit.
+        pending: list[tuple[Revision, BuildRecord | None]] = []
         for revision_data in archive.get("revisions", []):
             if not isinstance(revision_data, dict):
                 continue
@@ -99,28 +145,47 @@ def import_history(store, archive_path: Path) -> int:
             if not _SHA256_RE.fullmatch(model_sha256):
                 continue
 
-            # Write blob if provided.
-            if model_sha256 in blobs_data and not (
+            # Skip revisions whose blob failed validation — they would
+            # never be importable, but raise explicitly so an operator
+            # sees the broken digest instead of silent loss.
+            if model_sha256 not in validated_blobs and not (
                 store._blobs_dir / f"{model_sha256}.py"
             ).is_file():
-                blob_content = str(blobs_data[model_sha256])
-                store._write_blob_bytes(blob_content.encode("utf-8"), model_sha256)
+                raise RevisionIntegrityError(
+                    f"Archive references revision {rev_id} with sha256 "
+                    f"{model_sha256} but provides no matching blob."
+                )
 
-            # Write revision manifest.
             try:
                 revision = Revision.from_dict(revision_data)
             except (KeyError, TypeError):
                 continue  # Skip malformed revision entries.
-            store._write_revision(revision)
 
-            # Write build record if present.
+            build_record: BuildRecord | None = None
             build_data = revision_data.get("build")
             if isinstance(build_data, dict):
                 try:
-                    store._append_build(BuildRecord.from_dict(build_data))
+                    build_record = BuildRecord.from_dict(build_data)
                 except (KeyError, TypeError):
-                    pass  # Best-effort; skip malformed build data.
+                    build_record = None
 
+            pending.append((revision, build_record))
+
+        # Phase 3: write everything. ``_write_blob_bytes`` may still
+        # raise ``RevisionIntegrityError`` if the on-disk blob disagrees
+        # with its declared digest, but that is the canonical integrity
+        # path — a different failure mode from the import-time
+        # corruption we just guarded against.
+        imported = 0
+        for revision, build_record in pending:
+            model_sha256 = revision.model_sha256
+            if model_sha256 in validated_blobs and not (
+                store._blobs_dir / f"{model_sha256}.py"
+            ).is_file():
+                store._write_blob_bytes(validated_blobs[model_sha256], model_sha256)
+            store._write_revision(revision)
+            if build_record is not None:
+                store._append_build(build_record)
             imported += 1
 
         # If no head exists, adopt the archive head.

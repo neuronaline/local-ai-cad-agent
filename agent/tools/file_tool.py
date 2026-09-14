@@ -6,6 +6,8 @@ import json
 import math
 import operator
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from agent.revisions import RevisionOrigin, RevisionStore
@@ -35,25 +37,44 @@ _BINARY_OPERATORS = {
     ast.Div: operator.truediv,
     ast.Pow: operator.pow,
 }
-# Only ``model.py`` is editable (see ``EDITABLE_FILES``), so every path
-# that reaches ``_file_lock`` resolves to that single file. A single
-# module-level RLock is enough to serialise concurrent writes against
-# ``model.py`` across projects; the previous dictionary keying grew
-# without eviction (audit_270).
-_MODEL_FILE_LOCK: threading.RLock = threading.RLock()
+# Per-project locks for ``model.py`` writes. The previous design used a
+# single module-level :class:`threading.RLock` so writes from unrelated
+# projects blocked each other (audit_032). A second attempt keyed a
+# dict per project but tried to evict idle entries — and because the
+# eviction ran in the same critical section as the ref-count decrement,
+# a writer that had already bumped ``refs`` and grabbed the ``RLock``
+# reference could outlive the pop and end up serialising against a
+# brand-new ``RLock`` allocated for the next caller, breaking mutual
+# exclusion (audit_032 follow-up).
+#
+# The race-free design keeps every ``RLock`` for the lifetime of the
+# process. The dict grows by exactly one entry per project ever created
+# on the host (the project list is bounded by user action), so memory
+# cost is negligible in practice.
+_MODEL_FILE_LOCKS: dict[str, threading.RLock] = {}
+_MODEL_FILE_LOCKS_GUARD: threading.Lock = threading.Lock()
 
 
-def _file_lock(path: Path) -> threading.RLock:
-    """Return the lock used to serialise writes to ``model.py``.
+@contextmanager
+def _file_lock(path: Path) -> Iterator[threading.RLock]:
+    """Serialise writes to ``model.py`` per project.
 
-    The argument is ignored for backwards compatibility with call sites
-    that pass the resolved path. New callers may pass any value (the
-    editable-file check upstream guarantees ``model.py``); the shared
-    lock ensures consistent cross-project serialisation without any
-    per-path bookkeeping.
+    Only ``model.py`` is editable (see ``EDITABLE_FILES``), so keying by
+    ``path.parent`` (= the project directory) is sufficient: two writes
+    for the same project share a lock while writes for different projects
+    run in parallel (audit_032).
     """
-    del path  # explicit: the path no longer keys the lock.
-    return _MODEL_FILE_LOCK
+    key = str(path.parent)
+    with _MODEL_FILE_LOCKS_GUARD:
+        lock = _MODEL_FILE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _MODEL_FILE_LOCKS[key] = lock
+    lock.acquire()
+    try:
+        yield lock
+    finally:
+        lock.release()
 
 
 class ModelPreflight(ast.NodeVisitor):
@@ -465,9 +486,13 @@ class FileTool:
                 )
             updated = current.replace(old_string, new_string, 1)
             start_line = current[: current.find(old_string)].count("\n") + 1
-            old_lines = old_string.count("\n") or 1
+            # ``splitlines()`` correctly counts trailing fragments that lack
+            # a final newline (audit_032). The previous ``count("\n") or 1``
+            # undercounted any ``old_string`` whose last line was unterminated
+            # — a common case when the LLM copies just the body of a block.
+            old_lines = len(old_string.splitlines()) or 1
             end_line = start_line + old_lines - 1
-            new_lines = new_string.count("\n") or 1
+            new_lines = len(new_string.splitlines()) or 1
             new_end_line = start_line + new_lines - 1
             base = self._write_model(updated, "edit_file")
         return (
@@ -588,9 +613,12 @@ class FileTool:
                 parts.append(current[cursor:start])
                 parts.append(new_string)
                 start_line = current[:start].count("\n") + 1
-                old_lines = old_string.count("\n") or 1
+                # ``splitlines()`` correctly counts trailing fragments
+                # that lack a final newline (audit_032). See the matching
+                # comment in ``edit_file`` above.
+                old_lines = len(old_string.splitlines()) or 1
                 end_line = start_line + old_lines - 1
-                new_lines = new_string.count("\n") or 1
+                new_lines = len(new_string.splitlines()) or 1
                 new_end_line = start_line + new_lines - 1
                 ranges.append((start_line, end_line, new_end_line))
                 cursor = end

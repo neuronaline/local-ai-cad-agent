@@ -20,9 +20,14 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from PIL import Image, ImageDraw
 
 from agent.cad_review import (
     review_cad,
@@ -30,6 +35,7 @@ from agent.cad_review import (
 )
 from agent.review_paths import review_dir as review_path_for
 from agent.tools.cad_screenshot_tool import CadScreenshotTool
+from agent.tools.cad_scripts.renderer import VIEWS
 from agent.tools.process_runner import MAX_SANDBOX_TIMEOUT_SECONDS
 from agent.tools.tool_events import publish_tool_phase
 
@@ -152,6 +158,13 @@ class CadReviewTool:
         preview_sha = evidence.preview_sha
         request_text = self._latest_user_request()
         model_source = self._load_model_source()
+        # Track the narrowed contact sheet so its lifetime spans the
+        # ``review_cad`` call and the temp file is always cleaned up.
+        # Without this we'd either mutate ``contact_sheet["view_order"]``
+        # and lie to the multimodal reviewer (the previous bug — the
+        # on-disk PNG still showed all eight tiles) or leak a temp file
+        # when the review raised.
+        narrowed_sheet_path: Path | None = None
         # Filter the visual manifest to the agent's narrowed subset when the
         # agent asked for one; the deterministic layer keeps checking the full
         # model so narrowed views do not hide a real defect.
@@ -181,39 +194,89 @@ class CadReviewTool:
                 )
             review_manifest = dict(review_manifest)
             review_manifest["views"] = narrowed_views
-            # Keep the prompt's tile ordering consistent with the narrowed
-            # ``allowed_view_ids`` enforced by ``_coerce_finding``; otherwise
-            # the reviewer can attribute findings to a tile that the visual
-            # layer then silently strips via ``view_id = None``.
+            # Re-compose a narrowed contact sheet from the per-view PNGs that
+            # already exist on disk. The previous implementation only narrowed
+            # ``view_order`` in the manifest while leaving the on-disk PNG
+            # untouched, so the multimodal reviewer saw eight tiles but was
+            # told "left to right: [x_positive]" — a guaranteed recipe for
+            # it to invent findings on the wrong tiles. The narrowed sheet
+            # is written to a temp file so the canonical review evidence is
+            # never modified by a read-time filter; ``_verify_artifact_hashes``
+            # below then re-hashes the new PNG and confirms the manifest
+            # matches what the reviewer actually sees.
+            views_dir = sheet_path.parent / "views"
+            requested_ids = tuple(
+                entry.get("view_id")
+                for entry in narrowed_views
+                if isinstance(entry, dict)
+                and isinstance(entry.get("view_id"), str)
+            )
+            sheet_fd, sheet_temp_str = tempfile.mkstemp(
+                prefix="cad-review-narrowed-", suffix=".png"
+            )
+            os.close(sheet_fd)
+            narrowed_sheet_path = Path(sheet_temp_str)
+            try:
+                sheet_meta = self._compose_narrowed_contact_sheet(
+                    views_dir, requested_ids, narrowed_sheet_path
+                )
+            except Exception:
+                # Clean up the half-written temp file on the failure path so
+                # we don't leave zero-byte residue around when an exception
+                # fires between ``mkstemp`` and the compose helper.
+                try:
+                    narrowed_sheet_path.unlink()
+                except OSError:
+                    pass
+                narrowed_sheet_path = None
+                raise
             contact_sheet = review_manifest.get("contact_sheet")
-            if isinstance(contact_sheet, dict):
-                contact_sheet = dict(contact_sheet)
-                contact_sheet["view_order"] = [
-                    entry.get("view_id")
-                    for entry in narrowed_views
-                    if isinstance(entry, dict)
-                    and isinstance(entry.get("view_id"), str)
-                ]
-                review_manifest["contact_sheet"] = contact_sheet
+            if not isinstance(contact_sheet, dict):
+                contact_sheet = {}
+            contact_sheet = dict(contact_sheet)
+            contact_sheet.update(
+                {
+                    "view_order": sheet_meta["view_order"],
+                    "image_sha256": sheet_meta["image_sha256"],
+                    "image_bytes": sheet_meta["image_bytes"],
+                    "width": sheet_meta["width"],
+                    "height": sheet_meta["height"],
+                    "tile_width": sheet_meta["tile_width"],
+                    "tile_height": sheet_meta["tile_height"],
+                    "path": narrowed_sheet_path.name,
+                    "narrowed_from_canonical": True,
+                }
+            )
+            review_manifest["contact_sheet"] = contact_sheet
+            sheet_path = narrowed_sheet_path
         # Pre-flight the manifest itself: the contact sheet + single render
         # must hash-match so the reviewer can't be tricked into visualising
         # a tampered file.
         self._verify_artifact_hashes(review_manifest, sheet_path, render_path)
         self._emit_status("reviewing", "Running deterministic + visual review…")
         # Direct LLM call (no subprocess) so the reviewer's stop_event is
-        # honoured by the chat-completions cancel path.
-        result = review_cad(
-            settings=self._settings,
-            request_text=request_text,
-            model_source=model_source,
-            metrics=metrics if isinstance(metrics, dict) else {},
-            feature_summary=feature_summary if isinstance(feature_summary, dict) else {},
-            review_manifest=review_manifest,
-            sheet_path=sheet_path,
-            single_render_path=render_path,
-            validation_results=validation_results,
-            stop_event=self._stop_event,
-        )
+        # honoured by the chat-completions cancel path. ``finally`` cleans
+        # up the temp narrowed contact sheet so the cleanup is symmetric
+        # across success / cancel / exception paths.
+        try:
+            result = review_cad(
+                settings=self._settings,
+                request_text=request_text,
+                model_source=model_source,
+                metrics=metrics if isinstance(metrics, dict) else {},
+                feature_summary=feature_summary if isinstance(feature_summary, dict) else {},
+                review_manifest=review_manifest,
+                sheet_path=sheet_path,
+                single_render_path=render_path,
+                validation_results=validation_results,
+                stop_event=self._stop_event,
+            )
+        finally:
+            if narrowed_sheet_path is not None:
+                try:
+                    narrowed_sheet_path.unlink()
+                except OSError:
+                    pass
         # Persist the verdict next to the manifest so the UI status pill
         # can render without a separate API call.
         model_sha = (
@@ -457,6 +520,85 @@ class CadReviewTool:
             return model_path.read_text(encoding="utf-8") if model_path.is_file() else ""
         except OSError:
             return ""
+
+    @staticmethod
+    def _compose_narrowed_contact_sheet(
+        views_dir: Path,
+        requested_ids: tuple[str, ...],
+        output_path: Path,
+    ) -> dict[str, object]:
+        """Build a labelled contact sheet containing only the requested views.
+
+        Mirrors :func:`agent.tools.cad_scripts.renderer.build_contact_sheet`
+        but composes a sheet from a caller-specified subset of
+        :data:`VIEWS`. The per-view PNGs at ``views_dir/<view_id>.png`` are
+        the canonical rasters produced by ``cad_build_and_verify``; the
+        host can re-stitch them into a smaller grid without re-running the
+        bubblewrap pipeline.
+
+        Returns a metadata dict whose ``image_sha256`` / ``image_bytes`` /
+        ``view_order`` keys are written back into ``review_manifest`` so
+        ``_verify_artifact_hashes`` and the visual layer agree on what the
+        multimodal reviewer is looking at. Raises :class:`RuntimeError`
+        when no requested view can be located on disk; this preserves the
+        strict "no evidence = inconclusive" contract instead of silently
+        feeding the LLM an empty image.
+        """
+        views_dir = Path(views_dir)
+        output_path = Path(output_path)
+        requested_set = set(requested_ids)
+        # Iterate the canonical VIEWS order so the narrow sheet's
+        # ``view_order`` matches the labels the runner writes.
+        ordered_views: list[tuple[Any, Path]] = []
+        for spec in VIEWS:
+            if spec.view_id not in requested_set:
+                continue
+            candidate = views_dir / f"{spec.view_id}.png"
+            if candidate.is_file() and candidate.stat().st_size > 0:
+                ordered_views.append((spec, candidate))
+        if not ordered_views:
+            raise RuntimeError(
+                "cad_review could not compose a narrowed contact sheet: "
+                f"no on-disk view matched {sorted(requested_set)!r}."
+            )
+        # Pick the per-tile size from the first available PNG; subset
+        # renders can differ per call so the sheet must match the latest
+        # pixel size.
+        first_path = ordered_views[0][1]
+        with Image.open(first_path) as first:
+            tile_w, tile_h = first.size
+        sheet_label_height = 28
+        columns = min(4, len(ordered_views))
+        rows = max(1, math.ceil(len(ordered_views) / columns))
+        sheet = Image.new(
+            "RGB",
+            (tile_w * columns, (tile_h + sheet_label_height) * rows),
+            (23, 25, 29),
+        )
+        draw = ImageDraw.Draw(sheet)
+        for index, (spec, path) in enumerate(ordered_views):
+            x = (index % columns) * tile_w
+            y = (index // columns) * (tile_h + sheet_label_height)
+            with Image.open(path) as source:
+                sheet.paste(source, (x, y))
+            draw.text(
+                (x + 8, y + tile_h + 6),
+                f"{spec.label} ({spec.view_id})",
+                fill=(210, 220, 240),
+            )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        sheet.save(output_path, "PNG", optimize=True)
+        body = output_path.read_bytes()
+        return {
+            "path": output_path.name,
+            "width": sheet.size[0],
+            "height": sheet.size[1],
+            "tile_width": tile_w,
+            "tile_height": tile_h,
+            "view_order": [spec.view_id for spec, _path in ordered_views],
+            "image_sha256": hashlib.sha256(body).hexdigest(),
+            "image_bytes": len(body),
+        }
 
     def _latest_user_request(self) -> str:
         history_path = self.project_dir / "conversation.jsonl"

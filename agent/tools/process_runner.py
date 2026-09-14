@@ -38,6 +38,22 @@ class TimedOut(RuntimeError):
         self.stderr = stderr
 
 
+class ProcessSlot:
+    """Mutable holder for the in-flight sandbox subprocess.
+
+    Replaces a list-literal process slot (``[self._process]``) which the
+    garbage collector freed as soon as the helper returned, leaving the
+    caller's ``self._process`` permanently ``None`` and turning ``stop()``
+    into a no-op. ``run_sandbox_subprocess`` mutates ``process`` in place
+    under the tool's lock; ``stop()`` reads it back.
+    """
+
+    __slots__ = ("process",)
+
+    def __init__(self) -> None:
+        self.process: subprocess.Popen[str] | None = None
+
+
 class _RingBuffer:
     """Thread-safe circular buffer capped at ``max_bytes`` bytes."""
 
@@ -154,15 +170,20 @@ def run_sandbox_subprocess(
     seccomp_fd: int,
     timeout_seconds: float,
     lock: threading.Lock,
-    process_slot: list[subprocess.Popen[str]],
+    process_slot: ProcessSlot,
     timeout_message: str,
 ) -> tuple[str, str, int]:
     """Spawn ``argv`` inside bubblewrap and stream stdout/stderr.
 
-    ``process_slot`` must be a single-element list; the helper assigns the
-    live :class:`subprocess.Popen` into ``process_slot[0]`` under ``lock`` so
-    :meth:`stop` can find it, and clears the slot inside ``finally`` once the
-    helper returns. Returns ``(stdout, stderr, returncode)`` on success.
+    ``process_slot`` must be a long-lived :class:`ProcessSlot` owned by the
+    caller (typically stored on ``self``). The helper assigns the live
+    :class:`subprocess.Popen` into ``process_slot.process`` under ``lock`` so
+    :meth:`stop` can find it, and clears the slot inside ``finally`` once
+    the helper returns. Using a mutable holder instead of a fresh
+    ``[self._process]`` list literal guarantees that the same object stays
+    alive for the duration of the call and is reachable from outside.
+
+    Returns ``(stdout, stderr, returncode)`` on success.
 
     Raises :class:`RuntimeError` on subprocess timeout (with
     ``timeout_message``) or when stdout/stderr exceeds the memory limit. The
@@ -180,7 +201,7 @@ def run_sandbox_subprocess(
                 pass_fds=(seccomp_fd,),
                 start_new_session=True,
             )
-            process_slot[0] = process
+            process_slot.process = process
         try:
             stdout, stderr = stream_with_limit(process, timeout=timeout_seconds)
         except TimedOut as error:
@@ -189,7 +210,7 @@ def run_sandbox_subprocess(
     finally:
         os.close(seccomp_fd)
         with lock:
-            process_slot[0] = None
+            process_slot.process = None
         # If ``stream_with_limit`` raised (timeout, memory-limit overflow, or
         # any other exception), ``process`` is still alive and would otherwise
         # be leaked: the slot has already been cleared, so ``stop()`` becomes

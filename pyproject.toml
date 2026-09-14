@@ -21,3 +21,8 @@ target-version = "py310"
 # previous log handles (rotation, cache eviction) — the caller has nothing
 # useful to do with such failures and we never want a retry loop.
 "agent/conversation.py" = ["BLE001", "S110"]
+# ``post_with_cancel`` force-closes the in-flight ``requests.Response``
+# (and its underlying socket) on the cancel path; the daemon worker will
+# GC the same object moments later, so swallowing close() failures is
+# the safe behaviour and we never want to surface them as agent errors.
+"agent/llm_base.py" = ["TRY004", "BLE001", "S110"]

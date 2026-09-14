@@ -39,35 +39,55 @@ class QuestionValidator:
             if not isinstance(qid, str):
                 return False
             required = q.get("required", True)
-            value = answers.get(qid, "")
-            if required and (not isinstance(value, str) or not value.strip()):
-                return False
-            if not isinstance(value, str) or not value.strip():
-                continue
             input_type = q.get("input_type", "text")
+            value = answers.get(qid, "")
+
+            # ``multiselect`` answers are JSON arrays (preferred) or legacy
+            # comma-separated strings. Treat both as legitimate "non-text"
+            # values and validate them below — the previous implementation
+            # bailed on ``not isinstance(value, str)`` before the multiselect
+            # branch could ever run, which made every JSON-array answer fail.
+            if input_type == "multiselect":
+                options = q.get("options", [])
+                if not isinstance(options, list):
+                    return False
+                if isinstance(value, list):
+                    selected = [str(v).strip() for v in value if str(v).strip()]
+                elif isinstance(value, str):
+                    selected = [v.strip() for v in value.split(",") if v.strip()]
+                else:
+                    # Anything else (number, null, …) is not a valid multiselect
+                    # payload. Fall through to the required-check below.
+                    selected = []
+                if not selected:
+                    # Empty selection is only valid for optional multiselects.
+                    if required:
+                        return False
+                    continue
+                if not all(v in options for v in selected):
+                    return False
+                continue
+
+            # All other input types expect a string. Reject non-string payloads
+            # (e.g. a stray list, None, or number) outright.
+            if not isinstance(value, str):
+                if required:
+                    return False
+                continue
+            if not value.strip():
+                if required:
+                    return False
+                continue
+
             if input_type == "select":
                 options = q.get("options", [])
                 if not isinstance(options, list) or value not in options:
                     return False
-            elif input_type == "multiselect":
-                options = q.get("options", [])
-                if not isinstance(options, list):
-                    return False
-                # Accept JSON arrays (preferred) or legacy comma-separated strings.
-                if isinstance(value, list):
-                    selected = [str(v).strip() for v in value if str(v).strip()]
-                else:
-                    selected = [v.strip() for v in str(value).split(",") if v.strip()]
-                if not selected:
-                    # All-optional: treat empty selection as valid.
-                    if required is False:
-                        continue
-                    return False
-                if not all(v in options for v in selected):
-                    return False
             elif input_type == "number":
                 if not QuestionValidator._is_valid_number_with_unit(value):
                     return False
+            # Plain "text" answers only need to be non-empty strings, which the
+            # strip() check above already enforced.
         return True
 
     @staticmethod

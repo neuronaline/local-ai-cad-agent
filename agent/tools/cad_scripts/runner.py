@@ -31,6 +31,29 @@ from pathlib import Path
 
 import numpy as np
 
+# OpenCASCADE surface orientation enum. The values are exposed via pybind11
+# as ``TopAbs_Orientation.TopAbs_FORWARD`` / ``TopAbs_REVERSED``. We import
+# defensively so the runner still functions (with the legacy heuristic only)
+# on hosts that ship without ``OCP``. On the sandbox image ``OCP`` is always
+# available because ``build123d`` pulls it in transitively.
+try:  # pragma: no cover - exercised implicitly on the sandbox host
+    from OCP.TopAbs import (  # type: ignore[import-not-found]
+        TopAbs_Orientation as _TopAbs_Orientation,
+    )
+
+    _OCP_TOPABS_AVAILABLE = True
+except ImportError:  # pragma: no cover - host-only fallback
+    _TopAbs_Orientation = None  # type: ignore[assignment]
+    _OCP_TOPABS_AVAILABLE = False
+
+# Integer values that ``TopExp_Explorer`` returns for the orientation enum.
+# Holes (cavities inside material) have a ``REVERSED`` orientation because
+# their lateral normal points into the void; bosses / studs / external
+# cylinders have a ``FORWARD`` orientation because their lateral normal
+# points away from the material.
+_TOPABS_FORWARD = 0
+_TOPABS_REVERSED = 1
+
 # ``renderer`` is a sibling module in the same sandbox workspace; defer the
 # import so this file stays importable from the host side (it is consumed
 # indirectly by ``agent.tools.cad_tool`` which only reads path constants).
@@ -87,6 +110,32 @@ def _axial_extent(bbox, axis: tuple[float, float, float]) -> float:
     return abs(size_x * axis[0]) + abs(size_y * axis[1]) + abs(size_z * axis[2])
 
 
+def _face_orientation(face) -> int | None:
+    """Return the ``TopAbs_Orientation`` integer for ``face``, or ``None``.
+
+    Returns ``None`` when ``OCP`` is unavailable or the wrapped shape does
+    not expose ``Orientation()``; callers fall back to the legacy heuristic
+    in that case. The integer codes are:
+
+    * ``_TOPABS_FORWARD`` (0) — outer surface / boss / protrusion; the
+      geometric normal points away from the solid material.
+    * ``_TOPABS_REVERSED`` (1) — inner cavity / hole; the geometric normal
+      points into the void.
+
+    Without this distinction, every cylindrical boss on a part would be
+    counted as a through hole (audit_028).
+    """
+    if not _OCP_TOPABS_AVAILABLE:
+        return None
+    try:
+        wrapped = getattr(face, "wrapped", None)
+        if wrapped is None:
+            return None
+        return int(wrapped.Orientation())
+    except Exception:  # noqa: BLE001 - malformed faces fall back to the legacy heuristic
+        return None
+
+
 def _candidate_cut_axes(shape) -> list[dict[str, object]]:
     """Detect cylindrical features that look like cuts/holes.
 
@@ -101,6 +150,15 @@ def _candidate_cut_axes(shape) -> list[dict[str, object]]:
     ``closed_circles >= 2`` heuristic misclassified blind holes as
     through (a flat-bottomed blind hole has both rim and bottom circles)
     and any through hole whose exit rim was filleted away (audit_026).
+
+    Cylindrical faces whose OpenCASCADE orientation is ``TopAbs_FORWARD``
+    (bosses, studs, mounting pins — i.e. material that protrudes outward)
+    are explicitly excluded from this enumeration. Their lateral normal
+    points away from the material, opposite to a real hole whose normal
+    points into the void (``TopAbs_REVERSED``). Without the orientation
+    guard, a 20 mm cylindrical stud on top of a plate would be reported
+    as a through hole and the deterministic reviewer would over-count
+    holes (audit_028).
     """
     bbox = shape.bounding_box()
     bbox_diag = _bbox_diag(bbox)
@@ -152,6 +210,15 @@ def _candidate_cut_axes(shape) -> list[dict[str, object]]:
         # determination is therefore defined on the cylindrical lateral
         # surface; end-caps contribute no signal.
         if geom_type == "CYLINDER":
+            # Skip cylindrical bosses / studs whose lateral normal points
+            # away from the material (``TopAbs_FORWARD``). Without this
+            # guard a 20 mm stud on top of a plate would be reported as a
+            # through hole and the deterministic reviewer would over-count
+            # holes (audit_028). When ``OCP`` is unavailable we fall back
+            # to the legacy heuristic for backward compatibility.
+            face_orient = _face_orientation(face)
+            if face_orient == _TOPABS_FORWARD:
+                continue
             lateral_length = area / (2.0 * math.pi * radius)
             extent = _axial_extent(bbox, axis)
             # Tolerance of 5 % of the part extent plus 0.5 mm (catches

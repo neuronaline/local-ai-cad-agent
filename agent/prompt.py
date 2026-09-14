@@ -1,6 +1,7 @@
 """The core system prompt used as the cacheable request prefix."""
 
 import hashlib
+import os
 from pathlib import Path
 from string import Template
 
@@ -9,6 +10,12 @@ _PLAYBOOK_PATH = (
 )
 
 _SUFFIX_FORMAT = """\n<build123d_cli_playbook>\n{playbook}\n</build123d_cli_playbook>"""
+
+# Set ``CAD_AGENT_PROMPT_HOT_RELOAD=1`` to make ``PromptCache.get_playbook``
+# re-stat and re-read the playbook on every prompt request. Off by default
+# because the playbook is a static markdown file shipped with the agent;
+# stat'ing it on every LLM call adds a syscall per request for no payoff.
+_HOT_RELOAD_ENV = "CAD_AGENT_PROMPT_HOT_RELOAD"
 
 _DESIGN_PRINCIPLES = """\
 Satisfy explicit dimensions and functional requirements first. Prefer compact,
@@ -130,14 +137,41 @@ def _render_base_prompt() -> str:
 _BASE_PROMPT = _render_base_prompt()
 
 
-class PromptCache:
-    """Lazy, mtime-aware prompt with embedded playbook content."""
+def _read_playbook_once() -> str:
+    """Read the playbook from disk at import time.
 
-    def __init__(self) -> None:
+    Reading on every prompt call added a syscall per LLM request for a
+    static markdown file; instead we read it once at module import and
+    hand the bytes to the cache. The ``CAD_AGENT_PROMPT_HOT_RELOAD``
+    env var opts back into the per-call re-read for development.
+    """
+    try:
+        return _PLAYBOOK_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+_BOOTSTRAP_PLAYBOOK = _read_playbook_once()
+
+
+class PromptCache:
+    """Lazy, mtime-aware prompt with embedded playbook content.
+
+    The playbook is loaded once at module import (``_BOOTSTRAP_PLAYBOOK``)
+    so the hot path does not stat or read the file on every request. The
+    ``hot_reload`` constructor flag (or the
+    ``CAD_AGENT_PROMPT_HOT_RELOAD`` env var) opts back into the original
+    mtime-aware behaviour for local development.
+    """
+
+    def __init__(self, *, hot_reload: bool | None = None) -> None:
         self._content: str | None = None
         self._playbook_content: str | None = None
         self._playbook_mtime: float | None = None
         self._last_playbook: str | None = None
+        if hot_reload is None:
+            hot_reload = os.environ.get(_HOT_RELOAD_ENV, "") == "1"
+        self._hot_reload: bool = hot_reload
 
     def get(self) -> str:
         playbook = self.get_playbook()
@@ -148,17 +182,26 @@ class PromptCache:
         return self._content
 
     def get_playbook(self) -> str:
-        """Return the playbook content, re-reading from disk when its mtime changes."""
-        playbook_path = _PLAYBOOK_PATH
+        """Return the playbook content.
+
+        Default: return the module-import snapshot, no filesystem calls.
+        With ``hot_reload=True``: re-stat the file and re-read only when
+        the mtime has changed (the original behaviour, useful when
+        iterating on the playbook content during development).
+        """
+        if not self._hot_reload:
+            if self._playbook_content is None:
+                self._playbook_content = _BOOTSTRAP_PLAYBOOK
+            return self._playbook_content
         try:
-            stat = playbook_path.stat()
+            stat = _PLAYBOOK_PATH.stat()
             mtime = stat.st_mtime
         except OSError:
             mtime = -1.0
         if self._playbook_content is not None and self._playbook_mtime == mtime:
             return self._playbook_content
         self._playbook_content = (
-            playbook_path.read_text(encoding="utf-8").strip() if mtime >= 0 else ""
+            _PLAYBOOK_PATH.read_text(encoding="utf-8").strip() if mtime >= 0 else ""
         )
         self._playbook_mtime = mtime
         return self._playbook_content
@@ -172,7 +215,7 @@ _PROMPT_CACHE = PromptCache()
 
 
 def get_system_prompt() -> str:
-    """Return the latest system prompt, re-reading the playbook if it changed on disk."""
+    """Return the latest system prompt, using the cached playbook by default."""
     return _PROMPT_CACHE.get()
 
 

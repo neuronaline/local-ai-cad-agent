@@ -4,7 +4,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import os
 import shutil
 import subprocess
 import tempfile
@@ -19,9 +18,11 @@ from agent.sandbox import command as sandbox_command
 from agent.tools.file_tool import FileTool
 from agent.tools.process_runner import (
     MAX_SANDBOX_TIMEOUT_SECONDS,
+    ProcessSlot,
     run_sandbox_subprocess,
     terminate,
 )
+from agent.tools.review_promotion import atomic_swap_directory
 from agent.tools.tool_events import publish_tool_phase
 
 # Sandbox-side script files. The host copies these into the bubblewrap
@@ -70,7 +71,15 @@ class CadTool:
         self._review_render_workers = max(1, int(review_render_workers))
         self._review_required_views = max(1, int(review_required_views))
         self._review_enabled = bool(review_enabled)
-        self._process: subprocess.Popen[str] | None = None
+        # ``ProcessSlot`` replaces the old ``self._process: Popen | None``
+        # attribute: passing ``[self._process]`` as a process slot would have
+        # produced a fresh list at every call site that the GC would free as
+        # soon as ``run_sandbox_subprocess`` returned, leaving ``self._process``
+        # permanently ``None`` and turning ``stop()`` into a no-op. The slot
+        # is a long-lived mutable holder, so the helper writes the running
+        # ``Popen`` into ``slot.process`` under the lock and ``stop()`` reads
+        # it back.
+        self._process = ProcessSlot()
         self._lock = threading.Lock()
         self._call_id = ""
 
@@ -169,7 +178,7 @@ class CadTool:
                     seccomp_fd=seccomp_fd,
                     timeout_seconds=MAX_SANDBOX_TIMEOUT_SECONDS,
                     lock=self._lock,
-                    process_slot=[self._process],
+                    process_slot=self._process,
                     timeout_message=(
                         f"CAD operation timed out after {MAX_SANDBOX_TIMEOUT_SECONDS} seconds."
                     ),
@@ -253,27 +262,47 @@ class CadTool:
     ) -> tuple[str, str]:
         """Copy multi-view review artifacts out of the bubblewrap workspace.
 
-        Returns the project-relative paths to the staged ``views/`` directory
-        and the contact sheet PNG. Both paths live under
-        ``project_dir/.review-staging/`` and survive the temp workspace
-        teardown so ``promote_review`` can verify and promote them. The
-        staging directory is recreated atomically each run; stale views from
-        previous renders do not bleed into the new manifest.
+        Returns the paths to a unique, per-call staging ``views/``
+        directory and contact sheet PNG. Both paths live under a
+        ``cad-review-staging-<random>/`` directory created next to the
+        project's review folder and removed by the caller (see
+        :meth:`promote_review`).
+
+        Each invocation used to reuse the same hard-coded
+        ``<project>/.review-staging`` directory and ``rmtree`` its
+        contents — a real race when two ``cad_build_and_verify`` runs
+        overlapped: a slow first job could see the second job's
+        ``rmtree`` followed by an unrelated ``mkdir`` and either crash
+        with ``FileNotFoundError`` or persist a half-built sheet as the
+        canonical evidence. A ``tempfile.mkdtemp`` per call removes the
+        shared global state; the directory survives the workspace
+        teardown so ``promote_review`` can verify and promote the
+        PNGs, and the helper is responsible for cleanup on its own
+        failure paths.
         """
-        staging_root = self.project_dir / ".review-staging"
+        staging_root = Path(
+            tempfile.mkdtemp(prefix="cad-review-staging-", dir=self.project_dir)
+        )
         source_views = workspace / ".review-views"
         source_sheet = workspace / ".review-sheet.png"
         if not source_views.is_dir():
+            shutil.rmtree(staging_root, ignore_errors=True)
             raise RuntimeError("Review views directory was not produced by the sandbox.")
         if not source_sheet.is_file() or source_sheet.stat().st_size == 0:
-            raise RuntimeError("Review contact sheet was not produced by the sandbox.")
-        if staging_root.exists():
             shutil.rmtree(staging_root, ignore_errors=True)
-        staging_root.mkdir(parents=True, exist_ok=True)
+            raise RuntimeError("Review contact sheet was not produced by the sandbox.")
         views_target = staging_root / "views"
-        shutil.copytree(source_views, views_target)
+        try:
+            shutil.copytree(source_views, views_target)
+        except Exception:
+            shutil.rmtree(staging_root, ignore_errors=True)
+            raise
         sheet_target = staging_root / "review-sheet.png"
-        shutil.copyfile(source_sheet, sheet_target)
+        try:
+            shutil.copyfile(source_sheet, sheet_target)
+        except Exception:
+            shutil.rmtree(staging_root, ignore_errors=True)
+            raise
         return str(views_target), str(sheet_target)
 
     def _enforce_basic_geometry(self, metrics: dict[str, Any]) -> None:
@@ -446,18 +475,12 @@ class CadTool:
                 json.dumps(persisted_manifest, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-            backup = review_dir.with_suffix(review_dir.suffix + ".previous")
-            if backup.exists():
-                shutil.rmtree(backup, ignore_errors=True)
-            if review_dir.exists():
-                os.replace(review_dir, backup)
-            try:
-                os.replace(staging, review_dir)
-            except OSError:
-                if backup.exists() and not review_dir.exists():
-                    os.replace(backup, review_dir)
-                raise
-            shutil.rmtree(backup, ignore_errors=True)
+            # ``atomic_swap_directory`` centralises the previous
+            # hand-rolled ``os.replace`` dance (with ``.previous``
+            # rollback + cleanup). The contract is now identical to
+            # ``cad_screenshot_tool._promote_to_cache``'s, so the two
+            # call sites can't drift again.
+            atomic_swap_directory(review_dir, staging)
         finally:
             if staging.exists():
                 shutil.rmtree(staging, ignore_errors=True)
@@ -608,7 +631,7 @@ class CadTool:
         Source parameters are extracted from the model AST.
         """
         if not isinstance(render, bool):
-            raise ValueError("build_and_verify render must be a boolean.")
+            raise TypeError("build_and_verify render must be a boolean.")
         execute_args: dict[str, Any] = {"render": render}
         if self._call_id:
             execute_args["call_id"] = self._call_id
@@ -659,7 +682,7 @@ class CadTool:
 
     def stop(self) -> None:
         with self._lock:
-            process = self._process
+            process = self._process.process
         if process is None:
             return
         terminate(process, force=False)

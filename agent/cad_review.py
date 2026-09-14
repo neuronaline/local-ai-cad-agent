@@ -669,21 +669,39 @@ def review_cad(
             model_sha256=model_sha,
             preview_sha256=preview_sha,
         )
-    # Strict verdict: any blocking or major forces fail.
-    has_blocking = any(f.severity == "blocking" for f in combined)
-    has_major = any(f.severity == "major" for f in combined)
-    if has_blocking or has_major:
+    # Strict verdict: any blocking or major forces fail. Split by source
+    # so the summary truthfully names the culprit layer — a clean
+    # deterministic layer must never be blamed for a visual-only failure.
+    deterministic_blocking_or_major = any(
+        f.severity in {"blocking", "major"} for f in deterministic_findings
+    )
+    visual_findings_list: list[Finding] = (
+        list(visual.findings) if visual is not None else []
+    )
+    visual_blocking_or_major = any(
+        f.severity in {"blocking", "major"} for f in visual_findings_list
+    )
+    if deterministic_blocking_or_major or visual_blocking_or_major:
         status = "fail"
     elif visual is None:
         status = "inconclusive"
     else:
         status = visual.status if visual.status in {"pass", "fail", "inconclusive"} else "inconclusive"
-    if visual is not None and visual.summary:
-        summary: str = visual.summary
-    elif has_blocking or has_major:
-        # The strict verdict forced ``fail``; surface the source of the
-        # failure so the UI does not show a stale visual summary.
+    # Pick the summary based on which layer actually reported the failure.
+    # The previous wording ("Deterministic verification reported ...")
+    # was applied whenever the *combined* list had a blocking/major
+    # finding, which meant a clean deterministic layer plus a visual
+    # failure was reported as a deterministic failure — a lie that sent
+    # operators hunting through the wrong code path.
+    if deterministic_blocking_or_major:
         summary = "Deterministic verification reported blocking or major failures."
+    elif visual_blocking_or_major:
+        summary = (
+            "Visual review reported blocking or major failures "
+            "(deterministic checks passed)."
+        )
+    elif visual is not None and visual.summary:
+        summary = visual.summary
     else:
         # Visual layer was skipped; combined still carries (minor-only)
         # deterministic findings, so the previous "Deterministic checks

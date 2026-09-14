@@ -29,7 +29,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import shutil
 import subprocess
 import tempfile
@@ -45,9 +44,11 @@ from agent.tools.cad_scripts import screenshot as screenshot_script
 from agent.tools.file_tool import FileTool
 from agent.tools.process_runner import (
     MAX_SANDBOX_TIMEOUT_SECONDS,
+    ProcessSlot,
     run_sandbox_subprocess,
     terminate,
 )
+from agent.tools.review_promotion import atomic_swap_directory
 from agent.tools.tool_events import publish_tool_phase
 
 _LOG = logging.getLogger(__name__)
@@ -76,7 +77,14 @@ class CadScreenshotTool:
         """Wire the orchestrator to the active project and shared publish bus."""
         self.project_dir = project_dir.resolve()
         self._publish = publish
-        self._process: subprocess.Popen[str] | None = None
+        # ``ProcessSlot`` replaces the previous ``self._process: Popen | None``
+        # attribute: passing ``[self._process]`` to the sandbox helper would
+        # have produced a one-shot list that the GC freed as soon as the call
+        # returned, leaving ``self._process`` permanently ``None`` and
+        # turning ``stop()`` into a no-op. The same long-lived slot is shared
+        # between ``stop()`` and ``run_sandbox_subprocess`` so the live
+        # ``Popen`` is reachable from outside the helper.
+        self._process = ProcessSlot()
         self._lock = threading.Lock()
         self._call_id = ""
 
@@ -99,7 +107,7 @@ class CadScreenshotTool:
     def stop(self) -> None:
         """Terminate any in-flight sandbox subprocess (used by AgentRunner)."""
         with self._lock:
-            process = self._process
+            process = self._process.process
         if process is None:
             return
         terminate(process, force=False)
@@ -656,7 +664,7 @@ class CadScreenshotTool:
                     seccomp_fd=seccomp_fd,
                     timeout_seconds=timeout_seconds,
                     lock=self._lock,
-                    process_slot=[self._process],
+                    process_slot=self._process,
                     timeout_message=(
                         f"cad_screenshot timed out after {timeout_seconds} seconds."
                     ),
@@ -788,18 +796,12 @@ class CadScreenshotTool:
                 json.dumps(merged, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-            backup = review_dir.with_suffix(review_dir.suffix + ".previous")
-            if backup.exists():
-                shutil.rmtree(backup, ignore_errors=True)
-            if review_dir.exists():
-                os.replace(review_dir, backup)
-            try:
-                os.replace(staging_tmp, review_dir)
-            except OSError:
-                if backup.exists() and not review_dir.exists():
-                    os.replace(backup, review_dir)
-                raise
-            shutil.rmtree(backup, ignore_errors=True)
+            # ``atomic_swap_directory`` centralises the previous
+            # hand-rolled ``os.replace`` dance (with ``.previous``
+            # rollback + cleanup). Identical contract to
+            # ``cad_tool.promote_review`` so the two call sites cannot
+            # drift again.
+            atomic_swap_directory(review_dir, staging_tmp)
         finally:
             if staging_tmp.exists():
                 shutil.rmtree(staging_tmp, ignore_errors=True)

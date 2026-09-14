@@ -245,7 +245,7 @@ def _response_text(response: requests.Response) -> str:
         if callable(value):
             value = value()
         return value if isinstance(value, str) else ""
-    except Exception:  # noqa: BLE001 - Error reporting must not mask the HTTP error.
+    except Exception:  # Error reporting must not mask the HTTP error.
         return ""
 
 
@@ -292,35 +292,87 @@ def post_with_cancel(
     The HTTP call is dispatched to a daemon thread so the agent-loop stop
     signal can interrupt it within ``~100 ms`` instead of waiting for the
     underlying socket timeout.
+
+    The worker publishes its :class:`requests.Response` to ``response_holder``
+    *before* queueing it so the main thread can force-close the socket on
+    the cancel path. Without that hook a rapid stop/restart cycle leaks a
+    TCP socket (and the keepalive timer backing it) every time the user
+    cancels before the worker has finished draining ``requests.post`` —
+    the daemon thread keeps the underlying connection alive until process
+    exit (audit_030).
     """
     results: queue.Queue[requests.Response | BaseException] = queue.Queue(maxsize=1)
+    # Mutable slot for the in-flight Response. ``dict``-based rather than
+    # a list so ``setdefault``/``get`` give us atomic single-key access
+    # without an extra lock.
+    response_holder: dict[str, requests.Response] = {}
 
     def request_worker() -> None:
         try:
-            results.put(
-                requests.post(
-                    url,
-                    headers=headers,
-                    json=payload,
-                    stream=True,
-                    timeout=timeout_seconds,
-                )
+            response = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                stream=True,
+                timeout=timeout_seconds,
             )
-        except BaseException as error:  # noqa: BLE001 - Propagate worker failures unchanged.
+        except BaseException as error:  # Propagate worker failures unchanged.
             results.put(error)
+            return
+        # Publish the Response *before* queueing it so a concurrent
+        # cancel can close the socket even if the worker has not yet
+        # finished its ``put`` call.
+        response_holder["response"] = response
+        results.put(response)
 
     worker = threading.Thread(target=request_worker, daemon=True)
     if stop_event and stop_event.is_set():
         raise RequestCancelled("LLM request cancelled.")
     worker.start()
-    while worker.is_alive():
-        worker.join(timeout=0.1)
-        if stop_event and stop_event.is_set():
-            raise RequestCancelled("LLM request cancelled.")
-    result = results.get()
-    if isinstance(result, BaseException):
-        raise result
-    return result
+    try:
+        while worker.is_alive():
+            worker.join(timeout=0.1)
+            if stop_event and stop_event.is_set():
+                raise RequestCancelled("LLM request cancelled.")
+        # ``worker.join`` returned without timing out — the worker has
+        # already put something on the queue, but ``get`` is bounded so
+        # a stray stop between ``join`` and ``get`` cannot wedge us.
+        result = results.get(timeout=5)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+    except RequestCancelled:
+        # Cancel path: force-close any Response we can see so the
+        # underlying socket (and its keepalive timer) is released
+        # immediately. The daemon worker may still be alive while its
+        # ``requests.post`` is mid-handshake; wait briefly for it to
+        # publish, then drain the queue and close whatever is there
+        # (audit_030).
+        worker.join(timeout=2.0)
+        _force_close_response(response_holder.get("response"))
+        try:
+            queued = results.get_nowait()
+        except queue.Empty:
+            queued = None
+        if isinstance(queued, requests.Response):
+            _force_close_response(queued)
+        raise
+
+
+def _force_close_response(response: requests.Response | None) -> None:
+    """Force-close a streaming ``Response``, releasing the underlying socket.
+
+    ``stream=True`` keeps the connection attached to the :class:`Response`
+    until :meth:`Response.close` runs; without this helper the connection
+    pool keeps the socket alive until the read times out, leaking FDs on
+    rapid cancel/restart cycles (audit_030).
+    """
+    if response is None:
+        return
+    try:
+        response.close()
+    except Exception:  # best-effort cleanup; the daemon worker will GC anyway
+        pass
 
 
 def parse_chat_stream(

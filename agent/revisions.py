@@ -624,7 +624,14 @@ class RevisionStore:
         return self.project_dir / _BUILDS_LOG_NAME
 
     def _trim_builds_log(self, log_path: Path) -> None:
-        """Keep builds.jsonl under the size cap by dropping oldest lines."""
+        """Keep builds.jsonl under the size cap by dropping oldest lines.
+
+        Runs in a single linear pass: compute per-line byte sizes once,
+        then walk forward summing until we exceed ``_BUILDS_MAX_BYTES`` and
+        keep the tail. The previous implementation recomputed the total
+        size on every ``pop(0)`` call, which turned trimming into O(N^2)
+        CPU work and could wedge the worker thread once the log filled up.
+        """
         try:
             size = log_path.stat().st_size
         except OSError:
@@ -635,12 +642,32 @@ class RevisionStore:
             text = log_path.read_text(encoding="utf-8")
         except OSError:
             return
+        # ``splitlines()`` drops trailing empty entries (e.g. a final "\n")
+        # and matches the writer's "+1 for the newline" accounting closely
+        # enough that a single linear walk keeps us under the cap.
         lines = [line for line in text.splitlines() if line]
-        while lines and (sum(len(line.encode("utf-8")) + 1 for line in lines) > _BUILDS_MAX_BYTES):
-            lines.pop(0)
-        atomic_write_text(
-            log_path, "\n".join(lines) + ("\n" if lines else "")
-        )
+        if not lines:
+            return
+        # Per-line UTF-8 byte length + 1 for the trailing "\n".
+        sizes = [len(line.encode("utf-8")) + 1 for line in lines]
+        # Walk from the oldest entry forward, dropping leading bytes until
+        # the remaining tail fits. Total work is O(N) and we never
+        # recompute the partial sum inside a loop.
+        total = sum(sizes)
+        drop_bytes = total - _BUILDS_MAX_BYTES
+        if drop_bytes <= 0:
+            return
+        consumed = 0
+        cutoff = 0
+        for index, line_bytes in enumerate(sizes):
+            consumed += line_bytes
+            cutoff = index + 1
+            if consumed >= drop_bytes:
+                break
+        kept = lines[cutoff:]
+        if not kept:
+            return
+        atomic_write_text(log_path, "\n".join(kept) + "\n")
 
     @_synchronized
     def last_known_good(self) -> Revision | None:
@@ -680,7 +707,6 @@ class RevisionStore:
         head = self.head()
         head_id = head.id if head is not None else None
 
-        removed = 0
         # Keep the `target` most recent, plus the LKG and active head
         # if any of them are outside the recent window.
         keep_ids: set[str] = {r.id for r in revisions[:target]}
@@ -689,13 +715,19 @@ class RevisionStore:
         if head_id is not None:
             keep_ids.add(head_id)
 
-        for revision in revisions:
-            if revision.id in keep_ids:
-                continue
-            self._delete_revision(revision)
-            removed += 1
-
-        return removed
+        pruneable = [r for r in revisions if r.id not in keep_ids]
+        if not pruneable:
+            return 0
+        # Bulk-build-records rewrite: with N pruneable revisions and M
+        # bytes of ``builds.jsonl``, the legacy loop paid ``N`` full
+        # read/parse/write/fsync cycles (audit_031). Collect every
+        # doomed id up front and rewrite the log exactly once.
+        pruneable_ids = {revision.id for revision in pruneable}
+        for revision in pruneable:
+            manifest = self._revisions_dir / f"{revision.id}.json"
+            manifest.unlink(missing_ok=True)
+        self._remove_build_records(pruneable_ids)
+        return len(pruneable)
 
     def active_model_digest(self) -> str | None:
         """Return the SHA-256 of the active model.py, or None if absent.
@@ -725,12 +757,26 @@ class RevisionStore:
         manifest.unlink(missing_ok=True)
         self._remove_build_records(revision.id)
 
-    def _remove_build_records(self, revision_id: str) -> None:
-        """Rewrite builds.jsonl, dropping every entry for ``revision_id``.
+    def _remove_build_records(self, revision_ids: str | set[str]) -> None:
+        """Rewrite ``builds.jsonl``, dropping every entry for the given ids.
+
+        Accepts either a single ``revision_id`` (legacy callers) or a
+        ``set`` of ids (the prune path). For the bulk path the file is
+        read and rewritten exactly once instead of once per id, cutting
+        the I/O cost from ``O(N * M)`` to ``O(N + M)`` where ``N`` is the
+        number of revisions and ``M`` is the size of ``builds.jsonl``
+        (audit_031).
 
         Build records live in a single append-only JSONL log; without this
         filter, ``prune`` would leave orphaned build records that no future
-        ``build_for`` lookup can match (audit_176)."""
+        ``build_for`` lookup can match (audit_176).
+        """
+        if isinstance(revision_ids, str):
+            exclude_ids = {revision_ids}
+        else:
+            exclude_ids = set(revision_ids)
+            if not exclude_ids:
+                return
         try:
             log_path = self._builds_log_path()
         except OSError:
@@ -752,7 +798,7 @@ class RevisionStore:
             except json.JSONDecodeError:
                 kept.append(line)
                 continue
-            if isinstance(item, dict) and item.get("revision_id") == revision_id:
+            if isinstance(item, dict) and item.get("revision_id") in exclude_ids:
                 removed = True
                 continue
             kept.append(line)

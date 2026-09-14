@@ -70,7 +70,17 @@ class ConversationStore:
     @classmethod
     def invalidate(cls, project_dir: Path) -> None:
         """Forget the cached entry for ``project_dir`` (used after writes
-        and on project deletion)."""
+        and on project deletion).
+
+        **Caller MUST hold :func:`shared_history_lock`.** Performing this
+        mutation outside the lock lets a concurrent :meth:`load` refill
+        the cache from a pre-write snapshot and re-cache the now-stale
+        data after this method returns — a thread can subsequently observe
+        the line appended by another writer *forever* (audit_029). When
+        the lock contract is respected the invalidate and the next file
+        write happen as a single critical section, so no reader can refill
+        stale data between the two steps.
+        """
         cls._cache.pop(str(project_dir), None)
 
     @classmethod
@@ -83,7 +93,11 @@ class ConversationStore:
         cached = cls._cache.get(cache_key)
         if cached is not None:
             if not project_dir.exists():
-                cls._cache.pop(cache_key, None)
+                # Drop the stale entry under the lock so a concurrent
+                # append cannot race with the pop and silently re-cache
+                # stale data afterwards (audit_029).
+                with shared_history_lock():
+                    cls._cache.pop(cache_key, None)
             else:
                 return list(cached)
         # Serialise the read+cache-set against appends so a concurrent writer
@@ -114,10 +128,18 @@ class ConversationStore:
 
     @classmethod
     def append(cls, project_dir: Path, message: dict[str, Any]) -> None:
-        """Persist a single message and invalidate the cache."""
-        cls.invalidate(project_dir)
-        log = cls._get_log_handle(project_dir)
+        """Persist a single message and invalidate the cache.
+
+        The invalidate, the log-handle acquisition, and the file write
+        all happen inside :func:`shared_history_lock` so a concurrent
+        :meth:`load` cannot refill the cache from a pre-write snapshot
+        and silently overwrite the cache after this method returned —
+        the exact race that used to drop appended lines from every
+        subsequent read (audit_029).
+        """
         with shared_history_lock():
+            cls.invalidate(project_dir)
+            log = cls._get_log_handle(project_dir)
             log.write(
                 json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n"
             )
@@ -142,15 +164,20 @@ class ConversationStore:
         each opened its own file handle with an incompatible payload schema,
         which made a future refactor that swapped the lock slot or split the
         file silently break either the LLM context or the SSE history view.
+
+        The cache invalidate, the log-handle acquisition, and the file
+        write all run inside :func:`shared_history_lock` to keep the
+        race condition documented on :meth:`invalidate` from reappearing
+        here (audit_029).
         """
-        cls.invalidate(project_dir)
         record = {
             "timestamp": timestamp or cls._now_iso(),
             "type": event_type,
             "data": data,
         }
-        log = cls._get_log_handle(project_dir)
         with shared_history_lock():
+            cls.invalidate(project_dir)
+            log = cls._get_log_handle(project_dir)
             log.write(
                 json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
             )
@@ -172,6 +199,13 @@ class ConversationStore:
         are dropped if the project directory has been removed underneath us.
         Concurrent appenders are serialised by :func:`shared_history_lock`
         in :meth:`append`, so a single shared handle is sufficient.
+
+        **Caller MUST hold :func:`shared_history_lock`.** Without the
+        lock the eviction loop here iterates ``_open_log_handles`` while
+        another appender is mutating the same dict, which raises
+        ``RuntimeError: dictionary changed size during iteration`` and
+        also lets one appender overwrite another's eviction decision
+        (audit_029).
         """
         key = str(project_dir)
         log = cls._open_log_handles.get(key)
@@ -205,19 +239,25 @@ class ConversationStore:
     @classmethod
     def clear(cls, project_dir: Path) -> bool:
         """Remove the log file and cache entry. Returns whether anything
-        was removed."""
-        cls.invalidate(project_dir)
+        was removed.
+
+        The cache invalidate, the cached-handle drop, and the unlink all
+        run inside :func:`shared_history_lock` so a concurrent append or
+        load cannot race with the unlink and resurrect a half-deleted
+        file (audit_029).
+        """
         log_path = project_dir / "conversation.jsonl"
-        # Drop any cached handle so the unlink below cannot race with a
-        # buffered writer holding the inode open on Windows / POSIX.
-        cached = cls._open_log_handles.pop(str(project_dir), None)
-        if cached is not None:
-            try:
-                cached.close()
-            except Exception:
-                pass
         removed = False
         with shared_history_lock():
+            cls.invalidate(project_dir)
+            # Drop any cached handle so the unlink below cannot race with a
+            # buffered writer holding the inode open on Windows / POSIX.
+            cached = cls._open_log_handles.pop(str(project_dir), None)
+            if cached is not None:
+                try:
+                    cached.close()
+                except Exception:
+                    pass
             try:
                 log_path.unlink()
             except FileNotFoundError:
@@ -228,6 +268,15 @@ class ConversationStore:
 
     @classmethod
     def _set_cached(cls, key: str, history: list[dict[str, Any]]) -> None:
+        """Store ``history`` under ``key`` in the read cache, evicting the
+        oldest entry first when the cache is full.
+
+        **Caller MUST hold :func:`shared_history_lock`.** The eviction
+        loop iterates ``_cache`` and pops during iteration, which raises
+        ``RuntimeError: dictionary changed size during iteration`` if a
+        concurrent append invalidates an entry between ``len(...)`` and
+        the next ``pop`` (audit_029).
+        """
         while len(cls._cache) >= cls.CACHE_MAX:
             oldest = next(iter(cls._cache))
             if oldest == key:

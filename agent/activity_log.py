@@ -23,9 +23,12 @@ Wire model:
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -43,6 +46,12 @@ _LOG = logging.getLogger(__name__)
 # build/review loop without slowing the agent. Adjustable via the
 # ``AGENT_ACTIVITY_LOG_MAX_BYTES`` environment variable for one-off debugging.
 _DEFAULT_MAX_BYTES = 5 * 1024 * 1024
+
+# Trimming cadence. Running a full read-rewrite on every ``log()`` call
+# turned a hot loop into a multi-megabyte I/O storm that could pin the
+# event-loop worker. Trim only once every ``_TRIM_EVERY`` appends (or
+# sooner if a single oversized event would push us well past the cap).
+_TRIM_EVERY = 100
 
 # Keys whose value is always redacted regardless of context. Lowercased for
 # case-insensitive matching. Covers the headers and provider-specific payload
@@ -94,11 +103,55 @@ class ActivityLogger:
     ) -> None:
         self.project_dir = Path(project_dir).resolve()
         self._max_bytes = max_bytes if max_bytes is not None else _DEFAULT_MAX_BYTES
+        # Per-process lock so concurrent threads inside one worker do
+        # not race. The cross-process guarantee comes from the
+        # ``fcntl.flock`` on the sidecar lock file below — a
+        # ``threading.Lock`` alone is invisible to other processes.
         self._lock = threading.Lock()
+        # Increments on every ``log()`` so trimming happens on a fixed
+        # cadence instead of every single append.
+        self._writes_since_trim = 0
+        # Sidecar advisory lock file. Created lazily; ``flock`` is a
+        # POSIX/Linux primitive so this code path requires the same
+        # platform assumption as bwrap/libseccomp (see README).
+        self._lockfile: Path | None = None
 
     @property
     def log_path(self) -> Path:
         return self.project_dir / _LOG_DIRNAME / _LOG_FILENAME
+
+    @property
+    def lockfile_path(self) -> Path:
+        """Path of the sidecar advisory lock used for cross-process safety."""
+        return self.log_path.with_suffix(self.log_path.suffix + ".lock")
+
+    @contextmanager
+    def _acquire_file_lock(self) -> Iterator[None]:
+        """Acquire an advisory ``flock`` on the sidecar lock file.
+
+        Cross-process guarantee: requires POSIX ``fcntl``. Falls back to
+        a thread-only guarantee (matching the previous behaviour) when
+        ``flock`` is unavailable (e.g. non-POSIX runners).
+        """
+        path = self.lockfile_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = path.open("w", encoding="utf-8")
+        acquired = False
+        try:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                acquired = True
+            except (OSError, AttributeError):
+                # Either flock is unavailable or fcntl itself is missing.
+                pass
+            yield
+        finally:
+            if acquired:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            handle.close()
 
     def log(
         self,
@@ -117,13 +170,30 @@ class ActivityLogger:
             if payload:
                 entry["data"] = redact(payload)
             line = json.dumps(entry, ensure_ascii=False)
-            with self._lock:
-                log_dir = self.log_path.parent
-                log_dir.mkdir(parents=True, exist_ok=True)
+            log_dir = self.log_path.parent
+            log_dir.mkdir(parents=True, exist_ok=True)
+            # Acquire the cross-process lock first so concurrent workers
+            # (CLI + server, multiple gevent spawns, etc.) cannot
+            # interleave partial lines.
+            with self._lock, self._acquire_file_lock():
                 with self.log_path.open("a", encoding="utf-8") as handle:
                     handle.write(line)
                     handle.write("\n")
-                self._maybe_trim()
+                self._writes_since_trim += 1
+                # Cheap size probe — a single stat() is enough to detect
+                # when trimming is overdue. The actual rewrite happens
+                # at most every ``_TRIM_EVERY`` writes (or sooner when
+                # the cap is dramatically exceeded by a single event).
+                #
+                # ``force=True`` when one append alone blew past
+                # ``2 * max_bytes`` so the cadence never lets the log
+                # grow unboundedly when an unusually large event lands.
+                try:
+                    size = self.log_path.stat().st_size
+                except OSError:
+                    size = 0
+                force_trim = size > 2 * self._max_bytes
+                self._maybe_trim(force=force_trim)
         except (OSError, TypeError, ValueError) as error:
             # Activity logging must never break the agent loop. Surface
             # the failure at DEBUG so persistent issues (e.g. disk full
@@ -160,13 +230,22 @@ class ActivityLogger:
 
     # ------------------------------------------------------------------ internals
 
-    def _maybe_trim(self) -> None:
-        """Drop oldest lines when the log exceeds ``max_bytes``."""
+    def _maybe_trim(self, *, force: bool = False) -> None:
+        """Drop oldest lines when the log exceeds ``max_bytes``.
+
+        Trimming is gated by ``_TRIM_EVERY`` so the previous behaviour of
+        a full read-rewrite on every ``log()`` call does not pin the
+        worker. ``force=True`` is reserved for the oversized-event case
+        (when one append alone blew past ``2 * max_bytes``) so we still
+        recover instead of waiting up to ``_TRIM_EVERY`` more appends.
+        """
         try:
             size = self.log_path.stat().st_size
         except OSError:
             return
         if size <= self._max_bytes:
+            return
+        if not force and self._writes_since_trim < _TRIM_EVERY:
             return
         try:
             text = self.log_path.read_text(encoding="utf-8")
@@ -186,8 +265,10 @@ class ActivityLogger:
         # next call trims again).
         try:
             atomic_write_text(self.log_path, "\n".join(kept) + "\n")
+            self._writes_since_trim = 0
         except OSError:
             return
+
 
 
 # ---------------------------------------------------------------------------
