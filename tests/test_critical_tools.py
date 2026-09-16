@@ -1157,4 +1157,82 @@ def test_edit_file_dispatcher_edge_cases(tmp_path: Path) -> None:
     assert "HEIGHT = 22" not in (tmp_path / "model.py").read_text(encoding="utf-8")
 
 
+def test_edit_file_whitespace_tolerance(tmp_path: Path) -> None:
+    """edit_file and edit_file_atomic must tolerate indentation and whitespace discrepancies."""
+    from agent.tools.file_tool import FileTool
 
+    tool = FileTool(tmp_path)
+    initial_code = (
+        "from build123d import *\n\n"
+        "hex_pts = [\n"
+        "    (a, a)\n"
+        "    for a in (30, 90, 150)  # vertex\n"
+        "]\n\n"
+        "with BuildPart() as model:\n"
+        "    with Locations((0, 0, 0)):\n"
+        "        Box(10, 10, 10)\n"
+    )
+    tool.write_file("model.py", initial_code)
+
+    # 1. Single-line indentation mismatch (LLM passes 8 spaces, file has 4 spaces)
+    tool.edit_file(
+        "model.py",
+        "        for a in (30, 90, 150)  # vertex",
+        "        for a in (0, 60, 120)  # peaked vertex",
+    )
+    content = (tmp_path / "model.py").read_text(encoding="utf-8")
+    assert "    for a in (0, 60, 120)  # peaked vertex" in content
+
+    # 2. Multi-line nested block with indent mismatch (re-aligns to file indent)
+    tool.edit_file(
+        "model.py",
+        "        with Locations((0, 0, 0)):\n            Box(10, 10, 10)",
+        "        with Locations((0, 0, 5)):\n            Cylinder(5, 10)",
+    )
+    content = (tmp_path / "model.py").read_text(encoding="utf-8")
+    assert "    with Locations((0, 0, 5)):\n        Cylinder(5, 10)" in content
+
+    # 3. edit_file_atomic handles multiple edits with whitespace discrepancies
+    tool.edit_file_atomic(
+        "model.py",
+        [
+            {
+                "old_string": "    for a in (0, 60, 120)  # peaked vertex   ",  # trailing spaces
+                "new_string": "    for a in (0, 60)",
+            },
+            {
+                "old_string": "        Cylinder(5, 10)",  # 8 spaces instead of 8 (or 4)
+                "new_string": "        Cylinder(6, 12)",
+            },
+        ],
+    )
+    content = (tmp_path / "model.py").read_text(encoding="utf-8")
+    assert "    for a in (0, 60)" in content
+    assert "        Cylinder(6, 12)" in content
+
+
+def test_failure_signature_threshold_allows_escalation() -> None:
+    """AgentRunner must allow 2 retries (total 3 attempts on same error) before stopping."""
+    from agent.core import AgentRunner
+
+    err_msg = 'CAD execution failed:\n  File "model.py", line 111\nValueError: Expected 1 shelf fillet edge, found 0'
+    sig = AgentRunner._failure_signature(err_msg)
+    assert len(sig) == 16
+
+    # Verify line numbers are normalized in signature
+    err_msg_diff_line = 'CAD execution failed:\n  File "model.py", line 125\nValueError: Expected 1 shelf fillet edge, found 0'
+    sig_diff_line = AgentRunner._failure_signature(err_msg_diff_line)
+    assert sig == sig_diff_line
+
+    signatures: dict[str, int] = {}
+    # Attempt 1: Initial failure
+    signatures[sig] = signatures.get(sig, 0) + 1
+    assert not (signatures[sig] >= 3), "Attempt 1 must not terminate"
+
+    # Attempt 2: First repair attempt fails with same error -> must NOT terminate (allows escalation)
+    signatures[sig] = signatures.get(sig, 0) + 1
+    assert not (signatures[sig] >= 3), "Attempt 2 must not terminate, allowing 3-step escalation"
+
+    # Attempt 3: Second repair attempt fails with same error -> now terminates
+    signatures[sig] = signatures.get(sig, 0) + 1
+    assert signatures[sig] >= 3, "Attempt 3 must terminate repeated failures"

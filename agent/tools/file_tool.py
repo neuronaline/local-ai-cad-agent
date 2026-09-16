@@ -362,6 +362,112 @@ class FileTool:
             f"{len(content)} chars, revision {revision.id[:8]})."
         )
 
+    @staticmethod
+    def _reindent(
+        file_lines: list[str], old_lines: list[str], new_string: str
+    ) -> str:
+        def get_indent(lines: list[str]) -> int:
+            for line in lines:
+                if line.strip():
+                    return len(line) - len(line.lstrip(" "))
+            return 0
+
+        file_indent = get_indent(file_lines)
+        old_indent = get_indent(old_lines)
+        delta = file_indent - old_indent
+        if delta == 0 or not new_string:
+            return new_string
+
+        new_lines = new_string.splitlines(keepends=True)
+        new_indent = get_indent(new_lines)
+        if new_indent == file_indent:
+            return new_string
+
+        if new_indent == old_indent:
+            adjusted: list[str] = []
+            for line in new_lines:
+                if not line.strip():
+                    adjusted.append(line)
+                else:
+                    curr_indent = len(line) - len(line.lstrip(" "))
+                    target_indent = max(0, curr_indent + delta)
+                    adjusted.append(" " * target_indent + line.lstrip(" "))
+            return "".join(adjusted)
+        return new_string
+
+    @classmethod
+    def _resolve_match(
+        cls, current: str, old_string: str, new_string: str
+    ) -> tuple[tuple[int, int], str, str]:
+        # 1. Exact match fast-path
+        matches = current.count(old_string)
+        if matches == 1:
+            start = current.find(old_string)
+            end = start + len(old_string)
+            return ((start, end), old_string, new_string)
+        if matches > 1:
+            raise ValueError(
+                f"expected one exact match, found {matches}; file was not changed."
+            )
+
+        # 2. Whitespace-tolerant match (only when exact match found 0 matches)
+        file_lines = current.splitlines(keepends=True)
+        old_lines = old_string.splitlines(keepends=True)
+        k = len(old_lines)
+        if k == 0 or len(file_lines) < k:
+            raise ValueError(
+                "expected one exact match, found 0; file was not changed."
+            )
+
+        # Attempt A: Trailing-whitespace/line-ending normalization (indent matches)
+        candidates = [
+            i
+            for i in range(len(file_lines) - k + 1)
+            if [f.rstrip("\r\n \t") for f in file_lines[i : i + k]]
+            == [o.rstrip("\r\n \t") for o in old_lines]
+        ]
+
+        # Attempt B: Full whitespace normalization (both leading indent and trailing whitespace)
+        if not candidates and any(line.strip() for line in old_lines):
+            candidates = [
+                i
+                for i in range(len(file_lines) - k + 1)
+                if [f.strip() for f in file_lines[i : i + k]]
+                == [o.strip() for o in old_lines]
+            ]
+
+        if len(candidates) == 1:
+            idx = candidates[0]
+            matched_slice = file_lines[idx : idx + k]
+            start_char = sum(len(file_lines[j]) for j in range(idx))
+            matched_text = "".join(matched_slice)
+
+            if old_string.endswith(("\n", "\r")):
+                end_char = start_char + len(matched_text)
+                replacement = cls._reindent(matched_slice, old_lines, new_string)
+                if replacement and not replacement.endswith(("\n", "\r")):
+                    replacement += "\n"
+            else:
+                line_ending = (
+                    "\r\n"
+                    if matched_text.endswith("\r\n")
+                    else ("\n" if matched_text.endswith("\n") else "")
+                )
+                end_char = start_char + len(matched_text) - len(line_ending)
+                replacement = cls._reindent(matched_slice, old_lines, new_string)
+
+            matched_sub = current[start_char:end_char]
+            return ((start_char, end_char), matched_sub, replacement)
+
+        if len(candidates) > 1:
+            raise ValueError(
+                f"expected one match, found {len(candidates)} after whitespace normalization; file was not changed."
+            )
+
+        raise ValueError(
+            "expected one exact match, found 0; file was not changed."
+        )
+
     def edit_file(
         self,
         filename: str,
@@ -383,20 +489,20 @@ class FileTool:
                     f"{filename} does not exist; use write_file to create it."
                 )
             current = path.read_text(encoding="utf-8")
-            matches = current.count(old_string)
-            if matches != 1:
-                raise ValueError(
-                    f"Expected one exact match, found {matches}; file was not changed."
+            try:
+                (start, end), old_match, replacement = self._resolve_match(
+                    current, old_string, new_string
                 )
-            updated = current.replace(old_string, new_string, 1)
-            start_line = current[: current.find(old_string)].count("\n") + 1
-            # ``splitlines()`` correctly counts trailing fragments that lack
-            # a final newline (audit_032). The previous ``count("\n") or 1``
-            # undercounted any ``old_string`` whose last line was unterminated
-            # — a common case when the LLM copies just the body of a block.
-            old_lines = len(old_string.splitlines()) or 1
+            except ValueError as err:
+                msg = str(err)
+                if msg and msg[0].islower():
+                    msg = msg[0].upper() + msg[1:]
+                raise ValueError(msg) from None
+            updated = current[:start] + replacement + current[end:]
+            start_line = current[:start].count("\n") + 1
+            old_lines = len(old_match.splitlines()) or 1
             end_line = start_line + old_lines - 1
-            new_lines = len(new_string.splitlines()) or 1
+            new_lines = len(replacement.splitlines()) or 1
             new_end_line = start_line + new_lines - 1
             base = self._write_model(updated, "edit_file")
         return (
@@ -480,51 +586,33 @@ class FileTool:
             # ``old_string`` after a previous replace has rewritten the region.
             resolved: list[tuple[tuple[int, int], str, str]] = []
             for index, (old_string, new_string) in enumerate(normalised):
-                matches = sum(
-                    1
-                    for start in range(len(current))
-                    if current.startswith(old_string, start)
-                )
-                if matches != 1:
-                    raise ValueError(
-                        f"edits[{index}] expected one exact match, found "
-                        f"{matches}; file was not changed."
+                try:
+                    (start, end), old_match, replacement = self._resolve_match(
+                        current, old_string, new_string
                     )
-                start = current.find(old_string)
-                resolved.append(((start, start + len(old_string)), old_string, new_string))
+                except ValueError as err:
+                    raise ValueError(f"edits[{index}] {err}") from None
+                resolved.append(((start, end), old_match, replacement))
             # Reject any pair of edits whose resolved byte ranges overlap.
             ordered = sorted(resolved, key=lambda entry: entry[0][0])
             previous_end = -1
-            for (start, end), old_string, _new_string in ordered:
+            for (start, end), _old, _new in ordered:
                 if start < previous_end:
                     raise ValueError(
                         "edit_file_atomic rejected overlapping edits; verify "
                         "each old_string is copied from the same file state."
                     )
                 previous_end = end
-            # All validations passed — apply the replacements using the
-            # offsets resolved against the original buffer. Applying in caller
-            # order against the running buffer would let an earlier edit's
-            # ``new_string`` introduce text that the next edit's ``old_string``
-            # then matches, silently leaving the original target untouched.
-            # We rebuild slices from each edit's start/end so the byte ranges
-            # always refer to the original positions the LLM copied from.
             parts: list[str] = []
             cursor = 0
             ranges: list[tuple[int, int, int]] = []
-            ordered_offsets = sorted(
-                ((start, end, old_string, new_string) for (start, end), old_string, new_string in resolved)
-            )
-            for index, (start, end, old_string, new_string) in enumerate(ordered_offsets):
+            for (start, end), old_match, replacement in ordered:
                 parts.append(current[cursor:start])
-                parts.append(new_string)
+                parts.append(replacement)
                 start_line = current[:start].count("\n") + 1
-                # ``splitlines()`` correctly counts trailing fragments
-                # that lack a final newline (audit_032). See the matching
-                # comment in ``edit_file`` above.
-                old_lines = len(old_string.splitlines()) or 1
+                old_lines = len(old_match.splitlines()) or 1
                 end_line = start_line + old_lines - 1
-                new_lines = len(new_string.splitlines()) or 1
+                new_lines = len(replacement.splitlines()) or 1
                 new_end_line = start_line + new_lines - 1
                 ranges.append((start_line, end_line, new_end_line))
                 cursor = end

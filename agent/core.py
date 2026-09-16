@@ -524,7 +524,7 @@ class AgentRunner:
                             )
                             if (
                                 build_failure_count >= 6
-                                or build_failure_signatures[signature] >= 2
+                                or build_failure_signatures[signature] >= 3
                             ):
                                 self.publish(
                                     "agent_error",
