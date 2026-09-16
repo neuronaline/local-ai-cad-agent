@@ -392,99 +392,108 @@ def parse_chat_stream(
     reasoning_text = ""
     reasoning_details: list[dict[str, Any]] = []
 
-    for raw_line in response.iter_lines():
-        if stop_event and stop_event.is_set():
-            response.close()
-            raise RequestCancelled(f"{provider_label} request cancelled.")
-        line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
-        if not line or not line.startswith("data:"):
-            continue
-        payload = line[5:].strip()
-        if payload == "[DONE]":
-            saw_done = True
-            break
-        try:
-            chunk = json.loads(payload)
-        except json.JSONDecodeError as error:
-            raise RuntimeError(
-                f"{provider_label} returned malformed streaming JSON."
-            ) from error
-        stream_error = chunk.get("error")
-        if stream_error:
-            raise StreamResponseError(
-                f"{provider_label} stream failed: {_stream_error_detail(stream_error)}",
-                retryable=not (content or tool_calls or reasoning_text or reasoning_details),
-            )
-        if isinstance(chunk.get("usage"), dict):
-            last_usage = chunk["usage"]
-        choices = chunk.get("choices") or []
-        if not choices:
-            continue
-        choice = choices[0]
-        finish_reason = choice.get("finish_reason") or finish_reason
-        if finish_reason == "error":
-            delta = choice.get("delta") or {}
-            stream_error = choice.get("error") or delta.get("error")
-            detail = (
-                _stream_error_detail(stream_error)
-                if stream_error
-                else "upstream completion returned finish_reason='error'"
-            )
-            raise StreamResponseError(
-                f"{provider_label} stream failed: {detail}",
-                retryable=not (content or tool_calls or reasoning_text or reasoning_details),
-            )
-        delta = choice.get("delta") or {}
-        role = delta.get("role") or role
-        text = delta.get("content")
-        if isinstance(text, str) and text:
-            content += text
-            if stream_callback:
-                stream_callback({"type": "content", "delta": text})
-        reasoning = delta.get("reasoning") or delta.get("reasoning_content")
-        details = delta.get("reasoning_details")
-        if isinstance(details, list):
-            reasoning_details.extend(
-                deepcopy(detail) for detail in details if isinstance(detail, dict)
-            )
-            # ``reasoning_details`` is the authoritative source for structured
-            # thinking content. Do not also accumulate ``.text`` into
-            # ``reasoning_text`` — that path is reserved for providers that emit
-            # only a plain ``reasoning`` string per delta and would otherwise
-            # double-count the same text into both the structured list and the
-            # fallback string.
-            reasoning_delta_text: str | None = None
-        elif isinstance(reasoning, str) and reasoning:
-            reasoning_delta_text = reasoning
-        else:
-            reasoning_delta_text = None
-        if reasoning_delta_text:
-            reasoning_text += reasoning_delta_text
-            if stream_callback:
-                stream_callback({"type": "reasoning", "delta": reasoning_delta_text})
-        for call_delta in delta.get("tool_calls") or []:
-            index = int(call_delta.get("index", 0))
-            call = tool_calls.setdefault(
-                index,
-                {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
-            )
-            if call_delta.get("id"):
-                call["id"] = call_delta["id"]
-            function = call_delta.get("function") or {}
-            name_delta = function.get("name") or ""
-            arguments_delta = function.get("arguments") or ""
-            call["function"]["name"] += name_delta
-            call["function"]["arguments"] += arguments_delta
-            if stream_callback:
-                stream_callback(
-                    {
-                        "type": "tool_call",
-                        "index": index,
-                        "id": call["id"],
-                        "name_delta": name_delta,
-                        "arguments_delta": arguments_delta,
-                    }
+    try:
+        for raw_line in response.iter_lines():
+            if stop_event and stop_event.is_set():
+                response.close()
+                raise RequestCancelled(f"{provider_label} request cancelled.")
+            line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+            if not line or not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                saw_done = True
+                break
+            try:
+                chunk = json.loads(payload)
+            except json.JSONDecodeError as error:
+                raise RuntimeError(
+                    f"{provider_label} returned malformed streaming JSON."
+                ) from error
+            stream_error = chunk.get("error")
+            if stream_error:
+                raise StreamResponseError(
+                    f"{provider_label} stream failed: {_stream_error_detail(stream_error)}",
+                    retryable=not (content or tool_calls or reasoning_text or reasoning_details),
                 )
+            if isinstance(chunk.get("usage"), dict):
+                last_usage = chunk["usage"]
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            choice = choices[0]
+            finish_reason = choice.get("finish_reason") or finish_reason
+            if finish_reason == "error":
+                delta = choice.get("delta") or {}
+                stream_error = choice.get("error") or delta.get("error")
+                detail = (
+                    _stream_error_detail(stream_error)
+                    if stream_error
+                    else "upstream completion returned finish_reason='error'"
+                )
+                raise StreamResponseError(
+                    f"{provider_label} stream failed: {detail}",
+                    retryable=not (content or tool_calls or reasoning_text or reasoning_details),
+                )
+            delta = choice.get("delta") or {}
+            role = delta.get("role") or role
+            text = delta.get("content")
+            if isinstance(text, str) and text:
+                content += text
+                if stream_callback:
+                    stream_callback({"type": "content", "delta": text})
+            reasoning = delta.get("reasoning") or delta.get("reasoning_content")
+            details = delta.get("reasoning_details")
+            if isinstance(details, list):
+                reasoning_details.extend(
+                    deepcopy(detail) for detail in details if isinstance(detail, dict)
+                )
+                # ``reasoning_details`` is the authoritative source for structured
+                # thinking content. Do not also accumulate ``.text`` into
+                # ``reasoning_text`` — that path is reserved for providers that emit
+                # only a plain ``reasoning`` string per delta and would otherwise
+                # double-count the same text into both the structured list and the
+                # fallback string.
+                reasoning_delta_text: str | None = None
+            elif isinstance(reasoning, str) and reasoning:
+                reasoning_delta_text = reasoning
+            else:
+                reasoning_delta_text = None
+            if reasoning_delta_text:
+                reasoning_text += reasoning_delta_text
+                if stream_callback:
+                    stream_callback({"type": "reasoning", "delta": reasoning_delta_text})
+            for call_delta in delta.get("tool_calls") or []:
+                index = int(call_delta.get("index", 0))
+                call = tool_calls.setdefault(
+                    index,
+                    {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                )
+                if call_delta.get("id"):
+                    call["id"] = call_delta["id"]
+                function = call_delta.get("function") or {}
+                name_delta = function.get("name") or ""
+                arguments_delta = function.get("arguments") or ""
+                call["function"]["name"] += name_delta
+                call["function"]["arguments"] += arguments_delta
+                if stream_callback:
+                    stream_callback(
+                        {
+                            "type": "tool_call",
+                            "index": index,
+                            "id": call["id"],
+                            "name_delta": name_delta,
+                            "arguments_delta": arguments_delta,
+                        }
+                    )
+    except (requests.exceptions.RequestException, OSError):
+        if stop_event and stop_event.is_set():
+            try:
+                response.close()
+            except Exception:
+                pass
+            raise RequestCancelled(f"{provider_label} request cancelled.")
+        raise
 
     if not saw_done:
         # The connection closed before the provider emitted ``[DONE]``.
@@ -662,6 +671,16 @@ class FallbackChatClient:
             client.activity_logger = self.activity_logger
             client.run_id = self.run_id
 
+    def abort(self) -> None:
+        if self.stop_event is not None:
+            self.stop_event.set()
+        for client in (self._primary, self._fallback):
+            if hasattr(client, "abort"):
+                try:
+                    client.abort()
+                except Exception:
+                    pass
+
     def _capture_result(self, client: ChatCompletionsClient) -> None:
         """Copy per-call metrics from the successful inner client.
 
@@ -778,6 +797,8 @@ class ChatCompletionsClient:
         # surface and consumed by ``chat()`` directly.
         self.activity_logger = None
         self.run_id: str | None = None
+        self._active_response: requests.Response | None = None
+        self._response_lock = threading.Lock()
 
     def _endpoint(self) -> str:  # pragma: no cover — overridden by subclass
         raise NotImplementedError
@@ -798,15 +819,34 @@ class ChatCompletionsClient:
         return sanitize_messages(messages, preserve_reasoning=self.preserve_reasoning)
 
     def _stream_response(self, response):
-        result = parse_chat_stream(
-            response,
-            provider_label=self._provider_label,
-            stop_event=self.stop_event,
-            stream_callback=self.stream_callback,
-        )
-        usage = result.get("usage") if isinstance(result, dict) else None
-        self.last_usage = usage if isinstance(usage, dict) else None
-        return result
+        with self._response_lock:
+            self._active_response = response
+        try:
+            result = parse_chat_stream(
+                response,
+                provider_label=self._provider_label,
+                stop_event=self.stop_event,
+                stream_callback=self.stream_callback,
+            )
+            usage = result.get("usage") if isinstance(result, dict) else None
+            self.last_usage = usage if isinstance(usage, dict) else None
+            return result
+        finally:
+            with self._response_lock:
+                self._active_response = None
+
+    def abort(self) -> None:
+        if self.stop_event is not None:
+            self.stop_event.set()
+        with self._response_lock:
+            resp = self._active_response
+        if resp is not None:
+            try:
+                resp.close()
+                if hasattr(resp, "raw") and resp.raw is not None:
+                    resp.raw.close()
+            except Exception:
+                pass
 
     def _try_image_fallback(self, payload, response):
         messages_without_images, removed = without_images(payload["messages"])

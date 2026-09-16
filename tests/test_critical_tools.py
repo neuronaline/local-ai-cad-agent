@@ -342,7 +342,9 @@ def test_fallback_wrapper_mirrors_state_onto_inner_clients() -> None:
     fallback = _StubChatClient(chat_result={"choices": [{"message": {}}]})
     wrapper = FallbackChatClient(primary, fallback, "openai")
     wrapper.session_id = "session-x"
-    callback = lambda *_args, **_kwargs: None
+
+    def callback(*_args, **_kwargs):
+        return None
 
     wrapper.chat([])  # initial value: stream_callback=None
     wrapper.stream_callback = callback
@@ -687,3 +689,156 @@ def test_prompt_cache_does_not_stat_playbook_per_call(
         "the per-call stat regression has returned."
     )
     assert tracker.read_calls == 0
+
+
+def test_file_tools_ignore_and_do_not_require_sha(tmp_path: Path) -> None:
+    """File tool methods must not require SHA digests or fail on invalid digests."""
+    import json
+    tool = FileTool(tmp_path)
+
+    # 1. write_file works unconditionally and ignores invalid expected_sha256
+    initial_code = "from build123d import Box\nWIDTH = 10\nresult = Box(WIDTH, 20, 30)\n"
+    tool.write_file("model.py", initial_code, expected_sha256="not_a_sha")
+
+    # 2. read_file returns clean content without sha256 and ignores known_sha256
+    raw_read = tool.read_file("model.py", known_sha256="invalid")
+    read_data = json.loads(raw_read)
+    assert read_data["exists"] is True
+    assert "WIDTH = 10" in read_data["content"]
+    assert "sha256" not in read_data
+
+    # 3. edit_file succeeds with invalid / mismatched expected_sha256
+    tool.edit_file(
+        "model.py",
+        "WIDTH = 10",
+        "WIDTH = 25",
+        expected_sha256="short",
+    )
+    assert "WIDTH = 25" in (tmp_path / "model.py").read_text(encoding="utf-8")
+
+    # 4. insert_file succeeds with invalid expected_sha256
+    tool.insert_file(
+        "model.py",
+        anchor="WIDTH = 25\n",
+        content="HEIGHT = 40\n",
+        position="after",
+        expected_sha256="bad_digest",
+    )
+    content = (tmp_path / "model.py").read_text(encoding="utf-8")
+    assert "HEIGHT = 40" in content
+
+    # 5. edit_file_atomic succeeds with invalid expected_sha256
+    tool.edit_file_atomic(
+        "model.py",
+        [{"old_string": "WIDTH = 25", "new_string": "WIDTH = 30"}],
+        expected_sha256="0" * 32,
+    )
+    assert "WIDTH = 30" in (tmp_path / "model.py").read_text(encoding="utf-8")
+
+
+def test_tool_schemas_do_not_expose_sha_parameters() -> None:
+    """Tool schemas presented to the LLM must not include sha parameter properties."""
+    from agent.tool_schemas import TOOL_SCHEMAS
+
+    for tool in TOOL_SCHEMAS:
+        func = tool.get("function", {})
+        name = func.get("name", "")
+        params = func.get("parameters", {})
+        props = params.get("properties", {})
+        assert "expected_sha256" not in props, f"{name} should not expose expected_sha256"
+        assert "known_sha256" not in props, f"{name} should not expose known_sha256"
+        desc = func.get("description", "").lower()
+        assert "expected_sha256" not in desc, f"{name} description should not mention expected_sha256"
+        assert "known_sha256" not in desc, f"{name} description should not mention known_sha256"
+
+
+def test_tool_schemas_streamlined_to_five_core_tools() -> None:
+    """TOOL_SCHEMAS must contain exactly the 5 streamlined tools."""
+    from agent.tool_schemas import TOOL_SCHEMAS
+
+    names = [tool["function"]["name"] for tool in TOOL_SCHEMAS]
+    assert names == [
+        "read_file",
+        "write_file",
+        "edit_file",
+        "cad_build_and_verify",
+        "question",
+    ]
+
+
+def test_edit_file_dispatcher_supports_root_level_strings_and_dict(tmp_path: Path) -> None:
+    """Dispatcher must accept root-level old_string/new_string and single edit dict."""
+    from agent.dispatcher import dispatch
+    from agent.core import ProjectTools
+
+    tools = ProjectTools(tmp_path, lambda *args: None)
+    tools.file.write_file("model.py", "WIDTH = 10\nHEIGHT = 20\n")
+
+    # Root-level old_string and new_string
+    result, waiting = dispatch(tools, "test", "edit_file", {"old_string": "WIDTH = 10", "new_string": "WIDTH = 15"})
+    assert not waiting
+    assert "WIDTH = 15" in (tmp_path / "model.py").read_text(encoding="utf-8")
+
+    # Dict in edits
+    result, waiting = dispatch(tools, "test", "edit_file", {"edits": {"old_string": "HEIGHT = 20", "new_string": "HEIGHT = 25"}})
+    assert not waiting
+    assert "HEIGHT = 25" in (tmp_path / "model.py").read_text(encoding="utf-8")
+
+
+def test_write_file_does_not_emit_preflight_warning_for_indexed_selectors(tmp_path: Path) -> None:
+    """Writing idiomatic build123d indexed selectors must not emit PRE-FLIGHT WARNING."""
+    tool = FileTool(tmp_path)
+    code = (
+        "from build123d import Box, Axis\n"
+        "box = Box(10, 10, 10)\n"
+        "top_edges = box.edges().sort_by(Axis.Z)[-1]\n"
+        "result = box\n"
+    )
+    result = tool.write_file("model.py", code)
+    assert "PRE-FLIGHT WARNING" not in result
+    assert "Wrote model.py" in result
+
+
+def test_read_file_defaults_to_full_file(tmp_path: Path) -> None:
+    """Calling read_file without parameters returns the full file content."""
+    import json
+    tool = FileTool(tmp_path)
+    code = "line1\nline2\nline3\n"
+    tool.write_file("model.py", code)
+
+    res = json.loads(tool.read_file("model.py"))
+    assert res["content"] == code
+    assert res["total_lines"] == 3
+
+
+def test_edit_file_dispatcher_edge_cases(tmp_path: Path) -> None:
+    """Dispatcher must handle None new_string, empty edits list with old_string, and reject malformed edits."""
+    import pytest
+    from agent.dispatcher import dispatch
+    from agent.core import ProjectTools
+
+    tools = ProjectTools(tmp_path, lambda *args: None)
+    tools.file.write_file("model.py", "WIDTH = 10\nHEIGHT = 20\nDEPTH = 30\n")
+
+    # 1. new_string is None or omitted (treated as deletion)
+    dispatch(tools, "test", "edit_file", {"old_string": "DEPTH = 30\n", "new_string": None})
+    assert "DEPTH = 30" not in (tmp_path / "model.py").read_text(encoding="utf-8")
+
+    # 2. edits is [] but old_string is provided at top level
+    dispatch(tools, "test", "edit_file", {"old_string": "HEIGHT = 20", "new_string": "HEIGHT = 22", "edits": []})
+    assert "HEIGHT = 22" in (tmp_path / "model.py").read_text(encoding="utf-8")
+
+    # 3. edits contains non-dict element
+    with pytest.raises(ValueError, match="must be a list of objects"):
+        dispatch(tools, "test", "edit_file", {"edits": ["invalid"]})
+
+    # 4. empty edits with no old_string
+    with pytest.raises(ValueError, match="edit_file requires 'edits'"):
+        dispatch(tools, "test", "edit_file", {"edits": []})
+
+    # 5. atomic edit with new_string=None deletes
+    tools.file.edit_file_atomic("model.py", [{"old_string": "HEIGHT = 22\n", "new_string": None}])
+    assert "HEIGHT = 22" not in (tmp_path / "model.py").read_text(encoding="utf-8")
+
+
+

@@ -51,25 +51,20 @@ _OPERATIONAL_RULES = """\
   current directory listing.
 - Use the right tool for the job. ``read_file`` is for content you don't
   already know; skip it when your own previous ``write_file``/``edit_file``
-  already returned the post-state. Prefer ``edit_file`` with multiple edits
-  in one call for related parameter changes (e.g. width, depth, height
-  together). Use ``write_file`` only for the initial model.py or a deliberate
-  full rewrite. ``insert_file`` is for substantial new feature blocks.
+  already returned the post-state. Use ``write_file`` only for the initial
+  model.py or a deliberate full rewrite. Use ``edit_file`` for all incremental
+  modifications (pass ``old_string`` and ``new_string`` for a single edit, or
+  an ``edits`` array for multiple related changes).
 - Every tool result is a JSON envelope (``ok``, ``tool``, ``data`` /
   ``error``). The ``data`` block is shaped for the tool (``read_file`` →
-  ``{exists, content, sha256, ...}``; ``write_file``/``edit_file``/``insert_file``
-  → ``{summary, revision_id, warnings}``; ``cad_build_and_verify`` →
-  ``{rendered, metrics, declared_parameters, model_sha256, preview_sha256,
-  summary, ...}``). Errors carry ``{code, phase, message, retryable, hint}``;
-  the ``hint`` is the next step.
+  ``{exists, content, total_lines, ...}``; ``write_file``/``edit_file``
+  → ``{summary, revision_id}``; ``cad_build_and_verify`` →
+  ``{rendered, metrics, declared_parameters, summary, ...}``). Errors carry
+  ``{code, phase, message, retryable, hint}``; the ``hint`` is the next step.
 - ``cad_build_and_verify`` validates geometry, extracts numeric UPPER_CASE
   parameters from the initial model.py AST block, and produces the canonical
   eight-view rasterisation + contact sheet in one call. Inspect the inline
   evidence and either accept or iterate.
-- ``cad_screenshot`` and ``cad_review`` are heavy, opt-in tools. Reserve
-  them for complex, visually ambiguous, fit-critical, or explicitly
-  user-requested work; the inline evidence from a default-rendered
-  ``cad_build_and_verify`` already answers most small edits.
 - Geometric conflict (slot clipping a fastener hole, self-intersecting
   fillet, wall-thickness violation, etc.): STOP and call ``question`` with
   the trade-off. Never silently mutate a user-stated dimension to "make it

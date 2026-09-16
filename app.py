@@ -550,6 +550,8 @@ def create_app(settings: Settings | None = None) -> Flask:
                 return jsonify({"error": str(error)}), 404
             runner = app.config["AGENT_RUNNER"]
             if runner.has_active_state_for(project_name):
+                runner.stop(project_name)
+            if runner.has_active_state_for(project_name):
                 return jsonify({"error": "Cannot delete a project with active agent state."}), 409
             shutil.rmtree(project_dir)
         return jsonify({"deleted": True})
@@ -575,6 +577,8 @@ def create_app(settings: Settings | None = None) -> Flask:
                 return jsonify({"error": str(error)}), 404
             runner = app.config["AGENT_RUNNER"]
             if runner.has_active_state_for(project_name):
+                runner.stop(project_name)
+            if runner.has_active_state_for(project_name):
                 return jsonify(
                     {"error": "Cannot reset a project with active agent state."}
                 ), 409
@@ -583,6 +587,7 @@ def create_app(settings: Settings | None = None) -> Flask:
                     {"error": "Cannot reset while an agent task is running."}
                 ), 409
             removed = runner.clear_history(project_dir)
+            (project_dir / ".agent_state.json").unlink(missing_ok=True)
         bus.publish(
             "conversation_reset",
             {"project": project_name, "removed": removed},
@@ -611,6 +616,8 @@ def create_app(settings: Settings | None = None) -> Flask:
             if target.exists():
                 return jsonify({"error": "A project with that name already exists."}), 409
             runner = app.config["AGENT_RUNNER"]
+            if runner.has_active_state_for(project_name):
+                runner.stop(project_name)
             if runner.has_active_state_for(project_name):
                 return jsonify({"error": "Cannot rename a project with active agent state."}), 409
             metadata = _read_project_metadata(project_dir)
@@ -1123,6 +1130,8 @@ def create_app(settings: Settings | None = None) -> Flask:
         with _project_lock(app, project_name):
             runner = app.config["AGENT_RUNNER"]
             if runner.has_active_state_for(project_name):
+                runner.stop(project_name)
+            if runner.has_active_state_for(project_name):
                 return jsonify({"error": "Cannot restore while the agent is active."}), 409
             store = RevisionStore(
                 project_dir,
@@ -1146,7 +1155,7 @@ def create_app(settings: Settings | None = None) -> Flask:
             from agent.tools.cad_tool import CadTool
             cad = CadTool(project_dir, bus.publish, store)
             try:
-                build = cad.build_and_verify(mode="final")
+                build = cad.build_and_verify(render=True)
                 metrics = build.get("metrics") or {}
             except (RuntimeError, ValueError, TypeError) as error:
                 bus.publish("agent_error", {

@@ -142,6 +142,7 @@ class AgentRunner:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._active_tools: ProjectTools | None = None
+        self._active_client: Any | None = None
         self._active_project: str | None = None
         # Per-run activity-log handles. ``_run()`` assigns these when the
         # operator enabled ``agent.log_tool_activity`` and clears them in
@@ -161,14 +162,17 @@ class AgentRunner:
     def is_running(self) -> bool:
         with self._lock:
             thread = self._thread
-            complete = self._run_complete.is_set()
-        # A run is considered active if either we know the thread is alive or
-        # the run-completion flag has not yet been raised by its finally. The
-        # completion flag is the authoritative signal; we still fall back to
-        # is_alive() for tests/synthetic runners that inject a thread object.
-        if thread is not None and thread.is_alive():
-            return True
-        return not complete
+            if thread is None:
+                return False
+            if not thread.is_alive():
+                # Thread has terminated. Clean up stale references if finally was bypassed.
+                self._thread = None
+                self._run_complete.set()
+                self._active_project = None
+                self._active_tools = None
+                self._active_client = None
+                return False
+            return not self._run_complete.is_set()
 
     def has_active_state_for(self, project: str) -> bool:
         """Return whether the project has an agent run that must not be deleted."""
@@ -266,8 +270,18 @@ class AgentRunner:
                 affected = [project]
             if stop_active_task:
                 self._stop_event.set()
-            if stop_active_task and self._active_tools:
-                self._active_tools.stop()
+                if self._active_tools:
+                    self._active_tools.stop()
+                if self._active_client:
+                    try:
+                        self._active_client.abort()
+                    except Exception:
+                        pass
+            thread_to_join = self._thread if stop_active_task else None
+
+        if thread_to_join is not None and thread_to_join.is_alive():
+            thread_to_join.join(timeout=2.0)
+
         for cleared in affected:
             (
                 self.settings.workspace_root / cleared / ".agent_state.json"
@@ -282,21 +296,32 @@ class AgentRunner:
         message: str,
         image_paths: list[Path] | None = None,
     ) -> None:
-        self.publish(
-            "agent_status",
-            {
-                "project": project,
-                "status": "started",
-                "message": "Planning CAD task...",
-            },
-        )
+        activity_logger: ActivityLogger | None = None
+        run_id = uuid.uuid4().hex
         project_dir = self.settings.workspace_root / project
-        tools = ProjectTools(
-            project_dir, self.publish, self.settings, self._stop_event
-        )
-        with self._lock:
-            self._active_tools = tools
         try:
+            self.publish(
+                "agent_status",
+                {
+                    "project": project,
+                    "status": "started",
+                    "message": "Planning CAD task...",
+                },
+            )
+            tools = ProjectTools(
+                project_dir, self.publish, self.settings, self._stop_event
+            )
+            client = create_llm_client(self.settings)
+            client.stop_event = self._stop_event
+            session_prefix = (
+                self.settings.openrouter_session_prefix
+                if self.settings.llm_provider == "openrouter"
+                else self.settings.llm_provider
+            )
+            client.session_id = f"{session_prefix}:{project}"
+            with self._lock:
+                self._active_tools = tools
+                self._active_client = client
             messages = self._context(project_dir, message, image_paths or [])
             preview_id: str | None = None
             cad_error: str | None = None
@@ -306,20 +331,6 @@ class AgentRunner:
             nudged_final_verification = False
             build_failure_count = 0
             build_failure_signatures: dict[str, int] = {}
-            client = create_llm_client(self.settings)
-            client.stop_event = self._stop_event
-            session_prefix = (
-                self.settings.openrouter_session_prefix
-                if self.settings.llm_provider == "openrouter"
-                else self.settings.llm_provider
-            )
-            client.session_id = f"{session_prefix}:{project}"
-            # Wire the activity logger when the operator enabled
-            # ``agent.log_tool_activity``. The logger is opt-in so default
-            # runs keep the same on-disk footprint; tests and reviewers
-            # leave it ``None`` and the wire path becomes a no-op.
-            activity_logger: ActivityLogger | None = None
-            run_id = uuid.uuid4().hex
             if activity_logging_enabled(self.settings):
                 activity_logger = get_logger(project_dir)
                 client.activity_logger = activity_logger
@@ -634,6 +645,7 @@ class AgentRunner:
         finally:
             with self._lock:
                 self._active_tools = None
+                self._active_client = None
                 if self._active_project == project:
                     self._active_project = None
                 # Mark this run finished and drop the thread reference so a
@@ -643,11 +655,14 @@ class AgentRunner:
             self._active_activity_logger = None
             self._active_run_id = None
             if activity_logger is not None:
-                activity_logger.log(
-                    "run_end",
-                    {"project": project, "cancelled": self._stop_event.is_set()},
-                    run_id=run_id,
-                )
+                try:
+                    activity_logger.log(
+                        "run_end",
+                        {"project": project, "cancelled": self._stop_event.is_set()},
+                        run_id=run_id,
+                    )
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------ context
 
@@ -684,8 +699,7 @@ class AgentRunner:
             content = (
                 "<project_state>\n"
                 "model.py does not exist. Create it directly with write_file; do not "
-                "call read_file, edit_file, cad_build_and_verify, "
-                "cad_screenshot, or cad_review first.\n"
+                "call read_file, edit_file, or cad_build_and_verify first.\n"
                 "</project_state>"
             )
         # Gemini normalizes all system messages into an immutable instruction.
@@ -738,6 +752,7 @@ class AgentRunner:
         removed, ``False`` when the project had no recorded conversation.
         The model, preview, renders, and revision blobs are left untouched.
         """
+        (project_dir / ".agent_state.json").unlink(missing_ok=True)
         return ConversationStore.clear(project_dir)
 
     def _publish_usage(self, project: str, usage: dict | None) -> None:

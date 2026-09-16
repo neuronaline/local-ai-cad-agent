@@ -595,6 +595,17 @@ async function loadCurrentState() {
     showQuestion({project: currentProject, ...q});
   } else if (data.status === 'running') {
     setThinking(true);
+  } else if (data.status === 'idle') {
+    setThinking(false);
+    const agentRunItem = activityItems.get('agent-run');
+    if (agentRunItem && (agentRunItem.status === 'started' || agentRunItem.status === 'running')) {
+      addToolMessage({
+        call_id: 'agent-run',
+        tool: 'agent',
+        status: 'stopped',
+        result: 'Agent is idle.',
+      });
+    }
   }
 }
 
@@ -682,7 +693,7 @@ function addInfoMessage(type, data = {}) {
     updateUsagePill(data);
   } else if (type === 'agent_stopped') {
     addToolMessage({
-      call_id: `stopped-${crypto.randomUUID()}`,
+      call_id: 'agent-run',
       tool: 'agent',
       status: 'stopped',
       result: 'Agent task stopped.',
@@ -755,6 +766,13 @@ sendToggle?.addEventListener('click', async () => {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({project: currentProject}),
+      });
+      setThinking(false);
+      addToolMessage({
+        call_id: 'agent-run',
+        tool: 'agent',
+        status: 'stopped',
+        result: 'Agent task stopped.',
       });
     } catch (error) {
       addMessage(error.message, 'error');
@@ -1283,6 +1301,12 @@ function connectStream() {
       addMessage(data.message || 'Agent error.', 'error');
       // Errors are terminal; ensure the thinking indicator clears.
       setThinking(false);
+      addToolMessage({
+        call_id: 'agent-run',
+        tool: 'agent',
+        status: 'failed',
+        result: data.message || 'Agent error.',
+      });
     } catch {}
   });
   eventSource.addEventListener('agent_stopped', event => {
@@ -1290,6 +1314,12 @@ function connectStream() {
       const data = JSON.parse(event.data);
       if (data.project !== currentProject) return;
       setThinking(false);
+      addToolMessage({
+        call_id: 'agent-run',
+        tool: 'agent',
+        status: 'stopped',
+        result: 'Agent task stopped.',
+      });
     } catch {}
   });
   eventSource.addEventListener('stream_reset', () => {

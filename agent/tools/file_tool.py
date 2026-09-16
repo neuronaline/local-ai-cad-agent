@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import hashlib
 import json
 import math
 import operator
@@ -83,12 +82,6 @@ class ModelPreflight(ast.NodeVisitor):
     def __init__(self) -> None:
         self.values: dict[str, object] = {}
         self.edge_points: dict[str, tuple[tuple[float, ...], tuple[float, ...]]] = {}
-        # Topology-change tracking is a depth counter rather than a one-way
-        # boolean so the warning fires only for assignments nested inside the
-        # fillet/chamfer expression chain. A boolean latch persisted across
-        # every later statement and produced false positives for unrelated
-        # parts (audit_024).
-        self._topology_depth: int = 0
         self.warnings: list[str] = []
         self.blocked_errors: list[str] = []
 
@@ -117,19 +110,6 @@ class ModelPreflight(ast.NodeVisitor):
             points = self._line_points(node.value)
             if points is not None:
                 self.edge_points[name] = points
-            # ``_topology_depth > 0`` means this assignment is nested inside
-            # a fillet/chamfer expression chain (depth was bumped in
-            # ``visit_Call`` before ``generic_visit`` walked the args).
-            # Sibling statements after the fillet see ``depth == 0`` and
-            # do not trigger the warning, fixing the unrelated-over-warning
-            # case (audit_024).
-            if self._topology_depth > 0 and self._contains_fixed_selector_index(
-                node.value
-            ):
-                self.warnings.append(
-                    f"line {node.lineno}: fixed selector index used after a topology-changing "
-                    "operation; reselect by geometry, position, radius, or adjacency"
-                )
         self.generic_visit(node)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
@@ -160,27 +140,6 @@ class ModelPreflight(ast.NodeVisitor):
                 )
         elif name == "RadiusArc":
             self._validate_radius_arc(node)
-        elif name in {"fillet", "chamfer"}:
-            # In-call check: a fixed selector index passed directly to a
-            # topology-changing call resolves against the pre-call geometry
-            # but the returned selector points at a different edge after
-            # the call, so the indexed edge is fragile (audit_024).
-            for arg in node.args:
-                if self._contains_fixed_selector_index(arg):
-                    self.warnings.append(
-                        f"line {node.lineno}: fixed selector index passed to {name}; "
-                        "reselect by geometry, position, radius, or adjacency"
-                    )
-            # Bump the depth counter for the duration of the children walk
-            # so nested visit_Assign calls in the same expression chain see
-            # ``_topology_depth > 0``. Reset on exit so unrelated later
-            # statements are not warned.
-            self._topology_depth += 1
-            try:
-                self.generic_visit(node)
-            finally:
-                self._topology_depth -= 1
-            return
         self.generic_visit(node)
 
     def _validate_radius_arc(self, node: ast.Call) -> None:
@@ -279,23 +238,7 @@ class ModelPreflight(ast.NodeVisitor):
             return node.func.attr
         return None
 
-    @staticmethod
-    def _contains_fixed_selector_index(node: ast.AST) -> bool:
-        selector_names = {"edges", "faces", "vertices", "wires", "sort_by", "group_by"}
-        for child in ast.walk(node):
-            if not isinstance(child, ast.Subscript):
-                continue
-            index = child.slice
-            if not (isinstance(index, ast.Constant) and isinstance(index.value, int)):
-                continue
-            calls = {
-                part.func.attr
-                for part in ast.walk(child.value)
-                if isinstance(part, ast.Call) and isinstance(part.func, ast.Attribute)
-            }
-            if calls & selector_names:
-                return True
-        return False
+
 
 
 class FileTool:
@@ -345,6 +288,7 @@ class FileTool:
         offset: int = 1,
         limit: int | None = None,
         known_sha256: str | None = None,
+        **_ignored: object,
     ) -> str:
         path = self._path(filename)
         if offset < 1:
@@ -354,7 +298,6 @@ class FileTool:
                 {
                     "exists": False,
                     "content": "",
-                    "sha256": None,
                     "total_lines": 0,
                     "offset": offset,
                     "returned_lines": 0,
@@ -367,15 +310,6 @@ class FileTool:
                 f"{filename} is too large to read safely (max {MAX_FILE_BYTES // 1024} KiB)."
             )
         content = path.read_text(encoding="utf-8")
-        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-        if known_sha256:
-            if len(known_sha256) != 64:
-                raise ValueError("known_sha256 must be a SHA-256 digest.")
-            if known_sha256 == digest:
-                return json.dumps(
-                    {"exists": True, "unchanged": True, "sha256": digest},
-                    ensure_ascii=False,
-                )
         if limit is None:
             limit = None if offset == 1 else DEFAULT_READ_LIMIT
         if limit is not None and (limit < 1 or limit > MAX_READ_LINES):
@@ -393,7 +327,6 @@ class FileTool:
             {
                 "exists": True,
                 "content": chunk,
-                "sha256": digest,
                 "total_lines": len(lines),
                 "offset": offset,
                 "returned_lines": len(chunk.splitlines()),
@@ -402,42 +335,20 @@ class FileTool:
             ensure_ascii=False,
         )
 
-    @staticmethod
-    def _validate_expected_sha(
-        filename: str, content: str, expected_sha256: str | None
-    ) -> None:
-        if expected_sha256 is None:
-            return
-        if len(expected_sha256) != 64:
-            raise ValueError("expected_sha256 must be a SHA-256 digest.")
-        actual = hashlib.sha256(content.encode("utf-8")).hexdigest()
-        if actual != expected_sha256:
-            raise ValueError(
-                f"{filename} changed since it was read (current sha256={actual}); "
-                "call read_file again and use that digest as expected_sha256."
-            )
-
     def write_file(
         self,
         filename: str,
         content: str,
         expected_sha256: str | None = None,
+        **_ignored: object,
     ) -> str:
         path = self._path(filename)
         with _file_lock(path):
-            current = path.read_text(encoding="utf-8") if path.exists() else ""
-            # ``expected_sha256`` is optional. When omitted, the caller is
-            # declaring an unconditional overwrite; we still capture the
-            # current SHA so the caller can pass it on the next edit if they
-            # want strict conflict detection. This avoids forcing a redundant
-            # ``read_file`` round-trip before every ``write_file`` (the model
-            # already knows its own last write produced a known SHA).
-            self._validate_expected_sha(filename, current, expected_sha256)
             return self._write_model(content, "write_file")
 
     def _write_model(self, content: str, operation: str) -> str:
         """Validate, commit revision, and atomically write model.py."""
-        warnings = self.validate_model(content)
+        self.validate_model(content)
         revision = self._revisions.commit(
             content,
             RevisionOrigin(
@@ -446,31 +357,25 @@ class FileTool:
                 tool_call_id=self._tool_call_id,
             ),
         )
-        result = (
+        return (
             f"Wrote model.py ({len(content.splitlines())} lines, "
             f"{len(content)} chars, revision {revision.id[:8]})."
         )
-        if warnings:
-            result += "\nPRE-FLIGHT WARNING: " + " | ".join(warnings)
-        return result
 
     def edit_file(
         self,
         filename: str,
         old_string: str,
-        new_string: str,
+        new_string: str = "",
         expected_sha256: str | None = None,
+        **_ignored: object,
     ) -> str:
-        if not old_string:
+        if not isinstance(old_string, str) or not old_string:
             raise ValueError("old_string must not be empty.")
-        # ``expected_sha256`` is optional: omitting it means an unconditional
-        # edit (the same pattern as ``write_file``). The agent already knows
-        # the current content from its own previous write, so a redundant
-        # ``read_file`` round-trip only to capture the SHA would just waste a
-        # tool call + tokens + latency. Conflict detection remains opt-in via
-        # ``expected_sha256``; pass it when you want to guarantee no concurrent
-        # edit. If expected_sha256 mismatches, re-read; do not retry the same
-        # edit blindly.
+        if new_string is None:
+            new_string = ""
+        elif not isinstance(new_string, str):
+            raise ValueError("new_string must be a string.")
         path = self._path(filename)
         with _file_lock(path):
             if not path.exists():
@@ -478,7 +383,6 @@ class FileTool:
                     f"{filename} does not exist; use write_file to create it."
                 )
             current = path.read_text(encoding="utf-8")
-            self._validate_expected_sha(filename, current, expected_sha256)
             matches = current.count(old_string)
             if matches != 1:
                 raise ValueError(
@@ -508,6 +412,7 @@ class FileTool:
         content: str,
         position: str,
         expected_sha256: str | None = None,
+        **_ignored: object,
     ) -> str:
         """Insert content next to one short, exact anchor without replacing it."""
         if not anchor:
@@ -521,7 +426,6 @@ class FileTool:
             if not path.exists():
                 raise ValueError(f"{filename} does not exist; use write_file to create it.")
             current = path.read_text(encoding="utf-8")
-            self._validate_expected_sha(filename, current, expected_sha256)
             matches = current.count(anchor)
             if matches != 1:
                 raise ValueError(
@@ -538,6 +442,7 @@ class FileTool:
         filename: str,
         edits: list[dict[str, str]],
         expected_sha256: str | None = None,
+        **_ignored: object,
     ) -> str:
         """Apply several ``{old_string, new_string}`` replacements atomically.
 
@@ -555,7 +460,9 @@ class FileTool:
             if not isinstance(entry, dict):
                 raise ValueError(f"edits[{index}] must be an object.")
             old_string = entry.get("old_string")
-            new_string = entry.get("new_string", "")
+            new_string = entry.get("new_string")
+            if new_string is None:
+                new_string = ""
             if not isinstance(old_string, str) or not old_string:
                 raise ValueError(f"edits[{index}].old_string must be non-empty.")
             if not isinstance(new_string, str):
@@ -568,7 +475,6 @@ class FileTool:
                     f"{filename} does not exist; use write_file to create it."
                 )
             current = path.read_text(encoding="utf-8")
-            self._validate_expected_sha(filename, current, expected_sha256)
             # Validate every match against the original buffer (not the running
             # ``updated`` string) so an edit cannot invalidate another edit's
             # ``old_string`` after a previous replace has rewritten the region.

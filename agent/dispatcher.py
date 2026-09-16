@@ -55,12 +55,13 @@ def dispatch(
     ``waiting`` is True only for the question tool (the LLM is parked
     until the user replies).
 
-    The dispatcher knows only the eight tool names published by
-    :mod:`agent.tool_schemas`: ``cad_build_and_verify``, ``cad_screenshot``,
-    ``cad_review``, ``read_file``, ``write_file``, ``edit_file``,
-    ``insert_file``, and ``question``. Tool instances expose a per-call
-    ``with_call_id`` method plus a generic ``execute(args)`` entry; the
-    dispatcher selects the right one based on name.
+    The dispatcher recognizes the core tools published by
+    :mod:`agent.tool_schemas` (``cad_build_and_verify``, ``read_file``,
+    ``write_file``, ``edit_file``, and ``question``) as well as legacy
+    tools (``cad_screenshot``, ``cad_review``, ``insert_file``). Tool
+    instances expose a per-call ``with_call_id`` method plus a generic
+    ``execute(args)`` entry; the dispatcher selects the right one based on
+    name.
     """
     if name == "cad_build_and_verify":
         cad = tools.cad.with_call_id(call_id)
@@ -86,9 +87,8 @@ def dispatch(
         return (
             tool.read_file(
                 "model.py",
-                args.get("offset", 1),
+                args.get("offset") or 1,
                 args.get("limit"),
-                args.get("known_sha256"),
             ),
             False,
         )
@@ -100,7 +100,6 @@ def dispatch(
             tool.write_file(
                 "model.py",
                 args.get("content", ""),
-                args.get("expected_sha256"),
             ),
             False,
         )
@@ -109,9 +108,19 @@ def dispatch(
             tools.file.with_call_id(call_id) if call_id else tools.file
         )
         edits = args.get("edits")
-        if edits is None:
+        if not edits and "old_string" in args:
+            new_str = args.get("new_string")
+            edits = [
+                {
+                    "old_string": args["old_string"],
+                    "new_string": "" if new_str is None else new_str,
+                }
+            ]
+        elif isinstance(edits, dict):
+            edits = [edits]
+        if not edits:
             raise ValueError(
-                "edit_file requires 'edits' (list of {old_string, new_string})."
+                "edit_file requires 'edits' (list of {old_string, new_string}) or 'old_string' and 'new_string'."
             )
         if not isinstance(edits, list):
             raise ValueError("edit_file 'edits' must be a list of objects.")
@@ -120,17 +129,20 @@ def dispatch(
         # ``edit_file_atomic`` helper that performs the batch safely.
         if len(edits) == 1:
             entry = edits[0]
+            if not isinstance(entry, dict):
+                raise ValueError("edit_file 'edits' must be a list of objects.")
+            old_str = entry.get("old_string")
+            new_str = entry.get("new_string")
             return (
                 tool.edit_file(
                     "model.py",
-                    entry.get("old_string", ""),
-                    entry.get("new_string", ""),
-                    args.get("expected_sha256"),
+                    "" if old_str is None else old_str,
+                    "" if new_str is None else new_str,
                 ),
                 False,
             )
         return (
-            tool.edit_file_atomic("model.py", edits, args.get("expected_sha256")),
+            tool.edit_file_atomic("model.py", edits),
             False,
         )
     if name == "insert_file":
@@ -141,7 +153,6 @@ def dispatch(
                 anchor=args["anchor"],
                 content=args["content"],
                 position=args["position"],
-                expected_sha256=args.get("expected_sha256"),
             ),
             False,
         )
