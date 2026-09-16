@@ -51,19 +51,14 @@ def sanitize_assistant_message(
 ) -> dict[str, Any]:
     """Copy a model response while retaining supported continuation fields.
 
-    OpenRouter reasoning is retained only for tool-call turns, where it is
-    required to continue the interrupted model response. Anything else the
-    provider returns
-    (``audio``, ``function_call``, ``refusal``, ``annotations``, ``logprobs``,
-    ``name``, vendor-specific blobs, …) is dropped; otherwise the persisted
-    record cannot be compared with the canonical ``{"role", "content"}``
-    shape that ``AgentRunner._complete`` writes when it needs to re-append
-    the final assistant turn, and a duplicate assistant entry would be
-    emitted on the next history load.
+    When ``preserve_reasoning`` is True, reasoning and reasoning_details are
+    retained across all assistant turns (both tool-calling turns and conversational
+    responses) so the model's reasoning memory is never dropped and prompt prefixes
+    remain strictly append-only. Non-whitelisted fields (audio, logprobs, etc.)
+    are dropped.
     """
     sanitized = deepcopy(message)
-    has_tool_calls = bool(sanitized.get("tool_calls"))
-    if not preserve_reasoning or not has_tool_calls:
+    if not preserve_reasoning:
         sanitized.pop("reasoning", None)
         sanitized.pop("reasoning_details", None)
     for key in list(sanitized):
@@ -73,7 +68,7 @@ def sanitize_assistant_message(
     # provider-specific metadata that the canonical assistant record
     # (and the LLM context) does not carry.
     allowed = {"role", "content", "tool_calls"}
-    if preserve_reasoning and has_tool_calls:
+    if preserve_reasoning:
         allowed.update({"reasoning", "reasoning_details"})
     for key in list(sanitized):
         if key not in allowed:
@@ -108,23 +103,18 @@ def sanitize_messages(
     """Strip only unsupported assistant metadata, retaining content and tools.
 
     When ``preserve_reasoning`` is set, ``reasoning`` / ``reasoning_details`` are
-    only retained on the most recent assistant message — the one the provider
-    needs back in order to continue the interrupted tool-call response. Older
-    assistant turns are reduced to the canonical
-    ``{role, content, tool_calls}`` shape so a growing tool loop does not also
-    re-send every previous reasoning chain on every iteration.
+    retained across all assistant turns so the prompt prefix remains strictly
+    append-only. Mutating historical turns by dropping reasoning from earlier
+    assistant messages breaks provider prompt caches (causing cache misses)
+    and causes input token counts to fluctuate erratically across iterations.
     """
     sanitized = normalize_messages(messages)
-    last_assistant_index = max(
-        (index for index, message in enumerate(sanitized) if message.get("role") == "assistant"),
-        default=-1,
-    )
     for index, message in enumerate(sanitized):
         if message.get("role") != "assistant":
             continue
         sanitized[index] = sanitize_assistant_message(
             message,
-            preserve_reasoning=preserve_reasoning and index == last_assistant_index,
+            preserve_reasoning=preserve_reasoning,
         )
     return relocate_tool_images(sanitized)
 

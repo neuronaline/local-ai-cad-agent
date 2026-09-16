@@ -453,14 +453,11 @@ class AgentRunner:
                                     "model.py exists but it has not been verified. "
                                     "Call cad_build_and_verify now."
                                 )
-                                # Inject in-memory only; persisting the
-                                # synthetic reminder would (a) make the UI
-                                # history drawer render it as if the user
-                                # said it and (b) re-send the user-role
-                                # token on every later turn until
-                                # MAX_HISTORY truncation. The current run
-                                # still receives the nudge.
+                                # Persist the synthetic reminder so subsequent turns reload
+                                # an identical prompt prefix for prompt-cache stability.
+                                # The UI history endpoint ignores events with synthetic=True.
                                 messages.append(reminder)
+                                self._append_message(project_dir, reminder)
                                 continue
                             self.publish(
                                 "agent_error",
@@ -482,10 +479,8 @@ class AgentRunner:
                                 "verification. Call cad_build_and_verify with its default "
                                 "render=true before finishing."
                             )
-                            # In-memory only — see the nudge_cad branch above
-                            # for why synthetic reminders must not be appended
-                            # to the canonical conversation log.
                             messages.append(reminder)
+                            self._append_message(project_dir, reminder)
                             continue
                         self.publish(
                             "agent_error",
@@ -682,14 +677,65 @@ class AgentRunner:
             self._append_message(project_dir, user_message)
         return [
             {"role": "system", "content": get_system_prompt()},
-            self._project_state_message(project_dir),
+            self._project_state_message(project_dir, history),
             *history,
         ]
 
-    @staticmethod
-    def _project_state_message(project_dir: Path) -> dict[str, str]:
-        """Provide dynamic workspace state after the cacheable system prefix."""
-        if (project_dir / "model.py").is_file():
+    @classmethod
+    def _initial_model_existed(cls, project_dir: Path, history: list[dict]) -> bool:
+        """Determine whether model.py existed before this conversation started.
+
+        To keep the cacheable prompt prefix byte-stable across multi-turn chats,
+        the ``<project_state>`` message at index 1 must reflect the initial
+        state when the conversation began, rather than flipping dynamically
+        after ``write_file`` creates ``model.py``. The initial state is cached
+        in ``.agent_initial_state.json`` so it remains immutable for the lifetime
+        of the conversation.
+        """
+        init_state_path = project_dir / ".agent_initial_state.json"
+        if init_state_path.is_file():
+            try:
+                data = json.loads(init_state_path.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and "model_existed" in data:
+                    return bool(data["model_existed"])
+            except (OSError, json.JSONDecodeError):
+                pass
+
+        has_write = any(
+            isinstance(msg.get("tool_calls"), list)
+            and any(
+                isinstance(call, dict)
+                and call.get("function", {}).get("name") == "write_file"
+                for call in msg["tool_calls"]
+            )
+            for msg in history
+            if isinstance(msg, dict) and msg.get("role") == "assistant"
+        )
+        if has_write:
+            existed = False
+        else:
+            existed = (project_dir / "model.py").is_file()
+
+        try:
+            init_state_path.parent.mkdir(parents=True, exist_ok=True)
+            init_state_path.write_text(
+                json.dumps({"model_existed": existed}), encoding="utf-8"
+            )
+        except OSError:
+            pass
+        return existed
+
+    @classmethod
+    def _project_state_message(
+        cls, project_dir: Path, history: list[dict] | None = None
+    ) -> dict[str, str]:
+        """Provide initial workspace state after the cacheable system prefix."""
+        existed = (
+            cls._initial_model_existed(project_dir, history)
+            if history
+            else (project_dir / "model.py").is_file()
+        )
+        if existed:
             content = (
                 "<project_state>\n"
                 "model.py exists. Read it before making a targeted edit.\n"
@@ -703,7 +749,7 @@ class AgentRunner:
                 "</project_state>"
             )
         # Gemini normalizes all system messages into an immutable instruction.
-        # Keeping mutable workspace state in a later user message lets its
+        # Keeping workspace state in a later user message lets its
         # explicit system-message cache breakpoint remain reusable.
         return {"role": "user", "content": content}
 
@@ -753,6 +799,7 @@ class AgentRunner:
         The model, preview, renders, and revision blobs are left untouched.
         """
         (project_dir / ".agent_state.json").unlink(missing_ok=True)
+        (project_dir / ".agent_initial_state.json").unlink(missing_ok=True)
         return ConversationStore.clear(project_dir)
 
     def _publish_usage(self, project: str, usage: dict | None) -> None:
@@ -938,7 +985,11 @@ class AgentRunner:
         """
         project_dir = self.settings.workspace_root / project
         history = self._load_history(project_dir)
-        if not history or history[-1] != {"role": "assistant", "content": message}:
+        if not history or not (
+            isinstance(history[-1], dict)
+            and history[-1].get("role") == "assistant"
+            and history[-1].get("content") == message
+        ):
             self._append_message(
                 project_dir, {"role": "assistant", "content": message}
             )

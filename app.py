@@ -588,6 +588,7 @@ def create_app(settings: Settings | None = None) -> Flask:
                 ), 409
             removed = runner.clear_history(project_dir)
             (project_dir / ".agent_state.json").unlink(missing_ok=True)
+            (project_dir / ".agent_initial_state.json").unlink(missing_ok=True)
         bus.publish(
             "conversation_reset",
             {"project": project_name, "removed": removed},
@@ -778,6 +779,8 @@ def create_app(settings: Settings | None = None) -> Flask:
                 try:
                     event = json.loads(line)
                     if not isinstance(event, dict):
+                        continue
+                    if event.get("synthetic"):
                         continue
                     events.append(_redact_history_event(event))
                 except json.JSONDecodeError:

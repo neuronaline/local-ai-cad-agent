@@ -8,6 +8,7 @@ tool-calling lifecycle without dragging in JSONL serialisation rules.
 from __future__ import annotations
 
 import atexit
+from copy import deepcopy
 import json
 import threading
 from pathlib import Path
@@ -51,8 +52,9 @@ class ConversationStore:
     CACHE_MAX: ClassVar[int] = 32
 
     #: Maximum entries returned by :meth:`load` to keep the LLM context
-    #: window bounded.
-    MAX_HISTORY: ClassVar[int] = 100
+    #: window bounded. None disables truncation so full conversation history
+    #: is permanently preserved in memory without prompt prefix invalidation.
+    MAX_HISTORY: ClassVar[int | None] = None
 
     #: Roles kept when truncating the log on load.
     _KEPT_ROLES: ClassVar[set[str]] = {"user", "assistant", "tool"}
@@ -84,8 +86,10 @@ class ConversationStore:
         cls._cache.pop(str(project_dir), None)
 
     @classmethod
-    def load(cls, project_dir: Path) -> list[dict[str, Any]]:
-        """Load the truncated, image-redacted history for ``project_dir``."""
+    def load(
+        cls, project_dir: Path, *, redact_images: bool = False
+    ) -> list[dict[str, Any]]:
+        """Load the truncated history for ``project_dir``."""
         cache_key = str(project_dir)
         # A cache hit short-circuits the file read. The cache is invalidated
         # by ``append``/``clear`` and the cache fill is guarded by the lock
@@ -99,7 +103,12 @@ class ConversationStore:
                 with shared_history_lock():
                     cls._cache.pop(cache_key, None)
             else:
-                return list(cached)
+                if redact_images:
+                    return [
+                        cls._strip_image_parts(deepcopy(item), project_dir)
+                        for item in cached
+                    ]
+                return [deepcopy(item) for item in cached]
         # Serialise the read+cache-set against appends so a concurrent writer
         # cannot have its line missed by this load (or, conversely, so a
         # partially-written tail cannot be observed). ``RLock`` allows the
@@ -119,12 +128,14 @@ class ConversationStore:
                         and item.get("role") in cls._KEPT_ROLES
                     ):
                         history.append(item)
-            history = [
-                cls._strip_image_parts(item, project_dir) for item in history
-            ]
             history = cls._truncate(history)
-            cls._set_cached(cache_key, history)
-        return history
+            cls._set_cached(cache_key, [deepcopy(item) for item in history])
+        if redact_images:
+            return [
+                cls._strip_image_parts(deepcopy(item), project_dir)
+                for item in history
+            ]
+        return [deepcopy(item) for item in history]
 
     @classmethod
     def append(cls, project_dir: Path, message: dict[str, Any]) -> None:
@@ -306,7 +317,7 @@ class ConversationStore:
         ``assistant`` turn is dropped together with its trailing tool
         results if any of its ``tool_call_id`` references are missing.
         """
-        if len(history) <= ConversationStore.MAX_HISTORY:
+        if not ConversationStore.MAX_HISTORY or len(history) <= ConversationStore.MAX_HISTORY:
             return history
         truncated = history[-ConversationStore.MAX_HISTORY:]
         # Drop orphan tool results until we hit a non-tool message.

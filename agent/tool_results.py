@@ -44,44 +44,12 @@ def is_failure(value: str) -> bool:
 
 
 def compact_for_context(tool: str, result: str) -> str:
-    """Return a context-bounded copy of ``result`` for LLM history.
+    """Return ``result`` as-is without lossy compaction.
 
-    The returned string keeps the same envelope shape so the model can still
-    parse ``ok``/``tool``/``data``, but drops fields that are repeated across
-    every turn (which otherwise inflate the prompt and crowd out new turns).
-
-    Only the in-conversation copy is compacted: the raw result still flows to
-    the UI via ``tool_status`` events and to ``.cad-agent/`` artifacts on
-    disk, so operators and reviewers see the full payload.
+    Preserves all metrics, feature summaries, review details, and artifact
+    paths so the model's memory is 100% complete, uncompressed, and intact
+    across all turns.
     """
-    try:
-        payload = json.loads(result)
-    except (TypeError, json.JSONDecodeError):
-        return result
-    if not isinstance(payload, dict):
-        return result
-    if tool == "cad_build_and_verify" and payload.get("ok") is True:
-        data = payload.get("data")
-        if isinstance(data, dict):
-            metrics = data.get("metrics")
-            if isinstance(metrics, dict):
-                fs = metrics.get("feature_summary")
-                if isinstance(fs, dict):
-                    # Keep summary fields (counts); drop the per-feature
-                    # cylinder table — the agent only needs totals to decide
-                    # whether to rebuild.
-                    metrics["feature_summary"] = _summarize_feature_summary(fs)
-            data.pop("feature_summary", None)
-            # ``preview`` and ``render`` are file-path markers used by the UI
-            # SSE events and the on-disk artifact paths. The agent never
-            # reads them back; dropping them shrinks the prompt without
-            # information loss.
-            data.pop("preview", None)
-            data.pop("render", None)
-            rm = data.get("review_manifest")
-            if isinstance(rm, dict):
-                data["review_manifest"] = _compacted_review_manifest(rm)
-        return json.dumps(payload, ensure_ascii=False)
     return result
 
 

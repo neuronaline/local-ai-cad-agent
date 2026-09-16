@@ -1,4 +1,5 @@
 import io
+import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -6,13 +7,17 @@ import pytest
 
 from agent import dispatcher as dispatcher_module
 from agent.dispatcher import process_tool_call
+from agent.conversation import ConversationStore
+from agent.core import AgentRunner
 from agent.llm_base import (
     FallbackChatClient,
     RequestCancelled,
     StreamResponseError,
     parse_chat_stream,
+    sanitize_messages,
 )
 from agent.revisions import RevisionStore, compute_model_sha256
+from agent.settings import Settings
 from agent.tools.file_tool import FileTool
 
 
@@ -391,6 +396,317 @@ def test_fallback_wrapper_falls_back_to_fallback_preserve_reasoning() -> None:
 
     wrapper.chat([{"role": "user", "content": "hi"}])
     assert wrapper.preserve_reasoning is False
+
+
+def test_sanitize_messages_preserves_reasoning_across_all_assistant_turns() -> None:
+    """Historical assistant messages must keep reasoning across all turns for prompt cache stability."""
+    messages = [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "user request"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "write_file", "arguments": "{}"}}],
+            "reasoning_details": [{"type": "reasoning.text", "text": "Turn 1 thinking"}],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call_2", "type": "function", "function": {"name": "edit_file", "arguments": "{}"}}],
+            "reasoning_details": [{"type": "reasoning.text", "text": "Turn 2 thinking"}],
+        },
+        {"role": "tool", "tool_call_id": "call_2", "content": "ok"},
+    ]
+
+    sanitized = sanitize_messages(messages, preserve_reasoning=True)
+
+    # Both older (index 2) and latest (index 4) assistant messages must retain their reasoning
+    assert sanitized[2].get("reasoning_details") == [{"type": "reasoning.text", "text": "Turn 1 thinking"}]
+    assert sanitized[4].get("reasoning_details") == [{"type": "reasoning.text", "text": "Turn 2 thinking"}]
+
+
+def test_sanitize_messages_strips_reasoning_when_preserve_reasoning_is_false() -> None:
+    """When preserve_reasoning is False (e.g. OpenAI), all reasoning fields are stripped."""
+    messages = [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "user request"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "write_file", "arguments": "{}"}}],
+            "reasoning_details": [{"type": "reasoning.text", "text": "Turn 1 thinking"}],
+            "reasoning": "Turn 1 raw thinking",
+        },
+    ]
+
+    sanitized = sanitize_messages(messages, preserve_reasoning=False)
+    assert "reasoning_details" not in sanitized[2]
+    assert "reasoning" not in sanitized[2]
+
+
+def test_sanitize_messages_multi_turn_prefix_stability() -> None:
+    """Turn N messages must be a strict prefix of Turn N+1 messages to guarantee prompt cache hits."""
+    turn_1 = [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "user request"},
+        {
+            "role": "assistant",
+            "content": "Step 1",
+            "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "write_file", "arguments": "{}"}}],
+            "reasoning_details": [{"type": "reasoning.text", "text": "Thinking step 1"}],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+    ]
+    sanitized_t1 = sanitize_messages(turn_1, preserve_reasoning=True)
+
+    turn_2 = list(turn_1) + [
+        {
+            "role": "assistant",
+            "content": "Step 2",
+            "tool_calls": [{"id": "call_2", "type": "function", "function": {"name": "cad_build_and_verify", "arguments": "{}"}}],
+            "reasoning_details": [{"type": "reasoning.text", "text": "Thinking step 2"}],
+        },
+        {"role": "tool", "tool_call_id": "call_2", "content": "ok"},
+    ]
+    sanitized_t2 = sanitize_messages(turn_2, preserve_reasoning=True)
+
+    # The prefix of turn_2 (up to len(sanitized_t1)) must be 100% identical to sanitized_t1
+    assert sanitized_t2[:len(sanitized_t1)] == sanitized_t1
+
+
+def test_conversation_store_load_preserves_images(tmp_path: Path) -> None:
+    """ConversationStore.load preserves multimodal image_url parts so prompt prefixes don't diverge."""
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+
+    msg_with_img = {
+        "role": "tool",
+        "tool_call_id": "call_123",
+        "content": [
+            {"type": "text", "text": "build succeeded"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}},
+        ],
+    }
+    ConversationStore.append(project_dir, msg_with_img)
+
+    # By default, load() preserves the image_url payload
+    loaded = ConversationStore.load(project_dir)
+    assert len(loaded) == 1
+    assert loaded[0]["content"][1]["type"] == "image_url"
+    assert loaded[0]["content"][1]["image_url"]["url"] == "data:image/png;base64,iVBORw0KGgo="
+
+    # If redact_images=True is explicitly passed, it redacts
+    redacted = ConversationStore.load(project_dir, redact_images=True)
+    assert redacted[0]["content"][1]["type"] == "text"
+    assert "[Inline render" in redacted[0]["content"][1]["text"]
+
+
+def test_agent_runner_multi_turn_prefix_and_cache_stability(tmp_path: Path) -> None:
+    """Multi-turn chats must maintain byte-stable prompt prefixes across distinct user turns."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    project_dir = workspace / "test-project"
+    project_dir.mkdir()
+
+    settings = Settings(
+        workspace, "https://example.test", "test-model", 1, "127.0.0.1", 5000
+    )
+    runner = AgentRunner(settings, publish=lambda *args, **kwargs: None)
+
+    # --- Turn 1 ---
+    # Model does not exist initially
+    context_t1 = runner._context(project_dir, "Create a cylinder", [])
+    assert "model.py does not exist" in context_t1[1]["content"]
+
+    # Assistant executes write_file, creating model.py
+    (project_dir / "model.py").write_text("result = Cylinder(10, 20)", encoding="utf-8")
+    assistant_t1_1 = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {"id": "call_write", "type": "function", "function": {"name": "write_file", "arguments": "{}"}}
+        ],
+        "reasoning_details": [{"type": "reasoning.text", "text": "Creating model.py"}],
+    }
+    tool_write_result = {"role": "tool", "tool_call_id": "call_write", "content": "File written"}
+    assistant_t1_2 = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {"id": "call_build", "type": "function", "function": {"name": "cad_build_and_verify", "arguments": "{}"}}
+        ],
+        "reasoning_details": [{"type": "reasoning.text", "text": "Building CAD"}],
+    }
+    tool_build_result = {
+        "role": "tool",
+        "tool_call_id": "call_build",
+        "content": [
+            {"type": "text", "text": "CAD build ok"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="}},
+        ],
+    }
+    assistant_t1_final = {
+        "role": "assistant",
+        "content": "Cylinder has been created and verified.",
+    }
+
+    # Append all messages to store as would happen during run
+    for msg in [assistant_t1_1, tool_write_result, assistant_t1_2, tool_build_result, assistant_t1_final]:
+        ConversationStore.append(project_dir, msg)
+
+    # The full wire messages for Turn 1
+    messages_t1 = context_t1 + [assistant_t1_1, tool_write_result, assistant_t1_2, tool_build_result, assistant_t1_final]
+    wire_t1 = sanitize_messages(messages_t1, preserve_reasoning=True)
+
+    # --- Turn 2 ---
+    # User asks a follow-up question. Even though model.py now exists on disk,
+    # messages[1] must remain "model.py does not exist" so the prefix is unchanged.
+    context_t2 = runner._context(project_dir, "Now drill a 5mm hole through the center", [])
+    assert "model.py does not exist" in context_t2[1]["content"]
+
+    wire_t2 = sanitize_messages(context_t2, preserve_reasoning=True)
+
+    # Crucial assertion: wire_t1 must be an EXACT prefix of wire_t2!
+    # If wire_t2 prefix differs in ANY way, provider prompt cache is invalidated.
+    assert wire_t2[:len(wire_t1)] == wire_t1
+
+    # In particular, the tool image must still be in wire_t2 at the exact position
+    assert wire_t2[7]["role"] == "user"
+    assert wire_t2[7]["content"][1]["type"] == "image_url"
+    assert wire_t2[7]["content"][1]["image_url"]["url"] == "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
+
+
+def test_clear_history_cleans_initial_state_file(tmp_path: Path) -> None:
+    """clear_history removes .agent_initial_state.json along with conversation and state."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    project_dir = workspace / "test-project"
+    project_dir.mkdir()
+
+    settings = Settings(
+        workspace, "https://example.test", "test-model", 1, "127.0.0.1", 5000
+    )
+    runner = AgentRunner(settings, publish=lambda *args, **kwargs: None)
+
+    # Call _context to trigger initial state file creation
+    runner._context(project_dir, "Hello", [])
+    assert (project_dir / ".agent_initial_state.json").is_file()
+
+    # Clear history
+    runner.clear_history(project_dir)
+    assert not (project_dir / ".agent_initial_state.json").is_file()
+    assert not (project_dir / "conversation.jsonl").is_file()
+
+
+def test_sanitize_assistant_message_preserves_reasoning_for_non_tool_turn() -> None:
+    """Assistant messages without tool calls still preserve reasoning when preserve_reasoning=True."""
+    msg = {
+        "role": "assistant",
+        "content": "This is a direct response without any tool calls.",
+        "reasoning": "I thought deeply about how to answer.",
+        "reasoning_details": [{"type": "reasoning.text", "text": "Deep thinking text"}],
+    }
+    sanitized = sanitize_messages([msg], preserve_reasoning=True)
+    assert len(sanitized) == 1
+    assert sanitized[0].get("reasoning") == "I thought deeply about how to answer."
+    assert sanitized[0].get("reasoning_details") == [{"type": "reasoning.text", "text": "Deep thinking text"}]
+
+
+def test_conversation_store_unlimited_history_no_truncation(tmp_path: Path) -> None:
+    """ConversationStore does not truncate history, keeping all messages permanently in memory."""
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+
+    # Append 150 messages (more than the legacy 100 limit)
+    for i in range(150):
+        ConversationStore.append(
+            project_dir,
+            {"role": "user" if i % 2 == 0 else "assistant", "content": f"Message {i}"},
+        )
+
+    loaded = ConversationStore.load(project_dir)
+    assert len(loaded) == 150
+    assert loaded[0]["content"] == "Message 0"
+    assert loaded[-1]["content"] == "Message 149"
+
+
+def test_conversation_store_cache_deepcopy_protects_mutation(tmp_path: Path) -> None:
+    """Mutating loaded history dicts does not corrupt the internal ConversationStore cache."""
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+
+    ConversationStore.append(project_dir, {"role": "user", "content": "Original Content"})
+
+    first_load = ConversationStore.load(project_dir)
+    assert first_load[0]["content"] == "Original Content"
+
+    # Mutate the loaded dict in-place
+    first_load[0]["content"] = "MUTATED"
+
+    # Next load from cache must still have original content
+    second_load = ConversationStore.load(project_dir)
+    assert second_load[0]["content"] == "Original Content"
+
+
+def test_compact_for_context_preserves_full_tool_payload() -> None:
+    """compact_for_context returns tool results intact without lossy compression."""
+    from agent.tool_results import compact_for_context
+
+    raw_result = json.dumps({
+        "ok": True,
+        "tool": "cad_build_and_verify",
+        "data": {
+            "metrics": {
+                "feature_summary": {
+                    "cylinder_table": [{"radius": 5.0, "height": 10.0}],
+                    "through_hole_count": 1,
+                }
+            },
+            "preview": "preview.stl",
+            "render": "render.png",
+            "review_manifest": {"views": ["top", "front"]},
+        }
+    })
+
+    result = compact_for_context("cad_build_and_verify", raw_result)
+    parsed = json.loads(result)
+    # None of the fields were stripped
+    assert "cylinder_table" in parsed["data"]["metrics"]["feature_summary"]
+    assert parsed["data"]["preview"] == "preview.stl"
+    assert parsed["data"]["render"] == "render.png"
+    assert "review_manifest" in parsed["data"]
+
+
+def test_complete_does_not_duplicate_assistant_turn_with_reasoning(tmp_path: Path) -> None:
+    """_complete does not re-append a duplicate assistant turn when one already exists with reasoning."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    project_dir = workspace / "test-project"
+    project_dir.mkdir()
+
+    settings = Settings(
+        workspace, "https://example.test", "test-model", 1, "127.0.0.1", 5000
+    )
+    runner = AgentRunner(settings, publish=lambda *args, **kwargs: None)
+
+    # Simulate assistant message with reasoning already in conversation log
+    msg = {
+        "role": "assistant",
+        "content": "Finished part.",
+        "reasoning_details": [{"type": "reasoning.text", "text": "Reasoning"}],
+    }
+    ConversationStore.append(project_dir, msg)
+
+    # Call _complete
+    runner._complete("test-project", "Finished part.")
+
+    # Must still only be 1 message, not duplicated
+    loaded = ConversationStore.load(project_dir)
+    assert len(loaded) == 1
+    assert loaded[0]["content"] == "Finished part."
+
+
 
 
 def test_file_tool_write_reports_line_count_not_character_count(tmp_path: Path) -> None:
