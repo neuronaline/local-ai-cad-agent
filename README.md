@@ -19,8 +19,7 @@ A local-first web app that lets you **chat with an AI agent to create parametric
 - **Reference images** — Upload up to 5 images (10 MB each) to guide the agent
 - **Sandboxed execution** — All generated code runs in a Bubblewrap container with blocked network and resource limits
 - **Verified builds** — Each model is built, checked for a valid solid, and rendered before the agent reports completion
-- **Selective visual review** — For complex, high-risk, visually ambiguous, or fit-critical work, the agent can call `cad_review` to cross-check renders, geometry, dimensions, and features. Routine small edits use the normal build verification alone.
-- **Targeted screenshots** — For visually ambiguous or complex work, the agent can call `cad_screenshot` to re-rasterise one or more canonical views from the latest revision without re-running OpenSCAD; a `(model_sha, views, quality, contact_sheet)` cache keeps repeated lookups instant without overwriting canonical review evidence
+- **Multi-view visual evidence** — Builds automatically generate canonical 8-view isometric/orthographic renders and a contact sheet alongside geometry and dimension verification
 - **Project management** — Create, rename, and switch between multiple CAD projects with persisted conversation history
 - **Model history** — Inspect source diffs, track successful builds, and restore any retained `model.scad` revision
 - **Dark theme UI** — Compact, responsive interface with Markdown rendering and syntax highlighting
@@ -58,9 +57,9 @@ Only the key for the selected provider is required.
 2. Describe the part, its dimensions, and its intended function. Attach up to five
    PNG, JPEG, or WebP reference images if useful.
 3. Answer any material design questions the agent asks. In a new project, the
-   agent creates `model.scad` before reading, editing, building, screenshotting,
-   or reviewing it. It then builds the model in the sandbox and displays the
-   resulting STL and render.
+   agent creates `model.scad` before reading, editing, or building it. It then
+   builds the model in the sandbox and displays the resulting STL, render, and
+   multi-view evidence.
 4. Review the model and continue the conversation to refine it. Use the revision
    list to compare source changes or restore a previous version.
 
@@ -85,7 +84,7 @@ local-ai-cad-agent/
 │   ├── tool_schemas.py        # Operation-specific model tool contracts
 │   ├── tool_results.py        # Structured success and error envelopes
 │   ├── images.py              # Reference image normalization
-│   └── tools/                 # Agent tools (file, cad, cad_review, cad_screenshot, question)
+│   └── tools/                 # Agent tools (file, cad, question, sandbox runners)
 ├── static/
 │   ├── js/app.js              # SSE client, chat & UI logic
 │   ├── js/viewer.js           # Three.js CadViewer
@@ -111,15 +110,18 @@ per-user configuration file.
 |---|---|---|
 | `workspace_root` | `~/CAD-Agent-Projects` | Where project data lives |
 | `llm.provider` | `openrouter` | Active provider: `openrouter` or `openai` |
-| `agent.tool_call_limit` | `30` | Maximum tool rounds per task |
+| `llm.max_completion_tokens` | `8192` | Maximum token limit per completion |
+| `llm.fallback_provider` | `""` | Optional secondary provider fallback on failure |
+| `agent.tool_call_limit` | `30` | Maximum tool rounds per task (`12` if omitted from config) |
 | `agent.revision_retention_count` | `0` | Model revisions to retain (`0` keeps all) |
 | `agent.debug_log_tool_errors` | `false` | Write detailed recoverable tool failures to `<project>/debug-errors.jsonl` |
-| `agent.log_tool_activity` | `false` | Write a redacted, append-only JSONL trace of the tool loop (LLM requests, SSE deltas, tool calls) to `<project>/.cad-agent/activity.jsonl` |
-| `openrouter.model` | `google/gemini-3.6-flash` | OpenRouter model slug |
-| `openrouter.timeout_seconds` | `60` | Request timeout for OpenRouter |
+| `agent.log_tool_activity` | `false` | Write a redacted, append-only JSONL trace of the tool loop to `<project>/.cad-agent/activity.jsonl` |
+| `openrouter.model` | *(empty)* | OpenRouter model slug |
+| `openrouter.timeout_seconds` | `90` | Request timeout for OpenRouter |
 | `openrouter.reasoning_effort` | `medium` | `minimal`, `low`, `medium`, or `high` (when supported by the model) |
-| `openrouter.provider` | `google-vertex/global` | Preferred provider slug |
-| `openrouter.force_provider` | `true` | Disable provider fallbacks |
+| `openrouter.provider_order` | `["z-ai/fp8"]` | Priority-ordered upstream routing slugs |
+| `openrouter.provider` | `""` | Legacy single-provider slug (used when `provider_order` is empty) |
+| `openrouter.force_provider` | `false` | Disable provider fallbacks (requires single provider) |
 | `openai.model` | `gpt-5.6-terra` | Direct OpenAI model slug |
 | `openai.timeout_seconds` | `60` | Request timeout for OpenAI |
 | `openai.reasoning_effort` | *(empty)* | Optional reasoning setting for compatible OpenAI models |
@@ -128,6 +130,7 @@ per-user configuration file.
 | `review.enabled` | `true` | When false, `cad_build_and_verify` skips the canonical eight-view rasterisation + contact sheet |
 | `review.render_workers` | `4` | Worker processes used to rasterise the canonical views |
 | `review.required_views` | `8` | Views that must be produced and hashed successfully per build |
+| `viewer.grid.size` / `viewer.grid.divisions` | `200` / `20` | Ground grid size in mm and cell count per side |
 
 `reasoning_effort` must be one of `minimal`, `low`, `medium`, or `high` when it
 is set. YAML booleans must be unquoted (`true` / `false`).
@@ -140,7 +143,7 @@ Each project is stored below `workspace_root`. Its important files are:
 |---|---|
 | `model.scad` | Active OpenSCAD source |
 | `preview.stl` / `render.png` | Latest generated browser preview assets |
-| `.cad-agent/reviews/<model_sha>/` | Per-revision multi-view artifacts (`manifest.json`, `views/*.png`, `review-sheet.png`); `result.json` is added when `cad_review` runs |
+| `.cad-agent/reviews/<model_sha>/` | Per-revision multi-view artifacts (`manifest.json`, `views/*.png`, `review-sheet.png`) |
 | `conversation.jsonl` | Persisted chat and tool-event history |
 | `.cad-agent/history/` | Revision manifests, source blobs, and build records |
 | `inputs/` | Normalized reference-image uploads |
