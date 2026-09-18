@@ -1,98 +1,145 @@
-# OpenSCAD 2021.01+ CAD Playbook
+# OpenSCAD 2021.01+ CLI & CAD Reference Playbook
 
-Critical tips only. The system prompt's Golden Rules already cover `$fn = 60`,
-`EPS = 0.01`, the UPPER_CASE parameter rule, the EPS cutter rule, the
-`difference()` first-child rule, and the semicolon rule — do not restate
-them here.
+Authoritative reference aligned with the official OpenSCAD Manual, Cheatsheet, and GitHub compiler specifications.
+(Note: `$fn = 60`, `EPS = 0.01`, UPPER_CASE parameters, EPS cutter overshoot, `difference()` first-child `union()` wrap, and semicolon rules are established in Golden Rules; apply them uniformly.)
 
-## 1. Execution Contract
+---
 
-- **Units**: millimetres for linear dimensions, degrees for angles.
-- **File**: always `model.scad`.
-- **Top-level geometry**: a single 3D solid (clean union / difference of
-  components).
-- **No GUI state**: never read `$vpr`, `$vpt`, `$vpd`, `$t` unless asked.
+## 1. Syntax, Language Semantics & Anti-Hallucination
 
-## 2. Primitives — Centering Cheatsheet
+OpenSCAD is a declarative, functional language. Code defines a CSG (Constructive Solid Geometry) evaluation tree, not an imperative execution sequence.
 
-- `cube([w, l, h], center = true)` → centred on all three axes.
-- `cube([w, l, h], center = false)` → corner at origin, extends to
-  `[w, l, h]`.
-- `cylinder(h, d, center = true)` → centred on **Z only**; X/Y stay at
-  `(0, 0)`.
-- `cylinder(h, d, center = false)` → base at `Z = 0`; X/Y stay at
-  `(0, 0)`.
-- `sphere(d)` → centred at `[0, 0, 0]`.
+### 1.1 Python Bleed & Syntax Guardrails
+| Feature | OpenSCAD Standard (Required) | Common LLM Trap (Never Use) |
+|---|---|---|
+| Comments | `// line` or `/* block */` | `# comment` (`#` is the debug modifier!) |
+| Booleans | `true`, `false` | `True`, `False` |
+| Exponentiation | `pow(b, e)` or `b ^ e` | `b ** e` (syntax error) |
+| Conditionals | `if (...) { } else if (...) { }` | `elif` (syntax error) |
+| Null / Undefined | `undef` | `None`, `null`, `nil` |
+| Console Print | `echo("val:", v);` | `print(...)`, `console.log(...)` |
+| Definition | `module name(...) { ... }` (geometry)<br>`function name(...) = expr;` (values) | `def`, `class`, `return` in modules |
 
-Transformation order: `translate() rotate() shape()` rotates the object
-around its own centre, then places it (default for most features).
-`rotate() translate() shape()` places it first, then orbits around the
-global origin.
+### 1.2 Variables & Scope Immutability
+- **Compile-time Binding**: Variables are evaluated at compile time per scope. In any scope, the last assigned value applies throughout that entire scope.
+- **No Procedural Mutation**: Variables cannot be incremented or reassigned inside loops or conditionals:
+  ```scad
+  // INVALID: a = 1; for (i = [0:2]) a = a + i;
+  // VALID: Use list comprehensions, ternaries, or recursion
+  vals = [for (i = [0:2]) i * 10]; // [0, 10, 20]
+  dim = is_compact ? 10.0 : 25.0;  // Conditional value
+  ```
+- **Spatial `for` Operator**: `for (i = [...])` replicates and implicitly unions geometry. It is not an imperative loop. Use `intersection_for()` when an intersection of iterations is required.
+- **`let (...)`**: Binds local variables before expressions or module blocks:
+  ```scad
+  let (r = 10, h = 20) cylinder(h = h, r = r);
+  ```
 
-## 3. Critical Rules (must-haves)
+### 1.3 Mathematical & Vector Built-ins
+- **Trigonometry (Degrees)**: `sin(a)`, `cos(a)`, `tan(a)`, `asin(v)`, `acos(v)`, `atan(v)`, `atan2(y, x)`.
+- **Arithmetic**: `sqrt(x)`, `pow(b, e)`, `abs(x)`, `min(...)`, `max(...)`, `round(x)`, `floor(x)`, `ceil(x)`, `sign(x)`.
+- **Vectors & Lists**: `len(v)`, `concat(v1, v2)`, `norm(v)` (magnitude), `cross(v1, v2)` (cross product).
 
-### 3.1 Extrusion Restrictions (2D Only & Consistent X-Side)
+### 1.4 Debug & Modifier Characters
+Prefix any module or primitive to inspect geometry during authoring:
+- `*` **Disable**: Ignores the subtree completely.
+- `!` **Root**: Renders only this subtree, ignoring the rest of the file.
+- `#` **Debug**: Highlights the subtree in semi-transparent red (ideal for cutter inspection).
+- `%` **Background**: Renders the subtree in transparent gray (omitted from STL exports).
 
-- `linear_extrude()` and `rotate_extrude()` accept **only 2D children**
-  (`square`, `circle`, `polygon`, `text`, 2D modules). Passing a 3D
-  primitive (`cube`, `cylinder`) raises
-  `ERROR: Current top level object is not a 2D object`.
-- `rotate_extrude()` requires every vertex to lie on the **same side**
-  of the Y-axis — all `X >= 0` (recommended) or all `X <= 0`. A shape
-  that straddles the Y-axis raises
-  `ERROR: all points for rotate_extrude() must have the same X
-  coordinate sign`. Touching the axis is allowed only along a line
-  segment, not at a single point (a single point collapses to a
-  zero-thickness object and triggers a CGAL error). The right side
-  (`X >= 0`) is the convention every official example uses.
+---
 
-### 3.2 Variable Immutability & Scope
+## 2. Primitives & Centering Cheatsheet
 
-- OpenSCAD is declarative and evaluated at compile time — variables
-  cannot be reassigned inside a `for` loop or `if` branch.
-- A `for (i = [...])` loop is a **spatial replication operator** that
-  unions the iterations; it is not a procedural loop. Use ternaries
-  (`cond ? a : b`) or list comprehensions for calculated values.
+### 2.1 3D Solids
+| Primitive | Syntax | Origin & Positioning |
+|---|---|---|
+| `cube` | `cube([x, y, z], center = true)` | Centred at `[0, 0, 0]` across X, Y, and Z (`-x/2` to `+x/2`). |
+| `cube` | `cube([x, y, z], center = false)` | Corner at `(0, 0, 0)`; extends strictly into positive `[+x, +y, +z]`. |
+| `cylinder` | `cylinder(h, r\|d, center = true)` | **Centred on Z only** (`-h/2` to `+h/2`). X and Y remain centred at `(0, 0)`. |
+| `cylinder` | `cylinder(h, r\|d, center = false)` | Base sits on `Z = 0` (`0` to `+h`). X and Y remain centred at `(0, 0)`. |
+| `cylinder` (cone) | `cylinder(h, r1\|d1, r2\|d2, center)` | `r1`/`d1` = bottom Z face; `r2`/`d2` = top Z face. |
+| `sphere` | `sphere(r\|d)` | Always centred at `[0, 0, 0]`. |
+| `polyhedron` | `polyhedron(points, faces, convexity = 10)` | Winding must be clockwise when viewed from outside the solid. |
 
-### 3.3 Never Use 3D `minkowski()`
+### 2.2 2D Shapes (Extrusions & 2D Subsystem)
+| Primitive | Syntax | Origin & Placement |
+|---|---|---|
+| `square` | `square([w, h], center = true\|false)` | Sits on the XY plane (`Z = 0`). |
+| `circle` | `circle(r\|d)` | Centred at `(0, 0)`. |
+| `polygon` | `polygon(points = [[x, y], ...])` | 2D planar polygon. Specify points counter-clockwise. |
+| `text` | `text("...", size, font, halign, valign)` | Planar text. Set `halign = "center"`, `valign = "center"`. |
 
-3D `minkowski()` produces tens of thousands of polyhedra and freezes or
-times out the sandbox. For rounded boxes use `hull()` of four cylinders,
-or `offset()` on a 2D profile before `linear_extrude()`.
+---
 
-### 3.4 Manifold / Watertight Geometry
+## 3. Transformations, Booleans & Extrusions
 
-- The Golden Rules cover the EPS cutter overshoot; the rule is the
-  same in every direction: extend every cutter past the boundary on
-  both ends, and overlap joined parts in `union()` by at least `EPS`.
-- Tangent faces touching at a line (not a point) are non-manifold. If
-  two cylinders must meet smoothly, use `hull()` between two spheres
-  rather than abutting cylinders.
+### 3.1 Transformation Order
+Transformations chain from right to left (innermost / closest to child executes first):
+- `translate([x, y, z]) rotate([ax, ay, az]) shape();` → Rotates shape about its local origin, then translates.
+- `rotate([ax, ay, az]) translate([x, y, z]) shape();` → Translates shape, then orbits it around global `(0, 0, 0)`.
+- Other transforms: `scale([sx, sy, sz])`, `mirror([nx, ny, nz])`, `multmatrix(M)`.
 
-## 4. Compact Helpers
+### 3.2 Extrusions (Strict 2D-Only Rule)
+- **`linear_extrude(height, twist, scale, center, convexity = 10)`**:
+  - Accepts **strictly 2D children** (`circle`, `square`, `polygon`, `text`, 2D `offset()`).
+  - Passing a 3D object (`cube`, `cylinder`) raises `ERROR: Current top level object is not a 2D object`.
+- **`rotate_extrude(angle = 360, convexity = 10)`**:
+  - Accepts **strictly 2D children**.
+  - **Strict X >= 0 Rule**: Every vertex in the 2D profile must lie on the positive side of the Y-axis (`X >= 0`). Crossing the axis raises `ERROR: all points for rotate_extrude() must have the same X coordinate sign`.
+  - Touching `X = 0` is allowed along a continuous line segment, never at an isolated point (zero-thickness CGAL failure).
 
-Copy these verbatim into `model.scad`. They cover the two patterns the
-agent most often gets wrong from memory.
+### 3.3 2D Operations & The Minkowski Ban
+- **2D Fillets / Offsets**: Use `offset(r = R)` (rounded) or `offset(delta = D, chamfer = true|false)` on 2D profiles before `linear_extrude()`.
+- **NEVER use 3D `minkowski()`**:
+  - 3D Minkowski sums produce $O(N \times M)$ polyhedral expansions, causing compiler freeze or timeout.
+  - **Direct Replacement**: Use `hull()` across primitives or apply `offset()` in 2D before extruding.
 
-### 4.1 Rounded Box (`hull()`)
+---
 
+## 4. Manifold Geometry & Safe CSG Patterns
+
+OpenSCAD renders via CGAL Nef Polyhedra. Models must form watertight, 2-manifold closed solids.
+
+1. **Boundary Overshoot (EPS Rule)**:
+   - Difference cutters must overshoot target boundaries by `EPS` on both ends to eliminate coincident surfaces:
+     ```scad
+     difference() {
+         cube([W, L, H], center = true);
+         // Cutter extends 2*EPS in length and begins at -H/2 - EPS
+         translate([0, 0, -H/2 - EPS])
+             cylinder(h = H + 2 * EPS, d = HOLE_D);
+     }
+     ```
+   - Joined components in `union()` must overlap by at least `EPS`. Zero-thickness planar contact creates non-manifold CGAL assertion errors.
+2. **Tangent Face & Edge Traps**:
+   - Two shapes touching at an infinitesimal point or edge line produce non-manifold geometry. Either intersect them with an intentional overlap or merge them using `hull()`.
+3. **Difference Multi-Base Rule**:
+   - `difference()` subtracts all subsequent children from the first child. If the positive base comprises multiple shapes, enclose them in `union()` as the first child.
+
+---
+
+## 5. Production Helper Modules
+
+Copy these verified, compact modules directly into `model.scad`:
+
+### 5.1 Rounded Box via `hull()`
 ```scad
-// L, W, H = outer dims; R = corner radius. Uses four short corner cylinders.
-module rounded_box(L, W, H, R) {
+// Solid rounded box centred on XY, seated on Z = 0
+module rounded_box(w, l, h, r) {
     hull() {
-        for (x = [-L/2 + R, L/2 - R],
-             y = [-W/2 + R, W/2 - R])
-            translate([x, y, 0]) cylinder(h = H, r = R);
+        for (x = [-w/2 + r, w/2 - r],
+             y = [-l/2 + r, l/2 - r]) {
+            translate([x, y, 0])
+                cylinder(h = h, r = r);
+        }
     }
 }
 ```
 
-### 4.2 Hex Nut Pocket
-
-`AF` is the across-flats distance of the nut (M3 ≈ 5.5, M4 ≈ 7.0,
-M5 ≈ 8.0, M6 ≈ 10.0). Circumradius = `AF / sqrt(3) ≈ AF / 1.73205`;
-the cylinder must use `$fn = 6` to render as a hexagon.
-
+### 5.2 Hex Nut Pocket (Cutter)
+Across-flats standard widths (`AF`): M3 = 5.5, M4 = 7.0, M5 = 8.0, M6 = 10.0.
+Circumradius $R = \frac{AF}{\sqrt{3}} \approx \frac{AF}{1.73205}$.
 ```scad
 module hex_nut_pocket(depth, af) {
     translate([0, 0, -EPS])
@@ -100,32 +147,45 @@ module hex_nut_pocket(depth, af) {
 }
 ```
 
-## 5. Failure Diagnosis & Repair
+### 5.3 Countersunk Screw Hole (Cutter)
+```scad
+module countersunk_hole(h, d_shaft, d_head, h_head) {
+    translate([0, 0, -EPS]) {
+        // Through-hole shaft (overshoot on both sides)
+        cylinder(h = h + 2 * EPS, d = d_shaft);
+        // Conical countersunk head
+        translate([0, 0, h - h_head + EPS])
+            cylinder(h = h_head + EPS, d1 = d_shaft, d2 = d_head);
+    }
+}
+```
 
-Read the tool's `code` / `phase` / `message` / `hint` and fix the
-specific cause before retrying — never repeat an identical failed call.
+---
 
-| Reported Error / Symptom | Root Cause | Direct Fix |
+## 6. OpenSCAD CLI Compiler Diagnostics & Fixes
+
+When `cad_build_and_verify` returns a non-zero exit code or diagnostic message, apply the direct remedy:
+
+| Reported Error / Diagnostic | Root Cause | Direct Fix |
 |---|---|---|
-| `syntax error` | Missing `;`, mismatched `{}`, Python keyword (`def` / `import`). | Check syntax; every statement ends with `;`; balance braces. |
-| `Current top level object is not a 2D object` | 3D primitive inside `linear_extrude` / `rotate_extrude`. | Replace with `square` / `circle` / `polygon` inside the extrude block. |
-| `rotate_extrude()` "all points must have the same X coordinate sign" error | 2D profile straddles the Y-axis (mixes positive and negative X). | `translate([inner_radius, 0])` the profile, or rebuild so every vertex is on one side (positive X is the convention). |
-| `OpenSCAD shape is empty or invalid` | `difference()` cutter consumed the part, or a stray body was subtracted. | Wrap base parts in `union()`; re-check cutter positions and sizes. |
-| Non-manifold edges / zero-thickness artefacts | Missing `EPS` overshoot; tangent faces touching at a line. | Extend cutters by `EPS` on both ends; overlap joined parts slightly. |
-| Render timeout / CPU lockup | 3D `minkowski()` or excessive `$fn` (> 120). | Remove `minkowski()`; use `hull()` or 2D `offset()`; cap `$fn` ≤ 60. |
+| `syntax error` | Missing semicolon `;`, mismatched brackets `{ [ (`, or Python keywords (`def`, `import`). | Terminate every statement with `;`; verify brace balance; remove Python constructs. |
+| `Current top level object is not a 2D object` | 3D primitive (`cube`, `cylinder`) passed to `linear_extrude` or `rotate_extrude`. | Use only 2D primitives (`square`, `circle`, `polygon`, `text`, `offset()`) inside extrusion blocks. |
+| `all points for rotate_extrude() must have the same X coordinate sign` | 2D profile straddles the Y-axis (mixes positive and negative X). | Shift profile to positive half-plane (`X >= 0`): `translate([R_inner, 0]) shape();`. |
+| `UI-WARNING: No top level geometry to render` / Empty STL | All geometry commented out, or `difference()` cutter completely consumed the base. | Verify cutter dimensions and positioning; confirm base object is larger than cutters. |
+| `CGAL error in CGAL_Nef_polyhedron3` / Non-manifold mesh | Coincident faces without `EPS` overshoot, or parts touching only at a point or line edge. | Add `EPS` overshoot on cutter boundaries; ensure joined bodies in `union()` overlap by `EPS`. |
+| Render timeout / Sandbox lockup | 3D `minkowski()` executed, or `$fn` exceeds reasonable limits (> 100). | Replace `minkowski()` with `hull()` or 2D `offset()`; clamp global `$fn = 60`. |
 
-## 6. Summary Checklist Before Emitting Code
+---
 
-- [ ] Top-level 3D solid emitted; units in mm & degrees.
-- [ ] Every statement and assignment ends with `;`.
-- [ ] All numeric dimensions are UPPER_CASE parameters at the top of
-      `model.scad`, each with a unit-and-purpose comment.
-- [ ] `EPS = 0.01;` declared and added on both ends of every
-      `difference()` cutter.
-- [ ] `$fn = 60;` declared.
-- [ ] Only 2D primitives inside `linear_extrude` / `rotate_extrude`.
-- [ ] All points in a `rotate_extrude` profile satisfy `X >= 0`.
-- [ ] Multi-body bases wrapped in `union()` as the first child of
-      `difference()`.
-- [ ] No 3D `minkowski()`; `hull()` or 2D `offset()` used instead.
-- [ ] Watertight, positive volume, single connected component.
+## 7. Pre-flight Model Checklist
+
+Before emitting code to `model.scad`:
+- [ ] **Single Solid**: Generates a single, connected, watertight 3D solid.
+- [ ] **Units**: Millimetres for linear dimensions, degrees for angular measures.
+- [ ] **Parameters Block**: All numeric dimensions declared at the top in `UPPER_CASE` with unit comments.
+- [ ] **Global Flags**: `EPS = 0.01;` and `$fn = 60;` declared once near the top of the file.
+- [ ] **Semicolons**: Every statement, parameter assignment, and module call ends with `;`.
+- [ ] **Extrusions**: Children of `linear_extrude` and `rotate_extrude` are strictly 2D shapes.
+- [ ] **`rotate_extrude` Profile**: All vertices strictly satisfy `X >= 0`.
+- [ ] **CSG Manifoldness**: Cutters extend `EPS` past both ends; multi-part base wrapped in `union()`.
+- [ ] **No 3D Minkowski**: No 3D `minkowski()` in the file; `hull()` or 2D `offset()` used instead.
