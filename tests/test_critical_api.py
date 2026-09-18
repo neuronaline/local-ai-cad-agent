@@ -2,6 +2,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import subprocess
 
 from PIL import Image
 
@@ -379,3 +380,82 @@ def test_security_headers_and_cross_origin_mutations(tmp_path: Path) -> None:
         headers={"Host": "external.com"},
     )
     assert form_blocked.status_code == 403
+
+
+def test_export_endpoints(tmp_path: Path) -> None:
+    """Test the /api/projects/<name>/export endpoint across various formats and error conditions."""
+    settings = Settings(
+        tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000
+    )
+    client = create_app(settings).test_client()
+
+    # 1. Unknown project -> 404
+    res_404 = client.get("/api/projects/ghost/export?format=stl")
+    assert res_404.status_code == 404
+
+    # Create project
+    client.post("/api/projects/new", json={"name": "export-widget"})
+    proj_dir = settings.workspace_root / "export-widget"
+
+    # 2. Unsupported format -> 400
+    res_400 = client.get("/api/projects/export-widget/export?format=badfmt")
+    assert res_400.status_code == 400
+    assert "Unsupported format" in res_400.get_json()["error"]
+
+    # 3. Missing model.scad -> 404
+    res_no_model = client.get("/api/projects/export-widget/export?format=stl")
+    assert res_no_model.status_code == 404
+
+    # Write model.scad
+    scad_content = "cube([10, 10, 10]);"
+    (proj_dir / "model.scad").write_text(scad_content, encoding="utf-8")
+
+    # 4. SCAD export succeeds even without preview
+    res_scad = client.get("/api/projects/export-widget/export?format=scad")
+    assert res_scad.status_code == 200
+    assert "text/x-scad" in res_scad.headers.get("Content-Type", "")
+    disp_scad = res_scad.headers.get("Content-Disposition", "")
+    assert "attachment" in disp_scad and "export-widget.scad" in disp_scad
+    assert res_scad.data.decode("utf-8") == scad_content
+
+    # 5. STL/OBJ without preview.stl -> 404
+    res_no_preview = client.get("/api/projects/export-widget/export?format=stl")
+    assert res_no_preview.status_code == 404
+    res_no_preview_obj = client.get("/api/projects/export-widget/export?format=obj")
+    assert res_no_preview_obj.status_code == 404
+
+    # Generate preview.stl
+    preview_file = proj_dir / "preview.stl"
+    subprocess.run(
+        ["openscad", "-o", str(preview_file), "--export-format", "binstl", str(proj_dir / "model.scad")],
+        check=True,
+    )
+
+    # 6. STL export (default format, including empty format param) -> 200
+    res_default = client.get("/api/projects/export-widget/export")
+    assert res_default.status_code == 200
+    assert "model/stl" in res_default.headers.get("Content-Type", "")
+    disp_default = res_default.headers.get("Content-Disposition", "")
+    assert "attachment" in disp_default and "export-widget.stl" in disp_default
+    assert len(res_default.data) == preview_file.stat().st_size
+
+    res_empty_fmt = client.get("/api/projects/export-widget/export?format=")
+    assert res_empty_fmt.status_code == 200
+    assert "model/stl" in res_empty_fmt.headers.get("Content-Type", "")
+
+    # 7. OBJ export -> 200
+    res_obj = client.get("/api/projects/export-widget/export?format=obj")
+    assert res_obj.status_code == 200
+    assert "model/obj" in res_obj.headers.get("Content-Type", "")
+    disp_obj = res_obj.headers.get("Content-Disposition", "")
+    assert "attachment" in disp_obj and "export-widget.obj" in disp_obj
+    assert b"# OBJ export" in res_obj.data
+
+    # 8. 3MF export -> 200
+    res_3mf = client.get("/api/projects/export-widget/export?format=3mf")
+    assert res_3mf.status_code == 200
+    assert "model/3mf" in res_3mf.headers.get("Content-Type", "")
+    disp_3mf = res_3mf.headers.get("Content-Disposition", "")
+    assert "attachment" in disp_3mf and "export-widget.3mf" in disp_3mf
+    assert len(res_3mf.data) > 0
+

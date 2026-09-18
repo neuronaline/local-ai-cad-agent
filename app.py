@@ -32,6 +32,11 @@ from flask import (
 from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
 
 from agent.conversation import ConversationStore, set_shared_history_lock
+from agent.converter import (
+    EXPORT_MIME_TYPES,
+    SUPPORTED_EXPORT_FORMATS,
+    export_project_model,
+)
 from agent.core import AgentRunner
 from agent.images import store_images
 from agent.io import utc_now_iso
@@ -860,6 +865,36 @@ def create_app(settings: Settings | None = None) -> Flask:
             "model_sha256": model_sha256,
             "review_status": review_status,
         })
+
+    @app.get("/api/projects/<project_name>/export")
+    def export_model(project_name: str):
+        fmt = (request.args.get("format") or "stl").lower().strip()
+        if fmt not in SUPPORTED_EXPORT_FORMATS:
+            supported = ", ".join(sorted(SUPPORTED_EXPORT_FORMATS))
+            return jsonify({"error": f"Unsupported format '{fmt}'. Supported: {supported}"}), 400
+        try:
+            project_dir = _project_path(app.config["SETTINGS"], project_name)
+        except (ValueError, FileNotFoundError) as error:
+            return jsonify({"error": str(error)}), 404
+
+        try:
+            exported_path = export_project_model(project_dir, fmt)
+        except FileNotFoundError as error:
+            return jsonify({"error": str(error)}), 404
+        except ValueError as error:
+            return jsonify({"error": str(error)}), 422
+        except (RuntimeError, OSError) as error:
+            return jsonify({"error": str(error)}), 500
+
+        mimetype = EXPORT_MIME_TYPES.get(fmt, "application/octet-stream")
+        download_name = f"{project_name}.{fmt}"
+        return send_file(
+            exported_path,
+            mimetype=mimetype,
+            as_attachment=True,
+            download_name=download_name,
+            max_age=0,
+        )
 
     # ------------------------------------------------------------------ #
     #  Multi-view review APIs (read-only views into .cad-agent/reviews/)

@@ -100,6 +100,23 @@
             <button id="toggle-wireframe" class="quiet" aria-pressed="false">Wireframe</button>
             <button id="toggle-grid" class="quiet" aria-pressed="true">Grid</button>
             <button id="reset-view" class="quiet">Fit</button>
+            <div class="export-group" role="group" aria-label="Export model">
+              <select id="export-format" class="export-select" title="Export format" aria-label="Export format">
+                <option value="stl" selected>STL (.stl)</option>
+                <option value="scad">SCAD (.scad)</option>
+                <option value="3mf">3MF (.3mf)</option>
+                <option value="obj">OBJ (.obj)</option>
+                <option value="amf">AMF (.amf)</option>
+                <option value="off">OFF (.off)</option>
+                <option value="csg">CSG (.csg)</option>
+              </select>
+              <button id="download-model" type="button" class="quiet download-btn" title="Download model in selected format" aria-label="Download model" disabled>
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                  <path d="M12 3v12m0 0 4-4m-4 4-4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                <span>Download</span>
+              </button>
+            </div>
           </div>
         </header>
         <div id="viewer" class="viewer"><div id="viewer-empty" class="viewer-empty"><span class="preview-icon">◇</span><strong>No preview yet</strong><span>Inspect the model here once it is ready.</span></div></div>

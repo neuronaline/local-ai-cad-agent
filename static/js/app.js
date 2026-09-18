@@ -25,6 +25,8 @@ const activityList = document.querySelector('#activity-list');
 const usagePill = document.querySelector('#usage-pill');
 const attachmentPreview = document.querySelector('#attachment-preview');
 const modelActions = document.querySelector('#model-actions');
+const downloadModelBtn = document.querySelector('#download-model');
+const exportFormatSelect = document.querySelector('#export-format');
 const appConfig = JSON.parse(document.querySelector('#app-config')?.textContent || '{}');
 const showInfoMessages = appConfig.showInfoMessages ?? true;
 const currentProject = appConfig.projectName || '';
@@ -450,8 +452,10 @@ async function loadCurrentPreview(previewId) {
       // ``agent_message`` from being persisted.
       await refreshRender();
       modelActions.hidden = false;
+      if (downloadModelBtn) downloadModelBtn.disabled = false;
       loadReviewGallery();
     } catch (error) {
+      if (downloadModelBtn) downloadModelBtn.disabled = true;
       addMessage(`Preview failed: ${error.message}`, 'error');
     } finally {
       previewLoadPromise = null;
@@ -464,6 +468,7 @@ function hideUnapprovedPreview(reviewStatus = 'pending') {
   previewProject = '';
   loadedPreviewRevision = '';
   modelActions.hidden = true;
+  if (downloadModelBtn) downloadModelBtn.disabled = true;
   viewer.clear(
     reviewStatus === 'fail'
       ? 'Preview was rejected by review'
@@ -878,6 +883,33 @@ document.querySelector('#toggle-grid')?.addEventListener('click', event => {
   event.currentTarget.setAttribute('aria-pressed', String(viewer.toggleGrid()));
 });
 document.querySelector('#reset-view')?.addEventListener('click', () => viewer.fit());
+downloadModelBtn?.addEventListener('click', async () => {
+  if (!currentProject || downloadModelBtn.disabled) return;
+  const format = exportFormatSelect?.value || 'stl';
+  const downloadUrl = `/api/projects/${encodeURIComponent(currentProject)}/export?format=${encodeURIComponent(format)}`;
+  downloadModelBtn.disabled = true;
+  try {
+    const res = await fetch(downloadUrl);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: 'Export failed' }));
+      addMessage(`Export failed: ${err.error || res.statusText}`, 'error');
+      return;
+    }
+    const blob = await res.blob();
+    const blobUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = blobUrl;
+    a.download = `${currentProject}.${format}`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
+  } catch (error) {
+    addMessage(`Export failed: ${error.message}`, 'error');
+  } finally {
+    downloadModelBtn.disabled = Boolean(modelActions?.hidden);
+  }
+});
 document.querySelectorAll('[data-view]').forEach(button => {
   button.addEventListener('click', () => {
     viewer.setView(button.dataset.view);
