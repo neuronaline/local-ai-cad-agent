@@ -58,9 +58,28 @@ def sanitize_assistant_message(
     are dropped.
     """
     sanitized = deepcopy(message)
+    # Normalize reasoning_content alias to reasoning if reasoning is not already present
+    reasoning_content = sanitized.pop("reasoning_content", None)
+    if (
+        preserve_reasoning
+        and isinstance(reasoning_content, str)
+        and reasoning_content.strip()
+        and not sanitized.get("reasoning")
+    ):
+        sanitized["reasoning"] = reasoning_content
+
     if not preserve_reasoning:
         sanitized.pop("reasoning", None)
         sanitized.pop("reasoning_details", None)
+    else:
+        # Strip empty reasoning fields so they do not trigger 400s on strict providers
+        reasoning = sanitized.get("reasoning")
+        if isinstance(reasoning, str) and not reasoning.strip():
+            sanitized.pop("reasoning", None)
+        details = sanitized.get("reasoning_details")
+        if isinstance(details, list) and not details:
+            sanitized.pop("reasoning_details", None)
+
     for key in list(sanitized):
         if key.startswith("_"):
             sanitized.pop(key, None)
@@ -82,6 +101,8 @@ def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     System messages are kept as separate, leading messages. Combining a static
     prompt with dynamic workspace state changes the cacheable prefix on every
     state change, defeating provider prompt caches.
+    Adjacent non-system messages with the same role (e.g. consecutive 'user'
+    messages) are merged to satisfy strict provider role-alternation contracts.
     """
     system_messages: list[dict[str, Any]] = []
     non_system: list[dict[str, Any]] = []
@@ -94,7 +115,29 @@ def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             system_messages.append(item)
         else:
             non_system.append(item)
-    return system_messages + non_system
+
+    merged_non_system: list[dict[str, Any]] = []
+    for msg in non_system:
+        if (
+            merged_non_system
+            and merged_non_system[-1].get("role") == "user"
+            and msg.get("role") == "user"
+        ):
+            prev = merged_non_system[-1]
+            prev_content = prev.get("content")
+            curr_content = msg.get("content")
+            if isinstance(prev_content, str) and isinstance(curr_content, str):
+                prev["content"] = f"{prev_content}\n\n{curr_content}"
+            elif isinstance(prev_content, list) and isinstance(curr_content, str):
+                prev["content"] = [*prev_content, {"type": "text", "text": curr_content}]
+            elif isinstance(prev_content, str) and isinstance(curr_content, list):
+                prev["content"] = [{"type": "text", "text": prev_content}, *curr_content]
+            elif isinstance(prev_content, list) and isinstance(curr_content, list):
+                prev["content"] = [*prev_content, *curr_content]
+        else:
+            merged_non_system.append(msg)
+
+    return system_messages + merged_non_system
 
 
 def sanitize_messages(
@@ -289,7 +332,7 @@ def post_with_cancel(
     TCP socket (and the keepalive timer backing it) every time the user
     cancels before the worker has finished draining ``requests.post`` —
     the daemon thread keeps the underlying connection alive until process
-    exit (audit_030).
+    exit.
     """
     results: queue.Queue[requests.Response | BaseException] = queue.Queue(maxsize=1)
     # Mutable slot for the in-flight Response. ``dict``-based rather than
@@ -337,7 +380,7 @@ def post_with_cancel(
         # immediately. The daemon worker may still be alive while its
         # ``requests.post`` is mid-handshake; wait briefly for it to
         # publish, then drain the queue and close whatever is there
-        # (audit_030).
+        #.
         worker.join(timeout=2.0)
         _force_close_response(response_holder.get("response"))
         try:
@@ -355,7 +398,7 @@ def _force_close_response(response: requests.Response | None) -> None:
     ``stream=True`` keeps the connection attached to the :class:`Response`
     until :meth:`Response.close` runs; without this helper the connection
     pool keeps the socket alive until the read times out, leaking FDs on
-    rapid cancel/restart cycles (audit_030).
+    rapid cancel/restart cycles.
     """
     if response is None:
         return
@@ -609,9 +652,10 @@ class FallbackChatClient:
     # Class default mirrors ``ChatCompletionsClient``; ``_capture_result``
     # overwrites it with the successful inner client's value so the
     # runner's response sanitization sees the same ``preserve_reasoning``
-    # flag the inner provider actually needs. OpenRouter requires
-    # ``True`` to keep reasoning on tool-call turns; hard-coding
-    # ``False`` here would silently strip it.
+    # flag the inner provider actually needs. ``OpenRouterClient`` now
+    # defaults to ``False`` (drop historical reasoning between turns to
+    # shrink the cacheable prefix), so a freshly-constructed wrapper is a
+    # safe starting state.
     preserve_reasoning: bool = False
 
     def __init__(
@@ -678,9 +722,11 @@ class FallbackChatClient:
         / ``preserve_reasoning`` from the wrapper immediately after
         ``chat()`` returns, so the successful inner client's values must be
         visible on the wrapper. ``preserve_reasoning`` differs between
-        providers (e.g. ``OpenRouterClient`` keeps it ``True`` so reasoning
-        survives on tool-call turns); copying it avoids silently stripping
-        reasoning from a response that came back through the fallback path.
+        providers (e.g. ``OpenRouterClient`` defaults to ``False`` so
+        reasoning is dropped between turns, while some other adapters
+        keep it ``True``); copying it avoids stripping reasoning from a
+        response that came back through the fallback path on a
+        ``True``-using provider.
         """
         self.last_usage = client.last_usage
         self.last_image_fallback_used = client.last_image_fallback_used

@@ -10,20 +10,6 @@ from pathlib import Path
 
 _BWRAP = shutil.which("bwrap")
 _DENIED_SYSCALLS = (
-    "socket",
-    "socketpair",
-    "connect",
-    "bind",
-    "listen",
-    "accept",
-    "accept4",
-    "sendto",
-    "sendmsg",
-    "sendmmsg",
-    "recvfrom",
-    "recvmsg",
-    "recvmmsg",
-    "shutdown",
     "ptrace",
     "process_vm_readv",
     "process_vm_writev",
@@ -94,18 +80,55 @@ def command(
     if not writable_tmp:
         tmp_mount.extend(["--remount-ro", "/tmp"])
     seccomp_fd = seccomp_filter_fd()
+    path_dirs = ["/venv/bin", "/usr/local/bin", "/usr/bin", "/bin"]
+    extra_binds: list[str] = [
+        "--ro-bind-try", "/opt", "/opt",
+    ]
+    openscad_bin = shutil.which("openscad")
+    if openscad_bin:
+        scad_real = Path(openscad_bin).resolve()
+        scad_dir = scad_real.parent
+        try:
+            scad_dir.relative_to(python_root)
+        except ValueError:
+            try:
+                scad_dir.relative_to("/usr")
+            except ValueError:
+                extra_binds.extend(["--ro-bind-try", str(scad_dir), str(scad_dir)])
+                if str(scad_dir) not in path_dirs:
+                    path_dirs.append(str(scad_dir))
+        scad_runtime = scad_dir.parent / "openscad"
+        if scad_runtime.is_dir():
+            extra_binds.extend([
+                "--ro-bind-try", str(scad_runtime), str(scad_runtime),
+                "--ro-bind-try", str(scad_runtime), "/venv/openscad",
+            ])
+
+    repo_scad = Path(__file__).resolve().parent.parent / ".venv" / "openscad"
+    if repo_scad.is_dir():
+        extra_binds.extend([
+            "--ro-bind-try", str(repo_scad), str(repo_scad),
+            "--ro-bind-try", str(repo_scad), "/venv/openscad",
+        ])
+        repo_scad_bin = repo_scad.parent / "bin"
+        if repo_scad_bin.is_dir() and str(repo_scad_bin) not in path_dirs:
+            extra_binds.extend(["--ro-bind-try", str(repo_scad_bin), str(repo_scad_bin)])
+            path_dirs.append(str(repo_scad_bin))
+
     sandbox = [
         _BWRAP,
         "--die-with-parent",
         "--new-session",
         "--unshare-user",
         "--unshare-pid",
+        "--unshare-net",
         "--unshare-ipc",
         "--unshare-uts",
         "--disable-userns",
         "--proc", "/proc",
         "--dev", "/dev",
         *tmp_mount,
+        *extra_binds,
         "--ro-bind", "/usr", "/usr",
         "--symlink", "usr/bin", "/bin",
         "--symlink", "usr/lib", "/lib",
@@ -116,7 +139,7 @@ def command(
         "--chdir", "/workspace",
         "--clearenv",
         "--setenv", "HOME", "/tmp",
-        "--setenv", "PATH", "/venv/bin:/usr/bin:/bin",
+        "--setenv", "PATH", ":".join(path_dirs),
         "--setenv", "PYTHONDONTWRITEBYTECODE", "1",
         "--setenv", "TMPDIR", "/tmp",
         "--setenv", "LANG", "C.UTF-8",
@@ -125,7 +148,7 @@ def command(
         "/usr/bin/prlimit",
         f"--cpu={timeout_seconds + 5}",
         "--fsize=536870912",
-        "--nofile=128",
+        "--nofile=512",
         "--nproc=64",
         "--as=8589934592",
         "--",

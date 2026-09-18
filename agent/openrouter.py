@@ -15,7 +15,10 @@ from agent.settings import Settings
 
 
 class OpenRouterClient(ChatCompletionsClient):
-    preserve_reasoning = True
+    # Drop historical reasoning between turns. Reasoning is useful in a single
+    # decision but bloats the prompt prefix over multi-step CAD runs, so the
+    # agent only ever sees the current file + build state at each step.
+    preserve_reasoning = False
 
     def __init__(self, settings: Settings) -> None:
         super().__init__(settings, provider_label="OpenRouter")
@@ -114,40 +117,23 @@ class OpenRouterClient(ChatCompletionsClient):
         return (legacy,) if legacy else ()
 
     def _apply_gemini_cache_breakpoint(self, payload: dict[str, Any]) -> None:
-        """Mark text deterministically so old Gemini wire messages never change.
+        """Mark a single Gemini cache breakpoint on the system message.
 
-        OpenRouter uses the final explicit breakpoint for Gemini, but permits
-        multiple markers. Marking only the latest text moves the marker on the
-        next request and rewrites the previous prefix. Applying the same
-        transform to every text block keeps the old prefix byte-stable while
-        still making the final marker advance as the conversation grows.
+        OpenRouter's Gemini path accepts multiple ``cache_control`` markers
+        per request, but only the *last* one determines the cached prefix.
+        Walking every message and rewriting every text block into
+        ``list[dict]`` (just to splice a marker on each one) bloats the
+        payload and triggers a transform on every chat-completions call.
+        The stable system message is the prefix that we want cached — a
+        single explicit marker on that slot is both cheaper and sufficient
+        for prompt-cache stability.
         """
         if (
             not self.settings.openrouter_enable_gemini_cache
             or not self.settings.openrouter_model.startswith("google/gemini-")
         ):
             return
-        for message in payload["messages"]:
-            content = message.get("content")
-            if isinstance(content, str):
-                message["content"] = [
-                    {
-                        "type": "text",
-                        "text": content,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ]
-                continue
-            if not isinstance(content, list):
-                continue
-            for part in content:
-                if not (
-                    isinstance(part, dict)
-                    and part.get("type") == "text"
-                    and isinstance(part.get("text"), str)
-                ):
-                    continue
-                part["cache_control"] = {"type": "ephemeral"}
+        self._mark_first_system_message(payload)
 
     @staticmethod
     def _mark_first_system_message(payload: dict[str, Any]) -> None:

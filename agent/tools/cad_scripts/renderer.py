@@ -247,16 +247,60 @@ def rasterize_view(
 # ---------------------------------------------------------------------------
 
 
+def load_stl(stl_path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Parse binary or ASCII STL into (vertices, triangles)."""
+    stl_path = Path(stl_path)
+    data = stl_path.read_bytes()
+    if len(data) < 84:
+        raise ValueError("STL file too short.")
+    num_triangles = int.from_bytes(data[80:84], byteorder="little")
+    expected_bin_size = 84 + num_triangles * 50
+    if len(data) == expected_bin_size and num_triangles > 0:
+        dtype = np.dtype([
+            ("normal", "<f4", (3,)),
+            ("v0", "<f4", (3,)),
+            ("v1", "<f4", (3,)),
+            ("v2", "<f4", (3,)),
+            ("attr", "<u2"),
+        ])
+        records = np.frombuffer(data[84:], dtype=dtype, count=num_triangles)
+        tri_coords = np.stack([records["v0"], records["v1"], records["v2"]], axis=1).reshape(-1, 3)
+        unique_verts, inverse_indices = np.unique(tri_coords, axis=0, return_inverse=True)
+        triangles = inverse_indices.reshape(-1, 3).astype(np.int32)
+        return unique_verts.astype(np.float64), triangles
+
+    # Fallback to ASCII STL
+    text = data.decode("utf-8", errors="replace")
+    coords: list[list[float]] = []
+    for line in text.splitlines():
+        parts = line.strip().split()
+        if len(parts) >= 4 and parts[0] == "vertex":
+            try:
+                coords.append([float(parts[1]), float(parts[2]), float(parts[3])])
+            except ValueError:
+                continue
+    if not coords or len(coords) % 3 != 0:
+        raise ValueError("Invalid STL: no renderable triangles found.")
+    tri_coords = np.array(coords, dtype=np.float32)
+    unique_verts, inverse_indices = np.unique(tri_coords, axis=0, return_inverse=True)
+    triangles = inverse_indices.reshape(-1, 3).astype(np.int32)
+    return unique_verts.astype(np.float64), triangles
+
+
 def _tessellate(source_shape) -> tuple[np.ndarray, np.ndarray]:
-    """Return (vertices, triangles) for the given build123d ``shape``."""
-    raw_vertices, raw_triangles = source_shape.tessellate(0.1)
-    vertices = np.array(
-        [[float(p.X), float(p.Y), float(p.Z)] for p in raw_vertices]
-    )
-    triangles = np.asarray(raw_triangles, dtype=np.int32)
-    if not len(vertices) or not len(triangles):
-        raise ValueError("Shape tessellation did not produce renderable triangles.")
-    return vertices, triangles
+    """Return (vertices, triangles) for an STL path, shape, or (vertices, triangles) tuple."""
+    if isinstance(source_shape, tuple) and len(source_shape) == 2 and isinstance(source_shape[0], np.ndarray):
+        return source_shape
+    if isinstance(source_shape, (str, Path)):
+        return load_stl(Path(source_shape))
+    if hasattr(source_shape, "tessellate"):
+        raw_vertices, raw_triangles = source_shape.tessellate(0.1)
+        vertices = np.array([[float(p.X), float(p.Y), float(p.Z)] for p in raw_vertices])
+        triangles = np.asarray(raw_triangles, dtype=np.int32)
+        if not len(vertices) or not len(triangles):
+            raise ValueError("Shape tessellation did not produce renderable triangles.")
+        return vertices, triangles
+    raise TypeError(f"Cannot tessellate {type(source_shape)}")
 
 
 def _worker_render(args: tuple[str, dict[str, object]]) -> dict[str, object]:
@@ -316,8 +360,8 @@ def render_views(
 ) -> dict[str, object]:
     """Render every required canonical view and persist them under ``output_dir``.
 
-    The caller must supply exactly one of ``source_shape`` (a build123d shape
-    to be tessellated) or the pre-tessellated ``vertices``/``triangles`` pair.
+    The caller must supply either ``source_shape`` (which can provide
+    vertices/triangles) or the pre-tessellated ``vertices``/``triangles`` pair.
     Returns a manifest dictionary describing the rendered views; the caller is
     responsible for atomic promotion of ``output_dir`` into the review tree.
     Raises ``RuntimeError`` if any required view fails to render or its PNG is
@@ -360,12 +404,7 @@ def render_views(
         # ``fork`` is required here. The renderer runs inside the bubblewrap
         # sandbox (no execve, no writable tmp for spawn's bootstrap); the
         # worker function only depends on numpy + PIL which are already
-        # imported in the parent, so the forking cost is bounded. The
-        # fork-after-OCP-init safety concern flagged by PEP-687 / CPython
-        # issue 84531 is real for general Python 3.12+ code paths, but
-        # the renderer is invoked from the sandbox runner that already
-        # imports build123d before reaching this block, so any fork-
-        # related hazards would already affect the parent process.
+        # imported in the parent, so the forking cost is bounded.
         import multiprocessing
 
         ctx_method = (

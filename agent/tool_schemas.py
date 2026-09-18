@@ -33,14 +33,28 @@ def _tool(
 TOOL_SCHEMAS = [
     _tool(
         "read_file",
-        "Read the current model.py. Returns whether the file exists and its complete contents.",
-        {},
+        "Read the current model.scad. Returns whether the file exists and its contents. "
+        "Optionally provide offset and limit to inspect specific line ranges.",
+        {
+            "offset": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 1,
+                "description": "1-indexed starting line number (defaults to 1).",
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 2000,
+                "description": "Maximum number of lines to return (1-2000).",
+            },
+        },
         [],
     ),
     _tool(
         "write_file",
-        "Create model.py, or deliberately replace its entire contents. Use this "
-        "ONLY for the initial creation of model.py or a deliberate full rewrite; "
+        "Create model.scad, or deliberately replace its entire contents. Use this "
+        "ONLY for the initial creation of model.scad or a deliberate full rewrite; "
         "for localized changes, prefer edit_file.",
         {
             "content": {"type": "string", "description": "Complete file contents."},
@@ -49,7 +63,7 @@ TOOL_SCHEMAS = [
     ),
     _tool(
         "edit_file",
-        "Apply exact replacements to model.py. Pass either old_string and new_string "
+        "Apply exact replacements to model.scad. Pass either old_string and new_string "
         "for a single replacement, or an edits array for multiple atomic replacements.",
         {
             "old_string": {
@@ -87,7 +101,7 @@ TOOL_SCHEMAS = [
     ),
     _tool(
         "cad_build_and_verify",
-        "Build the latest model.py, validate basic geometry, export preview.stl, and "
+        "Build the latest model.scad, validate basic geometry, export preview.stl, and "
         "render canonical eight-view visual evidence + contact sheet inline. Automatically "
         "reports dimensions, solid count, volume, and numeric UPPER_CASE parameters.",
         {
@@ -101,7 +115,7 @@ TOOL_SCHEMAS = [
     ),
     _tool(
         "question",
-        "Ask all blocking clarification questions together, then stop and wait. Use only when the answer materially affects fit, function, or manufacturability. Each item's input_type defaults to ``text``; pass ``select`` (single choice) or ``multiselect`` to add an ``options`` array. ``required`` defaults to ``true``; pass ``false`` only for genuinely optional questions.",
+        "Ask all blocking clarification questions together, then stop and wait. ``input_type`` defaults to ``text``; pass ``select`` or ``multiselect`` for choice questions. ``required`` defaults to ``true``.",
         {
             "title": {"type": "string", "description": "Optional short heading."},
             "questions": {

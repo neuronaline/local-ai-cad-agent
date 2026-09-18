@@ -46,6 +46,7 @@ class OpenAIClient(ChatCompletionsClient):
             if isinstance(message, dict) and message.get("role") == "assistant":
                 message.pop("reasoning", None)
                 message.pop("reasoning_details", None)
+                message.pop("reasoning_content", None)
         payload: dict[str, Any] = {
             "model": self.settings.openai_model,
             "messages": wire_messages,

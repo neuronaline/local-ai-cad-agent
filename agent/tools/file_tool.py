@@ -1,67 +1,30 @@
 from __future__ import annotations
 
-import ast
-import json
-import math
-import operator
+import re
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from agent.revisions import RevisionOrigin, RevisionStore
+from agent.revisions import MODEL_FILENAME, RevisionOrigin, RevisionStore
 
-BLOCKED_IMPORTS = {
-    "builtins",
-    "importlib",
-    "os",
-    "pathlib",
-    "shutil",
-    "socket",
-    "subprocess",
-    "sys",
-}
-BLOCKED_CALLS = {"__import__", "breakpoint", "compile", "eval", "exec", "input", "open"}
-EDITABLE_FILES = {"model.py"}
+EDITABLE_FILES = {MODEL_FILENAME}
 MAX_FILE_BYTES = 1 * 1024 * 1024
-DEFAULT_READ_LIMIT = 400
 # Maximum number of lines a single ``read_file`` call may return. Mirrors
 # the JSON schema's ``maximum`` so the runtime guard and the model-facing
 # limit cannot drift.
 MAX_READ_LINES = 2000
-_BINARY_OPERATORS = {
-    ast.Add: operator.add,
-    ast.Sub: operator.sub,
-    ast.Mult: operator.mul,
-    ast.Div: operator.truediv,
-    ast.Pow: operator.pow,
-}
-# Per-project locks for ``model.py`` writes. The previous design used a
-# single module-level :class:`threading.RLock` so writes from unrelated
-# projects blocked each other (audit_032). A second attempt keyed a
-# dict per project but tried to evict idle entries — and because the
-# eviction ran in the same critical section as the ref-count decrement,
-# a writer that had already bumped ``refs`` and grabbed the ``RLock``
-# reference could outlive the pop and end up serialising against a
-# brand-new ``RLock`` allocated for the next caller, breaking mutual
-# exclusion (audit_032 follow-up).
-#
-# The race-free design keeps every ``RLock`` for the lifetime of the
-# process. The dict grows by exactly one entry per project ever created
-# on the host (the project list is bounded by user action), so memory
-# cost is negligible in practice.
+# Per-project locks for ``model.scad`` writes.
 _MODEL_FILE_LOCKS: dict[str, threading.RLock] = {}
 _MODEL_FILE_LOCKS_GUARD: threading.Lock = threading.Lock()
 
 
 @contextmanager
 def _file_lock(path: Path) -> Iterator[threading.RLock]:
-    """Serialise writes to ``model.py`` per project.
+    """Serialise writes to ``model.scad`` per project.
 
-    Only ``model.py`` is editable (see ``EDITABLE_FILES``), so keying by
-    ``path.parent`` (= the project directory) is sufficient: two writes
-    for the same project share a lock while writes for different projects
-    run in parallel (audit_032).
+    Only ``model.scad`` is editable (see ``EDITABLE_FILES``), so keying by
+    ``path.parent`` (= the project directory) is sufficient.
     """
     key = str(path.parent)
     with _MODEL_FILE_LOCKS_GUARD:
@@ -76,167 +39,128 @@ def _file_lock(path: Path) -> Iterator[threading.RLock]:
         lock.release()
 
 
-class ModelPreflight(ast.NodeVisitor):
-    """Catch deterministic build123d mistakes before running the CAD kernel."""
+class OpenScadPreflight:
+    """Catch deterministic OpenSCAD mistakes and unsafe patterns before running CLI."""
 
     def __init__(self) -> None:
-        self.values: dict[str, object] = {}
-        self.edge_points: dict[str, tuple[tuple[float, ...], tuple[float, ...]]] = {}
         self.warnings: list[str] = []
         self.blocked_errors: list[str] = []
 
-    def visit_Import(self, node: ast.Import) -> None:
-        names = [alias.name.split(".")[0] for alias in node.names]
-        forbidden = set(names) & BLOCKED_IMPORTS
-        if forbidden:
-            self.blocked_errors.append(
-                f"Unsafe import blocked: {', '.join(sorted(forbidden))}"
-            )
+    def validate(self, code: str) -> None:
+        # Strip comments to prevent false positives in comments/documentation
+        clean_code = re.sub(r"/\*.*?\*/", "", code, flags=re.DOTALL)
+        clean_code = re.sub(r"//.*", "", clean_code)
 
-    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
-        names = [(node.module or "").split(".")[0]]
-        forbidden = set(names) & BLOCKED_IMPORTS
-        if forbidden:
-            self.blocked_errors.append(
-                f"Unsafe import blocked: {', '.join(sorted(forbidden))}"
-            )
-
-    def visit_Assign(self, node: ast.Assign) -> None:
-        if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-            name = node.targets[0].id
-            value = self._number_or_tuple(node.value)
-            if value is not None:
-                self.values[name] = value
-            points = self._line_points(node.value)
-            if points is not None:
-                self.edge_points[name] = points
-        self.generic_visit(node)
-
-    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
-        if isinstance(node.target, ast.Name) and node.value is not None:
-            value = self._number_or_tuple(node.value)
-            if value is not None:
-                self.values[node.target.id] = value
-        self.generic_visit(node)
-
-    def visit_Call(self, node: ast.Call) -> None:
-        # Check for blocked built-in calls. Direct calls (eval(...)) and
-        # attribute-access forms (builtins.eval(...), __builtins__["eval"](...))
-        # both reach the same dangerous function, so cover both shapes.
-        if isinstance(node.func, ast.Name) and node.func.id in BLOCKED_CALLS:
-            self.blocked_errors.append(f"Unsafe function blocked: {node.func.id}")
-        elif isinstance(node.func, ast.Attribute) and node.func.attr in BLOCKED_CALLS:
-            self.blocked_errors.append(f"Unsafe function blocked: {node.func.attr}")
-        name = self._call_name(node)
-        if name == "Ellipse":
-            invalid = {"center", "start_angle", "end_angle"} & {
-                keyword.arg for keyword in node.keywords
-            }
-            if invalid:
-                raise ValueError(
-                    "Invalid Ellipse argument(s): "
-                    + ", ".join(sorted(invalid))
-                    + ". Ellipse is a full 2D sketch; use EllipticalCenterArc in BuildLine."
+        # 1. Check for accidental Python syntax
+        python_keywords = ("def ", "import ", "from ", "class ", "elif ")
+        for kw in python_keywords:
+            if re.search(r"^[ \t]*" + re.escape(kw), clean_code, re.MULTILINE):
+                self.blocked_errors.append(
+                    f"Unsafe or invalid OpenSCAD syntax: Python keyword '{kw.strip()}' found. "
+                    "Write native OpenSCAD code (use 'module', 'use <...>', etc.)."
                 )
-        elif name == "RadiusArc":
-            self._validate_radius_arc(node)
-        self.generic_visit(node)
+                return
 
-    def _validate_radius_arc(self, node: ast.Call) -> None:
-        start = self._point(self._argument(node, 0, "start_point"))
-        end = self._point(self._argument(node, 1, "end_point"))
-        radius = self._number(self._argument(node, 2, "radius"))
-        # ``build123d.RadiusArc`` accepts a signed radius: ``radius > 0``
-        # yields the short sagitta on one side of the chord, ``radius < 0``
-        # yields the equivalent arc mirrored to the other side. The
-        # preflight must align with the real API instead of rejecting the
-        # negative convention that the playbook documents.
-        if radius == 0:
-            raise ValueError("RadiusArc radius must be non-zero.")
-        if start is None or end is None or radius is None:
+        # 2. Check for unsafe file inclusions / path traversal
+        inc_matches = re.findall(r"(?:include|use)\s*<([^>]+)>", code)
+        for inc_path in inc_matches:
+            inc_path = inc_path.strip()
+            if inc_path.startswith("/") or ".." in inc_path or "\\" in inc_path:
+                self.blocked_errors.append(
+                    f"Unsafe include/use path blocked: '{inc_path}'. "
+                    "Path must be relative and cannot escape the project directory."
+                )
+                return
+
+        # 3. Check balanced delimiters
+        pairs = {"{": "}", "[": "]", "(": ")"}
+        stack: list[tuple[str, int]] = []
+        in_line_comment = False
+        in_block_comment = False
+        in_string = False
+
+        i = 0
+        n = len(code)
+        lineno = 1
+        while i < n:
+            char = code[i]
+            if char == "\n":
+                lineno += 1
+                in_line_comment = False
+                i += 1
+                continue
+
+            if in_line_comment:
+                i += 1
+                continue
+
+            if in_block_comment:
+                if code[i : i + 2] == "*/":
+                    in_block_comment = False
+                    i += 2
+                else:
+                    i += 1
+                continue
+
+            if in_string:
+                if char == "\\" and i + 1 < n:
+                    i += 2
+                elif char == '"':
+                    in_string = False
+                    i += 1
+                else:
+                    i += 1
+                continue
+
+            if code[i : i + 2] == "//":
+                in_line_comment = True
+                i += 2
+                continue
+
+            if code[i : i + 2] == "/*":
+                in_block_comment = True
+                i += 2
+                continue
+
+            if char == '"':
+                in_string = True
+                i += 1
+                continue
+
+            if char in pairs:
+                stack.append((char, lineno))
+            elif char in pairs.values():
+                if not stack:
+                    self.blocked_errors.append(f"Unmatched closing '{char}' at line {lineno}.")
+                    return
+                top, top_line = stack.pop()
+                if pairs[top] != char:
+                    self.blocked_errors.append(
+                        f"Mismatched delimiter: opened '{top}' at line {top_line} but closed with '{char}' at line {lineno}."
+                    )
+                    return
+            i += 1
+
+        if in_string:
+            self.blocked_errors.append("Unclosed string literal.")
             return
-        chord = math.dist(start, end)
-        minimum = chord / 2
-        # Compare against the magnitude: ``abs(radius)`` is the chord-
-        # distance bound; the sign only flips the arc side.
-        if abs(radius) + 1e-9 < minimum:
-            raise ValueError(
-                f"RadiusArc radius {radius:g} is too small for chord {chord:.3f}; "
-                f"minimum magnitude is {minimum:.3f}."
+
+        if in_block_comment:
+            self.blocked_errors.append("Unclosed block comment.")
+            return
+
+        if stack:
+            unclosed, start_line = stack[-1]
+            self.blocked_errors.append(f"Unclosed delimiter '{unclosed}' opened at line {start_line}.")
+            return
+
+        # 4. Check for UPPER_CASE parameter definition
+        has_params = bool(re.search(r"^[ \t]*[A-Z][A-Z0-9_]*[ \t]*=", code, re.MULTILINE))
+        if not has_params:
+            self.warnings.append(
+                "PRE-FLIGHT WARNING: No UPPER_CASE parameters declared at top of model.scad. "
+                "Define numeric parameters at top (e.g. WIDTH = 50;)."
             )
-
-    def _line_points(
-        self, node: ast.AST
-    ) -> tuple[tuple[float, ...], tuple[float, ...]] | None:
-        if not isinstance(node, ast.Call) or self._call_name(node) != "Line":
-            return None
-        start = self._point(self._argument(node, 0, "start"))
-        end = self._point(self._argument(node, 1, "end"))
-        return (start, end) if start is not None and end is not None else None
-
-    def _point(self, node: ast.AST | None) -> tuple[float, ...] | None:
-        if (
-            isinstance(node, ast.BinOp)
-            and isinstance(node.op, ast.MatMult)
-            and isinstance(node.left, ast.Name)
-        ):
-            index = self._number(node.right)
-            points = self.edge_points.get(node.left.id)
-            if points is not None and index in {0, 1}:
-                return points[int(index)]
-        value = self._number_or_tuple(node)
-        if (
-            isinstance(value, tuple)
-            and len(value) in {2, 3}
-            and all(isinstance(item, float) for item in value)
-        ):
-            return value
-        return None
-
-    def _number(self, node: ast.AST | None) -> float | None:
-        value = self._number_or_tuple(node)
-        return value if isinstance(value, float) else None
-
-    def _number_or_tuple(
-        self, node: ast.AST | None
-    ) -> float | tuple[float, ...] | None:
-        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
-            return float(node.value)
-        if isinstance(node, ast.Name):
-            return self.values.get(node.id)  # type: ignore[return-value]
-        if isinstance(node, ast.Tuple):
-            values = tuple(self._number(item) for item in node.elts)
-            return values if all(value is not None for value in values) else None
-        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
-            value = self._number(node.operand)
-            if value is not None:
-                return value if isinstance(node.op, ast.UAdd) else -value
-        if isinstance(node, ast.BinOp) and type(node.op) in _BINARY_OPERATORS:
-            left = self._number(node.left)
-            right = self._number(node.right)
-            if left is not None and right is not None:
-                try:
-                    return float(_BINARY_OPERATORS[type(node.op)](left, right))
-                except (ArithmeticError, OverflowError):
-                    return None
-        return None
-
-    @staticmethod
-    def _argument(node: ast.Call, index: int, keyword_name: str) -> ast.AST | None:
-        if len(node.args) > index:
-            return node.args[index]
-        return next(
-            (keyword.value for keyword in node.keywords if keyword.arg == keyword_name),
-            None,
-        )
-
-    @staticmethod
-    def _call_name(node: ast.Call) -> str | None:
-        if isinstance(node.func, ast.Name):
-            return node.func.id
-        if isinstance(node.func, ast.Attribute):
-            return node.func.attr
-        return None
 
 
 
@@ -262,7 +186,7 @@ class FileTool:
 
     def _path(self, filename: str) -> Path:
         if filename not in EDITABLE_FILES:
-            raise ValueError("Only model.py can be edited.")
+            raise ValueError(f"Only {MODEL_FILENAME} can be edited.")
         path = (self.project_dir / filename).resolve()
         if path.parent != self.project_dir:
             raise ValueError("Path escapes the project directory.")
@@ -270,14 +194,8 @@ class FileTool:
 
     @staticmethod
     def validate_model(code: str) -> list[str]:
-        try:
-            tree = ast.parse(code, filename="model.py")
-        except SyntaxError as error:
-            raise ValueError(
-                f"Invalid Python: {error.msg} (line {error.lineno})"
-            ) from error
-        preflight = ModelPreflight()
-        preflight.visit(tree)
+        preflight = OpenScadPreflight()
+        preflight.validate(code)
         if preflight.blocked_errors:
             raise ValueError(preflight.blocked_errors[0])
         return preflight.warnings
@@ -289,32 +207,37 @@ class FileTool:
         limit: int | None = None,
         known_sha256: str | None = None,
         **_ignored: object,
-    ) -> str:
+    ) -> dict:
+        """Return ``model.scad`` content as a plain dict.
+
+        The dispatcher wraps this in the standard :func:`tool_success`
+        envelope, which performs the JSON encoding exactly once. Returning
+        a dict here — instead of a pre-serialised JSON string — avoids a
+        double-encoded payload whose ``data`` field is a stringified JSON
+        blob. A double-encoded payload wastes context tokens and trips up
+        models when they copy exact ``old_string`` snippets into
+        ``edit_file``.
+        """
         path = self._path(filename)
         if offset < 1:
             raise ValueError("offset must be at least 1.")
         if not path.exists():
-            return json.dumps(
-                {
-                    "exists": False,
-                    "content": "",
-                    "total_lines": 0,
-                    "offset": offset,
-                    "returned_lines": 0,
-                    "next_offset": None,
-                },
-                ensure_ascii=False,
-            )
+            return {
+                "exists": False,
+                "content": "",
+                "total_lines": 0,
+                "offset": offset,
+                "returned_lines": 0,
+                "next_offset": None,
+            }
         if path.stat().st_size > MAX_FILE_BYTES:
             raise ValueError(
                 f"{filename} is too large to read safely (max {MAX_FILE_BYTES // 1024} KiB)."
             )
         content = path.read_text(encoding="utf-8")
-        if limit is None:
-            limit = None if offset == 1 else DEFAULT_READ_LIMIT
+        lines = content.splitlines(keepends=True)
         if limit is not None and (limit < 1 or limit > MAX_READ_LINES):
             raise ValueError(f"limit must be between 1 and {MAX_READ_LINES} lines.")
-        lines = content.splitlines(keepends=True)
         if offset > len(lines) + 1:
             raise ValueError(
                 f"offset {offset} exceeds {filename}'s {len(lines)} lines."
@@ -323,17 +246,14 @@ class FileTool:
             lines[offset - 1 :] if limit is None else lines[offset - 1 : offset - 1 + limit]
         )
         next_offset = offset + len(chunk.splitlines())
-        return json.dumps(
-            {
-                "exists": True,
-                "content": chunk,
-                "total_lines": len(lines),
-                "offset": offset,
-                "returned_lines": len(chunk.splitlines()),
-                "next_offset": next_offset if next_offset <= len(lines) else None,
-            },
-            ensure_ascii=False,
-        )
+        return {
+            "exists": True,
+            "content": chunk,
+            "total_lines": len(lines),
+            "offset": offset,
+            "returned_lines": len(chunk.splitlines()),
+            "next_offset": next_offset if next_offset <= len(lines) else None,
+        }
 
     def write_file(
         self,
@@ -347,7 +267,7 @@ class FileTool:
             return self._write_model(content, "write_file")
 
     def _write_model(self, content: str, operation: str) -> str:
-        """Validate, commit revision, and atomically write model.py."""
+        """Validate, commit revision, and atomically write model.scad."""
         self.validate_model(content)
         revision = self._revisions.commit(
             content,
@@ -358,7 +278,7 @@ class FileTool:
             ),
         )
         return (
-            f"Wrote model.py ({len(content.splitlines())} lines, "
+            f"Wrote model.scad ({len(content.splitlines())} lines, "
             f"{len(content)} chars, revision {revision.id[:8]})."
         )
 
@@ -510,38 +430,6 @@ class FileTool:
             f"(replaced lines {start_line}-{end_line} with lines "
             f"{start_line}-{new_end_line})."
         )
-
-    def insert_file(
-        self,
-        filename: str,
-        anchor: str,
-        content: str,
-        position: str,
-        expected_sha256: str | None = None,
-        **_ignored: object,
-    ) -> str:
-        """Insert content next to one short, exact anchor without replacing it."""
-        if not anchor:
-            raise ValueError("anchor must not be empty.")
-        if not content:
-            raise ValueError("content must not be empty.")
-        if position not in {"before", "after"}:
-            raise ValueError("position must be 'before' or 'after'.")
-        path = self._path(filename)
-        with _file_lock(path):
-            if not path.exists():
-                raise ValueError(f"{filename} does not exist; use write_file to create it.")
-            current = path.read_text(encoding="utf-8")
-            matches = current.count(anchor)
-            if matches != 1:
-                raise ValueError(
-                    f"Expected one exact anchor, found {matches}; file was not changed."
-                )
-            replacement = content + anchor if position == "before" else anchor + content
-            updated = current.replace(anchor, replacement, 1)
-            line = current[: current.find(anchor)].count("\n") + 1
-            base = self._write_model(updated, "insert_file")
-        return f"{base} (inserted {position} anchor at line {line})."
 
     def edit_file_atomic(
         self,

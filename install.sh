@@ -41,18 +41,21 @@ command -v bwrap     >/dev/null 2>&1 || SYSTEM_PACKAGES+=("bubblewrap")
 dpkg -s libseccomp2  >/dev/null 2>&1 || SYSTEM_PACKAGES+=("libseccomp2")
 command -v python3   >/dev/null 2>&1 || SYSTEM_PACKAGES+=("python3")
 dpkg -s python3-venv >/dev/null 2>&1 || SYSTEM_PACKAGES+=("python3-venv")
+command -v openscad  >/dev/null 2>&1 || SYSTEM_PACKAGES+=("openscad")
+command -v xvfb-run  >/dev/null 2>&1 || SYSTEM_PACKAGES+=("xvfb")
 
 if [ ${#SYSTEM_PACKAGES[@]} -gt 0 ]; then
     if command -v apt-get >/dev/null 2>&1; then
-        warn "Installing system packages: ${SYSTEM_PACKAGES[*]}"
-        sudo apt-get update -qq
-        sudo apt-get install -y -qq "${SYSTEM_PACKAGES[@]}"
-        info "System packages installed."
+        warn "Attempting to install system packages: ${SYSTEM_PACKAGES[*]}"
+        if sudo -n true 2>/dev/null; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq "${SYSTEM_PACKAGES[@]}" || true
+        else
+            warn "Root permissions needed for apt-get (enter sudo password if prompted, or press Ctrl+C to skip):"
+            sudo apt-get update -qq && sudo apt-get install -y -qq "${SYSTEM_PACKAGES[@]}" || true
+        fi
     else
-        warn "apt-get not available. Please install these packages manually: ${SYSTEM_PACKAGES[*]}"
+        warn "apt-get not available. Please install these packages manually if possible: ${SYSTEM_PACKAGES[*]}"
     fi
-else
-    info "All required system packages are installed."
 fi
 
 # ── Virtual environment ──
@@ -76,6 +79,50 @@ info "Installing Python dependencies from requirements.txt…"
 "$VENV_PIP" install --upgrade pip -q
 "$VENV_PIP" install -r requirements.txt -q
 info "Python dependencies installed."
+
+# ── Ensure OpenSCAD is available ──
+if ! command -v openscad >/dev/null 2>&1 && [ ! -x "$PROJECT_DIR/.venv/bin/openscad" ]; then
+    info "OpenSCAD is not available in system PATH. Setting up standalone OpenSCAD in .venv…"
+    OPENSCAD_APPIMAGE_URL="https://github.com/openscad/openscad/releases/download/openscad-2021.01/OpenSCAD-2021.01-x86_64.AppImage"
+    OPENSCAD_TMP_APPIMAGE="/tmp/openscad-$$.AppImage"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL -o "$OPENSCAD_TMP_APPIMAGE" "$OPENSCAD_APPIMAGE_URL" || true
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O "$OPENSCAD_TMP_APPIMAGE" "$OPENSCAD_APPIMAGE_URL" || true
+    fi
+
+    if [ -f "$OPENSCAD_TMP_APPIMAGE" ]; then
+        chmod +x "$OPENSCAD_TMP_APPIMAGE"
+        EXTRACT_DIR="/tmp/openscad-extract-$$"
+        mkdir -p "$EXTRACT_DIR"
+        (cd "$EXTRACT_DIR" && "$OPENSCAD_TMP_APPIMAGE" --appimage-extract >/dev/null 2>&1 || true)
+        rm -f "$OPENSCAD_TMP_APPIMAGE"
+        if [ -x "$EXTRACT_DIR/squashfs-root/AppRun" ]; then
+            mkdir -p "$PROJECT_DIR/.venv/openscad"
+            cp -r "$EXTRACT_DIR/squashfs-root"/* "$PROJECT_DIR/.venv/openscad/"
+            rm -rf "$EXTRACT_DIR"
+            cat <<'WRAPPER' > "$PROJECT_DIR/.venv/bin/openscad"
+#!/bin/sh
+SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
+if [ -x "/venv/openscad/AppRun" ]; then
+    exec /venv/openscad/AppRun "$@"
+elif [ -x "$SCRIPT_DIR/../openscad/AppRun" ]; then
+    exec "$SCRIPT_DIR/../openscad/AppRun" "$@"
+else
+    echo "openscad not found" >&2
+    exit 127
+fi
+WRAPPER
+            chmod +x "$PROJECT_DIR/.venv/bin/openscad"
+            info "Standalone OpenSCAD installed to .venv/bin/openscad."
+        else
+            rm -rf "$EXTRACT_DIR"
+            warn "Could not extract OpenSCAD AppImage. Please install openscad via your package manager."
+        fi
+    else
+        warn "Could not download OpenSCAD AppImage. Please install openscad via your package manager."
+    fi
+fi
 
 # ── Configuration files ──
 if [ ! -f .env ]; then

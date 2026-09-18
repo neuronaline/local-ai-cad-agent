@@ -13,7 +13,7 @@ from typing import Any
 
 from agent.io import atomic_write_bytes
 from agent.review_paths import review_dir
-from agent.revisions import RevisionIntegrityError, RevisionStore
+from agent.revisions import MODEL_FILENAME, RevisionIntegrityError, RevisionStore
 from agent.sandbox import command as sandbox_command
 from agent.tools.file_tool import FileTool
 from agent.tools.process_runner import (
@@ -141,9 +141,9 @@ class CadTool:
         render: bool = False,
         call_id: str = "",
     ) -> dict[str, Any]:
-        model_path = self.project_dir / "model.py"
+        model_path = self.project_dir / MODEL_FILENAME
         if not model_path.exists():
-            raise ValueError("model.py does not exist yet.")
+            raise ValueError(f"{MODEL_FILENAME} does not exist yet.")
         model_code = model_path.read_text(encoding="utf-8")
         FileTool.validate_model(model_code)
         # Copy ``renderer.py`` and ``runner.py`` as siblings into the workspace
@@ -157,7 +157,7 @@ class CadTool:
 
         with tempfile.TemporaryDirectory(prefix="cad-agent-") as temporary:
             workspace = Path(temporary)
-            (workspace / "model.py").write_text(model_code, encoding="utf-8")
+            (workspace / MODEL_FILENAME).write_text(model_code, encoding="utf-8")
             (workspace / _RUNNER_FILENAME).write_text(
                 (_SCRIPTS_DIR / _RUNNER_FILENAME).read_text(encoding="utf-8"),
                 encoding="utf-8",
@@ -375,7 +375,7 @@ class CadTool:
     def _atomic_copy(source: Path, target: Path) -> None:
         # Read the source into memory and delegate to the canonical byte
         # helper so the temp-cleanup + replace semantics match every other
-        # atomic write in the agent (audit_272).
+        # atomic write in the agent.
         atomic_write_bytes(target, source.read_bytes())
 
     # ------------------------------------------------------------------ review promotion
@@ -550,11 +550,11 @@ class CadTool:
                         if i + 1 < len(lines) and lines[i + 1].startswith("    "):
                             frames.append(lines[i + 1])
                 elif not line.startswith("  ") and line.strip():
-                    frames.append(line)
+                    frames.extend(lines[i:])
                     break
         if not frames:
             for i, line in enumerate(lines):
-                if 'File "model.py"' in line:
+                if "model.scad" in line:
                     frames.append(line)
                     if i + 1 < len(lines):
                         frames.append(lines[i + 1])

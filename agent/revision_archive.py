@@ -2,7 +2,7 @@
 
 Both :func:`export_history` and :func:`import_history` were originally
 methods on :class:`agent.revisions.RevisionStore` and were documented as
-test-suite-only (audit_031). Extracting them into a sibling module keeps
+test-suite-only. Extracting them into a sibling module keeps
 the production class surface focused on commit/restore/prune while still
 allowing the round-trip suite to exercise the JSON archive format.
 

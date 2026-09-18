@@ -15,23 +15,22 @@ from pathlib import Path
 
 from agent.activity_log import ActivityLogger
 from agent.io import atomic_write_json
-from agent.revisions import model_is_built as _model_is_built
+from agent.revisions import MODEL_FILENAME
 from agent.tool_results import (
     build_cad_build_multimodal_content,
-    build_cad_screenshot_multimodal_content,
     compact_for_context,
 )
 from agent.tool_results import failure as tool_failure
 from agent.tool_results import success as tool_success
 
 
-def is_model_mutation(name: str, arguments: dict) -> bool:
-    """True for tool calls that change ``model.py`` and so invalidate the
-    current preview/review state."""
-    return name in {"write_file", "edit_file", "insert_file"}
+def is_model_mutation(name: str) -> bool:
+    """True for tool calls that mutate ``model.scad`` and invalidate
+    preview/review state."""
+    return name in {"write_file", "edit_file"}
 
 
-def is_cad_build(name: str, arguments: dict) -> bool:
+def is_cad_build(name: str) -> bool:
     """True for the canonical CAD build tool call."""
     return name == "cad_build_and_verify"
 
@@ -55,38 +54,25 @@ def dispatch(
     ``waiting`` is True only for the question tool (the LLM is parked
     until the user replies).
 
-    The dispatcher recognizes the core tools published by
+    Only the five model-facing tools published by
     :mod:`agent.tool_schemas` (``cad_build_and_verify``, ``read_file``,
-    ``write_file``, ``edit_file``, and ``question``) as well as legacy
-    tools (``cad_screenshot``, ``cad_review``, ``insert_file``). Tool
-    instances expose a per-call ``with_call_id`` method plus a generic
-    ``execute(args)`` entry; the dispatcher selects the right one based on
-    name.
+    ``write_file``, ``edit_file``, and ``question``) are recognised. Tool
+    instances expose a per-call ``with_call_id`` method that propagates
+    the call id into activity-log / debug-log entries; this dispatcher
+    uses an explicit ``if/elif`` table so unknown names surface as a
+    clear ``ValueError`` instead of a bare ``AttributeError`` from a
+    stray ``getattr`` lookup on the ``ProjectTools`` bundle.
     """
     if name == "cad_build_and_verify":
         cad = tools.cad.with_call_id(call_id)
         return cad.build_and_verify(render=_build_render(args)), False
-    if name == "cad_screenshot":
-        tool = (
-            tools.screenshot.with_call_id(call_id)
-            if call_id
-            else tools.screenshot
-        )
-        return tool.execute(args), False
-    if name == "cad_review":
-        tool = (
-            tools.review.with_call_id(call_id)
-            if call_id
-            else tools.review
-        )
-        return tool.execute(args), False
     if name == "read_file":
         tool = (
             tools.file.with_call_id(call_id) if call_id else tools.file
         )
         return (
             tool.read_file(
-                "model.py",
+                MODEL_FILENAME,
                 args.get("offset") or 1,
                 args.get("limit"),
             ),
@@ -98,83 +84,93 @@ def dispatch(
         )
         return (
             tool.write_file(
-                "model.py",
+                MODEL_FILENAME,
                 args.get("content", ""),
             ),
             False,
         )
     if name == "edit_file":
-        tool = (
-            tools.file.with_call_id(call_id) if call_id else tools.file
+        return _dispatch_edit_file(tools.file, args, call_id)
+    if name == "question":
+        return _dispatch_question(tools.question, tools.project_dir, project, args)
+    raise ValueError(f"Unknown or unsupported tool: {name!r}")
+
+
+def _dispatch_edit_file(file_tool, args: dict, call_id: str) -> tuple[object, bool]:
+    """Resolve ``edit_file`` arguments into a single ``edit_file`` /
+    ``edit_file_atomic`` call.
+
+    ``edit_file`` accepts either ``{old_string, new_string}`` for a
+    single replacement, or ``edits`` (a list of such pairs) for an
+    atomic batch. ``edit_file_atomic`` performs the batch safely so the
+    revision captures the final post-state under the file tool's lock.
+    """
+    tool = (
+        file_tool.with_call_id(call_id) if call_id else file_tool
+    )
+    edits = args.get("edits")
+    if not edits and "old_string" in args:
+        new_str = args.get("new_string")
+        edits = [
+            {
+                "old_string": args["old_string"],
+                "new_string": "" if new_str is None else new_str,
+            }
+        ]
+    elif isinstance(edits, dict):
+        edits = [edits]
+    if not edits:
+        raise ValueError(
+            "edit_file requires 'edits' (list of {old_string, new_string}) or 'old_string' and 'new_string'."
         )
-        edits = args.get("edits")
-        if not edits and "old_string" in args:
-            new_str = args.get("new_string")
-            edits = [
-                {
-                    "old_string": args["old_string"],
-                    "new_string": "" if new_str is None else new_str,
-                }
-            ]
-        elif isinstance(edits, dict):
-            edits = [edits]
-        if not edits:
-            raise ValueError(
-                "edit_file requires 'edits' (list of {old_string, new_string}) or 'old_string' and 'new_string'."
-            )
-        if not isinstance(edits, list):
+    if not isinstance(edits, list):
+        raise ValueError("edit_file 'edits' must be a list of objects.")
+    if len(edits) == 1:
+        entry = edits[0]
+        if not isinstance(entry, dict):
             raise ValueError("edit_file 'edits' must be a list of objects.")
-        # Apply all edits in one lock so the revision captures the final
-        # post-state atomically; the file tool exposes an
-        # ``edit_file_atomic`` helper that performs the batch safely.
-        if len(edits) == 1:
-            entry = edits[0]
-            if not isinstance(entry, dict):
-                raise ValueError("edit_file 'edits' must be a list of objects.")
-            old_str = entry.get("old_string")
-            new_str = entry.get("new_string")
-            return (
-                tool.edit_file(
-                    "model.py",
-                    "" if old_str is None else old_str,
-                    "" if new_str is None else new_str,
-                ),
-                False,
-            )
+        old_str = entry.get("old_string")
+        new_str = entry.get("new_string")
         return (
-            tool.edit_file_atomic("model.py", edits),
-            False,
-        )
-    if name == "insert_file":
-        tool = tools.file.with_call_id(call_id) if call_id else tools.file
-        return (
-            tool.insert_file(
-                "model.py",
-                anchor=args["anchor"],
-                content=args["content"],
-                position=args["position"],
+            tool.edit_file(
+                MODEL_FILENAME,
+                "" if old_str is None else old_str,
+                "" if new_str is None else new_str,
             ),
             False,
         )
-    if name == "question":
-        # execute() returns the normalized list as its third element; reuse
-        # it for the persisted state instead of re-running normalize_questions
-        # here. Validation also already ran inside execute(), so ask() can
-        # publish straight away.
-        result, _waiting, questions = tools.question.execute(args, project=project)
-        title = args.get("title", "")
-        question_state = {
-            "title": title.strip() if isinstance(title, str) else "",
-            "questions": questions,
-        }
-        state_path = tools.project_dir / ".agent_state.json"
-        atomic_write_json(
-            state_path,
-            {"status": "WAITING_FOR_USER", "waiting_question": question_state},
-        )
-        return result, True
-    tool = getattr(tools, name)
-    return tool.execute(args), False
+    return (
+        tool.edit_file_atomic(MODEL_FILENAME, edits),
+        False,
+    )
+
+
+def _dispatch_question(
+    question_tool, project_dir: Path, project: str, args: dict
+) -> tuple[object, bool]:
+    """Persist the ``WAITING_FOR_USER`` state and return the question tool
+    envelope.
+
+    ``QuestionTool.execute`` already validates and normalises the
+    questions; this dispatcher only writes the persistent state marker
+    so the next user request can resume the conversation cleanly.
+    """
+    # execute() returns the normalized list as its third element; reuse
+    # it for the persisted state instead of re-running normalize_questions
+    # here. Validation also already ran inside execute(), so ask() can
+    # publish straight away.
+    result, _waiting, questions = question_tool.execute(args, project=project)
+    title = args.get("title", "")
+    question_state = {
+        "title": title.strip() if isinstance(title, str) else "",
+        "questions": questions,
+    }
+    state_path = project_dir / ".agent_state.json"
+    atomic_write_json(
+        state_path,
+        {"status": "WAITING_FOR_USER", "waiting_question": question_state},
+    )
+    return result, True
 
 
 def normalize_tool_calls(raw_calls: object) -> list[dict]:
@@ -264,32 +260,16 @@ def process_tool_call(
                 },
                 run_id=run_id,
             )
-        if is_cad_build(name, arguments):
+        if is_cad_build(name):
             preview_id = None
-        # Gate ``cad_screenshot`` / ``cad_review`` on a fresh build of the
-        # current model.py revision, NOT on ``cad_fix_required``. The loop's
-        # ``cad_fix_required`` flag tracks the stricter "rendered visual
-        # verification pending" requirement; coupling the dispatcher to it
-        # forced a wasteful second rendered build after every cheap
-        # ``cad_build_and_verify(render=false)``. ``model_is_built`` reads
-        # ``.cad_metrics.json`` and only requires *any* successful build
-        # of the current revision — the screenshot tool re-runs build123d
-        # in its own sandbox subprocess when needed.
-        if (
-            name in {"cad_screenshot", "cad_review"}
-            and not _model_is_built(project_dir)
-        ):
-            raise ValueError(
-                f"{name} requires a successful build of the current revision."
-            )
         raw_result, waiting = dispatch(tools, project, name, arguments, call_id)
         result = tool_success(name, raw_result)
-        if is_model_mutation(name, arguments):
+        if is_model_mutation(name):
             preview_id = None
             cad_error = None
             cad_fix_required = True
             publish("revision_updated", {"project": project})
-        if is_cad_build(name, arguments):
+        if is_cad_build(name):
             preview_id = register_preview(project, project_dir)
             cad_error = None
             build_succeeded = True
@@ -316,7 +296,7 @@ def process_tool_call(
         result, waiting = tool_failure(name, error), False
         if debug_log is not None:
             debug_log(project_dir, call_id, name, error, result)
-        if is_cad_build(name, arguments):
+        if is_cad_build(name):
             cad_error = str(error)
             cad_fix_required = True
             preview_id = None
@@ -347,13 +327,6 @@ def process_tool_call(
     context_content: str | list = context_result
     image_paths: list[Path] = []
     if name == "cad_build_and_verify":
-        # A successful rendered build can attach the rendered PNG
-        # directly to the tool message so the agent evaluates it in-band
-        # instead of calling the subordinate visual reviewer. This avoids the
-        # isolated sub-session that previously re-derived the design rationale
-        # from scratch. Drive the multimodal-decision off the *raw* result
-        # because ``compact_for_context`` strips ``render`` to shrink the
-        # prompt while the returned image remains the evidence signal.
         multimodal = build_cad_build_multimodal_content(
             result, project_dir, context_result=context_result
         )
@@ -362,64 +335,10 @@ def process_tool_call(
             image_paths = list(multimodal.get("image_paths") or [])
         if build_succeeded and _build_render(arguments) and image_paths:
             cad_fix_required = False
-    elif name == "cad_screenshot":
-        # Attach the requested views + contact sheet inline so the reviewer
-        # can inspect the rendered output without a separate read step. Skip
-        # the branch when no inline image is present (e.g. cache miss that
-        # raced the tool result path); the next turn can request a fresh
-        # screenshot.
-        multimodal = build_cad_screenshot_multimodal_content(
-            result, project_dir, context_result=context_result
-        )
-        if multimodal is not None:
-            context_content = multimodal["content"]
-            image_paths = list(multimodal.get("image_paths") or [])
     tool_message = {"role": "tool", "tool_call_id": call_id, "content": context_content}
     messages.append(tool_message)
     append_message(project_dir, tool_message)
-    _remember_inline_tool_images(project_dir, call_id, image_paths)
     return preview_id, cad_error, cad_fix_required, waiting
-
-
-def _remember_inline_tool_images(
-    project_dir: Path, call_id: str, image_paths: list[Path]
-) -> None:
-    """Record host-relative image paths for a tool message.
-
-    The conversation log stores the multimodal content verbatim so the next
-    turn can re-inject the same evidence, but the persisted paths let the
-    history redaction step replace stale inline images with ``[Inline render
-    from <view>]`` placeholders on subsequent loads.
-    """
-    if not image_paths or not call_id:
-        return
-    try:
-        rel = [
-            str(path.relative_to(project_dir))
-            for path in image_paths
-            if path.is_file()
-        ]
-    except ValueError:
-        return
-    if not rel:
-        return
-    index_path = project_dir / ".agent_tool_images.json"
-    try:
-        index: dict[str, list[str]] = {}
-        if index_path.is_file():
-            try:
-                payload = json.loads(index_path.read_text(encoding="utf-8"))
-                if isinstance(payload, dict):
-                    index = payload
-            except (OSError, json.JSONDecodeError):
-                index = {}
-        index[call_id] = rel
-        # Atomic replace (temp + fsync + rename) so a crash mid-write never
-        # truncates the JSON and the next load's JSONDecodeError path wipes
-        # every prior placeholder.
-        atomic_write_json(index_path, index)
-    except OSError:
-        return
 
 
 def cancel_remaining_tool_calls(
@@ -431,10 +350,13 @@ def cancel_remaining_tool_calls(
     append_message: Callable[[Path, dict], None],
 ) -> None:
     """Persist cancelled tool-result entries for unprocessed calls."""
-    cancelled = json.dumps({"error": "Tool call cancelled (question or stop)."})
     for tc in tool_calls:
         cid = tc.get("id", "")
         if cid and cid not in processed_call_ids:
+            tool_name = tc.get("function", {}).get("name", "unknown_tool")
+            cancelled = tool_failure(
+                tool_name, RuntimeError("Tool call cancelled (question or stop).")
+            )
             entry = {"role": "tool", "tool_call_id": cid, "content": cancelled}
             messages.append(entry)
             append_message(project_dir, entry)

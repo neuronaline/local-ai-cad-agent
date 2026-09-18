@@ -60,10 +60,17 @@ if [ ! -x "$PYTHON_BIN" ]; then
   .venv/bin/pip install -r requirements.txt"
 fi
 
+export PATH="$PROJECT_DIR/.venv/bin:$PATH"
+
 # ── System dependencies ──
 if ! command -v bwrap >/dev/null 2>&1; then
     error "bubblewrap (bwrap) is required for sandboxed CAD execution. Install it with:
   sudo apt install bubblewrap"
+fi
+
+if ! command -v openscad >/dev/null 2>&1; then
+    error "OpenSCAD is required for CAD modeling. Run ./install.sh or install openscad:
+  sudo apt install openscad"
 fi
 
 if ! "$PYTHON_BIN" -c 'import ctypes; ctypes.CDLL("libseccomp.so.2")' 2>/dev/null; then

@@ -76,6 +76,8 @@ instance/
 api_messages.jsonl
 conversation.jsonl
 .agent_state.json
+.cad_metrics.json
+.cad_validation.json
 preview.stl
 render.png
 output/
@@ -86,4 +88,7 @@ output/
 *.iges
 *.igs
 
-tests/AGENTS.md
+tests/TEST_RULES.md
+AGENTS.md
+
+.kilo/

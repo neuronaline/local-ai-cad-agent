@@ -31,12 +31,12 @@ from flask import (
 )
 from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
 
-from agent.conversation import ConversationStore
-from agent.core import AgentRunner, _history_lock_slot
+from agent.conversation import ConversationStore, set_shared_history_lock
+from agent.core import AgentRunner
 from agent.images import store_images
 from agent.io import utc_now_iso
 from agent.review_paths import review_dir
-from agent.revisions import RevisionIntegrityError, RevisionStore
+from agent.revisions import MODEL_FILENAME, RevisionIntegrityError, RevisionStore
 from agent.sandbox import _BWRAP, seccomp_filter_fd
 from agent.settings import Settings, load_settings
 
@@ -298,10 +298,12 @@ def _run_preflight(settings: Settings) -> dict[str, Any]:
     except RuntimeError:
         checks["seccomp"] = False
     try:
-        import build123d  # noqa: F401
+        import numpy  # noqa: F401
+        import PIL  # noqa: F401
         checks["python_packages"] = True
     except ImportError:
         checks["python_packages"] = False
+    checks["openscad_installed"] = shutil.which("openscad") is not None
     return checks
 
 
@@ -330,7 +332,7 @@ def _project_locks(app: Flask, *project_names: str):
 
 
 _PROJECT_MTIME_CANDIDATES = (
-    "model.py",
+    MODEL_FILENAME,
     "conversation.jsonl",
     "preview.stl",
     "render.png",
@@ -358,7 +360,7 @@ def create_app(settings: Settings | None = None) -> Flask:
     app.config["SETTINGS"] = settings
     bus = EventBus(settings, app)
     app.config["EVENT_BUS"] = bus
-    _history_lock_slot[0] = bus._history_lock
+    set_shared_history_lock(bus._history_lock)
     app.config["AGENT_RUNNER"] = AgentRunner(settings, bus.publish)
     app.config["PROJECT_LOCKS"]: dict[str, threading.Lock] = {}
     app.config["PROJECT_LOCKS_LOCK"] = threading.Lock()
@@ -561,7 +563,7 @@ def create_app(settings: Settings | None = None) -> Flask:
         """Clear the agent's conversation memory without touching the model.
 
         Removes ``conversation.jsonl`` so the next chat turn starts a fresh
-        context. ``model.py``, ``preview.stl``, ``render.png``, revisions, and
+        context. ``model.scad``, ``preview.stl``, ``render.png``, revisions, and
         review artifacts are left intact. Refuses to run while an agent task
         or a pending preview is in-flight so a reset cannot race the worker.
         """
@@ -803,7 +805,7 @@ def create_app(settings: Settings | None = None) -> Flask:
             manifest = build["review_manifest"]
             expected_sha = manifest["single_render"]["image_sha256"]
             current_model_sha = hashlib.sha256(
-                (project_dir / "model.py").read_bytes()
+                (project_dir / MODEL_FILENAME).read_bytes()
             ).hexdigest()
         except (OSError, KeyError, TypeError, json.JSONDecodeError):
             return jsonify({"error": "No render exists for the current model."}), 404
@@ -837,40 +839,20 @@ def create_app(settings: Settings | None = None) -> Flask:
         if not preview_path.is_file() or preview_path.stat().st_size == 0:
             return jsonify({"available": False, "displayable": False})
         stat = preview_path.stat()
-        preview_sha256 = hashlib.sha256(preview_path.read_bytes()).hexdigest()
-        model_path = project_dir / "model.py"
+        model_path = project_dir / MODEL_FILENAME
         model_sha256 = (
             hashlib.sha256(model_path.read_bytes()).hexdigest()
             if model_path.is_file()
             else None
         )
-        # ``cad_build_and_verify`` no longer auto-runs review, so the preview
-        # is always displayable as soon as ``preview.stl`` is on disk. The
-        # ``review_status`` field is informational: it surfaces the latest
-        # ``cad_review`` verdict when the agent chose to run one, otherwise
-        # it stays at ``"not_required"``. The UI uses it to render a status
-        # pill without blocking the preview.
+        # The ``review_status`` field is a backward-compatible stub. The
+        # dedicated ``cad_review`` tool was removed from the model-facing
+        # schema, so no structured verdict (``result.json``) is ever produced
+        # for new projects. We keep the field so the existing frontend
+        # (``hideUnapprovedPreview``) can keep reading it without breaking,
+        # but it always resolves to ``"not_required"`` because there is no
+        # reviewer gate in front of the preview.
         review_status = "not_required"
-        if model_sha256 is not None:
-            latest_review = _review_for_model(project_dir, model_sha256)
-        else:
-            latest_review = None
-        if latest_review is not None:
-            manifest_path = latest_review / _REVIEW_MANIFEST_NAME
-            result_path = latest_review / _REVIEW_RESULT_NAME
-            try:
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                result = json.loads(result_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                manifest = result = None
-            if (
-                isinstance(manifest, dict)
-                and manifest.get("preview_sha256") == preview_sha256
-                and manifest.get("model_sha256") == model_sha256
-                and isinstance(result, dict)
-                and result.get("status") in {"pass", "fail", "inconclusive"}
-            ):
-                review_status = result["status"]
         return jsonify({
             "available": True,
             "displayable": True,
@@ -884,9 +866,14 @@ def create_app(settings: Settings | None = None) -> Flask:
     # ------------------------------------------------------------------ #
 
     _REVIEW_MANIFEST_NAME = "manifest.json"
-    _REVIEW_RESULT_NAME = "result.json"
     _REVIEW_VIEWS_SUBDIR = "views"
     _REVIEW_SHEET_NAME = "review-sheet.png"
+
+    # NOTE: ``_REVIEW_RESULT_NAME`` was removed alongside the dedicated
+    # ``cad_review`` tool. The structured review verdict (``result.json``)
+    # was produced only by the now-deleted reviewer agent; ``cad_build_and_verify``
+    # still writes ``manifest.json`` / ``review-sheet.png`` / ``views/*.png``,
+    # which the endpoints below serve.
 
     def _review_for_model(project_dir: Path, model_sha256: str) -> Path | None:
         """Return the review directory matching ``model_sha256``, or ``None``.
@@ -909,9 +896,9 @@ def create_app(settings: Settings | None = None) -> Flask:
             project_dir = _project_path(app.config["SETTINGS"], project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
-        model_path = project_dir / "model.py"
+        model_path = project_dir / MODEL_FILENAME
         if not model_path.is_file():
-            return jsonify({"error": "model.py is missing."}), 404
+            return jsonify({"error": f"{MODEL_FILENAME} is missing."}), 404
         model_sha = hashlib.sha256(model_path.read_bytes()).hexdigest()
         latest = _review_for_model(project_dir, model_sha)
         if latest is None:
@@ -923,13 +910,10 @@ def create_app(settings: Settings | None = None) -> Flask:
             payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return jsonify({"error": "Review manifest is corrupted."}), 500
-        result_path = latest / _REVIEW_RESULT_NAME
-        if result_path.is_file():
-            try:
-                payload = dict(payload)
-                payload["result"] = json.loads(result_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                pass
+        # No ``result.json`` attachment: the structured verdict file was
+        # produced only by the now-removed ``cad_review`` tool. The manifest
+        # alone is enough for the multi-view gallery to render the
+        # previously-captured renders for the current model revision.
         payload = dict(payload)
         payload.setdefault("artifact_dir", latest.name)
         return jsonify(payload)
@@ -940,9 +924,9 @@ def create_app(settings: Settings | None = None) -> Flask:
             project_dir = _project_path(app.config["SETTINGS"], project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
-        model_path = project_dir / "model.py"
+        model_path = project_dir / MODEL_FILENAME
         if not model_path.is_file():
-            return jsonify({"error": "model.py is missing."}), 404
+            return jsonify({"error": f"{MODEL_FILENAME} is missing."}), 404
         model_sha = hashlib.sha256(model_path.read_bytes()).hexdigest()
         latest = _review_for_model(project_dir, model_sha)
         if latest is None:
@@ -962,9 +946,9 @@ def create_app(settings: Settings | None = None) -> Flask:
         # canonical names to avoid path traversal via the URL.
         if not view_id or "/" in view_id or "\\" in view_id or view_id.startswith("."):
             return jsonify({"error": "Unknown review view."}), 404
-        model_path = project_dir / "model.py"
+        model_path = project_dir / MODEL_FILENAME
         if not model_path.is_file():
-            return jsonify({"error": "model.py is missing."}), 404
+            return jsonify({"error": f"{MODEL_FILENAME} is missing."}), 404
         model_sha = hashlib.sha256(model_path.read_bytes()).hexdigest()
         latest = _review_for_model(project_dir, model_sha)
         if latest is None:
@@ -1087,7 +1071,7 @@ def create_app(settings: Settings | None = None) -> Flask:
             return jsonify({"error": str(error)}), 404
         # If ``?against=`` is explicitly provided (including empty string),
         # treat it as the authoritative source. Otherwise fall back to the
-        # revision's parent_id (audit_183).
+        # revision's parent_id.
         if "against" in request.args:
             against_id = request.args.get("against")
         else:
@@ -1165,7 +1149,7 @@ def create_app(settings: Settings | None = None) -> Flask:
                     "project": project_name,
                     "message": f"Restore succeeded but CAD rebuild failed: {error}",
                 })
-                # 207 Multi-Status signals a partial-success: ``model.py`` was
+                # 207 Multi-Status signals a partial-success: ``model.scad`` was
                 # restored, but the rebuild that re-derives ``preview.stl`` /
                 # ``render.png`` failed. The explicit ``ok: false`` plus a
                 # top-level ``error`` field lets clients detect the failure

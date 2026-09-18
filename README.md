@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 
-A local-first web app that lets you **chat with an AI agent to create parametric CAD models**. Built with [build123d](https://github.com/gumyr/build123d) for solid modeling, [Three.js](https://threejs.org/) for in-browser preview, and either [OpenRouter](https://openrouter.ai/) or [OpenAI](https://platform.openai.com/) for LLM access — all sandboxed with Bubblewrap.
+A local-first web app that lets you **chat with an AI agent to create parametric CAD models**. Built with [OpenSCAD](https://openscad.org/) for solid modeling, [Three.js](https://threejs.org/) for in-browser preview, and either [OpenRouter](https://openrouter.ai/) or [OpenAI](https://platform.openai.com/) for LLM access — all sandboxed with Bubblewrap.
 
 > **⚠️ Status:** This project is in **early development** and is also a **hobby project**. It is currently best suited for **simple, non-complex mechanical parts**. It may not yet be a good fit for finely detailed, large, or intricate models.
 
@@ -13,22 +13,22 @@ A local-first web app that lets you **chat with an AI agent to create parametric
 
 ## ✨ Features
 
-- **Chat-driven modeling** — Describe what you want in natural language; the agent writes and runs build123d Python code
+- **Chat-driven modeling** — Describe what you want in natural language; the agent writes and runs OpenSCAD code
 - **Live reasoning** — Watch the model's thinking stream in real-time while it works
 - **STL preview** — Rotate, pan, and inspect generated models directly in the browser
 - **Reference images** — Upload up to 5 images (10 MB each) to guide the agent
 - **Sandboxed execution** — All generated code runs in a Bubblewrap container with blocked network and resource limits
 - **Verified builds** — Each model is built, checked for a valid solid, and rendered before the agent reports completion
 - **Selective visual review** — For complex, high-risk, visually ambiguous, or fit-critical work, the agent can call `cad_review` to cross-check renders, geometry, dimensions, and features. Routine small edits use the normal build verification alone.
-- **Targeted screenshots** — For visually ambiguous or complex work, the agent can call `cad_screenshot` to re-rasterise one or more canonical views from the latest revision without re-running build123d; a `(model_sha, views, quality, contact_sheet)` cache keeps repeated lookups instant without overwriting canonical review evidence
+- **Targeted screenshots** — For visually ambiguous or complex work, the agent can call `cad_screenshot` to re-rasterise one or more canonical views from the latest revision without re-running OpenSCAD; a `(model_sha, views, quality, contact_sheet)` cache keeps repeated lookups instant without overwriting canonical review evidence
 - **Project management** — Create, rename, and switch between multiple CAD projects with persisted conversation history
-- **Model history** — Inspect source diffs, track successful builds, and restore any retained `model.py` revision
+- **Model history** — Inspect source diffs, track successful builds, and restore any retained `model.scad` revision
 - **Dark theme UI** — Compact, responsive interface with Markdown rendering and syntax highlighting
 
 ## 📋 Requirements
 
 - **Python** 3.10+
-- **Linux** with `bubblewrap` and `libseccomp2`
+- **Linux** with `openscad`, `xvfb`, `bubblewrap` and `libseccomp2`
 - An API key for either [OpenRouter](https://openrouter.ai/keys) or [OpenAI](https://platform.openai.com/api-keys)
 
 ## 🚀 Quick Start
@@ -58,7 +58,7 @@ Only the key for the selected provider is required.
 2. Describe the part, its dimensions, and its intended function. Attach up to five
    PNG, JPEG, or WebP reference images if useful.
 3. Answer any material design questions the agent asks. In a new project, the
-   agent creates `model.py` before reading, editing, building, screenshotting,
+   agent creates `model.scad` before reading, editing, building, screenshotting,
    or reviewing it. It then builds the model in the sandbox and displays the
    resulting STL and render.
 4. Review the model and continue the conversation to refine it. Use the revision
@@ -66,7 +66,7 @@ Only the key for the selected provider is required.
 
 Reference images are limited to 10 MB each and are normalized to PNG before being
 sent to the selected LLM provider. A successful build creates a local `preview.stl`
-and `render.png`; `model.py` remains the editable parametric source. Exporting
+and `render.png`; `model.scad` remains the editable parametric source. Exporting
 additional formats is not currently provided by the UI.
 
 ## 📁 Project Structure
@@ -81,7 +81,7 @@ local-ai-cad-agent/
 │   ├── revisions.py           # Immutable model revisions, builds & rollback
 │   ├── sandbox.py             # Bubblewrap workspace isolation
 │   ├── settings.py            # Configuration loading & Settings dataclass
-│   ├── prompt.py              # System prompt with build123d playbook
+│   ├── prompt.py              # System prompt with OpenSCAD playbook
 │   ├── tool_schemas.py        # Operation-specific model tool contracts
 │   ├── tool_results.py        # Structured success and error envelopes
 │   ├── images.py              # Reference image normalization
@@ -138,7 +138,7 @@ Each project is stored below `workspace_root`. Its important files are:
 
 | Path | Purpose |
 |---|---|
-| `model.py` | Active build123d source; its top-level `result` is the final shape |
+| `model.scad` | Active OpenSCAD source |
 | `preview.stl` / `render.png` | Latest generated browser preview assets |
 | `.cad-agent/reviews/<model_sha>/` | Per-revision multi-view artifacts (`manifest.json`, `views/*.png`, `review-sheet.png`); `result.json` is added when `cad_review` runs |
 | `conversation.jsonl` | Persisted chat and tool-event history |

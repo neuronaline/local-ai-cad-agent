@@ -1,4 +1,4 @@
-"""Application-managed source revision store for model.py.
+"""Application-managed source revision store for model.scad.
 
 Stores immutable content-addressed source blobs, revision manifests with
 explicit parentage, build records linked to revisions, and a head pointer.
@@ -25,6 +25,7 @@ from agent.io import (
     utc_now_iso,
 )
 
+MODEL_FILENAME = "model.scad"
 SCHEMA_VERSION = 1
 _MAX_SOURCE_BYTES = 2 * 1024 * 1024  # 2 MB
 _REVISION_ID_RE = re.compile(
@@ -53,7 +54,7 @@ def _synchronized(method: Callable[_P, _R]) -> Callable[_P, _R]:
     """Acquire the per-instance RLock so each store serializes its own mutations.
 
     The previous module-level RLock serialized every store across every project
-    (audit_033); this decorator uses the instance lock so parallel projects
+   ; this decorator uses the instance lock so parallel projects
     build/restore/prune concurrently while still protecting a single store
     from interleaved read-modify-write cycles.
     """
@@ -161,14 +162,14 @@ class BuildRecord:
 
 
 def compute_model_sha256(project_dir: Path) -> str | None:
-    """Return the SHA-256 of ``<project_dir>/model.py`` or ``None`` when absent.
+    """Return the SHA-256 of ``<project_dir>/model.scad`` or ``None`` when absent.
 
     Centralised so the orchestrators (``CadScreenshotTool``, ``AgentRunner``)
     and :meth:`RevisionStore.active_model_digest` agree on the exact same
     digest semantics instead of each re-rolling an ``is_file`` + ``read_bytes``
     + ``OSError`` dance.
     """
-    model_path = project_dir / "model.py"
+    model_path = project_dir / MODEL_FILENAME
     try:
         if not model_path.is_file():
             return None
@@ -178,7 +179,7 @@ def compute_model_sha256(project_dir: Path) -> str | None:
 
 
 def model_is_built(project_dir: Path) -> bool:
-    """True when ``.cad_metrics.json`` matches the current ``model.py`` sha256.
+    """True when ``.cad_metrics.json`` matches the current ``model.scad`` sha256.
 
     Decoupled from the loop's ``cad_fix_required`` flag so the dispatcher
     can gate visual tools (``cad_screenshot``, ``cad_review``) on a fresh
@@ -189,7 +190,7 @@ def model_is_built(project_dir: Path) -> bool:
     the body here avoids a circular import between ``agent.core`` and
     ``agent.dispatcher``.
 
-    ``True`` is also returned when ``model.py`` does not exist yet; there
+    ``True`` is also returned when ``model.scad`` does not exist yet; there
     is nothing stale to invalidate, so the screenshot/review tools' own
     validation paths surface the real error.
     """
@@ -212,7 +213,7 @@ class RevisionStore:
         self.project_dir = project_dir.resolve()
         self.retention_count = retention_count
         # Per-instance lock — was a module-level RLock that serialized every
-        # store across every project (audit_033). Per-instance lets parallel
+        # store across every project. Per-instance lets parallel
         # projects build/restore/prune concurrently.
         self._lock = threading.RLock()
         history = self.project_dir / ".cad-agent" / "history"
@@ -226,13 +227,13 @@ class RevisionStore:
 
     @_synchronized
     def reconcile(self) -> Revision | None:
-        """Ensure head.json, model.py, and the active revision are consistent.
+        """Ensure head.json, model.scad, and the active revision are consistent.
 
         Returns the recovery/import revision if one was created, or None if
-        already consistent.  Raises RevisionIntegrityError if model.py is
+        already consistent.  Raises RevisionIntegrityError if model.scad is
         missing but head exists, or if stored data is malformed.
         """
-        model_path = self.project_dir / "model.py"
+        model_path = self.project_dir / MODEL_FILENAME
         model_digest = (
             hashlib.sha256(model_path.read_bytes()).hexdigest() if model_path.is_file() else None
         )
@@ -243,7 +244,7 @@ class RevisionStore:
         if head_data is None:
             if model_digest is None:
                 return None
-            # Existing model.py without history — create an import revision.
+            # Existing model.scad without history — create an import revision.
             return self._adopt_existing_model(model_digest)
 
         # Validate head pointer.
@@ -264,13 +265,13 @@ class RevisionStore:
         if model_digest == head_digest:
             return None
 
-        # model.py exists but doesn't match head — create a recovery revision.
+        # model.scad exists but doesn't match head — create a recovery revision.
         if model_digest is not None:
             return self._create_recovery_revision(model_digest, head_revision_id)
 
-        # Head exists but model.py is missing — integrity error.
+        # Head exists but model.scad is missing — integrity error.
         raise RevisionIntegrityError(
-            "model.py is missing but head.json references an active revision. "
+            "model.scad is missing but head.json references an active revision. "
             "Use the restore API to recover from a known-good revision."
         )
 
@@ -292,7 +293,7 @@ class RevisionStore:
     def _read_and_validate_head(self) -> dict | None:
         """Read head.json, returning a validated ``{revision_id, model_sha256}``
         dict or ``None`` when no head exists. Raises ``RevisionIntegrityError``
-        for malformed pointers (audit_181)."""
+        for malformed pointers."""
         head_data = self._read_json_safe(self._head_path)
         if head_data is None:
             return None
@@ -328,7 +329,7 @@ class RevisionStore:
     def _all_revisions(self) -> list[Revision]:
         """Return every readable revision, newest first, for internal operations.
 
-        Must be called while holding ``self._lock`` (audit_185). All public
+        Must be called while holding ``self._lock``. All public
         callers wrap this in ``@_synchronized``; new callers must do the same.
 
         A directory scan on a few hundred revisions is on the order of
@@ -449,18 +450,18 @@ class RevisionStore:
             created_at=utc_now_iso(),
             origin=origin,
         )
-        # Write the manifest and update head.json *before* rewriting model.py
+        # Write the manifest and update head.json *before* rewriting model.scad
         # so that the recoverable invariant on crash is "head always points at
         # a revision whose manifest exists". If the process dies between the
-        # head.json write and model.py, reconcile() will detect the mismatch
-        # and create a recovery revision adopting the stale model.py content.
+        # head.json write and model.scad, reconcile() will detect the mismatch
+        # and create a recovery revision adopting the stale model.scad content.
         self._write_revision(revision)
         self._write_head(revision)
 
-        # Replace model.py last; any failure here leaves the revision history
+        # Replace model.scad last; any failure here leaves the revision history
         # consistent (head points at a valid manifest) and reconcile() will
-        # rebuild the model.py difference on the next run.
-        self._atomic_write_text(self.project_dir / "model.py", source)
+        # rebuild the model.scad difference on the next run.
+        self._atomic_write_text(self.project_dir / MODEL_FILENAME, source)
 
         if retention > 0:
             self.prune(retention)
@@ -507,11 +508,11 @@ class RevisionStore:
         # Manifest is unique even if the blob is shared.
         self._write_revision(revision)
 
-        # Update head.json *before* rewriting model.py so that crash recovery
+        # Update head.json *before* rewriting model.scad so that crash recovery
         # leaves the history consistent (head points at a valid manifest).
         self._write_head(revision)
 
-        self._atomic_write_text(self.project_dir / "model.py", source)
+        self._atomic_write_text(self.project_dir / MODEL_FILENAME, source)
 
         if self.retention_count > 0:
             self.prune(self.retention_count)
@@ -720,7 +721,7 @@ class RevisionStore:
             return 0
         # Bulk-build-records rewrite: with N pruneable revisions and M
         # bytes of ``builds.jsonl``, the legacy loop paid ``N`` full
-        # read/parse/write/fsync cycles (audit_031). Collect every
+        # read/parse/write/fsync cycles. Collect every
         # doomed id up front and rewrite the log exactly once.
         pruneable_ids = {revision.id for revision in pruneable}
         for revision in pruneable:
@@ -730,7 +731,7 @@ class RevisionStore:
         return len(pruneable)
 
     def active_model_digest(self) -> str | None:
-        """Return the SHA-256 of the active model.py, or None if absent.
+        """Return the SHA-256 of the active model.scad, or None if absent.
 
         Thin wrapper over :func:`compute_model_sha256` so callers that
         already hold a :class:`RevisionStore` do not need to repeat the
@@ -765,11 +766,11 @@ class RevisionStore:
         read and rewritten exactly once instead of once per id, cutting
         the I/O cost from ``O(N * M)`` to ``O(N + M)`` where ``N`` is the
         number of revisions and ``M`` is the size of ``builds.jsonl``
-        (audit_031).
+       .
 
         Build records live in a single append-only JSONL log; without this
         filter, ``prune`` would leave orphaned build records that no future
-        ``build_for`` lookup can match (audit_176).
+        ``build_for`` lookup can match.
         """
         if isinstance(revision_ids, str):
             exclude_ids = {revision_ids}
@@ -808,17 +809,17 @@ class RevisionStore:
         atomic_write_text(log_path, payload)
 
     def _verify_active_model(self, revision: Revision) -> None:
-        """Confirm the active model.py digest matches the revision."""
+        """Confirm the active model.scad digest matches the revision."""
         model_digest = self.active_model_digest()
         if model_digest != revision.model_sha256:
             raise RevisionIntegrityError(
-                "Cannot record build: active model.py digest does not match "
+                "Cannot record build: active model.scad digest does not match "
                 "the revision."
             )
 
     def _adopt_existing_model(self, model_digest: str) -> Revision:
-        """Create an import revision for an existing model.py without history."""
-        source = (self.project_dir / "model.py").read_text(encoding="utf-8")
+        """Create an import revision for an existing model.scad without history."""
+        source = (self.project_dir / MODEL_FILENAME).read_text(encoding="utf-8")
         revision = Revision(
             id=str(uuid.uuid4()),
             parent_id=None,
@@ -864,8 +865,8 @@ class RevisionStore:
     def _create_recovery_revision(
         self, model_digest: str, parent_id: str
     ) -> Revision:
-        """Create a recovery revision when model.py doesn't match head."""
-        source = (self.project_dir / "model.py").read_text(encoding="utf-8")
+        """Create a recovery revision when model.scad doesn't match head."""
+        source = (self.project_dir / MODEL_FILENAME).read_text(encoding="utf-8")
         revision = Revision(
             id=str(uuid.uuid4()),
             parent_id=parent_id,

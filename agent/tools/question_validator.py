@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 
 
 class QuestionValidator:
@@ -68,6 +69,19 @@ class QuestionValidator:
                     return False
                 continue
 
+            # Numeric questions may arrive as JSON numbers (e.g. ``25`` or
+            # ``3.14``) when the web UI or API client serialises the
+            # payload. Normalise those to strings so the unit-aware regex
+            # below can process them; ``bool`` is rejected because Python
+            # treats it as an ``int`` subclass and ``True`` / ``False`` are
+            # never legitimate numeric answers here.
+            if (
+                input_type == "number"
+                and isinstance(value, (int, float))
+                and not isinstance(value, bool)
+            ):
+                value = str(value)
+
             # All other input types expect a string. Reject non-string payloads
             # (e.g. a stray list, None, or number) outright.
             if not isinstance(value, str):
@@ -112,16 +126,28 @@ class QuestionValidator:
         """Validate against the deprecated flat question format."""
         return QuestionValidator._validate_single(question, answer)
 
-    @staticmethod
-    def _is_valid_number_with_unit(value: str) -> bool:
-        """Accept a finite number, optionally suffixed with a length unit."""
-        parts = value.split()
-        if not 1 <= len(parts) <= 2:
+    _NUMBER_UNIT_RE = re.compile(
+        r"^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*([a-zA-Z°]+)?\s*$"
+    )
+    _VALID_UNITS = frozenset(
+        {"mm", "cm", "m", "in", "inch", "inches", "deg", "degree", "degrees", "°", "rad"}
+    )
+
+    @classmethod
+    def _is_valid_number_with_unit(cls, value: str) -> bool:
+        """Accept a finite number, optionally suffixed with a length or angle unit."""
+        if not isinstance(value, str):
+            return False
+        match = cls._NUMBER_UNIT_RE.match(value)
+        if not match:
             return False
         try:
-            number = float(parts[0])
+            number = float(match.group(1))
         except ValueError:
             return False
-        return math.isfinite(number) and (
-            len(parts) == 1 or parts[1].lower() in {"mm", "in", "inch", "inches"}
-        )
+        if not math.isfinite(number):
+            return False
+        unit = match.group(2)
+        if unit:
+            return unit.lower() in cls._VALID_UNITS
+        return True

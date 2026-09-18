@@ -16,15 +16,13 @@ import uuid
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from agent.activity_log import ActivityLogger, get_logger
 from agent.activity_log import is_enabled as activity_logging_enabled
 from agent.conversation import (
     ConversationStore,
     shared_history_lock,
-)
-from agent.conversation import (
-    _history_lock_slot as _conversation_history_lock_slot,
 )
 from agent.dispatcher import (
     cancel_remaining_tool_calls,
@@ -39,11 +37,14 @@ from agent.llm_base import (
     sanitize_assistant_message,
 )
 from agent.prompt import get_system_prompt
-from agent.revisions import RevisionStore, compute_model_sha256, model_is_built
+from agent.revisions import (
+    MODEL_FILENAME,
+    RevisionStore,
+    compute_model_sha256,
+    model_is_built,
+)
 from agent.settings import Settings
 from agent.tool_schemas import TOOL_SCHEMAS
-from agent.tools.cad_review_tool import CadReviewTool
-from agent.tools.cad_screenshot_tool import CadScreenshotTool
 from agent.tools.cad_tool import CadTool
 from agent.tools.file_tool import FileTool
 from agent.tools.question_tool import QuestionTool
@@ -78,36 +79,10 @@ class ProjectTools:
             review_required_views=(settings.review_required_views if settings else 8),
             review_enabled=(settings.review_enabled if settings else True),
         )
-        # Screenshot/review orchestrators share the build-time review cache.
-        # The agent calls them explicitly; ``cad_build_and_verify`` no longer
-        # auto-triggers review.
-        self.screenshot = CadScreenshotTool(project_dir, publish=publish)
-        self.review = CadReviewTool(
-            project_dir,
-            publish=publish,
-            settings=settings,
-            stop_event=stop_event,
-        )
         self.question = QuestionTool(publish)
 
     def stop(self) -> None:
         self.cad.stop()
-        # Best-effort: screenshot/review may have never been used in this
-        # project, so guard against missing attributes on cold start.
-        for tool in (getattr(self, "screenshot", None), getattr(self, "review", None)):
-            if tool is None:
-                continue
-            try:
-                tool.stop()
-            except Exception:  # noqa: BLE001 - stop is best-effort.
-                _LOG.debug("Tool stop failed", exc_info=True)
-
-
-# Re-export the conversation store's lock slot under the legacy local name.
-# Flask replaces this slot with EventBus._history_lock at startup; keeping the
-# *same list* ensures ConversationStore appends and EventBus status writes
-# serialize against one another.
-_history_lock_slot = _conversation_history_lock_slot
 
 
 def _synthetic_user(content: str) -> dict[str, object]:
@@ -264,6 +239,13 @@ class AgentRunner:
             )
             if project is None:
                 affected = list(dict.fromkeys(list(self._waiting_questions)))
+                if self._active_project and self._active_project not in affected:
+                    affected.append(self._active_project)
+                if self.settings.workspace_root.is_dir():
+                    for item in self.settings.workspace_root.iterdir():
+                        if item.is_dir() and (item / ".agent_state.json").is_file():
+                            if item.name not in affected:
+                                affected.append(item.name)
                 self._waiting_questions.clear()
             else:
                 self._waiting_questions.pop(project, None)
@@ -275,12 +257,16 @@ class AgentRunner:
                 if self._active_client:
                     try:
                         self._active_client.abort()
-                    except Exception:
+                    except Exception:  # noqa: BLE001, S110
                         pass
             thread_to_join = self._thread if stop_active_task else None
 
         if thread_to_join is not None and thread_to_join.is_alive():
             thread_to_join.join(timeout=2.0)
+
+        with self._lock:
+            if stop_active_task and (self._thread is None or not self._thread.is_alive()):
+                self._active_project = None
 
         for cleared in affected:
             (
@@ -326,6 +312,12 @@ class AgentRunner:
             preview_id: str | None = None
             cad_error: str | None = None
             cad_fix_required = not self._model_is_built(project_dir)
+            # Track the most recently minted message_id at function scope so
+            # the outer exception handler can publish ``agent_stream_end``
+            # without introspecting ``locals()`` — the value only exists
+            # inside the tool-loop body, so a crash before the loop would
+            # otherwise skip the cleanup publish.
+            current_message_id: str | None = None
             any_tool_used = False
             nudged_cad = False
             nudged_final_verification = False
@@ -360,8 +352,14 @@ class AgentRunner:
                             "message": "Task stopped.",
                         },
                     )
+                    _close_dangling_tool_tail(
+                        project_dir,
+                        messages,
+                        "Task stopped by the user before the next turn started.",
+                    )
                     return
                 message_id = uuid.uuid4().hex
+                current_message_id = message_id
 
                 def publish_stream(
                     event: dict,
@@ -421,17 +419,43 @@ class AgentRunner:
                     and any_tool_used
                     and (not preview_id or cad_fix_required)
                 )
-                self.publish(
-                    "agent_stream_end",
-                    {
-                        "project": project,
-                        "message_id": message_id,
-                        "message": ""
-                        if invalid_final
-                        else assistant_message.get("content") or "",
-                    },
-                )
-                if not invalid_final:
+                if invalid_final:
+                    # The model returned text without tool calls even though
+                    # visual verification is still missing. Do NOT persist
+                    # this unverified turn to ``conversation.jsonl`` — a
+                    # subsequent ``/api/projects/<n>/history`` reload would
+                    # otherwise surface a ghost message that was never shown
+                    # to the user. Keep the assistant message in
+                    # ``messages`` so the prompt prefix stays stable across
+                    # the next iteration (prompt-cache continuity) and the
+                    # synthetic ``Call cad_build_and_verify now`` reminder
+                    # below reuses the same in-memory context.
+                    self.publish(
+                        "agent_status",
+                        {
+                            "project": project,
+                            "status": "verifying",
+                            "message": "Model verification required before finalizing.",
+                        },
+                    )
+                    self.publish(
+                        "agent_stream_end",
+                        {
+                            "project": project,
+                            "message_id": message_id,
+                            "message": "",
+                        },
+                    )
+                    messages.append(assistant_message)
+                else:
+                    self.publish(
+                        "agent_stream_end",
+                        {
+                            "project": project,
+                            "message_id": message_id,
+                            "message": assistant_message.get("content") or "",
+                        },
+                    )
                     messages.append(assistant_message)
                     self._append_message(project_dir, assistant_message)
                 if not tool_calls:
@@ -447,10 +471,10 @@ class AgentRunner:
                             )
                             self._publish_terminal_failure(project)
                         elif any_tool_used:
-                            if not nudged_cad and (project_dir / "model.py").is_file():
+                            if not nudged_cad and (project_dir / MODEL_FILENAME).is_file():
                                 nudged_cad = True
                                 reminder = _synthetic_user(
-                                    "model.py exists but it has not been verified. "
+                                    f"{MODEL_FILENAME} exists but it has not been verified. "
                                     "Call cad_build_and_verify now."
                                 )
                                 # Persist the synthetic reminder so subsequent turns reload
@@ -503,6 +527,11 @@ class AgentRunner:
                         self._cancel_remaining_tool_calls(
                             project_dir, tool_calls, processed_call_ids, messages
                         )
+                        _close_dangling_tool_tail(
+                            project_dir,
+                            messages,
+                            "Task stopped by the user mid-batch.",
+                        )
                         return
                     preview_id, cad_error, cad_fix_required, waiting = self._process_tool_call(
                         tools,
@@ -526,6 +555,9 @@ class AgentRunner:
                                 build_failure_count >= 6
                                 or build_failure_signatures[signature] >= 3
                             ):
+                                self._cancel_remaining_tool_calls(
+                                    project_dir, tool_calls, processed_call_ids, messages
+                                )
                                 self.publish(
                                     "agent_error",
                                     {
@@ -537,29 +569,22 @@ class AgentRunner:
                                     },
                                 )
                                 self._publish_terminal_failure(project)
+                                _close_dangling_tool_tail(
+                                    project_dir,
+                                    messages,
+                                    "Task stopped after repeated CAD build failures.",
+                                )
                                 return
                         else:
                             build_failure_count = 0
                             build_failure_signatures.clear()
                     if waiting:
-                        try:
-                            q_args = json.loads(call["function"]["arguments"] or "{}")
-                        except json.JSONDecodeError:
-                            q_args = {}
-                        questions_list = q_args.get("questions", [])
-                        if isinstance(questions_list, list) and questions_list:
-                            question_text = "; ".join(
-                                q.get("question", "")
-                                for q in questions_list
-                                if isinstance(q, dict)
-                            )
-                        else:
-                            question_text = q_args.get(
-                                "question", "Clarification requested"
-                            )
-                        self._log(
-                            project_dir, "assistant", f"Question: {question_text}"
-                        )
+                        # The model's tool result already captured the question
+                        # text in ``role: tool / ``Questions sent — wait for the
+                        # user's answers: ...``, and the UI surfaces the question
+                        # via ``.agent_state.json`` and the
+                        # ``agent_status:waiting_for_user`` SSE event. The
+                        # dispatcher no longer needs to parse the args here.
                         self.publish(
                             "agent_status",
                             {
@@ -570,6 +595,14 @@ class AgentRunner:
                         )
                         self._cancel_remaining_tool_calls(
                             project_dir, tool_calls, processed_call_ids, messages
+                        )
+                        _close_dangling_tool_tail(
+                            project_dir,
+                            messages,
+                            (
+                                "Question sent to the user; this turn is parked "
+                                "until a reply arrives."
+                            ),
                         )
                         return
             self.publish(
@@ -583,6 +616,19 @@ class AgentRunner:
                 },
             )
             self._publish_terminal_failure(project)
+            # The outer ``for`` loop just exhausted ``agent_tool_call_limit``.
+            # If the final iteration processed at least one tool call, the
+            # transcript tail is still ``role: tool`` and the next user turn
+            # would trip strict providers' role-alternation check. Close the
+            # tail with a synthetic assistant stop reason.
+            _close_dangling_tool_tail(
+                project_dir,
+                messages,
+                (
+                    f"Tool-call limit ({self.settings.agent_tool_call_limit}) "
+                    "reached without resolving the task."
+                ),
+            )
         except RequestCancelled:
             # Stopping is an expected control-flow path, not an OpenRouter error.
             self.publish(
@@ -592,6 +638,15 @@ class AgentRunner:
                     "status": "stopped",
                     "message": "Task stopped.",
                 },
+            )
+            # ``chat()`` was interrupted before the new assistant turn could
+            # be appended, so the prior iteration's tool results are still
+            # the tail of ``messages``. Close them so the transcript is
+            # well-formed for the next user request.
+            _close_dangling_tool_tail(
+                project_dir,
+                messages,
+                "Task stopped by the user while the model was responding.",
             )
         except Exception as error:  # noqa: BLE001 - Surface all agent failures to the local UI.
             import traceback
@@ -613,10 +668,10 @@ class AgentRunner:
                 phase="agent_loop",
                 traceback_text=tb_text,
             )
-            if "message_id" in locals():
+            if current_message_id is not None:
                 self.publish(
                     "agent_stream_end",
-                    {"project": project, "message_id": message_id, "message": ""},
+                    {"project": project, "message_id": current_message_id, "message": ""},
                 )
             if self._stop_event.is_set():
                 self.publish(
@@ -656,7 +711,7 @@ class AgentRunner:
                         {"project": project, "cancelled": self._stop_event.is_set()},
                         run_id=run_id,
                     )
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
 
     # ------------------------------------------------------------------ context
@@ -682,13 +737,15 @@ class AgentRunner:
         ]
 
     @classmethod
-    def _initial_model_existed(cls, project_dir: Path, history: list[dict]) -> bool:
-        """Determine whether model.py existed before this conversation started.
+    def _initial_model_existed(
+        cls, project_dir: Path, history: list[dict] | None = None
+    ) -> bool:
+        """Determine whether model.scad existed before this conversation began.
 
         To keep the cacheable prompt prefix byte-stable across multi-turn chats,
         the ``<project_state>`` message at index 1 must reflect the initial
         state when the conversation began, rather than flipping dynamically
-        after ``write_file`` creates ``model.py``. The initial state is cached
+        after ``write_file`` creates ``model.scad``. The initial state is cached
         in ``.agent_initial_state.json`` so it remains immutable for the lifetime
         of the conversation.
         """
@@ -701,20 +758,23 @@ class AgentRunner:
             except (OSError, json.JSONDecodeError):
                 pass
 
-        has_write = any(
-            isinstance(msg.get("tool_calls"), list)
-            and any(
-                isinstance(call, dict)
-                and call.get("function", {}).get("name") == "write_file"
-                for call in msg["tool_calls"]
+        has_write = False
+        if history:
+            has_write = any(
+                isinstance(msg.get("tool_calls"), list)
+                and any(
+                    isinstance(call, dict)
+                    and call.get("function", {}).get("name") == "write_file"
+                    for call in msg["tool_calls"]
+                )
+                for msg in history
+                if isinstance(msg, dict) and msg.get("role") == "assistant"
             )
-            for msg in history
-            if isinstance(msg, dict) and msg.get("role") == "assistant"
-        )
+
         if has_write:
             existed = False
         else:
-            existed = (project_dir / "model.py").is_file()
+            existed = (project_dir / MODEL_FILENAME).is_file()
 
         try:
             init_state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -730,21 +790,17 @@ class AgentRunner:
         cls, project_dir: Path, history: list[dict] | None = None
     ) -> dict[str, str]:
         """Provide initial workspace state after the cacheable system prefix."""
-        existed = (
-            cls._initial_model_existed(project_dir, history)
-            if history
-            else (project_dir / "model.py").is_file()
-        )
+        existed = cls._initial_model_existed(project_dir, history)
         if existed:
             content = (
                 "<project_state>\n"
-                "model.py exists. Read it before making a targeted edit.\n"
+                f"{MODEL_FILENAME} exists. Read it before making a targeted edit.\n"
                 "</project_state>"
             )
         else:
             content = (
                 "<project_state>\n"
-                "model.py does not exist. Create it directly with write_file; do not "
+                f"{MODEL_FILENAME} does not exist. Create it directly with write_file; do not "
                 "call read_file, edit_file, or cad_build_and_verify first.\n"
                 "</project_state>"
             )
@@ -777,6 +833,14 @@ class AgentRunner:
 
         normalized = re.sub(r"\bline \d+\b", "line #", message.lower())
         normalized = re.sub(r"\b0x[0-9a-f]+\b", "0x#", normalized)
+        # The sandbox stages the build under a fresh ``/tmp/<random>/...``
+        # directory every call, so two occurrences of the same logical error
+        # carry different absolute paths. Without this rule the signature
+        # drifts on every retry and the ``build_failure_signatures[signature] >= 3``
+        # loop-breaker never fires. Match either the immediate subfolder
+        # (``/tmp/tmp_xyz123/model.scad``) or the staging namespace
+        # (``/tmp/tmp_*/.staging/...``).
+        normalized = re.sub(r"/tmp/[^/\s]+/", "/tmp/<scratch>/", normalized)
         return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
 
     @classmethod
@@ -840,7 +904,7 @@ class AgentRunner:
         Centralised here so the agent loop stays focused on lifecycle state
         and the dispatcher stays unaware of the ``AgentRunner`` instance.
         """
-        return process_tool_call(
+        result = process_tool_call(
             tools,
             project,
             project_dir,
@@ -856,6 +920,7 @@ class AgentRunner:
             activity_logger=self._active_activity_logger,
             run_id=self._active_run_id,
         )
+        return result
 
     @classmethod
     def _cancel_remaining_tool_calls(
@@ -899,7 +964,7 @@ class AgentRunner:
         # contiguous tokens (e.g. ``model not found``, ``model not available``,
         # ``model is invalid``). Decoupled substring matching — ``"model"`` and
         # ``"not found"`` independently — would misroute unrelated errors that
-        # happen to mention "model" (e.g. ``FileNotFoundError: model.py``),
+        # happen to mention "model" (e.g. ``FileNotFoundError: model.scad``),
         # sending the agent chasing a phantom configuration problem.
         if (
             "model not found" in lower
@@ -938,7 +1003,7 @@ class AgentRunner:
         preview_path = project_dir / "preview.stl"
         if not preview_path.is_file() or preview_path.stat().st_size == 0:
             # The CAD tool already produces a structured RuntimeError with
-            # the actual sandbox/build123d cause (``_failure_detail``). When
+            # the actual sandbox/OpenSCAD cause (``_failure_detail``). When
             # that signal is missing we still surface the workspace path and
             # filesystem state so the operator can see whether the file was
             # never produced or removed after the build returned.
@@ -1105,3 +1170,32 @@ class AgentRunner:
         # concurrent canonical writes and left the in-memory cache stale,
         # which then dropped the question-log line on the next history load.
         ConversationStore.append(project_dir, item)
+
+
+def _close_dangling_tool_tail(
+    project_dir: Path,
+    messages: list[dict],
+    content: str,
+) -> bool:
+    """Append a terminal ``role: assistant`` message if the tail dangles.
+
+    Several abrupt termination paths (user stop, build-failure threshold,
+    question waiting, ``RequestCancelled`` inside the LLM call, and the
+    tool-call limit guard) leave the in-memory transcript and the on-disk
+    JSONL log appended with one or more ``role: tool`` records and no
+    following assistant turn. Anthropic and OpenAI-compatible providers
+    reject the next ``role: user`` request when tool results have not been
+    closed by an assistant turn (``400 Bad Request: roles must alternate /
+    tool results must be followed by assistant turn``).
+
+    Persisting the same terminal message via :func:`ConversationStore.append`
+    keeps the in-memory ``messages`` list and the on-disk ``conversation.jsonl``
+    transcript in lockstep, so the next user turn sees a clean
+    ``[..., assistant]`` closing turn.
+    """
+    if not messages or messages[-1].get("role") != "tool":
+        return False
+    item = {"role": "assistant", "content": content}
+    messages.append(item)
+    ConversationStore.append(project_dir, item)
+    return True

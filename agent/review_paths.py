@@ -14,7 +14,7 @@ from pathlib import Path
 def review_dir(project_dir: Path, model_sha256: str) -> Path:
     """Return the per-model review directory.
 
-    ``model_sha256`` is the content-addressed digest of ``model.py``. The
+    ``model_sha256`` is the content-addressed digest of ``model.scad``. The
     directory is content-addressed too: a different model always lands
     under a different leaf and never overwrites a prior review.
     """

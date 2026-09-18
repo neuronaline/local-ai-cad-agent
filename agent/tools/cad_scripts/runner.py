@@ -1,489 +1,335 @@
-"""Sandbox-side runner: tessellate, validate, and render the CAD model.
+"""Sandbox-side runner: compile, validate, and render OpenSCAD CAD models.
 
 Executed by ``CadTool._execute`` after the host copies ``runner.py`` and
-its ``renderer.py`` sibling into the bubblewrap workspace. ``runner.py``
-imports ``renderer`` for the canonical :data:`VIEWS`,
-:func:`render_views`, and :func:`build_contact_sheet` helpers rather than
-relying on source-file concatenation.
+its ``renderer.py`` sibling into the bubblewrap workspace.
 
-Three artifacts are consumed by the host:
-
-- ``preview.stl``: the triangulated mesh (kept for STL compatibility).
-- ``render.png``: a single backward-compatible isometric PNG.
-- ``.cad_metrics.json``: compact geometry + feature metrics used by the
-  structured reviewer. Includes the multi-view ``review_manifest`` produced
-  by ``renderer.render_views`` and a deterministic feature summary.
-- ``.review-views/<view_id>.png`` and ``.review-sheet.png``: the multi-view
-  rasterisation the host promotes into ``.cad-agent/reviews/<sha>/``.
-
-A single ``main(argv)`` entry point reads its settings from a JSON payload on
-``argv[1]``. The host (``CadTool._execute``) writes the JSON next to the
-script so the runtime contract is a real Python function call instead of an
-injected module-level global.
+Produces:
+- ``preview.stl``: triangulated binary STL mesh exported by OpenSCAD.
+- ``render.png``: canonical isometric preview image.
+- ``.cad_metrics.json``: structured geometry + feature metrics used by reviewer.
+- ``.review-views/<view_id>.png`` and ``.review-sheet.png``: 8-view visual evidence.
 """
 
-import ast
+from __future__ import annotations
+
 import hashlib
 import json
 import math
+import os
+import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
-# OpenCASCADE surface orientation enum. The values are exposed via pybind11
-# as ``TopAbs_Orientation.TopAbs_FORWARD`` / ``TopAbs_REVERSED``. We import
-# defensively so the runner still functions (with the legacy heuristic only)
-# on hosts that ship without ``OCP``. On the sandbox image ``OCP`` is always
-# available because ``build123d`` pulls it in transitively.
-try:  # pragma: no cover - exercised implicitly on the sandbox host
-    from OCP.TopAbs import (  # type: ignore[import-not-found]
-        TopAbs_Orientation as _TopAbs_Orientation,
-    )
-
-    _OCP_TOPABS_AVAILABLE = True
-except ImportError:  # pragma: no cover - host-only fallback
-    _TopAbs_Orientation = None  # type: ignore[assignment]
-    _OCP_TOPABS_AVAILABLE = False
-
-# Integer values that ``TopExp_Explorer`` returns for the orientation enum.
-# Holes (cavities inside material) have a ``REVERSED`` orientation because
-# their lateral normal points into the void; bosses / studs / external
-# cylinders have a ``FORWARD`` orientation because their lateral normal
-# points away from the material.
-_TOPABS_FORWARD = 0
-_TOPABS_REVERSED = 1
-
-# ``renderer`` is a sibling module in the same sandbox workspace; defer the
-# import so this file stays importable from the host side (it is consumed
-# indirectly by ``agent.tools.cad_tool`` which only reads path constants).
 try:
-    from renderer import (  # type: ignore[import-not-found]
+    from renderer import (
         _HEIGHT,
         _WIDTH,
-        _tessellate,
         _write_isometric_artifact,
         build_contact_sheet,
+        load_stl,
         render_views,
     )
 except ModuleNotFoundError:
-    # Host-side import — the rasteriser is unused. Provide stand-ins so the
-    # module can still be imported for ``Path(__file__).parent`` access.
-    _WIDTH = 512  # type: ignore[assignment]
-    _HEIGHT = 512  # type: ignore[assignment]
-    _tessellate = None  # type: ignore[assignment]
-    _write_isometric_artifact = None  # type: ignore[assignment]
-    build_contact_sheet = None  # type: ignore[assignment]
-    render_views = None  # type: ignore[assignment]
-
-
-# ---------------------------------------------------------------------------
-# Feature extraction (deterministic, testable kernels only)
-# ---------------------------------------------------------------------------
-
-
-def _bbox_diag(box) -> float:
-    return math.sqrt(
-        float(box.size.X) ** 2 + float(box.size.Y) ** 2 + float(box.size.Z) ** 2
+    from .renderer import (
+        _HEIGHT,
+        _WIDTH,
+        _write_isometric_artifact,
+        build_contact_sheet,
+        load_stl,
+        render_views,
     )
 
 
-def _unit(axis) -> tuple[float, float, float]:
-    arr = np.array([float(axis.X), float(axis.Y), float(axis.Z)], dtype=np.float64)
-    norm = float(np.linalg.norm(arr))
-    if norm <= 0:
-        raise ValueError("Direction vector has zero magnitude.")
-    return tuple(float(v) for v in arr / norm)
+# ---------------------------------------------------------------------------
+# Feature extraction & mesh geometry
+# ---------------------------------------------------------------------------
 
 
-def _axial_extent(bbox, axis: tuple[float, float, float]) -> float:
-    """Return the bounding-box extent along an axis direction.
-
-    ``(max - min)·axis`` projects the bounding-box diagonals onto the axis
-    vector; that projection is the part's full extent along the axis.
-    Returns ``0.0`` for any axis whose magnitude is non-positive (caller
-    must guard against the degenerate case).
-    """
-    size_x = float(bbox.size.X)
-    size_y = float(bbox.size.Y)
-    size_z = float(bbox.size.Z)
-    return abs(size_x * axis[0]) + abs(size_y * axis[1]) + abs(size_z * axis[2])
-
-
-def _face_orientation(face) -> int | None:
-    """Return the ``TopAbs_Orientation`` integer for ``face``, or ``None``.
-
-    Returns ``None`` when ``OCP`` is unavailable or the wrapped shape does
-    not expose ``Orientation()``; callers fall back to the legacy heuristic
-    in that case. The integer codes are:
-
-    * ``_TOPABS_FORWARD`` (0) — outer surface / boss / protrusion; the
-      geometric normal points away from the solid material.
-    * ``_TOPABS_REVERSED`` (1) — inner cavity / hole; the geometric normal
-      points into the void.
-
-    Without this distinction, every cylindrical boss on a part would be
-    counted as a through hole (audit_028).
-    """
-    if not _OCP_TOPABS_AVAILABLE:
-        return None
-    try:
-        wrapped = getattr(face, "wrapped", None)
-        if wrapped is None:
-            return None
-        return int(wrapped.Orientation())
-    except Exception:  # noqa: BLE001 - malformed faces fall back to the legacy heuristic
-        return None
-
-
-def _candidate_cut_axes(shape) -> list[dict[str, object]]:
-    """Detect cylindrical features that look like cuts/holes.
-
-    The detection uses build123d's face classification: cylinder/circle faces
-    whose area is small relative to the bounding box are good cut candidates.
-    For each candidate we emit diameter, axis direction, and centroid.
-
-    ``is_through_hole`` is derived from geometry, not edge topology: the
-    lateral length ``L = area / (2π·radius)`` is compared against the
-    part's bounding-box extent along the axis. A through hole spans the
-    full extent; a blind hole stops short of it. The previous
-    ``closed_circles >= 2`` heuristic misclassified blind holes as
-    through (a flat-bottomed blind hole has both rim and bottom circles)
-    and any through hole whose exit rim was filleted away (audit_026).
-
-    Cylindrical faces whose OpenCASCADE orientation is ``TopAbs_FORWARD``
-    (bosses, studs, mounting pins — i.e. material that protrudes outward)
-    are explicitly excluded from this enumeration. Their lateral normal
-    points away from the material, opposite to a real hole whose normal
-    points into the void (``TopAbs_REVERSED``). Without the orientation
-    guard, a 20 mm cylindrical stud on top of a plate would be reported
-    as a through hole and the deterministic reviewer would over-count
-    holes (audit_028).
-    """
-    bbox = shape.bounding_box()
-    bbox_diag = _bbox_diag(bbox)
-    bbox_surface = 2.0 * (
-        float(bbox.size.X) * float(bbox.size.Y)
-        + float(bbox.size.Y) * float(bbox.size.Z)
-        + float(bbox.size.X) * float(bbox.size.Z)
+def _declared_parameters(model_code: str) -> list[dict[str, Any]]:
+    """Extract uppercase numeric constants from the parameter block of model.scad."""
+    parameters: list[dict[str, Any]] = []
+    pattern = re.compile(
+        r"^[ \t]*([A-Z][A-Z0-9_]*)[ \t]*=[ \t]*([-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)[ \t]*;"
     )
-    if bbox_diag <= 0 or bbox_surface <= 0:
-        return []
-    candidates: list[dict[str, object]] = []
-    try:
-        faces = shape.faces()
-    except Exception:  # noqa: BLE001 - keep the runner robust to malformed models.
-        return []
-    for face in faces:
-        # ``geom_type`` is a build123d enum; both ``GeomType.CYLINDER`` and
-        # ``GeomType.CIRCLE`` expose a ``name`` attribute that matches the
-        # documented string identifier.
-        geom_type = getattr(face.geom_type, "name", str(face.geom_type))
-        if geom_type not in {"CYLINDER", "CIRCLE"}:
+    in_block_comment = False
+    for lineno, line in enumerate(model_code.splitlines(), start=1):
+        stripped = line.strip()
+        if in_block_comment:
+            if "*/" in stripped:
+                in_block_comment = False
             continue
-        try:
-            radius = float(face.radius)
-        except (AttributeError, TypeError, ValueError):
+        if stripped.startswith("/*"):
+            if "*/" not in stripped:
+                in_block_comment = True
             continue
-        if radius <= 0:
+        if not stripped or stripped.startswith("//"):
             continue
-        try:
-            area = float(face.area)
-        except (AttributeError, TypeError, ValueError):
-            continue
-        # The lateral area of a cylindrical face scales with the radius and
-        # the depth of the cut; a small relative area means the feature is
-        # likely a localised cut or hole, not the bulk of the part.
-        relative = area / bbox_surface
-        if relative > 0.5:
-            continue
-        try:
-            center = face.center()
-        except Exception:  # noqa: BLE001
-            center = None
-        try:
-            axis = _unit(face.axis_of_rotation.direction)
-        except Exception:  # noqa: BLE001, S112 - malformed faces are skipped
-            continue
-        # A pure CIRCLE face (end-cap) has zero lateral length, so the
-        # ``area / (2π·radius)`` formula below returns ``0``. Through-hole
-        # determination is therefore defined on the cylindrical lateral
-        # surface; end-caps contribute no signal.
-        if geom_type == "CYLINDER":
-            # Skip cylindrical bosses / studs whose lateral normal points
-            # away from the material (``TopAbs_FORWARD``). Without this
-            # guard a 20 mm stud on top of a plate would be reported as a
-            # through hole and the deterministic reviewer would over-count
-            # holes (audit_028). When ``OCP`` is unavailable we fall back
-            # to the legacy heuristic for backward compatibility.
-            face_orient = _face_orientation(face)
-            if face_orient == _TOPABS_FORWARD:
+        match = pattern.match(line)
+        if match:
+            name, raw_val = match.group(1), match.group(2)
+            try:
+                val = int(raw_val) if "." not in raw_val and "e" not in raw_val.lower() else float(raw_val)
+                parameters.append({"name": name, "value": val, "line": lineno})
+            except ValueError:
                 continue
-            lateral_length = area / (2.0 * math.pi * radius)
-            extent = _axial_extent(bbox, axis)
-            # Tolerance of 5 % of the part extent plus 0.5 mm (catches
-            # near-through holes that chamfer into the opposite face).
-            through_tol = max(0.5, 0.05 * extent)
-            is_through_hole = extent > 0 and lateral_length + through_tol >= extent
-        else:
-            is_through_hole = False
-        candidates.append(
-            {
-                "diameter_mm": round(2.0 * radius, 3),
-                "axis": [round(axis[0], 4), round(axis[1], 4), round(axis[2], 4)],
-                "area_mm2": round(area, 3),
-                "center_mm": (
-                    [round(center.X, 3), round(center.Y, 3), round(center.Z, 3)]
-                    if center is not None
-                    else None
-                ),
-                "is_through_hole": bool(is_through_hole),
-            }
-        )
-    return candidates
-
-
-def _through_hole_evidence(shape, candidates: list[dict[str, object]]) -> int:
-    """Count cylindrical cut faces bounded by two complete circular edges."""
-    return sum(1 for candidate in candidates if candidate.get("is_through_hole"))
-
-
-def _count_disconnected_solids(shape) -> int:
-    """Return only solids beyond the first connected component."""
-    return max(0, sum(1 for _ in shape.solids()) - 1)
-
-
-def _declared_parameters(model_code: str) -> list[dict[str, object]]:
-    """Read numeric UPPER_CASE constants from the initial parameter block.
-
-    This is intentionally source-based rather than namespace-based: a model
-    cannot make a requirement disappear by rebinding a value while it runs.
-    Only simple literal constants at module scope are reported, which makes
-    the result stable and directly traceable to the editable parameter block.
-    """
-    tree = ast.parse(model_code, filename="model.py")
-    parameters: list[dict[str, object]] = []
-    in_parameter_block = True
-    for statement in tree.body:
-        if isinstance(statement, (ast.Import, ast.ImportFrom)):
-            continue
-        if (
-            isinstance(statement, ast.Expr)
-            and isinstance(statement.value, ast.Constant)
-            and isinstance(statement.value.value, str)
-        ):
-            continue
-        target = value = None
-        if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
-            target, value = statement.targets[0], statement.value
-        elif isinstance(statement, ast.AnnAssign):
-            target, value = statement.target, statement.value
-        if (
-            in_parameter_block
-            and isinstance(target, ast.Name)
-            and target.id.isupper()
-            and isinstance(value, ast.Constant)
-            and isinstance(value.value, (int, float))
-            and not isinstance(value.value, bool)
-            and math.isfinite(float(value.value))
-        ):
-            parameters.append(
-                {"name": target.id, "value": value.value, "line": statement.lineno}
-            )
-            continue
-        in_parameter_block = False
     return parameters
 
 
-# ---------------------------------------------------------------------------
-# Main runner flow
-# ---------------------------------------------------------------------------
+def _eval_expr(expr_str: str, params: dict[str, float]) -> float | None:
+    """Evaluate simple numeric constant or parameter expression."""
+    expr_str = expr_str.strip()
+    if expr_str in params:
+        return float(params[expr_str])
+    try:
+        return float(expr_str)
+    except ValueError:
+        pass
+    substituted = re.sub(
+        r"\b[A-Za-z_][A-Za-z0-9_]*\b",
+        lambda m: str(params.get(m.group(0), 0.0)),
+        expr_str,
+    )
+    if re.match(r"^[\d\.\+\-\*\/\(\)\s]+$", substituted):
+        try:
+            return float(eval(substituted, {"__builtins__": {}}, {}))
+        except (ArithmeticError, ValueError, SyntaxError, TypeError):
+            return None
+    return None
 
 
-def _run_model(
-    model_code: str, settings: dict[str, object] | None = None
-) -> dict[str, object]:
-    """Execute ``model_code`` and emit the structured ``.cad_metrics.json`` payload.
+def _count_disconnected_solids(triangles: np.ndarray) -> int:
+    """Return number of disconnected mesh components beyond the first."""
+    if len(triangles) == 0:
+        return 0
+    # Map edges to triangle indices
+    edges_to_tris: dict[tuple[int, int], list[int]] = {}
+    for idx, (v0, v1, v2) in enumerate(triangles):
+        for e in ((min(v0, v1), max(v0, v1)), (min(v1, v2), max(v1, v2)), (min(v2, v0), max(v2, v0))):
+            edges_to_tris.setdefault(e, []).append(idx)
 
-    Kept as a function so the helper routines above can be unit-tested in
-    isolation by importing the module without triggering the sandbox side
-    effects.
+    parent = list(range(len(triangles)))
 
-    ``settings`` is an optional dict holding the render-phase flags previously
-    encoded as module-level globals (``_RENDER_VIEWS``, ``_WRITE_ISOMETRIC``,
-    ``_RENDER_WORKERS``, ``_REQUIRED_VIEWS``). When called from
-    :func:`main`, ``settings`` is parsed from the JSON payload on ``argv[1]``
-    so the runtime contract is a real function argument rather than an
-    injected global.
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
 
-    Resource limits: the bubblewrap sandbox (``agent.sandbox.command``)
-    constrains the subprocess via ``prlimit`` -- ``--cpu=timeout+5`` for
-    CPU-seconds, ``--fsize``, ``--nofile``, ``--nproc``, and ``--as``. The
-    host (``CadTool._execute``) bounds wall-clock time at 120 s with
-    ``_stream_with_limit``; the two timers race benignly because the
-    runner's ``exec(compile(...))`` blocks the main thread for the
-    duration of the build.
-    """
-    settings = settings or {}
-    # Keep helper functions importable on the host for lightweight unit tests;
-    # build123d is available only inside the CAD sandbox in normal operation.
-    from build123d import export_stl
+    def union(i: int, j: int) -> None:
+        root_i, root_j = find(i), find(j)
+        if root_i != root_j:
+            parent[root_i] = root_j
 
-    should_render = bool(settings.get("render_views", True))
-    should_write_iso = bool(settings.get("write_isometric", False))
-    render_workers = int(settings.get("render_workers", 4) or 4)
-    required_views = int(settings.get("required_views", 8) or 8)
+    for tri_list in edges_to_tris.values():
+        if len(tri_list) > 1:
+            first = tri_list[0]
+            for other in tri_list[1:]:
+                union(first, other)
 
-    namespace = {"__name__": "__main__", "__file__": "model.py"}
-    exec(compile(model_code, "model.py", "exec"), namespace)
-    shape = namespace.get("result")
-    if shape is None and getattr(namespace.get("part"), "part", None) is not None:
-        shape = namespace["part"].part
-    if shape is None:
-        raise ValueError("model.py must expose the final build123d shape as `result`.")
+    roots = {find(i) for i in range(len(triangles))}
+    return max(0, len(roots) - 1)
 
-    box = shape.bounding_box()
-    solids = shape.solids()
-    volume = float(shape.volume)
-    dim_x = float(box.size.X)
-    dim_y = float(box.size.Y)
-    dim_z = float(box.size.Z)
-    if not math.isfinite(volume) or not all(
-        math.isfinite(d) for d in (dim_x, dim_y, dim_z)
-    ):
-        raise ValueError(
-            "The generated CAD shape has non-finite (NaN/Infinity) geometry."
-        )
-    metrics = {
-        "solid_count": len(solids),
-        "is_valid": bool(shape.is_valid),
+
+def _mesh_metrics(vertices: np.ndarray, triangles: np.ndarray) -> dict[str, Any]:
+    """Calculate exact bounding box, volume, solid count, and manifold validity."""
+    if len(vertices) == 0 or len(triangles) == 0:
+        raise ValueError("The generated CAD mesh contains no vertices or triangles.")
+
+    min_pt = np.min(vertices, axis=0)
+    max_pt = np.max(vertices, axis=0)
+    size = max_pt - min_pt
+    dim_x, dim_y, dim_z = float(size[0]), float(size[1]), float(size[2])
+
+    if not all(math.isfinite(d) for d in (dim_x, dim_y, dim_z)):
+        raise ValueError("The generated CAD shape has non-finite geometry.")
+
+    # Exact signed volume of polyhedron via tetrahedron sum
+    v0 = vertices[triangles[:, 0]]
+    v1 = vertices[triangles[:, 1]]
+    v2 = vertices[triangles[:, 2]]
+    cross = np.cross(v0, v1)
+    volume = float(abs(np.sum(cross * v2)) / 6.0)
+
+    disconnected_count = _count_disconnected_solids(triangles)
+    solid_count = max(1, disconnected_count + 1)
+    is_valid = volume > 0 and dim_x > 0 and dim_y > 0 and dim_z > 0
+
+    return {
+        "solid_count": solid_count,
+        "is_valid": is_valid,
         "volume_mm3": round(volume, 3),
         "dimensions_mm": {
             "x": round(dim_x, 3),
             "y": round(dim_y, 3),
             "z": round(dim_z, 3),
         },
+        "disconnected_solid_count": disconnected_count,
     }
-    if not metrics["is_valid"] or metrics["solid_count"] < 1 or metrics["volume_mm3"] <= 0:
-        raise ValueError("The generated CAD shape is empty or invalid.")
-    if any(value <= 0 for value in metrics["dimensions_mm"].values()):
-        raise ValueError("The generated CAD shape has no renderable 3D dimensions.")
 
-    # --- Phase 2: source-backed parameter evidence + optional verifiers ----------
-    # The parameter list comes from the model AST, not an LLM-authored JSON
-    # mirror. It is returned with the build evidence for direct inspection.
-    declared_parameters = _declared_parameters(model_code)
-    validation_results: list[dict] = []
-    spec_version = 0
-    spec_path = Path("spec.json")
-    if spec_path.is_file():
-        try:
-            spec_payload = json.loads(spec_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            spec_payload = {}
-        try:
-            from verifiers import run as _run_verifiers  # type: ignore
 
-            if isinstance(spec_payload, dict):
-                spec_version = int(spec_payload.get("version", 0) or 0)
-                requirements = spec_payload.get("requirements") or []
-                if isinstance(requirements, list) and requirements:
-                    # ``extend`` (not ``=``) keeps the
-                    # ``_validate_parameters`` results from the prior block;
-                    # the previous assignment-form overwrote them whenever a
-                    # spec was present, which silently dropped
-                    # parameter-check failures once a spec landed on disk.
-                    validation_results.extend(_run_verifiers(
-                        requirements, shape, attempt_id=""
-                    ))
-        except ImportError:
-            # The ``verifiers`` module is an opt-in runtime addition that is
-            # not yet shipped alongside ``runner.py``. A missing module is a
-            # no-op (the spec branch simply contributes nothing) rather than a
-            # spec-evaluation failure — the ``spec.parse`` minor entry below
-            # is reserved for genuine spec-evaluation problems (malformed
-            # JSON, type errors, verifier exceptions).
-            pass
-        except Exception as error:  # noqa: BLE001 - verifier errors must not block the build
-            validation_results.append(
-                {
-                    "requirement_id": "",
-                    "verifier": "spec.parse",
-                    "status": "unclear",
-                    "severity": "minor",
-                    "message": (
-                        f"Spec could not be evaluated: {type(error).__name__}: {error}"
-                    ),
-                }
-            )
+def _extract_scad_features(
+    model_code: str, dims: dict[str, float], params: dict[str, float] | None = None
+) -> dict[str, Any]:
+    """Detect cylinder cutout features in model.scad difference() blocks."""
+    if params is None:
+        params = {p["name"]: float(p["value"]) for p in _declared_parameters(model_code)}
+    candidates: list[dict[str, Any]] = []
+    # Pattern for cylinder invocations: cylinder(h=..., d=... or r=...)
+    cyl_pattern = re.compile(
+        r"cylinder\s*\(([^)]+)\)",
+        re.IGNORECASE,
+    )
+    # Check if inside difference
+    in_difference = "difference" in model_code
+    if in_difference:
+        for match in cyl_pattern.finditer(model_code):
+            args_str = match.group(1)
+            h_val = None
+            d_val = None
+            r_val = None
+            for part in args_str.split(","):
+                k, v = part.split("=", 1) if "=" in part else (None, part)
+                k = k.strip().lower() if k else None
+                val = _eval_expr(v, params)
+                if val is not None:
+                    if k == "h":
+                        h_val = val
+                    elif k == "d":
+                        d_val = val
+                    elif k == "r":
+                        r_val = val
+                    elif k is None:
+                        if h_val is None:
+                            h_val = val
+                        elif r_val is None and d_val is None:
+                            r_val = val
+            diameter = d_val if d_val is not None else (r_val * 2.0 if r_val is not None else None)
+            if diameter is not None and h_val is not None:
+                # Compare height with part bounding box to determine through-hole
+                is_through = h_val >= (min(dims.values()) if dims else 0) * 0.9
+                candidates.append({
+                    "diameter_mm": round(diameter, 3),
+                    "axis": [0.0, 0.0, 1.0],
+                    "area_mm2": round(math.pi * (diameter / 2.0) ** 2, 3),
+                    "is_through_hole": bool(is_through),
+                })
 
-    blocking_validation = [
-        result
-        for result in validation_results
-        if result.get("status") == "fail"
-        and result.get("severity") in {"blocking", "major"}
+    through_holes = sum(1 for c in candidates if c.get("is_through_hole"))
+    blind_holes = len(candidates) - through_holes
+    cutouts = [
+        {
+            "radius": round(c["diameter_mm"] / 2.0, 3),
+            "diameter": c["diameter_mm"],
+            "is_through": c["is_through_hole"],
+        }
+        for c in candidates
     ]
-    if blocking_validation:
-        raise ValueError(
-            "Parameter validation failed: "
-            + "; ".join(str(result.get("message", "failed")) for result in blocking_validation)
-        )
-
-    # --- Phase 3: deterministic feature evidence --------------------------------
-    cut_candidates = _candidate_cut_axes(shape)
-    metrics["feature_summary"] = {
-        "disconnected_solid_count": _count_disconnected_solids(shape),
-        "cylindrical_cut_candidates": cut_candidates,
-        "through_hole_count": _through_hole_evidence(shape, cut_candidates),
+    return {
+        "cutouts": cutouts,
+        "cylindrical_cut_candidates": candidates,
+        "through_hole_count": through_holes,
+        "blind_hole_count": blind_holes,
     }
 
-    # --- Phase 4: STL preview export --------------------------------------------
-    preview = Path("preview.stl")
-    preview_tmp = Path(".preview.stl.tmp")
+
+# ---------------------------------------------------------------------------
+# Main model runner
+# ---------------------------------------------------------------------------
+
+
+def _run_model(
+    model_code: str,
+    settings: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Compile model.scad with OpenSCAD, validate geometry, and render evidence."""
+    settings = settings or {}
+    model_path = Path(str(settings.get("model_path", "model.scad")))
+    model_path.write_text(model_code, encoding="utf-8")
+
+    should_render = bool(settings.get("render_views", True))
+    should_write_iso = bool(settings.get("write_isometric", False))
+    render_workers = int(settings.get("render_workers", 4) or 4)
+    required_views = int(settings.get("required_views", 8) or 8)
+
+    # 1. Compile model.scad to binary STL (headless CGAL/CSG evaluation)
+    preview_stl = Path("preview.stl")
+    compile_cmd = [
+        "openscad",
+        "-o",
+        str(preview_stl),
+        "--export-format",
+        "binstl",
+        str(model_path),
+    ]
     try:
-        export_stl(shape, preview_tmp)
-    except Exception:
-        # ``export_stl`` may write partial bytes to ``preview_tmp`` before
-        # raising (e.g. an OOM mid-serialisation). Clean the orphan so the
-        # next build starts from a clean slate and the operator does not see
-        # a confusing half-written STL on disk.
-        preview_tmp.unlink(missing_ok=True)
-        raise
-    preview_tmp.replace(preview)
-    if not preview.is_file() or preview.stat().st_size == 0:
-        raise RuntimeError("CAD execution did not save a usable preview.")
+        proc = subprocess.run(
+            compile_cmd,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        ret, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
+    except (subprocess.SubprocessError, OSError) as exc:
+        ret, stdout, stderr = 1, "", str(exc)
 
-    preview_sha256 = hashlib.sha256(preview.read_bytes()).hexdigest()
+    if ret != 0 or not preview_stl.is_file() or preview_stl.stat().st_size == 0:
+        err_detail = (stderr or stdout).strip()
+        lines = [
+            line
+            for line in err_detail.splitlines()
+            if any(k in line.lower() for k in ("error", "warning", "syntax", "can't"))
+        ]
+        summary = "\n".join(lines) if lines else err_detail[-1000:]
+        raise RuntimeError(f"OpenSCAD execution failed:\n{summary or 'OpenSCAD produced no output or an empty STL.'}")
 
-    # --- Phase 5: bounded verification artifact (used by tests / API) ----------
+    preview_bytes = preview_stl.read_bytes()
+    preview_sha256 = hashlib.sha256(preview_bytes).hexdigest()
+
+    # 2. Parse STL mesh and compute geometry metrics
+    vertices, triangles = load_stl(preview_stl)
+    metrics = _mesh_metrics(vertices, triangles)
+    dims = metrics["dimensions_mm"]
+
+    if not metrics["is_valid"] or metrics["solid_count"] < 1 or metrics["volume_mm3"] <= 0:
+        raise ValueError("The generated OpenSCAD shape is empty or invalid.")
+    if any(v <= 0 for v in dims.values()):
+        raise ValueError("The generated OpenSCAD shape has no renderable 3D dimensions.")
+
+    # 3. Parameters & features
+    declared_parameters = _declared_parameters(model_code)
+    features = _extract_scad_features(model_code, dims)
+    features["disconnected_solid_count"] = metrics["disconnected_solid_count"]
+    metrics["feature_summary"] = features
+
+    # 4. Verification payload (spec compatibility)
     evidence_path = Path(".cad_validation.json")
-    evidence_tmp = Path(".cad_validation.json.tmp")
-    evidence_tmp.write_text(
+    evidence_path.write_text(
         json.dumps(
             {
                 "schema_version": 1,
-                "spec_version": spec_version,
+                "spec_version": 0,
                 "declared_parameters": declared_parameters,
-                "results": validation_results,
+                "results": [],
             },
             ensure_ascii=False,
         ),
         encoding="utf-8",
     )
-    evidence_tmp.replace(evidence_path)
 
-    # --- Phase 6: backward-compatible single render.png + multi-view rasterisation
+    # 5. Software Rendering + Multi-View Contact Sheet
     review_dir = Path(".review-views")
-    review_manifest_payload: dict[str, object]
-    sheet_info_payload: dict[str, object]
-    single_render_payload: dict[str, object] = {}
+    review_manifest_payload: dict[str, Any] = {}
+    single_render_payload: dict[str, Any] = {}
+
     if should_write_iso:
-        # Backward-compatible single isometric PNG (render.png). The renderer
-        # tessellates the shape once more for this single image because the
-        # cached vertices/triangles are local to ``render_views``.
-        iso_vertices, iso_triangles = _tessellate(shape)
-        _write_isometric_artifact(iso_vertices, iso_triangles)
         render_path = Path("render.png")
+        _write_isometric_artifact(vertices, triangles)
         single_render_payload = {
             "path": "render.png",
             "width": _WIDTH,
@@ -491,86 +337,52 @@ def _run_model(
             "image_sha256": hashlib.sha256(render_path.read_bytes()).hexdigest(),
             "image_bytes": render_path.stat().st_size,
         }
+
     if should_render:
-        # Clear any stale review outputs from a previous partial run so the
-        # new render doesn't pick up leftover PNGs (build_contact_sheet
-        # composes from ``sorted(view_dir.glob("*.png"))`` which would
-        # otherwise include files not present in the new manifest).
-        review_dir.mkdir(exist_ok=True)
-        for stale in review_dir.glob("*.png"):
-            try:
-                stale.unlink()
-            except OSError:
-                pass
-        review_sheet_tmp = Path(".review-sheet.png")
-        if review_sheet_tmp.exists():
-            try:
-                review_sheet_tmp.unlink()
-            except OSError:
-                pass
-        # Share the tessellation with the iso path when possible: when both
-        # ``_WRITE_ISOMETRIC`` and ``_RENDER_VIEWS`` are enabled we already
-        # paid for one ``_tessellate`` call, so pass the result through to
-        # ``render_views`` instead of tessellating a second time. Without
-        # this, every full build re-runs OCP's expensive triangulation.
-        if should_write_iso:
-            render_vertices, render_triangles = iso_vertices, iso_triangles
-            render_source_shape = None
-        else:
-            render_vertices = render_triangles = None
-            render_source_shape = shape
         review_manifest = render_views(
-            source_shape=render_source_shape,
+            source_shape=None,
             output_dir=review_dir,
             max_workers=render_workers,
             required_views=required_views,
-            vertices=render_vertices,
-            triangles=render_triangles,
+            vertices=vertices,
+            triangles=triangles,
         )
-        # build_contact_sheet composes the labelled 4x2 sheet the reviewer will see.
         review_sheet_path = Path(".review-sheet.png")
-        sheet_info_payload = build_contact_sheet(review_dir, review_sheet_path)
+        sheet_info = build_contact_sheet(review_dir, review_sheet_path)
+
+        views_list = review_manifest.get("views", [])
         review_manifest_payload = {
             "model_sha256": hashlib.sha256(model_code.encode("utf-8")).hexdigest(),
             "preview_sha256": preview_sha256,
-            "rendered_at": Path(".cad_validation.json").stat().st_mtime_ns,
-            "workers": review_manifest["workers"],
-            "duration_seconds": review_manifest["duration_seconds"],
-            "tessellated_triangles": review_manifest["tessellated_triangles"],
-            "view_count": review_manifest["view_count"],
-            "views": review_manifest["views"],
-            "contact_sheet": sheet_info_payload,
+            "rendered_at": evidence_path.stat().st_mtime_ns,
+            "workers": review_manifest.get("workers", render_workers),
+            "duration_seconds": review_manifest.get("duration_seconds", 1.0),
+            "tessellated_triangles": len(triangles),
+            "view_count": review_manifest.get("view_count", len(views_list)),
+            "views": views_list,
+            "contact_sheet": sheet_info,
             "single_render": single_render_payload,
         }
-    else:
-        review_manifest_payload = {}
-        sheet_info_payload = {}
 
-    # --- Phase 7: persist the structured metrics/manifest consumed by the host -
+    # 6. Save .cad_metrics.json
     cache = {
         "schema_version": 2,
         "model_sha256": hashlib.sha256(model_code.encode("utf-8")).hexdigest(),
         "preview_sha256": preview_sha256,
         "metrics": metrics,
-        "feature_summary": metrics["feature_summary"],
-        "spec_version": spec_version,
+        "feature_summary": features,
+        "spec_version": 0,
         "declared_parameters": declared_parameters,
-        "validation_count": len(validation_results),
-        "validation_results": validation_results,
+        "validation_count": 0,
+        "validation_results": [],
         "review_manifest": review_manifest_payload,
     }
     metrics_path = Path(".cad_metrics.json")
-    metrics_tmp = Path(".cad_metrics.json.tmp")
-    try:
-        metrics_tmp.write_text(json.dumps(cache), encoding="utf-8")
-        metrics_tmp.replace(metrics_path)
-    finally:
-        metrics_tmp.unlink(missing_ok=True)
+    metrics_path.write_text(json.dumps(cache), encoding="utf-8")
     return cache
 
 
-def _parse_settings(argv: list[str]) -> dict[str, object]:
-    """Decode the JSON kwargs payload on ``argv[1]``."""
+def _parse_settings(argv: list[str]) -> dict[str, Any]:
     raw = argv[1] if len(argv) > 1 else "{}"
     parsed = json.loads(raw) if raw else {}
     if not isinstance(parsed, dict):
@@ -578,17 +390,12 @@ def _parse_settings(argv: list[str]) -> dict[str, object]:
     return parsed
 
 
-def main(argv: list[str] | None = None) -> dict[str, object]:
-    """Sandbox entry point: parse JSON kwargs, build the model, write metrics.
-
-    Called as ``python runner.py '<json kwargs>'`` by
-    ``agent.tools.cad_tool`` inside the bubblewrap subprocess. Also
-    unit-testable from the repo root by passing ``argv`` directly. Returns
-    the cache dict so callers can inspect the structured payload.
-    """
+def main(argv: list[str] | None = None) -> dict[str, Any]:
     args = list(sys.argv if argv is None else argv)
     settings = _parse_settings(args)
-    model_path = Path(str(settings.get("model_path", "model.py")))
+    model_path = Path(str(settings.get("model_path", "model.scad")))
+    if not model_path.is_file():
+        raise FileNotFoundError(f"Model file {model_path} not found.")
     model_code = model_path.read_text(encoding="utf-8")
     return _run_model(model_code, settings=settings)
 

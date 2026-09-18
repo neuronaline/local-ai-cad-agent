@@ -1,19 +1,22 @@
+import hashlib
 import io
 import json
+import warnings
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
-from agent import dispatcher as dispatcher_module
-from agent.dispatcher import process_tool_call
+from agent import tool_results
 from agent.conversation import ConversationStore
 from agent.core import AgentRunner
 from agent.llm_base import (
     FallbackChatClient,
     RequestCancelled,
     StreamResponseError,
+    normalize_messages,
     parse_chat_stream,
+    sanitize_assistant_message,
     sanitize_messages,
 )
 from agent.revisions import RevisionStore, compute_model_sha256
@@ -24,21 +27,32 @@ from agent.tools.file_tool import FileTool
 def test_model_write_creates_a_revision_and_rejects_unsafe_code(tmp_path: Path) -> None:
     tool = FileTool(tmp_path)
 
-    tool.write_file("model.py", "from build123d import Box\nresult = Box(10, 20, 30)\n")
+    tool.write_file("model.scad", "WIDTH = 10;\ncube([WIDTH, 20, 30]);\n")
 
-    assert RevisionStore(tmp_path).head() is not None
-    with pytest.raises(ValueError, match="Unsafe import blocked"):
-        tool.write_file("model.py", "import subprocess\n")
-    assert "result = Box" in (tmp_path / "model.py").read_text(encoding="utf-8")
+    head = RevisionStore(tmp_path).head()
+    assert head is not None
+    assert len(head.id) == 36 and head.id.count("-") == 4
+    assert head.model_sha256 == hashlib.sha256(b"WIDTH = 10;\ncube([WIDTH, 20, 30]);\n").hexdigest()
+    assert head.parent_id is None
+    assert head.origin.kind == "agent_edit"
+    with pytest.raises(ValueError, match="Python keyword 'import' found"):
+        tool.write_file("model.scad", "import subprocess\n")
+    with pytest.raises(ValueError, match="Unclosed string literal"):
+        tool.write_file("model.scad", 'WIDTH = 10;\nstr = "unclosed;\n')
+    with pytest.raises(ValueError, match="Mismatched delimiter"):
+        tool.write_file("model.scad", "WIDTH = 10;\ncube([WIDTH, 20, 30);\n")
+    with pytest.raises(ValueError, match="Unclosed delimiter"):
+        tool.write_file("model.scad", "WIDTH = 10;\ncube([WIDTH, 20, 30;\n")
+    assert "cube([WIDTH, 20, 30])" in (tmp_path / "model.scad").read_text(encoding="utf-8")
 
 
 def _seed_metrics(project_dir: Path) -> str:
-    """Write a ``.cad_metrics.json`` whose ``model_sha256`` matches model.py.
+    """Write a ``.cad_metrics.json`` whose ``model_sha256`` matches model.scad.
 
     Returns the recorded sha so tests can reuse it for assertions.
     """
     model_sha = compute_model_sha256(project_dir)
-    assert model_sha is not None
+    assert model_sha is not None and len(model_sha) == 64 and all(c in "0123456789abcdef" for c in model_sha)
     metrics = {
         "model_sha256": model_sha,
         "preview_sha256": "",
@@ -62,97 +76,56 @@ def _make_call(name: str, arguments: dict) -> dict:
     }
 
 
-def test_dispatcher_allows_visual_tool_after_metrics_only_build(tmp_path: Path) -> None:
-    """``cad_screenshot`` must NOT be blocked after a cheap ``render=false`` build.
+def test_question_validator_number_with_units() -> None:
+    """QuestionValidator accepts whitespace-tolerant numbers and common length/angle units."""
+    from agent.tools.question_validator import QuestionValidator
 
-    Regression: the dispatcher previously keyed the screenshot/review gate on
-    ``cad_fix_required``, which was only cleared on a *rendered* build. That
-    forced the agent to do a wasteful second rendered build whenever it
-    iterated with ``render=false`` first. The gate now consults
-    ``model_is_built(project_dir)`` directly, so any successful build — even
-    a metrics-only one — unblocks visual tools.
-    """
-    FileTool(tmp_path).write_file(
-        "model.py",
-        "from build123d import Box\nresult = Box(10, 20, 30)\n",
-    )
-    _seed_metrics(tmp_path)
-    # The loop passes ``cad_fix_required=True`` after a metrics-only build
-    # because the loop's final-rendered-verification gate stays armed; the
-    # dispatcher must ignore that flag for the screenshot gate.
-    dispatched: list[tuple[str, dict]] = []
+    q = {"id": "length", "question": "Enter length", "input_type": "number"}
+    # Valid inputs without space, with space, decimals, and various units
+    assert QuestionValidator.validate(q, "10")
+    assert QuestionValidator.validate(q, "10mm")
+    assert QuestionValidator.validate(q, "10 mm")
+    assert QuestionValidator.validate(q, "10.5mm")
+    assert QuestionValidator.validate(q, "10.5 cm")
+    assert QuestionValidator.validate(q, "45 deg")
+    assert QuestionValidator.validate(q, "45°")
+    assert QuestionValidator.validate(q, "2 in")
+    assert QuestionValidator.validate(q, "2inches")
+    assert QuestionValidator.validate(q, "0.5")
 
-    def fake_dispatch(tools, project, name, args, call_id):
-        dispatched.append((name, args))
-        return {"summary": "skipped"}, False
-
-    original = dispatcher_module.dispatch
-    dispatcher_module.dispatch = fake_dispatch
-    try:
-        _preview_id, cad_error, cad_fix_required, waiting = process_tool_call(
-            tools=MagicMock(),
-            project="probe",
-            project_dir=tmp_path,
-            call=_make_call("cad_screenshot", {}),
-            cad_fix_required=True,
-            prev_preview_id=None,
-            cad_error=None,
-            messages=[],
-            publish=lambda *_args, **_kwargs: None,
-            register_preview=lambda *_args, **_kwargs: "preview-id",
-            append_message=lambda *_args, **_kwargs: None,
-        )
-    finally:
-        dispatcher_module.dispatch = original
-
-    assert dispatched == [("cad_screenshot", {})], (
-        "Dispatcher gate rejected cad_screenshot after a metrics-only build; "
-        "the gate must consult model_is_built(project_dir), not cad_fix_required."
-    )
-    assert cad_fix_required is True, (
-        "Loop-side cad_fix_required must keep its rendered-verification "
-        "semantics; only the dispatcher gate was relaxed."
-    )
-    assert cad_error is None
-    assert waiting is False
+    # Invalid inputs
+    assert not QuestionValidator.validate(q, "")
+    assert not QuestionValidator.validate(q, "abc")
+    assert not QuestionValidator.validate(q, "10 xyz")
+    assert not QuestionValidator.validate(q, "10 mm extra")
 
 
-def test_dispatcher_still_blocks_visual_tool_without_a_build(tmp_path: Path) -> None:
-    """No ``.cad_metrics.json`` for the current model must keep the gate armed."""
-    FileTool(tmp_path).write_file(
-        "model.py",
-        "from build123d import Box\nresult = Box(10, 20, 30)\n",
-    )
-    # Note: no _seed_metrics() call — the project has a model.py but no
-    # matching .cad_metrics.json, simulating an unverified edit.
+def test_cancel_remaining_tool_calls_produces_standard_failure_envelope(tmp_path: Path) -> None:
+    """cancel_remaining_tool_calls wraps cancelled tools in standard tool_failure envelopes."""
+    from agent.dispatcher import cancel_remaining_tool_calls
+
     appended: list[dict] = []
-
-    def capture_append(_project_dir: Path, payload: dict) -> None:
-        appended.append(payload)
-
-    preview_id, cad_error, cad_fix_required, waiting = process_tool_call(
-        tools=MagicMock(),
-        project="probe",
-        project_dir=tmp_path,
-        call=_make_call("cad_screenshot", {}),
-        cad_fix_required=False,
-        prev_preview_id=None,
-        cad_error=None,
-        messages=[],
-        publish=lambda *_args, **_kwargs: None,
-        register_preview=lambda *_args, **_kwargs: "preview-id",
-        append_message=capture_append,
+    tool_calls = [
+        {"id": "call_1", "function": {"name": "cad_build_and_verify", "arguments": "{}"}},
+        {"id": "call_2", "function": {"name": "read_file", "arguments": "{}"}},
+    ]
+    messages: list[dict] = []
+    cancel_remaining_tool_calls(
+        tmp_path,
+        tool_calls,
+        processed_call_ids={"call_1"},
+        messages=messages,
+        append_message=lambda _dir, msg: appended.append(msg),
     )
-    # ``process_tool_call`` converts tool exceptions into a failure envelope
-    # rather than re-raising. For non-cad_build tools the failure lands in the
-    # appended tool message; ``cad_error`` stays None because the loop's own
-    # terminal-error machinery is gated on ``is_cad_build``.
+    assert len(messages) == 1
     assert len(appended) == 1
-    assert "requires a successful build" in appended[0]["content"]
-    assert cad_fix_required is False  # loop gate stays as the loop set it
-    assert cad_error is None
-    assert waiting is False
-    assert preview_id is None
+    msg = messages[0]
+    assert msg["role"] == "tool"
+    assert msg["tool_call_id"] == "call_2"
+    parsed = json.loads(msg["content"])
+    assert parsed["ok"] is False
+    assert parsed["tool"] == "read_file"
+    assert parsed["error"]["message"] == "Tool call cancelled (question or stop)."
 
 
 class _FakeStreamResponse:
@@ -490,16 +463,14 @@ def test_conversation_store_load_preserves_images(tmp_path: Path) -> None:
     }
     ConversationStore.append(project_dir, msg_with_img)
 
-    # By default, load() preserves the image_url payload
+    # Multimodal content is preserved verbatim so the prompt prefix stays
+    # byte-stable across turns. Prompt caches rely on the same bytes the
+    # provider hashed on the previous request; rewriting to placeholders
+    # would invalidate every cached prefix.
     loaded = ConversationStore.load(project_dir)
     assert len(loaded) == 1
     assert loaded[0]["content"][1]["type"] == "image_url"
     assert loaded[0]["content"][1]["image_url"]["url"] == "data:image/png;base64,iVBORw0KGgo="
-
-    # If redact_images=True is explicitly passed, it redacts
-    redacted = ConversationStore.load(project_dir, redact_images=True)
-    assert redacted[0]["content"][1]["type"] == "text"
-    assert "[Inline render" in redacted[0]["content"][1]["text"]
 
 
 def test_agent_runner_multi_turn_prefix_and_cache_stability(tmp_path: Path) -> None:
@@ -517,17 +488,17 @@ def test_agent_runner_multi_turn_prefix_and_cache_stability(tmp_path: Path) -> N
     # --- Turn 1 ---
     # Model does not exist initially
     context_t1 = runner._context(project_dir, "Create a cylinder", [])
-    assert "model.py does not exist" in context_t1[1]["content"]
+    assert "model.scad does not exist" in context_t1[1]["content"]
 
-    # Assistant executes write_file, creating model.py
-    (project_dir / "model.py").write_text("result = Cylinder(10, 20)", encoding="utf-8")
+    # Assistant executes write_file, creating model.scad
+    (project_dir / "model.scad").write_text("cylinder(r=10, h=20);", encoding="utf-8")
     assistant_t1_1 = {
         "role": "assistant",
         "content": "",
         "tool_calls": [
             {"id": "call_write", "type": "function", "function": {"name": "write_file", "arguments": "{}"}}
         ],
-        "reasoning_details": [{"type": "reasoning.text", "text": "Creating model.py"}],
+        "reasoning_details": [{"type": "reasoning.text", "text": "Creating model.scad"}],
     }
     tool_write_result = {"role": "tool", "tool_call_id": "call_write", "content": "File written"}
     assistant_t1_2 = {
@@ -560,10 +531,10 @@ def test_agent_runner_multi_turn_prefix_and_cache_stability(tmp_path: Path) -> N
     wire_t1 = sanitize_messages(messages_t1, preserve_reasoning=True)
 
     # --- Turn 2 ---
-    # User asks a follow-up question. Even though model.py now exists on disk,
-    # messages[1] must remain "model.py does not exist" so the prefix is unchanged.
+    # User asks a follow-up question. Even though model.scad now exists on disk,
+    # messages[1] must remain "model.scad does not exist" so the prefix is unchanged.
     context_t2 = runner._context(project_dir, "Now drill a 5mm hole through the center", [])
-    assert "model.py does not exist" in context_t2[1]["content"]
+    assert "model.scad does not exist" in context_t2[1]["content"]
 
     wire_t2 = sanitize_messages(context_t2, preserve_reasoning=True)
 
@@ -571,14 +542,14 @@ def test_agent_runner_multi_turn_prefix_and_cache_stability(tmp_path: Path) -> N
     # If wire_t2 prefix differs in ANY way, provider prompt cache is invalidated.
     assert wire_t2[:len(wire_t1)] == wire_t1
 
-    # In particular, the tool image must still be in wire_t2 at the exact position
-    assert wire_t2[7]["role"] == "user"
-    assert wire_t2[7]["content"][1]["type"] == "image_url"
-    assert wire_t2[7]["content"][1]["image_url"]["url"] == "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
+    # In particular, the tool image must be in wire_t2 at index 6 with strictly alternating roles
+    assert wire_t2[6]["role"] == "user"
+    assert wire_t2[6]["content"][1]["type"] == "image_url"
+    assert wire_t2[6]["content"][1]["image_url"]["url"] == "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
 
 
 def test_clear_history_cleans_initial_state_file(tmp_path: Path) -> None:
-    """clear_history removes .agent_initial_state.json along with conversation and state."""
+    """clear_history removes legacy state files along with conversation and state."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     project_dir = workspace / "test-project"
@@ -589,13 +560,15 @@ def test_clear_history_cleans_initial_state_file(tmp_path: Path) -> None:
     )
     runner = AgentRunner(settings, publish=lambda *args, **kwargs: None)
 
-    # Call _context to trigger initial state file creation
-    runner._context(project_dir, "Hello", [])
-    assert (project_dir / ".agent_initial_state.json").is_file()
+    # Populate state files
+    (project_dir / ".agent_initial_state.json").write_text("{}", encoding="utf-8")
+    (project_dir / ".agent_state.json").write_text("{}", encoding="utf-8")
+    (project_dir / "conversation.jsonl").write_text("{}", encoding="utf-8")
 
     # Clear history
     runner.clear_history(project_dir)
     assert not (project_dir / ".agent_initial_state.json").is_file()
+    assert not (project_dir / ".agent_state.json").is_file()
     assert not (project_dir / "conversation.jsonl").is_file()
 
 
@@ -714,13 +687,13 @@ def test_file_tool_write_reports_line_count_not_character_count(tmp_path: Path) 
     tool = FileTool(tmp_path)
 
     message = tool.write_file(
-        "model.py",
-        "from build123d import Box\nresult = Box(10, 20, 30)\n",
+        "model.scad",
+        "WIDTH = 10;\ncube([WIDTH, 20, 30]);\n",
     )
 
     assert "lines" in message
     assert "chars" in message
-    # Two newline-terminated lines (1 import + 1 result) — splitlines() drops
+    # Two newline-terminated lines — splitlines() drops
     # the trailing empty entry so a 2-line file always reports "2 lines".
     assert "2 lines" in message
     assert "characters" not in message
@@ -768,64 +741,67 @@ def test_revisions_trim_builds_log_runs_in_linear_time(tmp_path: Path) -> None:
     assert log_path.stat().st_size > 0
 
 
-def test_cad_review_summary_attributes_failure_to_visual_layer(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A clean deterministic layer + blocking visual finding must blame the visual layer.
+def test_append_message_persists_assistant_turn_to_history(tmp_path: Path) -> None:
+    """``_append_message`` writes assistant turns to ``conversation.jsonl``.
 
-    Previously the summary always read ``"Deterministic verification
-    reported blocking or major failures."`` whenever the combined list
-    contained a blocking/major finding — even when the visual layer was
-    the sole source. Operators chasing a non-existent deterministic
-    regression is the user-visible bug.
+    The agent loop now intentionally skips persistence for ``invalid_final``
+    turns so the UI never shows a ghost message that was rejected by the
+    visual verification gate. The low-level helper still commits every
+    record it is given; the gate is enforced one layer up in
+    ``AgentRunner._run``.
     """
-    from agent import cad_review as cad_review_module
-    from agent.cad_review import Finding, ReviewResult, review_cad
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    project_dir = workspace / "test-project"
+    project_dir.mkdir()
 
-    sheet = tmp_path / "sheet.png"
-    single = tmp_path / "render.png"
-    sheet.write_bytes(b"\x89PNG\r\n\x1a\n")  # valid PNG magic
-    single.write_bytes(b"\x89PNG\r\n\x1a\n")
-
-    visual_findings = [
-        Finding(
-            severity="blocking",
-            category="visual",
-            message="shell intersects face",
-            source="visual",
-        )
-    ]
-
-    def fake_visual_review(*_args: object, **_kwargs: object) -> ReviewResult:
-        return ReviewResult(
-            status="fail",
-            summary="All checks passed.",
-            findings=visual_findings,
-        )
-
-    monkeypatch.setattr(cad_review_module, "_visual_review", fake_visual_review)
-
-    result = review_cad(
-        settings=object(),
-        request_text="probe",
-        model_source="",
-        metrics={
-            "solid_count": 1,
-            "is_valid": True,
-            "dimensions_mm": {"x": 1.0, "y": 1.0, "z": 1.0},
-            "volume_mm3": 1.0,
-        },
-        feature_summary={},
-        review_manifest={"model_sha256": "a" * 64, "preview_sha256": "b" * 64},
-        sheet_path=sheet,
-        single_render_path=single,
-        validation_results=[],
-        create_client=None,
+    settings = Settings(
+        workspace, "https://example.test", "test-model", 5, "127.0.0.1", 5000
     )
+    runner = AgentRunner(settings, publish=lambda *args, **kwargs: None)
 
-    assert result.status == "fail"
-    assert "Deterministic" not in result.summary
-    assert "Visual review" in result.summary
+    # Initial model.scad does not exist
+    runner._context(project_dir, "Make part", [])
+    assistant_msg = {
+        "role": "assistant",
+        "content": "I finished the part.",
+    }
+    runner._append_message(project_dir, assistant_msg)
+    history = ConversationStore.load(project_dir)
+    assert any(m.get("role") == "assistant" and m.get("content") == "I finished the part." for m in history)
+
+
+def test_cad_failure_threshold_cancels_remaining_tool_calls(tmp_path: Path) -> None:
+    """When CAD build failure threshold stops the run, remaining tool calls are cancelled."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    project_dir = workspace / "test-project"
+    project_dir.mkdir()
+
+    # Pre-populate model.scad with broken code
+    (project_dir / "model.scad").write_text("broken syntax !!", encoding="utf-8")
+
+    tool_calls = [
+        {"id": "call_cad", "function": {"name": "cad_build_and_verify", "arguments": "{}"}},
+        {"id": "call_read", "function": {"name": "read_file", "arguments": "{}"}},
+    ]
+    messages: list[dict] = []
+    appended: list[dict] = []
+
+    from agent.dispatcher import cancel_remaining_tool_calls
+    # If call_cad failed and loop stops, call_read must be cancelled
+    cancel_remaining_tool_calls(
+        project_dir,
+        tool_calls,
+        processed_call_ids={"call_cad"},
+        messages=messages,
+        append_message=lambda _dir, msg: appended.append(msg),
+    )
+    assert len(messages) == 1
+    assert messages[0]["tool_call_id"] == "call_read"
+    res = json.loads(messages[0]["content"])
+    assert res["ok"] is False
+    assert res["tool"] == "read_file"
 
 
 def test_activity_log_trims_on_cadence_not_every_call(tmp_path: Path) -> None:
@@ -897,12 +873,16 @@ def test_images_store_rejects_oversized_dimensions_before_decode(tmp_path: Path)
     height = over // width + 1
     raw = PILImage.new("RGB", (1, 1)).resize((width, height)).tobytes()
     buf = io.BytesIO()
-    PILImage.frombytes("RGB", (width, height), raw).save(buf, format="PNG")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", PILImage.DecompressionBombWarning)
+        PILImage.frombytes("RGB", (width, height), raw).save(buf, format="PNG")
     payload = buf.getvalue()
 
     upload = FileStorage(stream=io.BytesIO(payload), filename="bomb.png", content_type="image/png")
-    with pytest.raises(ValueError, match="dimensions exceed"):
-        store_images([upload], tmp_path)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", PILImage.DecompressionBombWarning)
+        with pytest.raises(ValueError, match="dimensions exceed"):
+            store_images([upload], tmp_path)
 
 
 def test_revision_archive_import_aborts_atomically_on_corrupt_blob(tmp_path: Path) -> None:
@@ -1009,47 +989,35 @@ def test_prompt_cache_does_not_stat_playbook_per_call(
 
 def test_file_tools_ignore_and_do_not_require_sha(tmp_path: Path) -> None:
     """File tool methods must not require SHA digests or fail on invalid digests."""
-    import json
     tool = FileTool(tmp_path)
 
     # 1. write_file works unconditionally and ignores invalid expected_sha256
-    initial_code = "from build123d import Box\nWIDTH = 10\nresult = Box(WIDTH, 20, 30)\n"
-    tool.write_file("model.py", initial_code, expected_sha256="not_a_sha")
+    initial_code = "WIDTH = 10;\ncube([WIDTH, 20, 30]);\n"
+    tool.write_file("model.scad", initial_code, expected_sha256="not_a_sha")
 
     # 2. read_file returns clean content without sha256 and ignores known_sha256
-    raw_read = tool.read_file("model.py", known_sha256="invalid")
-    read_data = json.loads(raw_read)
-    assert read_data["exists"] is True
-    assert "WIDTH = 10" in read_data["content"]
-    assert "sha256" not in read_data
+    raw_read = tool.read_file("model.scad", known_sha256="invalid")
+    assert isinstance(raw_read, dict), "read_file must return a dict, not a JSON string."
+    assert raw_read["exists"] is True
+    assert "WIDTH = 10" in raw_read["content"]
+    assert "sha256" not in raw_read
 
     # 3. edit_file succeeds with invalid / mismatched expected_sha256
     tool.edit_file(
-        "model.py",
+        "model.scad",
         "WIDTH = 10",
         "WIDTH = 25",
         expected_sha256="short",
     )
-    assert "WIDTH = 25" in (tmp_path / "model.py").read_text(encoding="utf-8")
+    assert "WIDTH = 25" in (tmp_path / "model.scad").read_text(encoding="utf-8")
 
-    # 4. insert_file succeeds with invalid expected_sha256
-    tool.insert_file(
-        "model.py",
-        anchor="WIDTH = 25\n",
-        content="HEIGHT = 40\n",
-        position="after",
-        expected_sha256="bad_digest",
-    )
-    content = (tmp_path / "model.py").read_text(encoding="utf-8")
-    assert "HEIGHT = 40" in content
-
-    # 5. edit_file_atomic succeeds with invalid expected_sha256
+    # 4. edit_file_atomic succeeds with invalid expected_sha256
     tool.edit_file_atomic(
-        "model.py",
+        "model.scad",
         [{"old_string": "WIDTH = 25", "new_string": "WIDTH = 30"}],
         expected_sha256="0" * 32,
     )
-    assert "WIDTH = 30" in (tmp_path / "model.py").read_text(encoding="utf-8")
+    assert "WIDTH = 30" in (tmp_path / "model.scad").read_text(encoding="utf-8")
 
 
 def test_tool_schemas_do_not_expose_sha_parameters() -> None:
@@ -1084,35 +1052,33 @@ def test_tool_schemas_streamlined_to_five_core_tools() -> None:
 
 def test_edit_file_dispatcher_supports_root_level_strings_and_dict(tmp_path: Path) -> None:
     """Dispatcher must accept root-level old_string/new_string and single edit dict."""
-    from agent.dispatcher import dispatch
     from agent.core import ProjectTools
+    from agent.dispatcher import dispatch
 
     tools = ProjectTools(tmp_path, lambda *args: None)
-    tools.file.write_file("model.py", "WIDTH = 10\nHEIGHT = 20\n")
+    tools.file.write_file("model.scad", "WIDTH = 10;\nHEIGHT = 20;\n")
 
     # Root-level old_string and new_string
-    result, waiting = dispatch(tools, "test", "edit_file", {"old_string": "WIDTH = 10", "new_string": "WIDTH = 15"})
+    _result, waiting = dispatch(tools, "test", "edit_file", {"old_string": "WIDTH = 10;", "new_string": "WIDTH = 15;"})
     assert not waiting
-    assert "WIDTH = 15" in (tmp_path / "model.py").read_text(encoding="utf-8")
+    assert "WIDTH = 15;" in (tmp_path / "model.scad").read_text(encoding="utf-8")
 
     # Dict in edits
-    result, waiting = dispatch(tools, "test", "edit_file", {"edits": {"old_string": "HEIGHT = 20", "new_string": "HEIGHT = 25"}})
+    _result, waiting = dispatch(tools, "test", "edit_file", {"edits": {"old_string": "HEIGHT = 20;", "new_string": "HEIGHT = 25;"}})
     assert not waiting
-    assert "HEIGHT = 25" in (tmp_path / "model.py").read_text(encoding="utf-8")
+    assert "HEIGHT = 25;" in (tmp_path / "model.scad").read_text(encoding="utf-8")
 
 
-def test_write_file_does_not_emit_preflight_warning_for_indexed_selectors(tmp_path: Path) -> None:
-    """Writing idiomatic build123d indexed selectors must not emit PRE-FLIGHT WARNING."""
+def test_write_file_does_not_emit_preflight_warning_for_valid_code(tmp_path: Path) -> None:
+    """Writing valid OpenSCAD code must not emit PRE-FLIGHT WARNING."""
     tool = FileTool(tmp_path)
     code = (
-        "from build123d import Box, Axis\n"
-        "box = Box(10, 10, 10)\n"
-        "top_edges = box.edges().sort_by(Axis.Z)[-1]\n"
-        "result = box\n"
+        "WIDTH = 10;\n"
+        "cube([WIDTH, 10, 10]);\n"
     )
-    result = tool.write_file("model.py", code)
+    result = tool.write_file("model.scad", code)
     assert "PRE-FLIGHT WARNING" not in result
-    assert "Wrote model.py" in result
+    assert "Wrote model.scad" in result
 
 
 def test_read_file_defaults_to_full_file(tmp_path: Path) -> None:
@@ -1120,29 +1086,47 @@ def test_read_file_defaults_to_full_file(tmp_path: Path) -> None:
     import json
     tool = FileTool(tmp_path)
     code = "line1\nline2\nline3\n"
-    tool.write_file("model.py", code)
+    tool.write_file("model.scad", code)
 
-    res = json.loads(tool.read_file("model.py"))
+    res = tool.read_file("model.scad")
+    assert isinstance(res, dict), "read_file must return a dict, not a JSON string."
     assert res["content"] == code
     assert res["total_lines"] == 3
+
+    # ``tool_success`` is responsible for the JSON envelope; verify the
+    # round-trip works end-to-end without producing a double-encoded blob.
+    # The ``data`` field must hold a *dict* (not a stringified JSON blob):
+    # a double-encoded ``data`` would surface as ``envelope["data"]`` being
+    # a ``str`` and ``json.loads(envelope["data"])`` would still parse, but
+    # the model receives needlessly escaped newlines / quotes. Asserting
+    # ``isinstance(..., dict)`` catches regressions cheaply.
+    envelope = json.loads(tool_results.success("read_file", res))
+    assert isinstance(envelope["data"], dict), (
+        "tool_success must surface read_file's dict payload as-is, "
+        "without an extra JSON encoding layer."
+    )
+    inner = envelope["data"]
+    assert inner["exists"] is True
+    assert inner["content"] == code
 
 
 def test_edit_file_dispatcher_edge_cases(tmp_path: Path) -> None:
     """Dispatcher must handle None new_string, empty edits list with old_string, and reject malformed edits."""
     import pytest
-    from agent.dispatcher import dispatch
+
     from agent.core import ProjectTools
+    from agent.dispatcher import dispatch
 
     tools = ProjectTools(tmp_path, lambda *args: None)
-    tools.file.write_file("model.py", "WIDTH = 10\nHEIGHT = 20\nDEPTH = 30\n")
+    tools.file.write_file("model.scad", "WIDTH = 10;\nHEIGHT = 20;\nDEPTH = 30;\n")
 
     # 1. new_string is None or omitted (treated as deletion)
-    dispatch(tools, "test", "edit_file", {"old_string": "DEPTH = 30\n", "new_string": None})
-    assert "DEPTH = 30" not in (tmp_path / "model.py").read_text(encoding="utf-8")
+    dispatch(tools, "test", "edit_file", {"old_string": "DEPTH = 30;\n", "new_string": None})
+    assert "DEPTH = 30;" not in (tmp_path / "model.scad").read_text(encoding="utf-8")
 
     # 2. edits is [] but old_string is provided at top level
-    dispatch(tools, "test", "edit_file", {"old_string": "HEIGHT = 20", "new_string": "HEIGHT = 22", "edits": []})
-    assert "HEIGHT = 22" in (tmp_path / "model.py").read_text(encoding="utf-8")
+    dispatch(tools, "test", "edit_file", {"old_string": "HEIGHT = 20;", "new_string": "HEIGHT = 22;", "edits": []})
+    assert "HEIGHT = 22;" in (tmp_path / "model.scad").read_text(encoding="utf-8")
 
     # 3. edits contains non-dict element
     with pytest.raises(ValueError, match="must be a list of objects"):
@@ -1153,8 +1137,8 @@ def test_edit_file_dispatcher_edge_cases(tmp_path: Path) -> None:
         dispatch(tools, "test", "edit_file", {"edits": []})
 
     # 5. atomic edit with new_string=None deletes
-    tools.file.edit_file_atomic("model.py", [{"old_string": "HEIGHT = 22\n", "new_string": None}])
-    assert "HEIGHT = 22" not in (tmp_path / "model.py").read_text(encoding="utf-8")
+    tools.file.edit_file_atomic("model.scad", [{"old_string": "HEIGHT = 22;\n", "new_string": None}])
+    assert "HEIGHT = 22;" not in (tmp_path / "model.scad").read_text(encoding="utf-8")
 
 
 def test_edit_file_whitespace_tolerance(tmp_path: Path) -> None:
@@ -1163,64 +1147,65 @@ def test_edit_file_whitespace_tolerance(tmp_path: Path) -> None:
 
     tool = FileTool(tmp_path)
     initial_code = (
-        "from build123d import *\n\n"
         "hex_pts = [\n"
-        "    (a, a)\n"
-        "    for a in (30, 90, 150)  # vertex\n"
-        "]\n\n"
-        "with BuildPart() as model:\n"
-        "    with Locations((0, 0, 0)):\n"
-        "        Box(10, 10, 10)\n"
+        "    [30, 30],\n"
+        "    [90, 90]  // vertex\n"
+        "];\n\n"
+        "union() {\n"
+        "    translate([0, 0, 0]) {\n"
+        "        cube([10, 10, 10]);\n"
+        "    }\n"
+        "}\n"
     )
-    tool.write_file("model.py", initial_code)
+    tool.write_file("model.scad", initial_code)
 
     # 1. Single-line indentation mismatch (LLM passes 8 spaces, file has 4 spaces)
     tool.edit_file(
-        "model.py",
-        "        for a in (30, 90, 150)  # vertex",
-        "        for a in (0, 60, 120)  # peaked vertex",
+        "model.scad",
+        "        [90, 90]  // vertex",
+        "        [60, 60]  // peaked vertex",
     )
-    content = (tmp_path / "model.py").read_text(encoding="utf-8")
-    assert "    for a in (0, 60, 120)  # peaked vertex" in content
+    content = (tmp_path / "model.scad").read_text(encoding="utf-8")
+    assert "    [60, 60]  // peaked vertex" in content
 
     # 2. Multi-line nested block with indent mismatch (re-aligns to file indent)
     tool.edit_file(
-        "model.py",
-        "        with Locations((0, 0, 0)):\n            Box(10, 10, 10)",
-        "        with Locations((0, 0, 5)):\n            Cylinder(5, 10)",
+        "model.scad",
+        "        translate([0, 0, 0]) {\n            cube([10, 10, 10]);",
+        "        translate([0, 0, 5]) {\n            cylinder(r=5, h=10);",
     )
-    content = (tmp_path / "model.py").read_text(encoding="utf-8")
-    assert "    with Locations((0, 0, 5)):\n        Cylinder(5, 10)" in content
+    content = (tmp_path / "model.scad").read_text(encoding="utf-8")
+    assert "    translate([0, 0, 5]) {\n        cylinder(r=5, h=10);" in content
 
     # 3. edit_file_atomic handles multiple edits with whitespace discrepancies
     tool.edit_file_atomic(
-        "model.py",
+        "model.scad",
         [
             {
-                "old_string": "    for a in (0, 60, 120)  # peaked vertex   ",  # trailing spaces
-                "new_string": "    for a in (0, 60)",
+                "old_string": "    [60, 60]  // peaked vertex   ",  # trailing spaces
+                "new_string": "    [0, 0]",
             },
             {
-                "old_string": "        Cylinder(5, 10)",  # 8 spaces instead of 8 (or 4)
-                "new_string": "        Cylinder(6, 12)",
+                "old_string": "        cylinder(r=5, h=10);",
+                "new_string": "        cylinder(r=6, h=12);",
             },
         ],
     )
-    content = (tmp_path / "model.py").read_text(encoding="utf-8")
-    assert "    for a in (0, 60)" in content
-    assert "        Cylinder(6, 12)" in content
+    content = (tmp_path / "model.scad").read_text(encoding="utf-8")
+    assert "    [0, 0]" in content
+    assert "        cylinder(r=6, h=12);" in content
 
 
 def test_failure_signature_threshold_allows_escalation() -> None:
     """AgentRunner must allow 2 retries (total 3 attempts on same error) before stopping."""
     from agent.core import AgentRunner
 
-    err_msg = 'CAD execution failed:\n  File "model.py", line 111\nValueError: Expected 1 shelf fillet edge, found 0'
+    err_msg = 'CAD execution failed:\n  File "model.scad", line 111\nERROR: Parser error'
     sig = AgentRunner._failure_signature(err_msg)
     assert len(sig) == 16
 
     # Verify line numbers are normalized in signature
-    err_msg_diff_line = 'CAD execution failed:\n  File "model.py", line 125\nValueError: Expected 1 shelf fillet edge, found 0'
+    err_msg_diff_line = 'CAD execution failed:\n  File "model.scad", line 125\nERROR: Parser error'
     sig_diff_line = AgentRunner._failure_signature(err_msg_diff_line)
     assert sig == sig_diff_line
 
@@ -1236,3 +1221,98 @@ def test_failure_signature_threshold_allows_escalation() -> None:
     # Attempt 3: Second repair attempt fails with same error -> now terminates
     signatures[sig] = signatures.get(sig, 0) + 1
     assert signatures[sig] >= 3, "Attempt 3 must terminate repeated failures"
+
+
+def test_cad_tool_failure_detail_preserves_multiline_errors() -> None:
+    """CadTool._failure_detail must preserve error details on lines following RuntimeError."""
+    from agent.tools.cad_tool import CadTool
+
+    traceback_text = (
+        'Traceback (most recent call last):\n'
+        '  File "runner.py", line 440, in <module>\n'
+        '    main()\n'
+        '  File "runner.py", line 338, in _run_model\n'
+        '    raise RuntimeError(f"OpenSCAD execution failed:\\n{summary}")\n'
+        'RuntimeError: OpenSCAD execution failed:\n'
+        'ERROR: Parser error: syntax error in file model.scad, line 10\n'
+        "Can't parse file 'model.scad'!\n"
+    )
+    detail = CadTool._failure_detail(traceback_text)
+    assert "ERROR: Parser error: syntax error in file model.scad, line 10" in detail
+    assert "Can't parse file 'model.scad'!" in detail
+
+
+def test_sanitize_assistant_message_handles_reasoning_content() -> None:
+    """sanitize_assistant_message must strip or normalize reasoning_content and drop empty reasoning."""
+    # When preserve_reasoning is False, reasoning_content is dropped
+    msg = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "test"}}],
+        "reasoning_content": "thinking...",
+    }
+    sanitized = sanitize_assistant_message(msg, preserve_reasoning=False)
+    assert "reasoning_content" not in sanitized
+    assert "reasoning" not in sanitized
+
+    # When preserve_reasoning is True, non-empty reasoning_content is normalized to reasoning
+    sanitized_preserved = sanitize_assistant_message(msg, preserve_reasoning=True)
+    assert "reasoning_content" not in sanitized_preserved
+    assert sanitized_preserved.get("reasoning") == "thinking..."
+
+    # Empty reasoning and empty reasoning_content are always stripped
+    empty_msg = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [],
+        "reasoning": "   ",
+        "reasoning_content": "",
+    }
+    sanitized_empty = sanitize_assistant_message(empty_msg, preserve_reasoning=True)
+    assert "reasoning_content" not in sanitized_empty
+    assert "reasoning" not in sanitized_empty
+
+
+def test_normalize_messages_merges_consecutive_user_messages() -> None:
+    """normalize_messages must merge adjacent user messages to satisfy strict role alternation."""
+    messages = [
+        {"role": "system", "content": "You are a CAD assistant."},
+        {"role": "user", "content": "<project_state>model.scad does not exist</project_state>"},
+        {"role": "user", "content": "Create a mounting plate."},
+        {"role": "assistant", "content": "Done."},
+        {"role": "user", "content": "Follow-up question."},
+    ]
+    normalized = normalize_messages(messages)
+    assert len(normalized) == 4
+    assert normalized[0]["role"] == "system"
+    assert normalized[1]["role"] == "user"
+    assert "<project_state>model.scad does not exist</project_state>\n\nCreate a mounting plate." == normalized[1]["content"]
+    assert normalized[2]["role"] == "assistant"
+    assert normalized[3]["role"] == "user"
+
+
+def test_initial_project_state_immutability(tmp_path: Path) -> None:
+    """_initial_model_existed ensures project state remains immutable across turns."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    project_dir = workspace / "fresh-proj"
+    project_dir.mkdir()
+
+    settings = Settings(workspace, "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    runner = AgentRunner(settings, publish=lambda *args, **kwargs: None)
+
+    # Initial turn: model does not exist
+    c1 = runner._context(project_dir, "Create plate", [])
+    assert "model.scad does not exist" in c1[1]["content"]
+
+    # Model is created on disk by a write_file tool
+    (project_dir / "model.scad").write_text("cube([10, 10, 10]);", encoding="utf-8")
+    ConversationStore.append(project_dir, {
+        "role": "assistant",
+        "tool_calls": [{"function": {"name": "write_file"}}]
+    })
+
+    # Second turn: state MUST remain 'does not exist' so the prefix cache is not invalidated
+    c2 = runner._context(project_dir, "Drill hole", [])
+    assert "model.scad does not exist" in c2[1]["content"]
+
