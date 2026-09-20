@@ -546,7 +546,8 @@ def parse_chat_stream(
     if finish_reason == "length":
         raise RuntimeError(
             f"{provider_label} completion was truncated (finish_reason='length'); "
-            "no tool calls were executed."
+            "no tool calls were executed. Consider increasing 'llm.max_completion_tokens' "
+            "in config.yaml or reducing 'reasoning_effort'."
         )
     # Some reasoning-first models (Anthropic extended thinking, OpenAI o-series,
     # Gemini thinking) emit reasoning deltas with no text content and finish
@@ -994,7 +995,9 @@ class ChatCompletionsClient:
                         if choices and choices[0].get("finish_reason") == "length":
                             raise RuntimeError(
                                 f"{self._provider_label} completion was truncated "
-                                "(finish_reason='length'); no tool calls were executed."
+                                "(finish_reason='length'); no tool calls were executed. "
+                                "Consider increasing 'llm.max_completion_tokens' "
+                                "in config.yaml or reducing 'reasoning_effort'."
                             )
                         return body
                 if log_payload:

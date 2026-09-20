@@ -98,6 +98,8 @@ function renderAgentContent(item, text) {
 
 function addMessage(text, type = 'agent', options = {}) {
   const target = options.target || feed;
+  const empty = target.querySelector('.empty-state');
+  if (empty) empty.remove();
   const item = document.createElement('div');
   item.className = `message ${type}`;
   item.dataset.raw = text;
@@ -587,17 +589,11 @@ async function loadCurrentState() {
   if (!currentProject) return;
   const data = await api(`/api/projects/${encodeURIComponent(currentProject)}/state`);
   if (data.status === 'waiting_for_user') {
+    setThinking(false);
     const q = data.question || {};
-    if (q.questions) {
-      const firstQ = q.questions[0] || {};
-      const preview = q.questions.length > 1
-        ? `${q.title || 'Questions'} (${q.questions.length} fields)`
-        : firstQ.question || '';
-      if (preview) addMessage(preview);
-    } else if (q.question) {
-      addMessage(q.question);
+    if (!questionArea.querySelector('.question-form')) {
+      showQuestion({project: currentProject, ...q});
     }
-    showQuestion({project: currentProject, ...q});
   } else if (data.status === 'running') {
     setThinking(true);
   } else if (data.status === 'idle') {
@@ -652,12 +648,12 @@ async function loadHistory(projectName, options = {}) {
     for (const evt of data.events) {
       const role = evt.role || '';
       const raw = evt.content;
-      const text = role === 'user' ? normalizeHistoryContent(raw) : (raw || '');
+      const text = normalizeHistoryContent(raw);
       if (role === 'user') {
         addMessage(text, 'user', {target});
         renderedAny = true;
       } else if (role === 'assistant' || role === 'agent') {
-        if (evt.tool_calls || !String(text).trim()) continue;
+        if (!String(text).trim()) continue;
         addMessage(text, 'agent', {target});
         renderedAny = true;
       } else if (evt.type === 'agent_error') {
@@ -1043,19 +1039,19 @@ function showQuestion(question) {
       });
     });
   } else if (question.question) {
-    fields.push({ id: 'answer', label: question.question, options: question.options || [], type: 'text' });
+    fields.push({ id: 'answer', label: question.question, options: question.options || [], type: question.input_type || 'text' });
   }
   for (const field of fields) {
     const label = document.createElement('label');
     label.textContent = field.label;
     let input;
-    if (field.options?.length && field.type !== 'multiselect') {
+    if (field.type === 'select' || (!field.type && field.options?.length)) {
       input = document.createElement('select');
-      input.required = true;
-      for (const opt of field.options) {
+      if (field.required) input.required = true;
+      for (const opt of field.options || []) {
         const optionEl = document.createElement('option');
-        optionEl.value = opt.value || opt;
-        optionEl.textContent = opt.label || opt;
+        optionEl.value = opt.value !== undefined ? opt.value : opt;
+        optionEl.textContent = opt.label !== undefined ? opt.label : opt;
         input.appendChild(optionEl);
       }
     } else if (field.type === 'number') {
@@ -1064,10 +1060,10 @@ function showQuestion(question) {
     } else if (field.type === 'multiselect') {
       input = document.createElement('select');
       input.multiple = true;
-      for (const opt of field.options) {
+      for (const opt of field.options || []) {
         const optionEl = document.createElement('option');
-        optionEl.value = opt;
-        optionEl.textContent = opt;
+        optionEl.value = opt.value !== undefined ? opt.value : opt;
+        optionEl.textContent = opt.label !== undefined ? opt.label : opt;
         input.appendChild(optionEl);
       }
     } else if (field.type === 'textarea') {
@@ -1088,12 +1084,18 @@ function showQuestion(question) {
   form.addEventListener('submit', async event => {
     event.preventDefault();
     const answers = {};
+    const answerLines = ['User answers:'];
     for (const field of fields) {
       const el = form.elements.namedItem(field.id);
       if (el) {
-        answers[field.id] = field.type === 'multiselect'
+        const val = field.type === 'multiselect'
           ? Array.from(el.selectedOptions).map(option => option.value)
           : el.value;
+        answers[field.id] = val;
+        if (val !== undefined && val !== '') {
+          const displayVal = Array.isArray(val) ? val.join(', ') : val;
+          answerLines.push(`- ${field.label}: ${displayVal}`);
+        }
       }
     }
     submit.disabled = true;
@@ -1104,6 +1106,8 @@ function showQuestion(question) {
         body: JSON.stringify({project: currentProject, answers}),
       });
       questionArea.replaceChildren();
+      addMessage(answerLines.join('\n'), 'user');
+      setThinking(true);
     } catch (error) {
       addMessage(error.message, 'error');
       submit.disabled = false;
@@ -1124,6 +1128,8 @@ let pendingFinalCard = null;
 
 function startStreamingCard(messageId) {
   if (!messageId || streamingMessages.has(messageId)) return streamingMessages.get(messageId);
+  const empty = feed.querySelector('.empty-state');
+  if (empty) empty.remove();
   const item = document.createElement('div');
   item.className = 'message agent';
   item.dataset.raw = '';
@@ -1213,12 +1219,13 @@ function connectStream() {
       });
       if (data.status === 'started' || data.status === 'reviewing') {
         setThinking(true);
-      } else if (['stopped', 'failed', 'completed'].includes(data.status)) {
+      } else if (['stopped', 'failed', 'completed', 'waiting_for_user'].includes(data.status)) {
         setThinking(false);
       }
     },
     question: data => {
       if (data.project !== currentProject) return;
+      setThinking(false);
       showQuestion(data);
     },
     agent_content_delta: data => {
@@ -1404,11 +1411,11 @@ document.addEventListener('click', event => {
 
 (async function init() {
   if (!currentProject) return;
-  await loadCurrentState();
   // Load the persisted conversation into the main feed so reopening a
   // project immediately shows its history. The empty-state element is
   // removed automatically once any displayable message is rendered.
   await loadHistory(currentProject);
+  await loadCurrentState();
   await syncCurrentPreview();
   connectStream();
 })();

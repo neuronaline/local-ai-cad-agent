@@ -12,10 +12,15 @@ def normalize_questions(args: dict) -> list[dict]:
     """Normalize the legacy flat question format into the list format."""
     questions = args.get("questions")
     if "questions" in args:
+        if isinstance(questions, dict):
+            return [questions]
         if not isinstance(questions, list):
             raise ValueError("'questions' must be a list.")
         return questions
-    input_type = args.get("input_type", "text")
+    input_type = args.get("input_type")
+    if not input_type:
+        raw_opts = args.get("options")
+        input_type = "select" if isinstance(raw_opts, list) and len(raw_opts) >= 2 else "text"
     options = args.get("options") if input_type in {"select", "multiselect"} else []
     question_text = args.get("question", "")
     if not isinstance(question_text, str) or not question_text.strip():
@@ -44,36 +49,52 @@ class QuestionTool:
         if not isinstance(questions, list) or not questions:
             raise ValueError("At least one question is required.")
         if len(questions) > 3:
-            raise ValueError("At most three questions may be asked in one batch.")
+            questions[:] = questions[:3]
         seen: set[str] = set()
         for i, item in enumerate(questions):
             if not isinstance(item, dict):
                 raise ValueError(f"Question {i} must be an object.")
             qid = item.get("id")
-            if not isinstance(qid, str) or not qid.strip():
-                raise ValueError(f"Question {i}: a non-empty string 'id' is required.")
+            if qid is None or (isinstance(qid, str) and not qid.strip()):
+                qid = f"q{i+1}"
+            elif isinstance(qid, (int, float)):
+                qid = str(qid)
+            elif not isinstance(qid, str):
+                qid = f"q{i+1}"
             qid = qid.strip()
             if qid in seen:
-                raise ValueError(f"Duplicate question id: {qid}")
+                qid = f"{qid}_{i+1}"
             seen.add(qid)
+            item["id"] = qid
+
             text = item.get("question", "")
             if not isinstance(text, str) or not text.strip():
                 raise ValueError(f"Question '{qid}': text cannot be empty.")
-            input_type = item.get("input_type", "text")
+            input_type = item.get("input_type")
+            if not input_type:
+                raw_opts = item.get("options")
+                input_type = "select" if isinstance(raw_opts, list) and len(raw_opts) >= 2 else "text"
+                item["input_type"] = input_type
             if input_type not in INPUT_TYPES:
                 raise ValueError(
                     f"Question '{qid}': input_type must be one of {sorted(INPUT_TYPES)}."
                 )
             if input_type in SINGLE_CHOICE_TYPES:
                 options = item.get("options", [])
-                if (
-                    not isinstance(options, list)
-                    or len(options) < 2
-                    or not all(isinstance(o, str) and o.strip() for o in options)
-                ):
-                    raise ValueError(
-                        f"Question '{qid}': {input_type} requires at least two non-empty string options."
-                    )
+                if isinstance(options, list):
+                    item["options"] = [
+                        str(o).strip()
+                        for o in options
+                        if o is not None and str(o).strip()
+                    ]
+                else:
+                    item["options"] = []
+                if len(item["options"]) < 2:
+                    input_type = "text"
+                    item["input_type"] = "text"
+                    item["options"] = []
+            else:
+                item.pop("options", None)
 
     def execute(self, args: dict, project: str = "") -> tuple[str, bool, list[dict]]:
         """Validate, normalize, and publish questions.

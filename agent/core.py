@@ -1151,9 +1151,13 @@ class AgentRunner:
                     for q in questions:
                         qid = q.get("id", "")
                         qtext = q.get("question", qid)
-                        value = answers.get(qid, "")
-                        if value:
-                            lines.append(f"- {qtext}: {value}")
+                        value = answers.get(qid)
+                        if value is not None and value != "":
+                            if isinstance(value, list):
+                                formatted_val = ", ".join(str(v) for v in value)
+                            else:
+                                formatted_val = str(value)
+                            lines.append(f"- {qtext}: {formatted_val}")
                     return "\n".join(lines)
         return answer
 
@@ -1195,7 +1199,7 @@ def _close_dangling_tool_tail(
     """
     if not messages or messages[-1].get("role") != "tool":
         return False
-    item = {"role": "assistant", "content": content}
+    item = {"role": "assistant", "content": content, "synthetic": True}
     messages.append(item)
     ConversationStore.append(project_dir, item)
     return True

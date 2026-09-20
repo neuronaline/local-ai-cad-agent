@@ -13,7 +13,7 @@ agent:
 # losing either configuration.
 llm:
   provider: openrouter
-  max_completion_tokens: 8192
+  max_completion_tokens: 32768
   # Optional secondary provider that takes over if the primary client
   # raises a non-cancellation error after its own retry loop is exhausted.
   # Must differ from ``provider`` above; leave as ``""`` to disable.
@@ -33,7 +33,8 @@ openrouter:
   # as ``"z-ai/fp8"`` or ``"novita/fp8"``. Leave empty to fall back to the
   # legacy ``provider`` string below.
   provider_order:
-    - z-ai/fp8
+    - google-ai-studio
+    - google-vertex/global
   # Legacy single-provider config. Only consulted when ``provider_order`` is
   # empty. Pair with ``force_provider: true`` to pin to one upstream with no
   # fallback fanout; otherwise OpenRouter routes to a less-loaded peer if the
@@ -51,7 +52,7 @@ openai:
 
 server:
   host: 127.0.0.1
-  port: 5000
+  port: 8000
 
 ui:
   show_info_messages: true

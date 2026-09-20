@@ -9,6 +9,7 @@ construction, terminal events) instead of re-stating which tool does what.
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -22,6 +23,164 @@ from agent.tool_results import (
 )
 from agent.tool_results import failure as tool_failure
 from agent.tool_results import success as tool_success
+
+
+def _is_empty_or_none(val: object) -> bool:
+    """True if a value represents absence of content (None, empty string, or empty container).
+
+    Numeric 0/0.0 and boolean False are valid domain values and are NEVER considered empty.
+    """
+    if val is None:
+        return True
+    if isinstance(val, str) and not val.strip():
+        return True
+    if isinstance(val, (list, dict, set)) and len(val) == 0:
+        return True
+    return False
+
+
+def _pick_intended_value(key: str, existing: object, candidate: object) -> object:
+    """Resolve conflicting values for duplicate keys emitted by streaming LLMs."""
+    # If one value represents absence of content, pick the other non-empty value.
+    if _is_empty_or_none(candidate) and not _is_empty_or_none(existing):
+        return existing
+    if _is_empty_or_none(existing) and not _is_empty_or_none(candidate):
+        return candidate
+
+    # Both values are non-empty. For primary code payloads (content/code in OpenSCAD files),
+    # pick the substantial payload (longest non-empty string) to prevent token leaks
+    # (e.g. "FEMALE" or trailing quotes) from overwriting multi-line OpenSCAD models.
+    if key in ("content", "code") and isinstance(existing, str) and isinstance(candidate, str):
+        return candidate if len(candidate) > len(existing) else existing
+
+    # For all other keys (or equal values), preserve the first emitted value.
+    return existing
+
+
+def _deduplicate_tool_keys(pairs: list) -> dict:
+    """Parse JSON key-value pairs, resolving duplicates to the intended payload.
+
+    Python's stdlib :func:`json.loads` silently keeps the *last* value when
+    a key is repeated, which masks streaming tokenization mistakes from
+    upstream LLMs (e.g. ``write_file`` called with
+    ``{"content": "<huge SCAD body>", "content": "FEMALE"}`` where ``FEMALE``
+    overwrote the full model). Conversely, strictly rejecting duplicate keys
+    with an error causes LLMs to retry and repeatedly emit the same tokenization
+    artifact until the task halts.
+
+    This hook safely deduplicates keys by selecting the non-empty, most substantial
+    value (or the first emitted value when equivalent) so the real payload
+    reaches the tool without crashing or corrupting files.
+    """
+    result: dict = {}
+    for key, value in pairs:
+        if not isinstance(key, str):
+            raise ValueError(
+                "Tool arguments must use string keys; "
+                f"got {type(key).__name__}."
+            )
+        if key in result:
+            result[key] = _pick_intended_value(key, result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def _clean_code_fences(code: str) -> str:
+    """Strip markdown code block fences if an LLM wraps code in ```scad ... ```."""
+    if not isinstance(code, str):
+        return ""
+    text = code.strip()
+    if not text.startswith("```"):
+        return code
+    lines = text.splitlines()
+    if len(lines) == 1:
+        line = lines[0]
+        if line.endswith("```") and len(line) >= 6:
+            inner = line[3:-3].strip()
+            m = re.match(r"^[a-zA-Z0-9_-]+\s+(.*)$", inner)
+            if m:
+                return m.group(1)
+            return inner
+        return code
+    if lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines)
+
+
+def _strip_json_trailing_commas(text: str) -> str:
+    r"""Remove trailing commas before '}' or ']' outside of JSON string literals.
+
+    A naive regex like `re.sub(r",\s*([}\]])", ...)` corrupts valid code inside
+    JSON strings (such as OpenSCAD matrices `[[0,0], [1,1], ]`). This scanner
+    tracks string-literal boundaries so that only structural trailing commas
+    in the JSON itself are removed.
+    """
+    out: list[str] = []
+    in_string = False
+    escape = False
+    comma_idx = -1
+    for char in text:
+        if in_string:
+            out.append(char)
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+        else:
+            if char == '"':
+                in_string = True
+                out.append(char)
+            elif char == ",":
+                comma_idx = len(out)
+                out.append(char)
+            elif char in ("}", "]"):
+                if comma_idx != -1 and all(c.isspace() for c in out[comma_idx + 1:]):
+                    out.pop(comma_idx)
+                comma_idx = -1
+                out.append(char)
+            else:
+                if not char.isspace():
+                    comma_idx = -1
+                out.append(char)
+    return "".join(out)
+
+
+def _parse_tool_arguments(argument_text: str | None) -> dict:
+    """Parse tool-call ``arguments`` JSON, safely deduplicating keys and handling
+    common LLM syntax artifacts like markdown code blocks and trailing commas.
+    """
+    text = argument_text or ""
+    text = text.strip()
+    if not text:
+        return {}
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+        if not text:
+            return {}
+    try:
+        parsed = json.loads(text, object_pairs_hook=_deduplicate_tool_keys)
+    except ValueError:
+        cleaned = _strip_json_trailing_commas(text)
+        if cleaned != text:
+            try:
+                parsed = json.loads(cleaned, object_pairs_hook=_deduplicate_tool_keys)
+            except ValueError:
+                raise
+        else:
+            raise
+    if not isinstance(parsed, dict):
+        raise ValueError("Tool arguments must be a JSON object.")
+    return parsed
 
 
 def is_model_mutation(name: str) -> bool:
@@ -38,9 +197,17 @@ def is_cad_build(name: str) -> bool:
 def _build_render(arguments: dict) -> bool:
     """Resolve the optional render switch used by CAD build calls."""
     render = arguments.get("render", True)
-    if not isinstance(render, bool):
-        raise ValueError("cad_build_and_verify render must be a boolean.")
-    return render
+    if isinstance(render, bool):
+        return render
+    if isinstance(render, str):
+        val = render.strip().lower()
+        if val in ("true", "1", "yes"):
+            return True
+        if val in ("false", "0", "no"):
+            return False
+    if isinstance(render, (int, float)):
+        return bool(render)
+    return True
 
 
 def dispatch(
@@ -70,11 +237,22 @@ def dispatch(
         tool = (
             tools.file.with_call_id(call_id) if call_id else tools.file
         )
+        raw_offset = args.get("offset")
+        raw_limit = args.get("limit")
+        try:
+            offset = int(raw_offset) if raw_offset is not None else 1
+        except (ValueError, TypeError):
+            offset = 1
+        offset = max(1, offset)
+        try:
+            limit = int(raw_limit) if raw_limit is not None else None
+        except (ValueError, TypeError):
+            limit = None
         return (
             tool.read_file(
                 MODEL_FILENAME,
-                args.get("offset") or 1,
-                args.get("limit"),
+                offset,
+                limit,
             ),
             False,
         )
@@ -82,10 +260,16 @@ def dispatch(
         tool = (
             tools.file.with_call_id(call_id) if call_id else tools.file
         )
+        content = args.get("content")
+        if content is None:
+            content = args.get("code", "")
+        clean_content = _clean_code_fences(
+            content if isinstance(content, str) else str(content or "")
+        )
         return (
             tool.write_file(
                 MODEL_FILENAME,
-                args.get("content", ""),
+                clean_content,
             ),
             False,
         )
@@ -131,16 +315,31 @@ def _dispatch_edit_file(file_tool, args: dict, call_id: str) -> tuple[object, bo
             raise ValueError("edit_file 'edits' must be a list of objects.")
         old_str = entry.get("old_string")
         new_str = entry.get("new_string")
+        clean_new = _clean_code_fences(
+            new_str if isinstance(new_str, str) else ("" if new_str is None else str(new_str))
+        )
         return (
             tool.edit_file(
                 MODEL_FILENAME,
                 "" if old_str is None else old_str,
-                "" if new_str is None else new_str,
+                clean_new,
             ),
             False,
         )
+    cleaned_edits = []
+    for entry in edits:
+        if isinstance(entry, dict):
+            ns = entry.get("new_string")
+            cleaned_edits.append({
+                **entry,
+                "new_string": _clean_code_fences(
+                    ns if isinstance(ns, str) else ("" if ns is None else str(ns))
+                ),
+            })
+        else:
+            cleaned_edits.append(entry)
     return (
-        tool.edit_file_atomic(MODEL_FILENAME, edits),
+        tool.edit_file_atomic(MODEL_FILENAME, cleaned_edits),
         False,
     )
 
@@ -239,9 +438,9 @@ def process_tool_call(
         argument_text = (
             function.get("arguments") if isinstance(function, dict) else ""
         )
-        arguments = json.loads(argument_text or "{}")
-        if not isinstance(arguments, dict):
-            raise TypeError("Tool arguments must be a JSON object.")
+        arguments = _parse_tool_arguments(
+            argument_text if isinstance(argument_text, str) else ""
+        )
         tool_event = {
             "project": project,
             "call_id": call_id,

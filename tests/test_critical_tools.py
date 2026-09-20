@@ -100,6 +100,228 @@ def test_question_validator_number_with_units() -> None:
     assert not QuestionValidator.validate(q, "10 mm extra")
 
 
+def test_parse_tool_arguments_deduplicates_keys() -> None:
+    """Regression: streaming LLMs occasionally emit duplicate JSON keys.
+
+    Python's stdlib ``json.loads`` silently keeps the LAST value when keys
+    repeat, which in production corrupted ``model.scad`` — the LLM intended
+    the OpenSCAD body but the dispatcher only saw a 6-char literal
+    (``"FEMALE"``) or empty string (``""``). Strictly rejecting duplicate
+    keys caused LLMs to enter an unrecoverable error loop. The parser now
+    safely deduplicates keys by picking the non-empty, substantial payload.
+    """
+    from agent.dispatcher import _parse_tool_arguments
+
+    # Baseline: clean JSON still parses.
+    assert _parse_tool_arguments('{"content": "WIDTH = 10;"}') == {
+        "content": "WIDTH = 10;"
+    }
+    assert _parse_tool_arguments("") == {}
+    assert _parse_tool_arguments("   \n\t  ") == {}
+
+    # Empty / non-object payloads surface a clear error.
+    with pytest.raises(ValueError, match="Tool arguments must be a JSON object"):
+        _parse_tool_arguments("[1, 2, 3]")
+    with pytest.raises(ValueError, match="Expecting property name"):
+        _parse_tool_arguments("{not json")
+
+    # The failure mode from docs/temp_files/raw-api.json: a ``write_file``
+    # call where the LLM emitted ``content`` twice and the second value
+    # (a 6-char literal) was previously winning. It must keep the real code.
+    assert _parse_tool_arguments(
+        '{"content": "WIDTH = 65;\\nEPS = 0.01;\\n", "content": "FEMALE"}'
+    ) == {"content": "WIDTH = 65;\nEPS = 0.01;\n"}
+
+    # The trailing empty string failure mode from raw-api.json and raw-api-2.json.
+    assert _parse_tool_arguments(
+        '{"content": "WIDTH = 65;\\n", "content": "", "content": ""}'
+    ) == {"content": "WIDTH = 65;\n"}
+
+    # Reverse order: empty first, real content second.
+    assert _parse_tool_arguments(
+        '{"content": "", "content": "WIDTH = 65;\\n"}'
+    ) == {"content": "WIDTH = 65;\n"}
+
+    # Equal-length or other duplicate keys preserve the first emitted value.
+    assert _parse_tool_arguments(
+        '{"old_string": "a", "new_string": "b", "old_string": "c"}'
+    ) == {"old_string": "a", "new_string": "b"}
+    assert _parse_tool_arguments(
+        '{"old_string": "a", "new_string": "b", "old_string": "ccc"}'
+    ) == {"old_string": "a", "new_string": "b"}
+
+    # Numeric 0 is a valid domain value and must not be treated as empty.
+    assert _parse_tool_arguments('{"offset": 0, "offset": ""}') == {"offset": 0}
+    assert _parse_tool_arguments('{"offset": "", "offset": 0}') == {"offset": 0}
+
+    # Structural trailing commas in JSON are stripped, while trailing commas
+    # inside string literals (e.g. OpenSCAD code) are preserved verbatim.
+    assert _parse_tool_arguments(
+        '{"content": "points = [[0, 0], [10, 0], ];", }'
+    ) == {"content": "points = [[0, 0], [10, 0], ];"}
+
+    # Nested duplicate keys inside an array of edits must also resolve cleanly.
+    assert _parse_tool_arguments(
+        '{"edits": [{"filename": "model.scad", "filename": "model.scad"}]}'
+    ) == {"edits": [{"filename": "model.scad"}]}
+
+
+def test_process_tool_call_handles_duplicate_key_payload(tmp_path: Path) -> None:
+    """End-to-end: a ``write_file`` call with trailing duplicate keys preserves
+    the intended OpenSCAD code and successfully writes it to ``model.scad``.
+
+    Drives ``process_tool_call`` directly with the exact JSON shape that
+    broke the user's session in docs/temp_files/raw-api.json, asserting
+    that ``model.scad`` is written with the real code (not "FEMALE").
+    """
+    from agent.dispatcher import process_tool_call
+
+    captured: list[dict] = []
+    appended: list[dict] = []
+    messages: list[dict] = []
+    mock_file_tool = MagicMock()
+    mock_file_tool.with_call_id.return_value = mock_file_tool
+    mock_file_tool.write_file.return_value = "Wrote model.scad"
+    mock_tools = MagicMock()
+    mock_tools.file = mock_file_tool
+
+    preview_id, cad_error, fix_required, waiting = process_tool_call(
+        tools=mock_tools,
+        project="demo",
+        project_dir=tmp_path,
+        call={
+            "id": "call_dup",
+            "function": {
+                "name": "write_file",
+                "arguments": '{"content": "WIDTH = 65;\\n", "content": "FEMALE"}',
+            },
+        },
+        cad_fix_required=False,
+        prev_preview_id=None,
+        cad_error=None,
+        messages=messages,
+        publish=lambda event, payload: captured.append({"event": event, **payload}),
+        register_preview=lambda *_: "preview-id",
+        append_message=lambda _dir, msg: appended.append(msg),
+    )
+    # The tool call should succeed with the deduplicated intended content
+    assert fix_required is True
+    assert waiting is False
+    mock_file_tool.write_file.assert_called_once_with("model.scad", "WIDTH = 65;\n")
+    status_events = [event for event in captured if event["event"] == "tool_status"]
+    assert status_events[-1]["status"] == "completed"
+    assert appended and appended[-1]["role"] == "tool"
+    assert appended[-1]["tool_call_id"] == "call_dup"
+
+
+def test_edit_file_dispatch_strips_code_fences() -> None:
+    """Regression: LLMs wrapping new_string in markdown code blocks must be stripped."""
+    from agent.dispatcher import _dispatch_edit_file
+
+    mock_file_tool = MagicMock()
+    mock_file_tool.with_call_id.return_value = mock_file_tool
+
+    # Single edit with code fence
+    _dispatch_edit_file(
+        mock_file_tool,
+        {
+            "old_string": "WIDTH = 50;",
+            "new_string": "```scad\nWIDTH = 80;\n```",
+        },
+        "call_1",
+    )
+    mock_file_tool.edit_file.assert_called_once_with(
+        "model.scad", "WIDTH = 50;", "WIDTH = 80;"
+    )
+
+    # Batch edits with code fence
+    _dispatch_edit_file(
+        mock_file_tool,
+        {
+            "edits": [
+                {
+                    "old_string": "HEIGHT = 20;",
+                    "new_string": "```\nHEIGHT = 40;\n```",
+                }
+            ]
+        },
+        "call_2",
+    )
+    mock_file_tool.edit_file.assert_called_with(
+        "model.scad", "HEIGHT = 20;", "HEIGHT = 40;"
+    )
+
+    # Single-line code fence
+    _dispatch_edit_file(
+        mock_file_tool,
+        {
+            "old_string": "DEPTH = 10;",
+            "new_string": "```scad DEPTH = 15; ```",
+        },
+        "call_3",
+    )
+    mock_file_tool.edit_file.assert_called_with(
+        "model.scad", "DEPTH = 10;", "DEPTH = 15;"
+    )
+
+
+def test_question_tool_robustness() -> None:
+    """QuestionTool must tolerate missing/numeric IDs, numeric options, and single dict format."""
+    from agent.tools.question_tool import QuestionTool, normalize_questions
+
+    # Single dict questions argument
+    normalized = normalize_questions({
+        "questions": {"question": "What length?"}
+    })
+    assert isinstance(normalized, list)
+    assert len(normalized) == 1
+
+    # Missing ID, numeric options, duplicate IDs, option degradation
+    questions = [
+        {"question": "Enter width", "id": 1, "input_type": "number"},
+        {"question": "Select size", "options": [10, 20, 30]},
+        {"question": "Second width", "id": "1", "options": ["only_one"], "input_type": "select"},
+    ]
+    published: list[tuple[str, dict]] = []
+    tool = QuestionTool(publish=lambda ev, pl: published.append((ev, pl)))
+    res, waiting, out_questions = tool.execute({"questions": questions}, project="demo")
+    assert waiting is True
+    assert len(out_questions) == 3
+    assert out_questions[0]["id"] == "1"
+    assert "options" not in out_questions[0]
+    assert out_questions[1]["id"] == "q2"
+    assert out_questions[1]["input_type"] == "select"
+    assert out_questions[1]["options"] == ["10", "20", "30"]
+    # Duplicate ID made unique
+    assert out_questions[2]["id"] == "1_3"
+    # Degradation from < 2 options to text clears options so UI does not render invalid select
+    assert out_questions[2]["input_type"] == "text"
+    assert out_questions[2]["options"] == []
+
+    # Batch with > 3 questions is smoothly capped to 3 without crashing
+    four_questions = [{"question": f"Question {i}"} for i in range(4)]
+    _, _, capped = tool.execute({"questions": four_questions}, project="demo")
+    assert len(capped) == 3
+
+
+def test_format_answer_handles_zero_and_multiselect() -> None:
+    """_format_answer must not drop numeric 0 answers and must format lists cleanly."""
+    from agent.core import AgentRunner
+
+    schema = {
+        "questions": [
+            {"id": "offset", "question": "Wall offset (mm)"},
+            {"id": "features", "question": "Selected features"},
+        ]
+    }
+    # User entered 0 for numeric offset and two choices for features
+    answer_json = json.dumps({"offset": 0, "features": ["Bevel", "Holes"]})
+    formatted = AgentRunner._format_answer(schema, answer_json)
+
+    assert "- Wall offset (mm): 0" in formatted
+    assert "- Selected features: Bevel, Holes" in formatted
+
+
 def test_cancel_remaining_tool_calls_produces_standard_failure_envelope(tmp_path: Path) -> None:
     """cancel_remaining_tool_calls wraps cancelled tools in standard tool_failure envelopes."""
     from agent.dispatcher import cancel_remaining_tool_calls
