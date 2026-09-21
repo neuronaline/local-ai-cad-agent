@@ -205,21 +205,6 @@ class ActivityLogger:
             )
             return
 
-    def tail(self, limit: int = 100) -> list[dict[str, Any]]:
-        """Return the last ``limit`` events (best-effort, may be shorter)."""
-        try:
-            text = self.log_path.read_text(encoding="utf-8")
-        except (FileNotFoundError, OSError):
-            return []
-        lines = text.splitlines()[-limit:]
-        entries: list[dict[str, Any]] = []
-        for line in lines:
-            try:
-                entries.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-        return entries
-
     def clear(self) -> bool:
         """Remove the log file. Returns True if anything was removed."""
         try:

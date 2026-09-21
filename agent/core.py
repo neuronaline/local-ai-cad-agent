@@ -40,7 +40,6 @@ from agent.prompt import get_system_prompt
 from agent.revisions import (
     MODEL_FILENAME,
     RevisionStore,
-    compute_model_sha256,
     model_is_built,
 )
 from agent.settings import Settings
@@ -49,6 +48,16 @@ from agent.tools.cad_tool import CadTool
 from agent.tools.file_tool import FileTool
 from agent.tools.question_tool import QuestionTool
 from agent.tools.question_validator import QuestionValidator
+
+
+# Circuit-breaker thresholds for repeated ``cad_build_and_verify`` failures.
+# ``_BUILD_FAILURE_TOTAL_MAX`` stops the agent after a broad burst of mixed
+# errors; ``_BUILD_FAILURE_PER_SIGNATURE_MAX`` stops it earlier when the
+# same logical error keeps repeating (useful for catching repair loops).
+# Both values flow through :meth:`AgentRunner._build_failure_exhausted` so
+# tests can target the predicate directly without re-rolling the literals.
+_BUILD_FAILURE_TOTAL_MAX = 6
+_BUILD_FAILURE_PER_SIGNATURE_MAX = 3
 
 _LOG = logging.getLogger(__name__)
 
@@ -88,13 +97,18 @@ class ProjectTools:
 def _synthetic_user(content: str) -> dict[str, object]:
     """Build a ``role: user`` message flagged as agent-generated.
 
-    The agent loop appends ``role: user`` reminders to nudge the LLM (e.g.
-    "Call cad_build_and_verify now."). Without a marker, downstream code
-    reconstructing the user's design intent — notably
-    ``CadReviewTool._latest_user_request`` — cannot distinguish a real
-    user-authored request from a system nudge, so a review can be judged
-    against the wrong requirement. The ``synthetic`` flag is a single,
-    explicit marker consumed by that reader.
+    The agent loop occasionally appends a ``role: user`` reminder to nudge the
+    LLM (e.g. "Call cad_build_and_verify now.") without losing the
+    user-role framing the provider expects. The ``synthetic`` flag is the
+    durable marker for that provenance:
+
+    - Persisted in ``conversation.jsonl`` alongside every other entry so the
+      prompt prefix — including the cache-stable seed of provider-side
+      request caches — remains stable across turns.
+    - Filtered out by ``app.py:project_history`` (drops ``synthetic: true``
+      items) so the History view never surfaces internal nudges to the user;
+      ``ConversationStore.load`` independently filters by role for prompt
+      construction.
     """
     return {"role": "user", "content": content, "synthetic": True}
 
@@ -311,7 +325,7 @@ class AgentRunner:
             messages = self._context(project_dir, message, image_paths or [])
             preview_id: str | None = None
             cad_error: str | None = None
-            cad_fix_required = not self._model_is_built(project_dir)
+            cad_fix_required = not model_is_built(project_dir)
             # Track the most recently minted message_id at function scope so
             # the outer exception handler can publish ``agent_stream_end``
             # without introspecting ``locals()`` — the value only exists
@@ -551,9 +565,10 @@ class AgentRunner:
                             build_failure_signatures[signature] = (
                                 build_failure_signatures.get(signature, 0) + 1
                             )
-                            if (
-                                build_failure_count >= 6
-                                or build_failure_signatures[signature] >= 3
+                            if self._build_failure_exhausted(
+                                build_failure_count,
+                                build_failure_signatures,
+                                signature,
                             ):
                                 self._cancel_remaining_tool_calls(
                                     project_dir, tool_calls, processed_call_ids, messages
@@ -836,12 +851,38 @@ class AgentRunner:
         # The sandbox stages the build under a fresh ``/tmp/<random>/...``
         # directory every call, so two occurrences of the same logical error
         # carry different absolute paths. Without this rule the signature
-        # drifts on every retry and the ``build_failure_signatures[signature] >= 3``
-        # loop-breaker never fires. Match either the immediate subfolder
-        # (``/tmp/tmp_xyz123/model.scad``) or the staging namespace
-        # (``/tmp/tmp_*/.staging/...``).
+        # drifts on every retry and
+        # :meth:`AgentRunner._build_failure_exhausted`'s
+        # ``signatures[signature] >= 3`` loop-breaker never fires. Match
+        # either the immediate subfolder (``/tmp/tmp_xyz123/model.scad``) or
+        # the staging namespace (``/tmp/tmp_*/.staging/...``).
         normalized = re.sub(r"/tmp/[^/\s]+/", "/tmp/<scratch>/", normalized)
         return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _build_failure_exhausted(
+        total_count: int,
+        signatures: dict[str, int],
+        signature: str,
+    ) -> bool:
+        """Return True when the build-failure circuit breaker should fire.
+
+        Stops the agent when *either*:
+
+        - ``total_count`` (the overall failure count for this run) hits
+          :data:`_BUILD_FAILURE_TOTAL_MAX`, or
+        - the per-signature count for ``signature`` hits
+          :data:`_BUILD_FAILURE_PER_SIGNATURE_MAX` — catching repair loops
+          where the agent keeps producing the same logical error.
+
+        Extracted from :meth:`_run` so tests can target the predicate
+        directly instead of re-implementing ``signatures[signature] >= 3``
+        in user space (which silently drifts if the constants change).
+        """
+        return (
+            total_count >= _BUILD_FAILURE_TOTAL_MAX
+            or signatures.get(signature, 0) >= _BUILD_FAILURE_PER_SIGNATURE_MAX
+        )
 
     @classmethod
     def _load_history(cls, project_dir: Path) -> list[dict]:
@@ -1015,16 +1056,6 @@ class AgentRunner:
                 f"(exists={exists}, size={size})."
             )
         return uuid.uuid4().hex
-
-    @staticmethod
-    def _model_digest(project_dir: Path) -> str | None:
-        """Delegate to :func:`agent.revisions.compute_model_sha256`."""
-        return compute_model_sha256(project_dir)
-
-    @classmethod
-    def _model_is_built(cls, project_dir: Path) -> bool:
-        return model_is_built(project_dir)
-
 
     def _publish_terminal_failure(self, project: str) -> None:
         # Mirror _complete's success-side agent_status so the UI clears the

@@ -178,14 +178,51 @@ def compute_model_sha256(project_dir: Path) -> str | None:
         return None
 
 
+# Module-level cache of ``model.scad`` digests, keyed by ``(project_dir,
+# (st_mtime_ns, st_size))``. The ``(mtime_ns, size)`` pair is a heuristic:
+# it changes whenever the file is rewritten on a filesystem with
+# sub-second timestamp resolution (the common case) but can stay stable
+# across an overwrite that preserves length and mtime, so two distinct
+# contents may in theory share a key. That is acceptable here because
+# every read endpoint that consults the cache already holds the project
+# lock, which serialises writes against reads, and the cache is only
+# consulted as a skip-the-read optimisation — any consumer that needs a
+# strict content hash can fall back to :func:`compute_model_sha256`.
+_MODEL_DIGEST_CACHE: dict[str, dict[tuple[int, int], str | None]] = {}
+
+
+def cached_model_sha256(project_dir: Path) -> str | None:
+    """Return the SHA-256 of ``<project_dir>/model.scad``, cached by stat.
+
+    Reads the file only when its ``(st_mtime_ns, st_size)`` changes. Returns
+    ``None`` when the file is missing or unreadable. Cache entries are scoped
+    per ``project_dir`` so two projects cannot collide on identical stat
+    tuples. Bounded only by the number of distinct content revisions each
+    project has ever produced (each entry is ~150 bytes).
+    """
+    model_path = project_dir / MODEL_FILENAME
+    try:
+        stat = model_path.stat()
+    except OSError:
+        return None
+    key = (stat.st_mtime_ns, stat.st_size)
+    project_cache = _MODEL_DIGEST_CACHE.setdefault(str(project_dir.resolve()), {})
+    if key not in project_cache:
+        try:
+            project_cache[key] = hashlib.sha256(model_path.read_bytes()).hexdigest()
+        except OSError:
+            project_cache[key] = None
+    return project_cache[key]
+
+
 def model_is_built(project_dir: Path) -> bool:
     """True when ``.cad_metrics.json`` matches the current ``model.scad`` sha256.
 
     Decoupled from the loop's ``cad_fix_required`` flag so the dispatcher
-    can gate visual tools (``cad_screenshot``, ``cad_review``) on a fresh
-    build of the current revision without forcing a wasteful second
+    can gate visual evidence tools (multi-view review / contact sheet) on a
+    fresh build of the current revision without forcing a wasteful second
     rendered build after a cheap ``cad_build_and_verify(render=false)``.
-    Both ``agent.core.AgentRunner._model_is_built`` and
+    Both the agent loop (``_run`` start) and
     :func:`agent.dispatcher.process_tool_call` consult this helper; keeping
     the body here avoids a circular import between ``agent.core`` and
     ``agent.dispatcher``.
@@ -733,11 +770,13 @@ class RevisionStore:
     def active_model_digest(self) -> str | None:
         """Return the SHA-256 of the active model.scad, or None if absent.
 
-        Thin wrapper over :func:`compute_model_sha256` so callers that
-        already hold a :class:`RevisionStore` do not need to repeat the
-        project_dir plumbing.
+        Thin wrapper over :func:`cached_model_sha256` (the stat-cached
+        digest helper) so callers that already hold a :class:`RevisionStore`
+        do not need to repeat the project_dir plumbing. The cache covers
+        both the read endpoints and this accessor, so the digest is
+        computed at most once per content revision for the whole process.
         """
-        return compute_model_sha256(self.project_dir)
+        return cached_model_sha256(self.project_dir)
 
     # ------------------------------------------------------------------ #
     #  Private helpers

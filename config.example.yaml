@@ -2,7 +2,7 @@
 workspace_root: ~/CAD-Agent-Projects
 
 agent:
-  tool_call_limit: 30
+  tool_call_limit: 15
   revision_retention_count: 0  # 0 keeps all model revisions
   debug_log_tool_errors: false  # Writes recoverable failures to <project>/debug-errors.jsonl
   log_tool_activity: false  # Writes raw tool-loop trace to <project>/.cad-agent/activity.jsonl
@@ -13,7 +13,7 @@ agent:
 # losing either configuration.
 llm:
   provider: openrouter
-  max_completion_tokens: 32768
+  max_completion_tokens: 65536
   # Optional secondary provider that takes over if the primary client
   # raises a non-cancellation error after its own retry loop is exhausted.
   # Must differ from ``provider`` above; leave as ``""`` to disable.
@@ -59,8 +59,8 @@ ui:
 
 # Review rendering settings. ``review.enabled`` controls whether
 # cad_build_and_verify rasterises the canonical eight views + contact sheet
-# (default true). The structured verdict (cad_review) is opt-in by the agent
-# and never auto-toggles on this flag.
+# (default true). The legacy structured verdict tool has been removed;
+# nothing else auto-toggles on this flag.
 review:
   enabled: true
   render_workers: 4

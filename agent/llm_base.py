@@ -814,12 +814,13 @@ class ChatCompletionsClient:
         self.settings = settings
         self.stop_event = None
         self.session_id: str | None = None
-        # Subordinate evaluator hook. Currently the only supported role string is
-        # ``"reviewer"`` (set by :func:`agent.cad_review.review_cad`); the base
-        # agent loop leaves this ``None``. The field is preserved on the base
-        # client so the OpenRouter adapter can tag the ``trace.span_name`` of
-        # subordinate requests without changing the cache prefix. OpenAI's
-        # adapter does not consume it today.
+        # Subordinate evaluator hook. The structured ``cad_review`` tool (the
+        # historical setter of ``"reviewer"``) was removed from the tool
+        # surface; the field is preserved here so a future sub-agent can
+        # tag its ``trace.span_name`` on the OpenRouter adapter without
+        # changing the cache prefix on the base client. Today nothing
+        # outside this module sets the attribute, so the value is always
+        # ``None`` in production. The OpenAI adapter does not consume it.
         self.agent_role: str | None = None
         self.last_usage: dict[str, Any] | None = None
         self.last_image_fallback_used = False

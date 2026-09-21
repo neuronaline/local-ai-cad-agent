@@ -163,6 +163,16 @@ class OpenScadPreflight:
             )
 
 
+class MatchError(ValueError):
+    """Raised by :meth:`FileTool._resolve_match` when ``old_string`` is ambiguous.
+
+    Subclassing :class:`ValueError` keeps the public tool contract intact —
+    callers that catch ``ValueError`` still see the failure — while giving
+    :meth:`FileTool.edit_file` a typed handle so it can normalise the
+    message (e.g. capitalise the first letter for end-user display)
+    without resorting to lowercase-first-character string sniffing.
+    """
+
 
 
 class FileTool:
@@ -205,8 +215,6 @@ class FileTool:
         filename: str,
         offset: int = 1,
         limit: int | None = None,
-        known_sha256: str | None = None,
-        **_ignored: object,
     ) -> dict:
         """Return ``model.scad`` content as a plain dict.
 
@@ -259,8 +267,6 @@ class FileTool:
         self,
         filename: str,
         content: str,
-        expected_sha256: str | None = None,
-        **_ignored: object,
     ) -> str:
         path = self._path(filename)
         with _file_lock(path):
@@ -326,7 +332,7 @@ class FileTool:
             end = start + len(old_string)
             return ((start, end), old_string, new_string)
         if matches > 1:
-            raise ValueError(
+            raise MatchError(
                 f"expected one exact match, found {matches}; file was not changed."
             )
 
@@ -335,7 +341,7 @@ class FileTool:
         old_lines = old_string.splitlines(keepends=True)
         k = len(old_lines)
         if k == 0 or len(file_lines) < k:
-            raise ValueError(
+            raise MatchError(
                 "expected one exact match, found 0; file was not changed."
             )
 
@@ -380,11 +386,11 @@ class FileTool:
             return ((start_char, end_char), matched_sub, replacement)
 
         if len(candidates) > 1:
-            raise ValueError(
+            raise MatchError(
                 f"expected one match, found {len(candidates)} after whitespace normalization; file was not changed."
             )
 
-        raise ValueError(
+        raise MatchError(
             "expected one exact match, found 0; file was not changed."
         )
 
@@ -393,8 +399,6 @@ class FileTool:
         filename: str,
         old_string: str,
         new_string: str = "",
-        expected_sha256: str | None = None,
-        **_ignored: object,
     ) -> str:
         if not isinstance(old_string, str) or not old_string:
             raise ValueError("old_string must not be empty.")
@@ -413,7 +417,12 @@ class FileTool:
                 (start, end), old_match, replacement = self._resolve_match(
                     current, old_string, new_string
                 )
-            except ValueError as err:
+            except MatchError as err:
+                # MatchError messages are formatted in lowercase (intended
+                # to slot into compound sentences). Capitalise the first
+                # letter for end-user display — this branch is reached
+                # only when we *know* the exception came from our own
+                # resolver, so the casing assumption is safe.
                 msg = str(err)
                 if msg and msg[0].islower():
                     msg = msg[0].upper() + msg[1:]
@@ -435,8 +444,6 @@ class FileTool:
         self,
         filename: str,
         edits: list[dict[str, str]],
-        expected_sha256: str | None = None,
-        **_ignored: object,
     ) -> str:
         """Apply several ``{old_string, new_string}`` replacements atomically.
 

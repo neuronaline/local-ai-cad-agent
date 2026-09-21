@@ -1209,37 +1209,32 @@ def test_prompt_cache_does_not_stat_playbook_per_call(
     assert tracker.read_calls == 0
 
 
-def test_file_tools_ignore_and_do_not_require_sha(tmp_path: Path) -> None:
-    """File tool methods must not require SHA digests or fail on invalid digests."""
+def test_file_tool_public_api_no_sha_kwargs(tmp_path: Path) -> None:
+    """File tool methods must not accept ``expected_sha256`` / ``known_sha256``.
+
+    These parameters were removed because no caller sent them and no schema
+    exposed them — silently ignoring unknown kwargs would have hidden a
+    future optimistic-concurrency regression (no real SHA was ever checked).
+    """
     tool = FileTool(tmp_path)
-
-    # 1. write_file works unconditionally and ignores invalid expected_sha256
     initial_code = "WIDTH = 10;\ncube([WIDTH, 20, 30]);\n"
-    tool.write_file("model.scad", initial_code, expected_sha256="not_a_sha")
+    tool.write_file("model.scad", initial_code)
 
-    # 2. read_file returns clean content without sha256 and ignores known_sha256
-    raw_read = tool.read_file("model.scad", known_sha256="invalid")
-    assert isinstance(raw_read, dict), "read_file must return a dict, not a JSON string."
-    assert raw_read["exists"] is True
-    assert "WIDTH = 10" in raw_read["content"]
-    assert "sha256" not in raw_read
-
-    # 3. edit_file succeeds with invalid / mismatched expected_sha256
-    tool.edit_file(
-        "model.scad",
-        "WIDTH = 10",
-        "WIDTH = 25",
-        expected_sha256="short",
-    )
-    assert "WIDTH = 25" in (tmp_path / "model.scad").read_text(encoding="utf-8")
-
-    # 4. edit_file_atomic succeeds with invalid expected_sha256
-    tool.edit_file_atomic(
-        "model.scad",
-        [{"old_string": "WIDTH = 25", "new_string": "WIDTH = 30"}],
-        expected_sha256="0" * 32,
-    )
-    assert "WIDTH = 30" in (tmp_path / "model.scad").read_text(encoding="utf-8")
+    # Each method must reject unknown kwargs explicitly via ``TypeError``
+    # so a future caller wiring up optimistic-concurrency either lands on
+    # a real implementation or fails loudly at the dispatch boundary.
+    with pytest.raises(TypeError):
+        tool.write_file("model.scad", initial_code, expected_sha256="x" * 64)
+    with pytest.raises(TypeError):
+        tool.read_file("model.scad", known_sha256="x" * 64)
+    with pytest.raises(TypeError):
+        tool.edit_file("model.scad", "WIDTH = 10", "WIDTH = 25", expected_sha256="x" * 64)
+    with pytest.raises(TypeError):
+        tool.edit_file_atomic(
+            "model.scad",
+            [{"old_string": "WIDTH = 10", "new_string": "WIDTH = 30"}],
+            expected_sha256="x" * 64,
+        )
 
 
 def test_tool_schemas_do_not_expose_sha_parameters() -> None:
@@ -1420,7 +1415,10 @@ def test_edit_file_whitespace_tolerance(tmp_path: Path) -> None:
 
 def test_failure_signature_threshold_allows_escalation() -> None:
     """AgentRunner must allow 2 retries (total 3 attempts on same error) before stopping."""
-    from agent.core import AgentRunner
+    from agent.core import (
+        AgentRunner,
+        _BUILD_FAILURE_PER_SIGNATURE_MAX,
+    )
 
     err_msg = 'CAD execution failed:\n  File "model.scad", line 111\nERROR: Parser error'
     sig = AgentRunner._failure_signature(err_msg)
@@ -1432,17 +1430,51 @@ def test_failure_signature_threshold_allows_escalation() -> None:
     assert sig == sig_diff_line
 
     signatures: dict[str, int] = {}
-    # Attempt 1: Initial failure
+    total_count = 0
+    # Attempt 1: Initial failure — must not terminate
+    total_count += 1
     signatures[sig] = signatures.get(sig, 0) + 1
-    assert not (signatures[sig] >= 3), "Attempt 1 must not terminate"
+    assert not AgentRunner._build_failure_exhausted(
+        total_count, signatures, sig
+    ), "Attempt 1 must not terminate"
 
-    # Attempt 2: First repair attempt fails with same error -> must NOT terminate (allows escalation)
+    # Attempt 2: First repair attempt fails with same error — must NOT terminate
+    total_count += 1
     signatures[sig] = signatures.get(sig, 0) + 1
-    assert not (signatures[sig] >= 3), "Attempt 2 must not terminate, allowing 3-step escalation"
+    assert not AgentRunner._build_failure_exhausted(
+        total_count, signatures, sig
+    ), "Attempt 2 must not terminate, allowing 3-step escalation"
 
-    # Attempt 3: Second repair attempt fails with same error -> now terminates
+    # Attempt 3: Second repair attempt fails with same error — now terminates
+    total_count += 1
     signatures[sig] = signatures.get(sig, 0) + 1
-    assert signatures[sig] >= 3, "Attempt 3 must terminate repeated failures"
+    assert AgentRunner._build_failure_exhausted(
+        total_count, signatures, sig
+    ), "Attempt 3 must terminate repeated failures"
+    # Sanity-check the constant — locks the 3-attempt cadence to the
+    # numeric budget so a future tuning cannot silently change behaviour.
+    assert _BUILD_FAILURE_PER_SIGNATURE_MAX == 3
+
+
+def test_build_failure_exhausted_total_cap_separate_from_signature() -> None:
+    """The total-count cap trips independently of any single signature."""
+    from agent.core import (
+        AgentRunner,
+        _BUILD_FAILURE_PER_SIGNATURE_MAX,
+        _BUILD_FAILURE_TOTAL_MAX,
+    )
+
+    # Use several distinct signatures; each stays below the per-sig cap
+    # but the rolling total crosses the budget.
+    distinct = [f"sig_{i}" for i in range(_BUILD_FAILURE_TOTAL_MAX)]
+    signatures: dict[str, int] = {sig: 1 for sig in distinct}
+    assert AgentRunner._build_failure_exhausted(
+        _BUILD_FAILURE_TOTAL_MAX, signatures, distinct[-1]
+    )
+    # Sanity: the per-sig budget never fires here because each signature
+    # only saw one occurrence.
+    assert _BUILD_FAILURE_PER_SIGNATURE_MAX > 1
+    assert not AgentRunner._build_failure_exhausted(1, {distinct[0]: 1}, distinct[0])
 
 
 def test_cad_tool_failure_detail_preserves_multiline_errors() -> None:

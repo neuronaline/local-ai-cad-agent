@@ -41,7 +41,12 @@ from agent.core import AgentRunner
 from agent.images import store_images
 from agent.io import utc_now_iso
 from agent.review_paths import review_dir
-from agent.revisions import MODEL_FILENAME, RevisionIntegrityError, RevisionStore
+from agent.revisions import (
+    MODEL_FILENAME,
+    RevisionIntegrityError,
+    RevisionStore,
+    cached_model_sha256,
+)
 from agent.sandbox import _BWRAP, seccomp_filter_fd
 from agent.settings import Settings, load_settings
 
@@ -160,6 +165,27 @@ def _project_path(settings: Settings, project_name: str) -> Path:
     return path
 
 
+def _resolve_project_or_404(
+    settings: Settings, project_name: str
+) -> Path | tuple[Response, int]:
+    """Return the project :class:`Path` or a Flask ``(body, 404)`` response.
+
+    Callers should run this *inside* the project lock so a project that
+    is concurrently deleted cannot leave the handler operating on a
+    dangling path. The helper packages the resolve+404 dance into one
+    call so each handler — previously repeating the try/except outside
+    *and* inside the lock — only inspects the result once. The shape is::
+
+        project_dir = _resolve_project_or_404(settings, project_name)
+        if not isinstance(project_dir, Path):
+            return project_dir
+    """
+    try:
+        return _project_path(settings, project_name)
+    except (ValueError, FileNotFoundError) as error:
+        return jsonify({"error": str(error)}), 404
+
+
 def _redact_history_event(event: dict[str, Any]) -> dict[str, Any]:
     """Replace inline image data URLs in history responses with a placeholder.
 
@@ -201,6 +227,14 @@ def _redact_history_event(event: dict[str, Any]) -> dict[str, Any]:
 # by every chat request and modified out-of-band by cleanup, so unsynchronized
 # access can produce redundant eviction work or skipped targets under load.
 _IDEMPOTENCY_LOCK = threading.Lock()
+# Cap and target for the in-flight idempotency cache. Eviction only triggers
+# when the cache exceeds ``_IDEMPOTENCY_CACHE_MAX``; we then drop every entry
+# outside the newest ``_IDEMPOTENCY_CACHE_TARGET`` so the kept window holds
+# exactly that many keys after eviction (not the trigger value). Both values
+# are named so a future change to the budget doesn't drift without a code
+# review.
+_IDEMPOTENCY_CACHE_MAX = 1000
+_IDEMPOTENCY_CACHE_TARGET = 500
 
 
 def _idempotency_check(app: Flask, key: str) -> bool:
@@ -213,15 +247,28 @@ def _idempotency_check(app: Flask, key: str) -> bool:
 
 
 def _idempotency_record(app: Flask, key: str) -> None:
-    """Record the key as in-flight and evict the oldest half if oversized."""
+    """Record the key as in-flight and evict down to the target on overflow.
+
+    When the cache exceeds ``_IDEMPOTENCY_CACHE_MAX`` every entry older
+    than the newest ``_IDEMPOTENCY_CACHE_TARGET`` keys is dropped, leaving
+    the cache at exactly the target size (not the trigger size — a burst
+    that pushes the cache to 1500 entries still trims it to 500). Keys
+    have no TTL today: this is a coarse burst-protection heuristic, not
+    a long-term store, so a request whose key falls outside the kept
+    window may lose dedupe protection if the cache churns faster than
+    the request lifecycle.
+    """
     if not key:
         return
     with _IDEMPOTENCY_LOCK:
         cache = app.config.setdefault("IDEMPOTENCY_CACHE", {})
         cache[key] = True
-        if len(cache) > 1000:
-            oldest_keys = list(cache.keys())[:-500]
-            for old_key in oldest_keys:
+        if len(cache) > _IDEMPOTENCY_CACHE_MAX:
+            keep = _IDEMPOTENCY_CACHE_TARGET
+            # ``list(cache.keys())`` is a snapshot of insertion order; the
+            # newest entry is the *last* one we just inserted, so dropping
+            # the prefix keeps the suffix (newest ``keep`` keys) intact.
+            for old_key in list(cache.keys())[:-keep]:
                 cache.pop(old_key, None)
 
 
@@ -546,15 +593,10 @@ def create_app(settings: Settings | None = None) -> Flask:
     @app.delete("/api/projects/<project_name>")
     def delete_project(project_name: str):
         current_settings = app.config["SETTINGS"]
-        try:
-            project_dir = _project_path(current_settings, project_name)
-        except (ValueError, FileNotFoundError) as error:
-            return jsonify({"error": str(error)}), 404
         with _project_lock(app, project_name):
-            try:
-                project_dir = _project_path(current_settings, project_name)
-            except (ValueError, FileNotFoundError) as error:
-                return jsonify({"error": str(error)}), 404
+            project_dir = _resolve_project_or_404(current_settings, project_name)
+            if not isinstance(project_dir, Path):
+                return project_dir
             runner = app.config["AGENT_RUNNER"]
             if runner.has_active_state_for(project_name):
                 runner.stop(project_name)
@@ -573,15 +615,10 @@ def create_app(settings: Settings | None = None) -> Flask:
         or a pending preview is in-flight so a reset cannot race the worker.
         """
         current_settings = app.config["SETTINGS"]
-        try:
-            project_dir = _project_path(current_settings, project_name)
-        except (ValueError, FileNotFoundError) as error:
-            return jsonify({"error": str(error)}), 404
         with _project_lock(app, project_name):
-            try:
-                project_dir = _project_path(current_settings, project_name)
-            except (ValueError, FileNotFoundError) as error:
-                return jsonify({"error": str(error)}), 404
+            project_dir = _resolve_project_or_404(current_settings, project_name)
+            if not isinstance(project_dir, Path):
+                return project_dir
             runner = app.config["AGENT_RUNNER"]
             if runner.has_active_state_for(project_name):
                 runner.stop(project_name)
@@ -605,10 +642,6 @@ def create_app(settings: Settings | None = None) -> Flask:
     @app.put("/api/projects/<project_name>/rename")
     def rename_project(project_name: str):
         current_settings = app.config["SETTINGS"]
-        try:
-            project_dir = _project_path(current_settings, project_name)
-        except (ValueError, FileNotFoundError) as error:
-            return jsonify({"error": str(error)}), 404
         payload = request.get_json(silent=True) or {}
         new_name = str(payload.get("name", "")).strip().lower().replace(" ", "-")
         if not PROJECT_NAME_RE.fullmatch(new_name):
@@ -617,10 +650,9 @@ def create_app(settings: Settings | None = None) -> Flask:
             return jsonify({"project": project_name})
         target = current_settings.workspace_root / new_name
         with _project_locks(app, project_name, new_name):
-            try:
-                project_dir = _project_path(current_settings, project_name)
-            except (ValueError, FileNotFoundError) as error:
-                return jsonify({"error": str(error)}), 404
+            project_dir = _resolve_project_or_404(current_settings, project_name)
+            if not isinstance(project_dir, Path):
+                return project_dir
             if target.exists():
                 return jsonify({"error": "A project with that name already exists."}), 409
             runner = app.config["AGENT_RUNNER"]
@@ -663,10 +695,6 @@ def create_app(settings: Settings | None = None) -> Flask:
         idempotency_key = str(payload.get("idempotency_key", "")).strip()
         if not message:
             return jsonify({"error": "Message is required."}), 400
-        try:
-            project_dir = _project_path(app.config["SETTINGS"], project_name)
-        except (ValueError, FileNotFoundError) as error:
-            return jsonify({"error": str(error)}), 404
         runner = app.config["AGENT_RUNNER"]
         if runner.waiting_question(project_name):
             return jsonify({"error": "Answer the pending question before sending another message."}), 409
@@ -683,8 +711,12 @@ def create_app(settings: Settings | None = None) -> Flask:
         if runner.is_running():
             return jsonify({"error": "An agent task is already running."}), 409
         with _project_lock(app, project_name):
+            project_dir = _resolve_project_or_404(
+                app.config["SETTINGS"], project_name
+            )
+            if not isinstance(project_dir, Path):
+                return project_dir
             try:
-                project_dir = _project_path(app.config["SETTINGS"], project_name)
                 image_paths = store_images(request.files.getlist("attachments"), project_dir)
             except FileNotFoundError as error:
                 return jsonify({"error": str(error)}), 404
@@ -809,9 +841,7 @@ def create_app(settings: Settings | None = None) -> Flask:
             )
             manifest = build["review_manifest"]
             expected_sha = manifest["single_render"]["image_sha256"]
-            current_model_sha = hashlib.sha256(
-                (project_dir / MODEL_FILENAME).read_bytes()
-            ).hexdigest()
+            current_model_sha = cached_model_sha256(project_dir)
         except (OSError, KeyError, TypeError, json.JSONDecodeError):
             return jsonify({"error": "No render exists for the current model."}), 404
         if (
@@ -844,12 +874,7 @@ def create_app(settings: Settings | None = None) -> Flask:
         if not preview_path.is_file() or preview_path.stat().st_size == 0:
             return jsonify({"available": False, "displayable": False})
         stat = preview_path.stat()
-        model_path = project_dir / MODEL_FILENAME
-        model_sha256 = (
-            hashlib.sha256(model_path.read_bytes()).hexdigest()
-            if model_path.is_file()
-            else None
-        )
+        model_sha256 = cached_model_sha256(project_dir)
         # The ``review_status`` field is a backward-compatible stub. The
         # dedicated ``cad_review`` tool was removed from the model-facing
         # schema, so no structured verdict (``result.json``) is ever produced
@@ -934,7 +959,7 @@ def create_app(settings: Settings | None = None) -> Flask:
         model_path = project_dir / MODEL_FILENAME
         if not model_path.is_file():
             return jsonify({"error": f"{MODEL_FILENAME} is missing."}), 404
-        model_sha = hashlib.sha256(model_path.read_bytes()).hexdigest()
+        model_sha = cached_model_sha256(project_dir)
         latest = _review_for_model(project_dir, model_sha)
         if latest is None:
             return jsonify({"error": "No review has been generated yet."}), 404
@@ -962,7 +987,7 @@ def create_app(settings: Settings | None = None) -> Flask:
         model_path = project_dir / MODEL_FILENAME
         if not model_path.is_file():
             return jsonify({"error": f"{MODEL_FILENAME} is missing."}), 404
-        model_sha = hashlib.sha256(model_path.read_bytes()).hexdigest()
+        model_sha = cached_model_sha256(project_dir)
         latest = _review_for_model(project_dir, model_sha)
         if latest is None:
             return jsonify({"error": "No review has been generated yet."}), 404
@@ -984,7 +1009,7 @@ def create_app(settings: Settings | None = None) -> Flask:
         model_path = project_dir / MODEL_FILENAME
         if not model_path.is_file():
             return jsonify({"error": f"{MODEL_FILENAME} is missing."}), 404
-        model_sha = hashlib.sha256(model_path.read_bytes()).hexdigest()
+        model_sha = cached_model_sha256(project_dir)
         latest = _review_for_model(project_dir, model_sha)
         if latest is None:
             return jsonify({"error": "No review has been generated yet."}), 404
@@ -1145,11 +1170,10 @@ def create_app(settings: Settings | None = None) -> Flask:
     @app.post("/api/projects/<project_name>/revisions/<revision_id>/restore")
     def restore_revision(project_name: str, revision_id: str):
         current_settings = app.config["SETTINGS"]
-        try:
-            project_dir = _project_path(current_settings, project_name)
-        except (ValueError, FileNotFoundError) as error:
-            return jsonify({"error": str(error)}), 404
         with _project_lock(app, project_name):
+            project_dir = _resolve_project_or_404(current_settings, project_name)
+            if not isinstance(project_dir, Path):
+                return project_dir
             runner = app.config["AGENT_RUNNER"]
             if runner.has_active_state_for(project_name):
                 runner.stop(project_name)

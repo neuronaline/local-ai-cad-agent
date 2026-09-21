@@ -45,6 +45,16 @@ except ModuleNotFoundError:
     )
 
 
+# ``runner.py`` is copied into the bubblewrap workspace at execution time
+# (see :meth:`agent.tools.cad_tool.CadTool._execute`), so it cannot import
+# from the host package tree — including
+# ``agent.tools.process_runner.MAX_SANDBOX_TIMEOUT_SECONDS``. Mirror the
+# value here as a self-contained constant; the host-side cap MUST stay
+# in lock-step with this literal so the two failure modes (outer bubblewrap
+# kill vs. inner OpenSCAD timeout) remain back-to-back.
+_OPENSCAD_TIMEOUT_SECONDS = 120
+
+
 # ---------------------------------------------------------------------------
 # Feature extraction & mesh geometry
 # ---------------------------------------------------------------------------
@@ -271,7 +281,7 @@ def _run_model(
             compile_cmd,
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=_OPENSCAD_TIMEOUT_SECONDS,
             check=False,
         )
         ret, stdout, stderr = proc.returncode, proc.stdout, proc.stderr

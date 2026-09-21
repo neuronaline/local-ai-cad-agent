@@ -121,11 +121,18 @@ class CadTool:
         ``_WRITE_ISOMETRIC``, ``_RENDER_WORKERS``, ``_REQUIRED_VIEWS``) so
         ``runner.py`` uses a normal Python function call rather than reading
         injected globals.
+
+        Coupling invariant: ``render=True`` always implies
+        ``write_isometric=True`` so ``/render`` endpoint's SHA gate
+        (``single_render.image_sha256``) can always find ``render.png``.
+        ``render_views`` alone is gated by :attr:`_review_enabled` so a
+        build-and-verify run with ``review_enabled=False`` still produces
+        the canonical isometric render but skips the eight-view manifest.
         """
         if render:
             return {
                 "render_views": self._review_enabled,
-                "write_isometric": True,
+                "write_isometric": True,  # see coupling invariant in the docstring above
                 "render_workers": self._review_render_workers,
                 "required_views": self._review_required_views,
             }
@@ -478,7 +485,7 @@ class CadTool:
             # ``atomic_swap_directory`` centralises the previous
             # hand-rolled ``os.replace`` dance (with ``.previous``
             # rollback + cleanup). The contract is now identical to
-            # ``cad_screenshot_tool._promote_to_cache``'s, so the two
+            # ``promote_review``'s internal cache swap, so the two
             # call sites can't drift again.
             atomic_swap_directory(review_dir, staging)
         finally:
@@ -638,9 +645,9 @@ class CadTool:
         payload = self._execute(**execute_args)
         metrics = payload.get("metrics") if isinstance(payload, dict) else None
         # Surface the model + preview SHAs once at the top level instead of
-        # nesting them inside ``review_manifest``. The structured reviewer has
-        # its own tool (``cad_review``); the agent does not need to re-parse a
-        # full manifest just to correlate a build with its result.
+        # nesting them inside ``review_manifest``. The agent does not need
+        # to re-parse a full manifest just to correlate a build with its
+        # result.
         model_sha = (
             payload.get("model_sha256") if isinstance(payload, dict) else None
         )

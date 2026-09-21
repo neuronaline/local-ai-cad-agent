@@ -1,11 +1,13 @@
 """Shared SSE status-publish helper for the CAD tools.
 
-Three tools (``cad_build_and_verify``, ``cad_screenshot``, ``cad_review``)
-need to publish phase events to the live activity panel. Before this
-module each one reimplemented the same callable-check + try/except
-boilerplate and quietly diverged in field names (``result`` vs
-``message``). Centralising the contract keeps the activity pill stable
-and stops activity-publish failures from aborting the actual tool.
+The agent exposes a five-tool surface (``read_file``, ``write_file``,
+``edit_file``, ``cad_build_and_verify``, ``question``); the single tool
+that runs sandboxed work — ``cad_build_and_verify`` — is what posts
+phase events to the live activity panel. Before this module each
+caller reimplemented the same callable-check + try/except boilerplate
+and quietly diverged in field names (``result`` vs ``message``).
+Centralising the contract keeps the activity pill stable and stops
+activity-publish failures from aborting the actual tool.
 """
 from __future__ import annotations
 

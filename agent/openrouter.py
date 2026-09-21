@@ -44,12 +44,12 @@ class OpenRouterClient(ChatCompletionsClient):
     def _apply_provider_payload(self, payload: dict[str, Any]) -> None:
         if self.session_id:
             payload["session_id"] = hashlib.sha256(self.session_id.encode()).hexdigest()[:64]
-        # Tag subordinate evaluators through OpenRouter's documented tracing
-        # surface so the request remains valid and observability can
-        # distinguish reviewer spans from the parent agent loop. Only the
-        # role strings produced by the agent — currently ``"reviewer"``
-        # from :func:`agent.cad_review.review_cad` — are forwarded; the
-        # default ``None`` skips the field entirely.
+        # Reserved-for-future trace hook: the structured ``cad_review`` evaluator
+        # that historically produced the only known role string was removed
+        # from the tool surface, so ``self.agent_role`` is always ``None``
+        # today. The branch is preserved so a future sub-agent can tag its
+        # ``trace.span_name`` on OpenRouter without changing the cache
+        # prefix; the default ``None`` skips the field entirely.
         if self.agent_role:
             trace = payload.setdefault("trace", {})
             if isinstance(trace, dict):

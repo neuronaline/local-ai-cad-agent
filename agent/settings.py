@@ -62,11 +62,11 @@ class Settings:
     # default; only enable when debugging model behaviour or wire-level
     # provider errors because the log can grow quickly.
     agent_log_tool_activity: bool = False
-    # ── Review rendering settings (used by cad_build_and_verify, cad_screenshot) ──
+    # ── Review rendering settings (used by cad_build_and_verify) ──
     # ``review_enabled`` is preserved for the existing ``cad_build_and_verify``
     # contract: when False the build skips the canonical eight-view rasteriser
-    # and contact sheet. The structured verdict (cad_review) is opt-in by the
-    # agent and never auto-toggles on this flag.
+    # and contact sheet. The structured verdict (the historical dedicated
+    # ``cad_review`` tool) was removed; nothing auto-toggles on this flag.
     review_enabled: bool = True
     review_render_workers: int = 4
     review_required_views: int = 8
@@ -83,11 +83,6 @@ class Settings:
         if self.llm_provider == "openai":
             return self.openai_model
         return self.openrouter_model
-
-    @property
-    def viewer_grid_extent(self) -> tuple[float, int]:
-        """Return ``(size, divisions)`` for the preview viewport grid."""
-        return (self.viewer_grid_size, self.viewer_grid_divisions)
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -122,7 +117,7 @@ def _reject_unknown(mapping: Any, allowed: set[str], namespace: str) -> None:
 _DEPRECATED_KEYS: dict[str, tuple[str, str]] = {
     "review.max_cycles": (
         "review",
-        "the structured review (cad_review) is opt-in; remove max_cycles from config.yaml.",
+        "the structured review tool was removed; remove max_cycles from config.yaml.",
     ),
 }
 
@@ -239,9 +234,10 @@ def load_settings(project_root: Path | None = None) -> Settings:
         "review",
     )
     # ``review.max_cycles`` is accepted for backward compatibility (legacy
-    # configs keep loading) but ignored — the structured review verdict
-    # (cad_review) is opt-in, not auto-cycled. Emit a one-time warning so
-    # users notice the dead key in the server log.
+    # configs keep loading) but ignored — the structured review verdict was
+    # removed from the tool surface, so the auto-cycle loop no longer makes
+    # sense. Emit a one-time warning so users notice the dead key in the
+    # server log.
     if isinstance(review, dict) and "max_cycles" in review:
         _warn_deprecated("review", "max_cycles")
 

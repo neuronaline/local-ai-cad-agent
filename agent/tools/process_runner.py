@@ -1,16 +1,16 @@
-"""Internal subprocess streaming helper used by
-``cad_tool`` and ``cad_screenshot_tool``.
+"""Internal subprocess streaming helper used by ``cad_tool``.
 
 The bubblewrap subprocesses that run CAD jobs stream their stdout/stderr
 through a bounded ring buffer so a runaway python process cannot exhaust
 the host's memory. ``terminate`` kills a process group so the bubblewrap
 namespace and any spawned python interpreter exit cleanly.
 
-Public surface (kept stable for callers):
+Public surface:
 
 - :func:`stream_with_limit`
 - :class:`TimedOut`
 - :func:`terminate`
+- :func:`run_sandbox_subprocess`
 """
 
 from __future__ import annotations
@@ -22,10 +22,10 @@ import threading
 
 MAX_OUTPUT_BYTES = 1 * 1024 * 1024  # 1 MB per stream
 
-# Sandbox subprocess timeout ceiling shared by ``cad_screenshot``,
-# ``cad_review``, and the corresponding JSON schema. Centralising the value
-# keeps the runtime cap, the tool class constant, and the schema's
-# ``maximum`` in lock-step so they cannot drift.
+# Sandbox subprocess timeout ceiling shared by ``cad_tool`` and the
+# corresponding JSON schema. Centralising the value keeps the runtime cap,
+# the tool class constant, and the schema's ``maximum`` in lock-step so they
+# cannot drift.
 MAX_SANDBOX_TIMEOUT_SECONDS = 120
 
 
@@ -137,30 +137,16 @@ def stream_with_limit(
 
 
 # --------------------------------------------------------------------------- #
-#  Backwards-compatible aliases for tests + dynamic imports.
-#
-#  These were the private names exposed by earlier refactors of
-#  ``cad_tool`` / ``cad_screenshot_tool`` and are kept so any external
-#  caller (or future migration step) keeps working without churn.
-# --------------------------------------------------------------------------- #
-
-_terminate = terminate
-_stream_with_limit = stream_with_limit
-_TimedOut = TimedOut
-
-
-# --------------------------------------------------------------------------- #
 #  Sandbox subprocess lifecycle.
 #
-#  ``cad_tool`` and ``cad_screenshot_tool`` both stage a small bubblewrap
-#  workspace, spawn ``bwrap`` with the seccomp FD, stream its stdout/stderr,
-#  and tear the process group down on timeout, error, or non-zero return. The
-#  only differences are the argv, the timeout, the tool's ``_lock``/active
-#  process slot, and the error message raised on timeout. Centralising the
-#  common shape keeps both call sites focused on "what" and prevents the
-#  boilerplate from drifting (e.g. the cleanup finally block must force-kill
-#  even when ``stream_with_limit`` raised, otherwise the inner python escapes
-#  ``stop()``).
+#  ``cad_tool`` stages a small bubblewrap workspace, spawns ``bwrap`` with the
+#  seccomp FD, streams its stdout/stderr, and tears the process group down on
+#  timeout, error, or non-zero return. The only knobs are the argv, the
+#  timeout, the tool's ``_lock``/active process slot, and the error message
+#  raised on timeout. Centralising the common shape keeps the call sites
+#  focused on "what" and prevents the boilerplate from drifting (e.g. the
+#  cleanup finally block must force-kill even when ``stream_with_limit``
+#  raised, otherwise the inner python escapes ``stop()``).
 # --------------------------------------------------------------------------- #
 
 
