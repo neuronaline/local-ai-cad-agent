@@ -66,10 +66,12 @@ _OPERATIONAL_RULES = """\
 - model.scad layout: parameter block first (see Golden Rules), geometry in
   named modules below, every major block marked with a module or short header
   comment. Comments must stay in sync with the code.
-- Fresh-project workspace state is delivered as a ``<project_state>`` user
-  message after the cacheable system prefix; follow whatever it says about
-  whether ``model.scad`` already exists. Do not re-derive the answer from the
-  current directory listing.
+- The current ``<project_state>`` user message after the cacheable system
+  prefix reports whether ``model.scad`` exists on disk right now. Trust it
+  on every turn; if the message flips (e.g. from "does not exist" to
+  "exists" after a ``write_file``), follow the new instruction. If the
+  state is ambiguous or stale, call ``read_file`` on ``model.scad`` to
+  confirm its contents before editing.
 - Use the right tool for the job. ``read_file`` is for content you don't
   already know; skip it when your own previous ``write_file``/``edit_file``
   already returned the post-state. Use ``write_file`` only for the initial

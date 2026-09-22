@@ -12,6 +12,7 @@ import json
 import re
 import threading
 import uuid
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import wraps
@@ -42,6 +43,81 @@ _MAX_ERROR_CHARS = 2000
 _DEFAULT_RETENTION = 25
 _BUILDS_LOG_NAME = "builds.jsonl"
 _BUILDS_MAX_BYTES = 2 * 1024 * 1024  # 2 MB append-only log
+
+# Cap the size of the per-project digest cache. The cache keys on
+# ``(st_mtime_ns, st_size)`` so it grows by one entry on every model.scad
+# rewrite; without a cap a long-lived server rewriting the file every
+# few seconds accumulates thousands of dead entries per project. The
+# FIFO window comfortably covers the bursty 4-5 reads that follow a
+# successful build (metrics + preview + reviewer + dispatcher).
+_MAX_DIGEST_ENTRIES_PER_PROJECT = 8
+# Cap the number of projects cached at once. Older projects are evicted
+# FIFO when a new project enters the cache; callers that need a strict
+# content hash fall back to :func:`compute_model_sha256`.
+_MAX_DIGEST_PROJECTS = 256
+_MODEL_DIGEST_CACHE: "OrderedDict[str, OrderedDict[tuple[int, int], str | None]]" = OrderedDict()
+_MODEL_DIGEST_CACHE_GUARD: threading.Lock = threading.Lock()
+
+
+def cached_model_sha256(project_dir: Path) -> str | None:
+    """Return the SHA-256 of ``<project_dir>/model.scad``, cached by stat.
+
+    Reads the file only when its ``(st_mtime_ns, st_size)`` changes. Returns
+    ``None`` when the file is missing or unreadable. Cache entries are scoped
+    per ``project_dir`` so two projects cannot collide on identical stat
+    tuples.
+
+    The per-project cache is bounded to
+    :data:`_MAX_DIGEST_ENTRIES_PER_PROJECT` (FIFO) and the project-level
+    cache to :data:`_MAX_DIGEST_PROJECTS` (FIFO), so a server that
+    rewrites the same file for hours or cycles through thousands of
+    short-lived projects cannot grow the cache unbounded.
+    """
+    model_path = project_dir / MODEL_FILENAME
+    try:
+        stat = model_path.stat()
+    except OSError:
+        return None
+    key = (stat.st_mtime_ns, stat.st_size)
+    project_key = str(project_dir.resolve())
+    with _MODEL_DIGEST_CACHE_GUARD:
+        project_cache = _MODEL_DIGEST_CACHE.get(project_key)
+        if project_cache is None:
+            project_cache = OrderedDict()
+            _MODEL_DIGEST_CACHE[project_key] = project_cache
+            _MODEL_DIGEST_CACHE.move_to_end(project_key)
+            while len(_MODEL_DIGEST_CACHE) > _MAX_DIGEST_PROJECTS:
+                _MODEL_DIGEST_CACHE.popitem(last=False)
+        cached_value = project_cache.get(key)
+        if cached_value is None and key not in project_cache:
+            try:
+                cached_value = hashlib.sha256(model_path.read_bytes()).hexdigest()
+            except OSError:
+                cached_value = None
+            project_cache[key] = cached_value
+            while len(project_cache) > _MAX_DIGEST_ENTRIES_PER_PROJECT:
+                project_cache.popitem(last=False)
+    return cached_value
+
+
+def invalidate_model_digest_cache(project_dir: Path) -> None:
+    """Drop the cached ``model.scad`` digest entries for ``project_dir``.
+
+    Called from the project-delete route so a long-running server does
+    not retain digest entries for projects it has already removed from
+    disk. Safe to call when no entry exists.
+
+    The key matches :func:`cached_model_sha256` exactly (``str(resolve())``)
+    so cache eviction finds entries written by callers that passed an
+    unresolved ``project_dir``. Without ``.resolve()`` a path containing
+    symlinks or ``.``/``..`` components would leak entries because the
+    two functions would hash different strings.
+    """
+    project_key = str(project_dir.resolve())
+    with _MODEL_DIGEST_CACHE_GUARD:
+        _MODEL_DIGEST_CACHE.pop(project_key, None)
+
+
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
@@ -176,43 +252,6 @@ def compute_model_sha256(project_dir: Path) -> str | None:
         return hashlib.sha256(model_path.read_bytes()).hexdigest()
     except OSError:
         return None
-
-
-# Module-level cache of ``model.scad`` digests, keyed by ``(project_dir,
-# (st_mtime_ns, st_size))``. The ``(mtime_ns, size)`` pair is a heuristic:
-# it changes whenever the file is rewritten on a filesystem with
-# sub-second timestamp resolution (the common case) but can stay stable
-# across an overwrite that preserves length and mtime, so two distinct
-# contents may in theory share a key. That is acceptable here because
-# every read endpoint that consults the cache already holds the project
-# lock, which serialises writes against reads, and the cache is only
-# consulted as a skip-the-read optimisation — any consumer that needs a
-# strict content hash can fall back to :func:`compute_model_sha256`.
-_MODEL_DIGEST_CACHE: dict[str, dict[tuple[int, int], str | None]] = {}
-
-
-def cached_model_sha256(project_dir: Path) -> str | None:
-    """Return the SHA-256 of ``<project_dir>/model.scad``, cached by stat.
-
-    Reads the file only when its ``(st_mtime_ns, st_size)`` changes. Returns
-    ``None`` when the file is missing or unreadable. Cache entries are scoped
-    per ``project_dir`` so two projects cannot collide on identical stat
-    tuples. Bounded only by the number of distinct content revisions each
-    project has ever produced (each entry is ~150 bytes).
-    """
-    model_path = project_dir / MODEL_FILENAME
-    try:
-        stat = model_path.stat()
-    except OSError:
-        return None
-    key = (stat.st_mtime_ns, stat.st_size)
-    project_cache = _MODEL_DIGEST_CACHE.setdefault(str(project_dir.resolve()), {})
-    if key not in project_cache:
-        try:
-            project_cache[key] = hashlib.sha256(model_path.read_bytes()).hexdigest()
-        except OSError:
-            project_cache[key] = None
-    return project_cache[key]
 
 
 def model_is_built(project_dir: Path) -> bool:
@@ -420,7 +459,7 @@ class RevisionStore:
         """Return the source code for a revision."""
         self._validate_revision_id(revision_id)
         revision = self.get(revision_id)
-        blob_path = self._blobs_dir / f"{revision.model_sha256}.py"
+        blob_path = self._blobs_dir / f"{revision.model_sha256}.scad"
         if not blob_path.is_file():
             raise RevisionIntegrityError(
                 f"Source blob for revision {revision_id} is missing."
@@ -442,7 +481,7 @@ class RevisionStore:
             revision = self.get(revision_id)
         except RevisionIntegrityError:
             return False
-        blob_path = self._blobs_dir / f"{revision.model_sha256}.py"
+        blob_path = self._blobs_dir / f"{revision.model_sha256}.scad"
         if not blob_path.is_file():
             return False
         return hashlib.sha256(blob_path.read_bytes()).hexdigest() == revision.model_sha256
@@ -707,12 +746,89 @@ class RevisionStore:
             return
         atomic_write_text(log_path, "\n".join(kept) + "\n")
 
+    def _latest_builds_by_revision(self) -> dict[str, BuildRecord]:
+        """Return ``{revision_id: latest BuildRecord}`` in one linear pass.
+
+        ``build_for`` already returns the latest build for a single
+        revision by walking the append-only ``builds.jsonl`` log. The
+        revision-store callers that need every revision's latest build
+        (``last_known_good``, the retention gate inside
+        :meth:`prune`) used to call ``build_for`` once per id, paying an
+        ``O(N)`` file scan per revision — ``O(N * M)`` wall time where
+        ``M`` is the size of ``builds.jsonl``. This helper reads the log
+        exactly once and returns the same latest-build map so the callers
+        run in ``O(N + M)``.
+
+        Records with a malformed ``status`` field are skipped rather than
+        raised on. ``build_for`` only raises when the *latest* record per
+        revision has an invalid status, so a corrupted older build should
+        not invalidate the entire ``last_known_good`` lookup; the bad
+        record stays visible in ``builds.jsonl`` for an operator to find.
+
+        The result reflects the log as of the call: callers must hold
+        :data:`_lock` (the existing ``@_synchronized`` decorator on every
+        public entry point ensures this) so no concurrent append can
+        race the read.
+        """
+        try:
+            log_path = self._builds_log_path()
+        except OSError:
+            return {}
+        if not log_path.is_file():
+            return {}
+        latest: dict[str, BuildRecord] = {}
+        with log_path.open("r", encoding="utf-8") as log:
+            for line in log:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError as error:
+                    raise RevisionIntegrityError(
+                        f"Build log is malformed: {error}"
+                    ) from error
+                if not isinstance(item, dict):
+                    continue
+                revision_id = item.get("revision_id")
+                if not isinstance(revision_id, str):
+                    continue
+                try:
+                    build = BuildRecord.from_dict(item)
+                except (KeyError, TypeError) as error:
+                    raise RevisionIntegrityError(
+                        f"Build record for {revision_id} is malformed."
+                    ) from error
+                # Match ``build_for``'s contract: skip malformed status
+                # records instead of aborting the whole lookup. The
+                # record is still on disk for diagnostics; it just does
+                # not influence ``last_known_good``.
+                if build.status not in {"succeeded", "failed"}:
+                    continue
+                existing = latest.get(revision_id)
+                if existing is None or build.attempted_at > existing.attempted_at:
+                    latest[revision_id] = build
+        return latest
+
     @_synchronized
     def last_known_good(self) -> Revision | None:
-        """Return the newest revision with a successful build, or None."""
+        """Return the newest revision with a successful build, or None.
+
+        Reads ``builds.jsonl`` exactly once and pairs the resulting
+        latest-build map against the revisions list, instead of paying
+        one full file scan per revision. The iteration still walks
+        :meth:`_all_revisions` in newest-first order so the returned
+        revision is the most recent successful one.
+        """
+        latest_builds = self._latest_builds_by_revision()
         for revision in self._all_revisions():
-            build = self.build_for(revision.id)
-            if build is not None and build.status == "succeeded":
+            build = latest_builds.get(revision.id)
+            if build is None:
+                continue
+            if (
+                build.status == "succeeded"
+                and build.model_sha256 == revision.model_sha256
+            ):
                 return revision
         return None
 
@@ -919,7 +1035,7 @@ class RevisionStore:
         return revision
 
     def _write_blob_bytes(self, source_bytes: bytes, sha256: str) -> None:
-        blob_path = self._blobs_dir / f"{sha256}.py"
+        blob_path = self._blobs_dir / f"{sha256}.scad"
         if blob_path.exists():
             if hashlib.sha256(blob_path.read_bytes()).hexdigest() != sha256:
                 raise RevisionIntegrityError(

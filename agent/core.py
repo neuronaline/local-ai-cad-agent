@@ -1058,60 +1058,21 @@ class AgentRunner:
         ]
 
     @classmethod
-    def _initial_model_existed(
-        cls, project_dir: Path, history: list[dict] | None = None
-    ) -> bool:
-        """Determine whether model.scad existed before this conversation began.
-
-        To keep the cacheable prompt prefix byte-stable across multi-turn chats,
-        the ``<project_state>`` message at index 1 must reflect the initial
-        state when the conversation began, rather than flipping dynamically
-        after ``write_file`` creates ``model.scad``. The initial state is cached
-        in ``.agent_initial_state.json`` so it remains immutable for the lifetime
-        of the conversation.
-        """
-        init_state_path = project_dir / ".agent_initial_state.json"
-        if init_state_path.is_file():
-            try:
-                data = json.loads(init_state_path.read_text(encoding="utf-8"))
-                if isinstance(data, dict) and "model_existed" in data:
-                    return bool(data["model_existed"])
-            except (OSError, json.JSONDecodeError):
-                pass
-
-        has_write = False
-        if history:
-            has_write = any(
-                isinstance(msg.get("tool_calls"), list)
-                and any(
-                    isinstance(call, dict)
-                    and call.get("function", {}).get("name") == "write_file"
-                    for call in msg["tool_calls"]
-                )
-                for msg in history
-                if isinstance(msg, dict) and msg.get("role") == "assistant"
-            )
-
-        if has_write:
-            existed = False
-        else:
-            existed = (project_dir / MODEL_FILENAME).is_file()
-
-        try:
-            init_state_path.parent.mkdir(parents=True, exist_ok=True)
-            init_state_path.write_text(
-                json.dumps({"model_existed": existed}), encoding="utf-8"
-            )
-        except OSError:
-            pass
-        return existed
-
-    @classmethod
     def _project_state_message(
         cls, project_dir: Path, history: list[dict] | None = None
     ) -> dict[str, str]:
-        """Provide initial workspace state after the cacheable system prefix."""
-        existed = cls._initial_model_existed(project_dir, history)
+        """Provide current workspace state after the cacheable system prefix.
+
+        The state reflects the file system as of this turn so the model is
+        never told a stale answer (e.g. "model.scad does not exist" after a
+        successful ``write_file``). The trade-off is that the user message at
+        index 1 invalidates the provider prompt cache when the file's
+        existence flips, but the system prompt remains byte-stable so
+        provider-side cache breakpoints anchored to the system prompt keep
+        paying off across turns. See :data:`agent.prompt._OPERATIONAL_RULES`
+        for the corresponding instruction the model receives.
+        """
+        existed = (project_dir / MODEL_FILENAME).is_file()
         if existed:
             content = (
                 "<project_state>\n"
@@ -1204,12 +1165,20 @@ class AgentRunner:
     def clear_history(cls, project_dir: Path) -> bool:
         """Reset the agent's memory for ``project_dir``.
 
-        Truncates the canonical ``conversation.jsonl`` log and evicts the
-        in-memory history cache entry. Returns ``True`` when a log file was
+        Truncates the canonical ``conversation.jsonl`` log, evicts the
+        in-memory history cache entry, and removes the per-project agent
+        state files (``agent_state.json``, plus the legacy
+        ``agent_initial_state.json`` left over from releases that cached
+        the initial workspace state). Returns ``True`` when a log file was
         removed, ``False`` when the project had no recorded conversation.
         The model, preview, renders, and revision blobs are left untouched.
         """
         (project_dir / ".agent_state.json").unlink(missing_ok=True)
+        # Legacy cleanup: older releases wrote ``.agent_initial_state.json``
+        # so the cached ``<project_state>`` message could lie about the
+        # file's existence across turns. The new prompt reports the live
+        # state every turn, so the file is dead weight — drop it so a
+        # project upgraded in place resets to a clean state.
         (project_dir / ".agent_initial_state.json").unlink(missing_ok=True)
         return ConversationStore.clear(project_dir)
 

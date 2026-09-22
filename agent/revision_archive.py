@@ -149,7 +149,7 @@ def import_history(store, archive_path: Path) -> int:
             # never be importable, but raise explicitly so an operator
             # sees the broken digest instead of silent loss.
             if model_sha256 not in validated_blobs and not (
-                store._blobs_dir / f"{model_sha256}.py"
+                store._blobs_dir / f"{model_sha256}.scad"
             ).is_file():
                 raise RevisionIntegrityError(
                     f"Archive references revision {rev_id} with sha256 "
@@ -180,7 +180,7 @@ def import_history(store, archive_path: Path) -> int:
         for revision, build_record in pending:
             model_sha256 = revision.model_sha256
             if model_sha256 in validated_blobs and not (
-                store._blobs_dir / f"{model_sha256}.py"
+                store._blobs_dir / f"{model_sha256}.scad"
             ).is_file():
                 store._write_blob_bytes(validated_blobs[model_sha256], model_sha256)
             store._write_revision(revision)

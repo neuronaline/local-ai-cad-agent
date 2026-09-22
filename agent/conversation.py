@@ -86,27 +86,28 @@ class ConversationStore:
         Multimodal ``image_url`` parts are returned verbatim so the
         prompt prefix stays byte-stable across turns. Returning the same
         bytes the provider hashed keeps prompt caches warm.
+
+        All cache reads and writes happen under :func:`shared_history_lock`
+        so a concurrent append cannot race with the lookup and silently
+        re-cache a pre-write snapshot. The cache is invalidated by
+        ``append``/``clear`` (also under the lock) so once a turn
+        completes its write the next ``load`` always observes the
+        latest state.
         """
         cache_key = str(project_dir)
-        # A cache hit short-circuits the file read. The cache is invalidated
-        # by ``append``/``clear`` and the cache fill is guarded by the lock
-        # below, so hits are consistent with the latest persisted state.
-        cached = cls._cache.get(cache_key)
-        if cached is not None:
-            if not project_dir.exists():
-                # Drop the stale entry under the lock so a concurrent
-                # append cannot race with the pop and silently re-cache
-                # stale data afterwards.
-                with shared_history_lock():
-                    cls._cache.pop(cache_key, None)
-                return []
-            return [deepcopy(item) for item in cached]
-        # Serialise the read+cache-set against appends so a concurrent writer
-        # cannot have its line missed by this load (or, conversely, so a
-        # partially-written tail cannot be observed). ``RLock`` allows the
-        # current thread to re-enter if it already holds the lock (e.g. the
-        # EventBus thread populating the cache after an append).
         with shared_history_lock():
+            cached = cls._cache.get(cache_key)
+            if cached is not None:
+                if not project_dir.exists():
+                    # Drop the stale entry under the same lock so a
+                    # concurrent append cannot race with the pop and
+                    # silently re-cache stale data afterwards.
+                    cls._cache.pop(cache_key, None)
+                    return []
+                return [deepcopy(item) for item in cached]
+            # Serialise the read+cache-set against appends so a concurrent
+            # writer cannot have its line missed by this load (or, conversely,
+            # so a partially-written tail cannot be observed).
             history: list[dict[str, Any]] = []
             log_path = project_dir / "conversation.jsonl"
             if log_path.exists():
@@ -121,7 +122,7 @@ class ConversationStore:
                     ):
                         history.append(item)
             cls._set_cached(cache_key, [deepcopy(item) for item in history])
-        return [deepcopy(item) for item in history]
+            return [deepcopy(item) for item in history]
 
     @classmethod
     def append(cls, project_dir: Path, message: dict[str, Any]) -> None:

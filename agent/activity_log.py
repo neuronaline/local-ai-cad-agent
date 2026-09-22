@@ -128,15 +128,29 @@ class ActivityLogger:
 
     @contextmanager
     def _acquire_file_lock(self) -> Iterator[None]:
-        """Acquire an advisory ``flock`` on the sidecar lock file.
+        """Acquire an advisory ``flock`` on the sidecar lock.
 
         Cross-process guarantee: requires POSIX ``fcntl``. Falls back to
         a thread-only guarantee (matching the previous behaviour) when
         ``flock`` is unavailable (e.g. non-POSIX runners).
+
+        The lock file is opened in append mode (``O_APPEND`` /
+        ``"a"``). Opening with ``"w"`` would truncate the file at
+        zero bytes, which would silently discard the inode another
+        process already has ``flock``'d — ``fcntl`` locks are bound to
+        the underlying file (inode + file descriptor), not the path, so
+        truncation does not steal an existing lock and instead causes
+        subsequent acquisitions on the same path to deadlock against
+        a phantom inode the holder no longer references.
         """
         path = self.lockfile_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        handle = path.open("w", encoding="utf-8")
+        # ``"a"`` is atomic on POSIX (writes always land at EOF, never
+        # at byte 0) and ensures we do not truncate an existing lock
+        # file. The descriptor is opened with O_APPEND so a crash
+        # mid-write leaves a contiguous extension of the original
+        # contents rather than a hole.
+        handle = path.open("a", encoding="utf-8")
         acquired = False
         try:
             try:

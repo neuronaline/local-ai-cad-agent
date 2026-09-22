@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import threading
+from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -14,8 +15,12 @@ MAX_FILE_BYTES = 1 * 1024 * 1024
 # the JSON schema's ``maximum`` so the runtime guard and the model-facing
 # limit cannot drift.
 MAX_READ_LINES = 2000
-# Per-project locks for ``model.scad`` writes.
-_MODEL_FILE_LOCKS: dict[str, threading.RLock] = {}
+# Per-project locks for ``model.scad`` writes. OrderedDict-backed so the
+# cache evicts the least-recently-touched project when it grows past
+# ``_MAX_PROJECT_FILE_LOCKS`` (long-running servers that create + delete
+# many projects otherwise accumulate an unbounded set of stale locks).
+_MAX_PROJECT_FILE_LOCKS = 256
+_MODEL_FILE_LOCKS: "OrderedDict[str, threading.RLock]" = OrderedDict()
 _MODEL_FILE_LOCKS_GUARD: threading.Lock = threading.Lock()
 
 
@@ -24,19 +29,40 @@ def _file_lock(path: Path) -> Iterator[threading.RLock]:
     """Serialise writes to ``model.scad`` per project.
 
     Only ``model.scad`` is editable (see ``EDITABLE_FILES``), so keying by
-    ``path.parent`` (= the project directory) is sufficient.
+    ``path.parent`` (= the project directory) is sufficient. Touched
+    projects are moved to the end of the OrderedDict so a steady-state
+    server naturally keeps its active projects warm and lets idle ones
+    age out.
     """
     key = str(path.parent)
     with _MODEL_FILE_LOCKS_GUARD:
         lock = _MODEL_FILE_LOCKS.get(key)
         if lock is None:
             lock = threading.RLock()
-            _MODEL_FILE_LOCKS[key] = lock
+        # Re-insert unconditionally so the eviction order is updated on
+        # every write — an existing lock for this project is moved to the
+        # end of the OrderedDict, keeping recently-touched projects warm.
+        _MODEL_FILE_LOCKS[key] = lock
+        _MODEL_FILE_LOCKS.move_to_end(key)
+        while len(_MODEL_FILE_LOCKS) > _MAX_PROJECT_FILE_LOCKS:
+            _MODEL_FILE_LOCKS.popitem(last=False)
     lock.acquire()
     try:
         yield lock
     finally:
         lock.release()
+
+
+def invalidate_model_file_lock(project_dir: Path) -> None:
+    """Drop the per-project file lock when its directory goes away.
+
+    Called from the project-delete route so a server that cycles through
+    many short-lived projects does not accumulate orphaned
+    ``threading.RLock`` objects. Safe to call when no lock exists.
+    """
+    key = str(Path(project_dir))
+    with _MODEL_FILE_LOCKS_GUARD:
+        _MODEL_FILE_LOCKS.pop(key, None)
 
 
 class OpenScadPreflight:

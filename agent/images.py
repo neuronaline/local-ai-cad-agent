@@ -60,14 +60,33 @@ def store_images(files: list[FileStorage], project_dir: Path) -> list[Path]:
                 # Real downsize — works for every supported format and
                 # shrinks in place to fit inside the
                 # ``MAX_IMAGE_DIMENSION`` square before we hand the
-                # buffer to the PNG encoder.
+                # buffer to the encoder.
                 image.thumbnail((MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION))
             except (UnidentifiedImageError, Image.DecompressionBombError, OSError) as error:
                 raise ValueError(f"Invalid image: {upload.filename}") from error
-            if image.mode not in {"RGB", "L"}:
+            # Preserve JPEG when the user uploaded JPEG, PNG only when
+            # the source is PNG. ``Pillow`` already detected the format
+            # from the file header; ``image.format`` reflects that.
+            # ``LA``/``RGBA`` are flattened to RGB for JPEG output.
+            output_format = (image.format or "PNG").upper()
+            if output_format == "JPEG" and image.mode not in {"RGB", "L"}:
                 image = image.convert("RGB")
-            target = project_dir / "inputs" / f"{uuid4().hex}.png"
-            image.save(target, format="PNG", optimize=True)
+            target = project_dir / "inputs" / f"{uuid4().hex}.{output_format.lower()}"
+            save_kwargs: dict[str, object] = {}
+            if output_format == "PNG":
+                save_kwargs["optimize"] = True
+            elif output_format == "JPEG":
+                # Web-quality JPEG: 5 reference photos at 1600px stay
+                # comfortably under the 20 MB payload ceiling that the
+                # OpenAI / OpenRouter endpoints enforce, while still
+                # preserving enough fidelity for the model to see the
+                # relevant geometry / colour cues.
+                save_kwargs["quality"] = 82
+                save_kwargs["optimize"] = True
+            elif output_format == "WEBP":
+                save_kwargs["quality"] = 82
+                save_kwargs["method"] = 6
+            image.save(target, format=output_format, **save_kwargs)
             stored.append(target)
     except Exception:
         for path in stored:
@@ -81,7 +100,19 @@ def as_chat_image(path: Path) -> dict[str, object]:
 
     Both OpenRouter and OpenAI Chat Completions accept the same
     ``{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}``
-    shape, so a single helper serves both providers.
+    shape, so a single helper serves both providers. The MIME type in the
+    data URL is derived from the on-disk file extension so JPEG /
+    WebP inputs round-trip without a wasteful PNG re-encode.
     """
+    suffix = path.suffix.lower()
+    mime_type = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+    }.get(suffix, "image/png")
     encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-    return {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}}
+    return {
+        "type": "image_url",
+        "image_url": {"url": f"data:{mime_type};base64,{encoded}"},
+    }

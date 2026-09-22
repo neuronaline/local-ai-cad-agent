@@ -7,6 +7,7 @@ stay thin and behave identically.
 """
 from __future__ import annotations
 
+import atexit
 import json
 import queue
 import threading
@@ -24,6 +25,31 @@ TOOL_IMAGE_PROMPT = (
     "The attached image is the visual artifact returned by the latest tool "
     "call. Inspect it and continue the task."
 )
+
+
+# Module-level HTTP session. ``requests.Session`` keeps an internal urllib3
+# connection pool so every LLM call to the same provider reuses the
+# previous TCP/TLS handshake instead of re-doing DNS resolution, the
+# 3-way handshake, and the TLS 1.3 negotiation. ``session.post`` is
+# thread-safe in urllib3 (the per-host pools take their own locks) so
+# the existing ``request_worker`` daemon thread in
+# :func:`post_with_cancel` can hand the work off without a second lock.
+_HTTP_SESSION: requests.Session = requests.Session()
+# Size the urllib3 connection pool per scheme. The default is 10/10
+# connections, which is enough for a single in-flight LLM call but tight
+# once the orchestrator fans out reviewer + dispatcher requests in
+# parallel. 8 hosts / 16 connections leaves headroom for those bursts
+# without unbounded growth — ``atexit`` closes the session so the
+# descriptors are released on shutdown.
+_HTTP_SESSION.mount(
+    "https://",
+    requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=16),
+)
+_HTTP_SESSION.mount(
+    "http://",
+    requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=16),
+)
+atexit.register(_HTTP_SESSION.close)
 
 
 class RequestCancelled(RuntimeError):
@@ -321,19 +347,22 @@ def post_with_cancel(
     timeout_seconds: int,
     stop_event: threading.Event | None,
 ) -> requests.Response:
-    """Run a blocking ``requests.post`` that can be cancelled by ``stop_event``.
+    """Run a blocking ``POST`` that can be cancelled by ``stop_event``.
 
     The HTTP call is dispatched to a daemon thread so the agent-loop stop
     signal can interrupt it within ``~100 ms`` instead of waiting for the
-    underlying socket timeout.
+    underlying socket timeout. The daemon uses the module-level
+    :data:`_HTTP_SESSION` (a thread-safe ``requests.Session`` with an
+    internal urllib3 connection pool) so successive calls reuse the
+    previous TLS handshake instead of re-doing DNS resolution, the
+    TCP 3-way handshake, and the TLS 1.3 negotiation on every request.
 
     The worker publishes its :class:`requests.Response` to ``response_holder``
     *before* queueing it so the main thread can force-close the socket on
     the cancel path. Without that hook a rapid stop/restart cycle leaks a
-    TCP socket (and the keepalive timer backing it) every time the user
-    cancels before the worker has finished draining ``requests.post`` —
-    the daemon thread keeps the underlying connection alive until process
-    exit.
+    pooled keepalive connection every time the user cancels before the
+    worker has finished draining the response stream — the daemon thread
+    keeps the underlying connection alive in the pool until process exit.
     """
     results: queue.Queue[requests.Response | BaseException] = queue.Queue(maxsize=1)
     # Mutable slot for the in-flight Response. ``dict``-based rather than
@@ -343,7 +372,7 @@ def post_with_cancel(
 
     def request_worker() -> None:
         try:
-            response = requests.post(
+            response = _HTTP_SESSION.post(
                 url,
                 headers=headers,
                 json=payload,

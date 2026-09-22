@@ -481,6 +481,14 @@ def delete_project(project_name: str):
         if runner.has_active_state_for(project_name):
             return jsonify({"error": "Cannot delete a project with active agent state."}), 409
         shutil.rmtree(project_dir)
+        # Drop the per-project advisory lock and the in-memory caches
+        # keyed on this directory so a long-running server does not
+        # accumulate orphaned resources for deleted projects.
+        from agent.tools.file_tool import invalidate_model_file_lock
+        from agent.revisions import invalidate_model_digest_cache
+
+        invalidate_model_file_lock(project_dir)
+        invalidate_model_digest_cache(project_dir)
     return jsonify({"deleted": True})
 
 
@@ -511,7 +519,6 @@ def reset_project(project_name: str):
             ), 409
         removed = runner.clear_history(project_dir)
         (project_dir / ".agent_state.json").unlink(missing_ok=True)
-        (project_dir / ".agent_initial_state.json").unlink(missing_ok=True)
     current_app.config["EVENT_BUS"].publish(
         "conversation_reset",
         {"project": project_name, "removed": removed},

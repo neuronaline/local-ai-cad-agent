@@ -889,7 +889,20 @@ def test_conversation_store_load_preserves_images(tmp_path: Path) -> None:
 
 
 def test_agent_runner_multi_turn_prefix_and_cache_stability(tmp_path: Path) -> None:
-    """Multi-turn chats must maintain byte-stable prompt prefixes across distinct user turns."""
+    """Multi-turn chats must keep the system prompt stable and report truthful state.
+
+    The cacheable contract is:
+    * The system prompt (index 0) is byte-stable across every turn of a
+      session — that is what provider-side prompt caching keys against.
+    * The ``<project_state>`` user message (index 1) reflects the current
+      disk state. It is allowed to change between turns when the file's
+      existence flips; flipping it on the first turn after ``write_file``
+      is correct (and was previously hidden by a buggy
+      ``.agent_initial_state.json`` cache that lied to the model).
+    * Once the file exists, subsequent turns without further file-system
+      changes must keep the system prompt AND the ``<project_state>``
+      prefix byte-stable so the provider cache can be reused.
+    """
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     project_dir = workspace / "test-project"
@@ -941,30 +954,45 @@ def test_agent_runner_multi_turn_prefix_and_cache_stability(tmp_path: Path) -> N
     for msg in [assistant_t1_1, tool_write_result, assistant_t1_2, tool_build_result, assistant_t1_final]:
         ConversationStore.append(project_dir, msg)
 
-    # The full wire messages for Turn 1
-    messages_t1 = context_t1 + [assistant_t1_1, tool_write_result, assistant_t1_2, tool_build_result, assistant_t1_final]
-    wire_t1 = sanitize_messages(messages_t1, preserve_reasoning=True)
-
     # --- Turn 2 ---
-    # User asks a follow-up question. Even though model.scad now exists on disk,
-    # messages[1] must remain "model.scad does not exist" so the prefix is unchanged.
+    # The file now exists, so the state message must flip from
+    # "does not exist" to "exists" so the model knows it can edit / verify.
     context_t2 = runner._context(project_dir, "Now drill a 5mm hole through the center", [])
-    assert "model.scad does not exist" in context_t2[1]["content"]
+    assert "model.scad exists" in context_t2[1]["content"]
 
-    wire_t2 = sanitize_messages(context_t2, preserve_reasoning=True)
+    # The system prompt (index 0) must be byte-identical between turns —
+    # that is what provider prompt caches key against.
+    assert context_t2[0] == context_t1[0]
+    # The ``<project_state>`` prefix legitimately flipped; subsequent turns
+    # with stable state must keep it byte-stable from now on.
+    assert "model.scad exists" in context_t2[1]["content"]
 
-    # Crucial assertion: wire_t1 must be an EXACT prefix of wire_t2!
-    # If wire_t2 prefix differs in ANY way, provider prompt cache is invalidated.
-    assert wire_t2[:len(wire_t1)] == wire_t1
+    # --- Turn 3 ---
+    # With the file still present and no further disk changes, the cached
+    # portion of the prompt (system + project_state + history up to the
+    # last final assistant message) must be byte-identical across turns.
+    # Each turn appends a new trailing user message, so we compare the
+    # common prefix by slicing the trailing per-turn messages off both.
+    context_t3 = runner._context(project_dir, "Add a chamfer to the edge", [])
+    assert context_t3[0] == context_t2[0]
+    assert context_t3[1] == context_t2[1]
+    # context_t2 = [system, project_state, *history_t1, user_t2]
+    # context_t3 = [system, project_state, *history_t1, user_t2, user_t3]
+    # The shared cached prefix is everything before the new user message
+    # each turn added. Both slices below produce that exact prefix.
+    assert context_t2[:-1] == context_t3[:-2]
 
-    # In particular, the tool image must be in wire_t2 at index 6 with strictly alternating roles
-    assert wire_t2[6]["role"] == "user"
-    assert wire_t2[6]["content"][1]["type"] == "image_url"
-    assert wire_t2[6]["content"][1]["image_url"]["url"] == "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
+    # Sanity check: the tool image survives in the history slice at the
+    # same logical position so the follow-up turn's tool evidence stays
+    # accessible without a redundant rebuild.
+    tool_with_image = context_t3[6]
+    assert tool_with_image["role"] == "tool"
+    assert tool_with_image["content"][1]["type"] == "image_url"
+    assert tool_with_image["content"][1]["image_url"]["url"] == "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
 
 
-def test_clear_history_cleans_initial_state_file(tmp_path: Path) -> None:
-    """clear_history removes legacy state files along with conversation and state."""
+def test_clear_history_removes_state_files(tmp_path: Path) -> None:
+    """``clear_history`` removes the per-project state files alongside the log."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     project_dir = workspace / "test-project"
@@ -975,7 +1003,9 @@ def test_clear_history_cleans_initial_state_file(tmp_path: Path) -> None:
     )
     runner = AgentRunner(settings, publish=lambda *args, **kwargs: None)
 
-    # Populate state files
+    # Populate state files including the legacy ``.agent_initial_state.json``
+    # left over from a previous release; ``clear_history`` cleans it up so
+    # a project upgraded in place resets to a clean state.
     (project_dir / ".agent_initial_state.json").write_text("{}", encoding="utf-8")
     (project_dir / ".agent_state.json").write_text("{}", encoding="utf-8")
     (project_dir / "conversation.jsonl").write_text("{}", encoding="utf-8")
@@ -1738,8 +1768,16 @@ def test_normalize_messages_merges_consecutive_user_messages() -> None:
     assert normalized[3]["role"] == "user"
 
 
-def test_initial_project_state_immutability(tmp_path: Path) -> None:
-    """_initial_model_existed ensures project state remains immutable across turns."""
+def test_project_state_reflects_current_disk_state(tmp_path: Path) -> None:
+    """The ``<project_state>`` message always reflects the current disk state.
+
+    Earlier versions cached the initial existence state in
+    ``.agent_initial_state.json`` to keep the prompt prefix byte-stable
+    across turns, but that lied to the model after ``write_file`` created
+    ``model.scad`` (it kept telling the model the file did not exist). The
+    state must now follow the file system on every turn so the model can
+    plan its next ``edit_file`` / ``cad_build_and_verify`` call correctly.
+    """
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     project_dir = workspace / "fresh-proj"
@@ -1759,9 +1797,10 @@ def test_initial_project_state_immutability(tmp_path: Path) -> None:
         "tool_calls": [{"function": {"name": "write_file"}}]
     })
 
-    # Second turn: state MUST remain 'does not exist' so the prefix cache is not invalidated
+    # Second turn: state MUST now read "exists" so the model can edit/verify.
     c2 = runner._context(project_dir, "Drill hole", [])
-    assert "model.scad does not exist" in c2[1]["content"]
+    assert "model.scad exists" in c2[1]["content"]
+    assert "does not exist" not in c2[1]["content"]
 
 
 # ---------------------------------------------------------------------------
