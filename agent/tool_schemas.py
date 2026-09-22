@@ -109,6 +109,52 @@ TOOL_SCHEMAS = [
         [],
     ),
     _tool(
+        "get_view_images",
+        "Retrieve rendered image(s) of the current model for permanent visual memory. "
+        "Each request selects one canonical view and optionally a cropped area within "
+        "it (normalized 0-1 coordinates, origin top-left). Request all areas you need "
+        "in one call (max 4). Requires a successful cad_build_and_verify first.",
+        {
+            "images": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 4,
+                "description": "Images to retrieve in this call.",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "view": {
+                            "type": "string",
+                            "enum": [
+                                "x_positive", "x_negative",
+                                "y_positive", "y_negative",
+                                "z_positive", "z_negative",
+                                "isometric_positive", "isometric_negative",
+                            ],
+                            "description": "Canonical rendered view to take the image from.",
+                        },
+                        "crop": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "description": "Optional sub-area of the 512x512 view. "
+                                           "Omit for the full view.",
+                            "properties": {
+                                "x":      {"type": "number", "minimum": 0, "maximum": 1},
+                                "y":      {"type": "number", "minimum": 0, "maximum": 1},
+                                "width":  {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+                                "height": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+                            },
+                            "required": ["x", "y", "width", "height"],
+                        },
+                    },
+                    "required": ["view"],
+                },
+            },
+        },
+        ["images"],
+    ),
+    _tool(
         "question",
         "Ask all blocking clarification questions together, then stop and wait. ``input_type`` defaults to ``text``; pass ``select`` or ``multiselect`` for choice questions. ``required`` defaults to ``true``.",
         {

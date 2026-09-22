@@ -1477,7 +1477,7 @@ def test_tool_schemas_do_not_expose_sha_parameters() -> None:
 
 
 def test_tool_schemas_streamlined_to_five_core_tools() -> None:
-    """TOOL_SCHEMAS must contain exactly the 5 streamlined tools."""
+    """TOOL_SCHEMAS must contain exactly the 6 streamlined tools."""
     from agent.tool_schemas import TOOL_SCHEMAS
 
     names = [tool["function"]["name"] for tool in TOOL_SCHEMAS]
@@ -1486,6 +1486,7 @@ def test_tool_schemas_streamlined_to_five_core_tools() -> None:
         "write_file",
         "edit_file",
         "cad_build_and_verify",
+        "get_view_images",
         "question",
     ]
 
@@ -2258,4 +2259,492 @@ def test_runner_settings_are_derived_from_validated_mode() -> None:
     settings = tool._runner_settings(RenderMode.NONE)
     assert settings["render_views"] is False
     assert settings["write_isometric"] is False
+
+
+# ---------------------------------------------------------------------------
+# ``get_view_images`` tool
+# ---------------------------------------------------------------------------
+
+
+from agent.tools.image_tool import (  # noqa: E402  (intentional late import)
+    CANONICAL_VIEW_IDS,
+    ImageTool,
+)
+
+
+def _make_tiny_png(path: Path, *, color: tuple[int, int, int] = (10, 20, 30)) -> bytes:
+    """Write a real 512x512 RGB PNG to ``path`` and return its bytes."""
+    import io
+
+    from PIL import Image
+
+    image = Image.new("RGB", (512, 512), color)
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG", optimize=True)
+    data = buffer.getvalue()
+    path.write_bytes(data)
+    return data
+
+
+def _seed_review_dir(
+    project_dir: Path,
+    *,
+    view_ids: tuple[str, ...] = CANONICAL_VIEW_IDS,
+) -> tuple[str, dict[str, str]]:
+    """Seed a synthetic review dir keyed by the current ``model.scad``.
+
+    Returns ``(review_sha256, view_sha256s)`` where ``view_sha256s`` maps
+    each view id to the freshly written PNG's sha256. ``model.scad`` is
+    written so :func:`compute_model_sha256` produces a stable digest.
+    """
+    from agent.revisions import MODEL_FILENAME, compute_model_sha256
+
+    (project_dir / MODEL_FILENAME).write_text("cube([1, 2, 3]);\n", encoding="utf-8")
+    digest = compute_model_sha256(project_dir)
+    assert digest is not None
+    review_root = project_dir / ".cad-agent" / "reviews" / digest
+    views_dir = review_root / "views"
+    views_dir.mkdir(parents=True, exist_ok=True)
+    view_entries: list[dict] = []
+    view_sha: dict[str, str] = {}
+    for index, view_id in enumerate(view_ids):
+        path = views_dir / f"{view_id}.png"
+        colour = (
+            (10 + 20 * index) % 255,
+            (20 + 30 * index) % 255,
+            (30 + 40 * index) % 255,
+        )
+        data = _make_tiny_png(path, color=colour)
+        sha = hashlib.sha256(data).hexdigest()
+        view_sha[view_id] = sha
+        view_entries.append(
+            {
+                "view_id": view_id,
+                "image_sha256": sha,
+                "path": f"views/{view_id}.png",
+            }
+        )
+    (review_root / "manifest.json").write_text(
+        json.dumps({"views": view_entries}),
+        encoding="utf-8",
+    )
+    return digest, view_sha
+
+
+def test_get_view_images_returns_full_views_and_paths(tmp_path: Path) -> None:
+    """Happy path: a full-view request returns the manifest hash and dims."""
+    digest, view_sha = _seed_review_dir(tmp_path)
+    tool = ImageTool(tmp_path)
+    result = tool.get_view_images(
+        [
+            {"view": "z_positive"},
+            {"view": "isometric_positive"},
+        ]
+    )
+    assert result["review_sha256"] == digest
+    images = result["images"]
+    assert [item["view"] for item in images] == ["z_positive", "isometric_positive"]
+    for item in images:
+        assert item["cropped"] is False
+        assert item["width"] == 512
+        assert item["height"] == 512
+        assert item["sha256"] == view_sha[item["view"]]
+        assert item["path"] == f"views/{item['view']}.png"
+
+
+def test_get_view_images_creates_and_reuses_crop_cache(tmp_path: Path) -> None:
+    """Cropped requests persist under crops/ with stable filenames."""
+    _, _ = _seed_review_dir(tmp_path)
+    tool = ImageTool(tmp_path)
+    crop = {"x": 0.1, "y": 0.2, "width": 0.5, "height": 0.5}
+    first = tool.get_view_images([{"view": "x_positive", "crop": crop}])
+    entry = first["images"][0]
+    assert entry["cropped"] is True
+    crop_path = tmp_path / ".cad-agent" / "reviews" / first["review_sha256"] / entry["path"]
+    assert crop_path.is_file()
+    mtime = crop_path.stat().st_mtime_ns
+    assert entry["width"] == 256
+    assert entry["height"] == 256
+    # Second call must reuse the cached file (no rewrite).
+    second = tool.get_view_images([{"view": "x_positive", "crop": crop}])
+    assert second["images"][0]["path"] == entry["path"]
+    assert crop_path.stat().st_mtime_ns == mtime
+
+
+def test_get_view_images_rejects_unknown_view(tmp_path: Path) -> None:
+    """``ValueError`` when the LLM sends a view id not in the enum."""
+    _seed_review_dir(tmp_path)
+    tool = ImageTool(tmp_path)
+    with pytest.raises(ValueError, match="Unknown view id"):
+        tool.get_view_images([{"view": "bogus_view"}])
+
+
+def test_get_view_images_rejects_degenerate_crop(tmp_path: Path) -> None:
+    """Crops smaller than 8 px on either side must be rejected."""
+    _seed_review_dir(tmp_path)
+    tool = ImageTool(tmp_path)
+    with pytest.raises(ValueError, match="degenerate"):
+        tool.get_view_images(
+            [
+                {
+                    "view": "y_positive",
+                    "crop": {"x": 0.0, "y": 0.0, "width": 0.001, "height": 0.5},
+                }
+            ]
+        )
+
+
+def test_get_view_images_deduplicates_identical_requests(tmp_path: Path) -> None:
+    """Two identical (view, crop) tuples in one call collapse to one entry."""
+    _seed_review_dir(tmp_path)
+    tool = ImageTool(tmp_path)
+    crop = {"x": 0.0, "y": 0.0, "width": 0.5, "height": 0.5}
+    result = tool.get_view_images(
+        [
+            {"view": "z_positive", "crop": crop},
+            {"view": "z_positive", "crop": crop},
+            {"view": "z_positive"},
+        ]
+    )
+    assert len(result["images"]) == 2
+
+
+def test_get_view_images_requires_existing_review(tmp_path: Path) -> None:
+    """Without a successful build the tool raises a clear ValueError."""
+    tool = ImageTool(tmp_path)
+    with pytest.raises(ValueError, match="cad_build_and_verify"):
+        tool.get_view_images([{"view": "z_positive"}])
+
+
+def test_get_view_images_detects_stale_review_after_model_edit(tmp_path: Path) -> None:
+    """Editing ``model.scad`` after a build must surface a stale-review error."""
+    from agent.revisions import MODEL_FILENAME
+
+    _seed_review_dir(tmp_path)
+    # The seeded review is keyed to the original hash. Mutate model.scad
+    # so its current sha no longer matches the review directory name.
+    (tmp_path / MODEL_FILENAME).write_text("cube([4, 5, 6]);\n", encoding="utf-8")
+    tool = ImageTool(tmp_path)
+    with pytest.raises(ValueError, match="cad_build_and_verify"):
+        tool.get_view_images([{"view": "z_positive"}])
+
+
+def test_get_view_images_rejects_tampered_view_png(tmp_path: Path) -> None:
+    """Tampered bytes -> the manifest hash check must skip the view.
+
+    A single tampered view must not produce a result if it's the only
+    request, and must be dropped from the returned list when other
+    views are requested alongside.
+    """
+    from agent.revisions import MODEL_FILENAME, compute_model_sha256
+
+    digest, _view_sha = _seed_review_dir(tmp_path)
+    review_root = tmp_path / ".cad-agent" / "reviews" / digest
+    tampered_view = review_root / "views" / "z_positive.png"
+    tampered_view.write_bytes(b"not-a-png-at-all")
+    assert compute_model_sha256(tmp_path) is not None
+    tool = ImageTool(tmp_path)
+    # Only the tampered view was requested -> overall failure.
+    with pytest.raises(ValueError, match="None of the requested views"):
+        tool.get_view_images([{"view": "z_positive"}])
+    # Mix in a clean view: tampered entry is dropped, valid one survives.
+    result = tool.get_view_images(
+        [{"view": "z_positive"}, {"view": "x_positive"}]
+    )
+    assert [item["view"] for item in result["images"]] == ["x_positive"]
+    # Sanity: the model on disk still matches the review dir (no edit happened).
+    assert (tmp_path / MODEL_FILENAME).read_text(encoding="utf-8")
+
+
+def test_dispatcher_routes_get_view_images_to_image_tool(tmp_path: Path) -> None:
+    """``dispatch`` returns ``(result, False)`` for ``get_view_images``."""
+    _seed_review_dir(tmp_path)
+    from agent.core import ProjectTools
+    from agent.dispatcher import dispatch
+
+    tools = ProjectTools(tmp_path, lambda *args: None)
+    _result, waiting = dispatch(
+        tools,
+        "test",
+        "get_view_images",
+        {"images": [{"view": "z_positive"}]},
+    )
+    assert waiting is False
+    # The raw result is the dict that ``tool_success`` will wrap.
+    assert isinstance(_result, dict)
+    assert _result["review_sha256"]
+    assert _result["images"][0]["view"] == "z_positive"
+
+
+def test_get_view_images_failure_envelope_via_dispatcher(tmp_path: Path) -> None:
+    """Errors raised by ImageTool must surface as a structured ``ok:false`` envelope."""
+    from agent.core import ProjectTools
+    from agent.dispatcher import dispatch
+    from agent.tool_results import failure as tool_failure
+
+    tools = ProjectTools(tmp_path, lambda *args: None)
+    with pytest.raises(ValueError, match="cad_build_and_verify"):
+        dispatch(
+            tools,
+            "test",
+            "get_view_images",
+            {"images": [{"view": "z_positive"}]},
+        )
+    # ``tool_failure`` produces the same envelope shape ``dispatch`` would
+    # emit on the failure branch of ``process_tool_call``.
+    envelope = json.loads(tool_failure("get_view_images", ValueError("boom")))
+    assert envelope["ok"] is False
+    assert envelope["tool"] == "get_view_images"
+    assert envelope["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_build_view_image_multimodal_content_appends_image_parts(tmp_path: Path) -> None:
+    """The dispatcher helper attaches one ``image_url`` per returned path."""
+    from agent.tool_results import build_view_image_multimodal_content
+
+    digest, _view_sha = _seed_review_dir(tmp_path)
+    success_json = json.dumps(
+        {
+            "ok": True,
+            "tool": "get_view_images",
+            "data": {
+                "review_sha256": digest,
+                "images": [
+                    {
+                        "view": "z_positive",
+                        "cropped": False,
+                        "path": "views/z_positive.png",
+                        "sha256": _view_sha["z_positive"],
+                        "width": 512,
+                        "height": 512,
+                    },
+                ],
+            },
+        }
+    )
+    multimodal = build_view_image_multimodal_content(success_json, tmp_path)
+    assert multimodal is not None
+    parts = multimodal["content"]
+    assert parts[0]["type"] == "text"
+    image_parts = [p for p in parts if p.get("type") == "image_url"]
+    assert len(image_parts) == 1
+    assert image_parts[0]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert len(multimodal["image_paths"]) == 1
+
+
+def test_build_view_image_multimodal_content_returns_none_on_failure_envelope(
+    tmp_path: Path,
+) -> None:
+    """Failure envelopes must never produce a multimodal payload."""
+    from agent.tool_results import build_view_image_multimodal_content
+
+    failure_json = json.dumps(
+        {
+            "ok": False,
+            "tool": "get_view_images",
+            "error": {"code": "VALIDATION_ERROR", "message": "boom"},
+        }
+    )
+    assert build_view_image_multimodal_content(failure_json, tmp_path) is None
+
+
+def test_get_view_images_dispatcher_preserves_history_prefix_stability(tmp_path: Path) -> None:
+    """Appending a get_view_images result must not mutate earlier messages.
+
+    Core guarantee from PLAN_get_view_images.md §4: images are only ever
+    appended at the tail of ``conversation.jsonl``. Pre-existing entries
+    remain byte-identical after the tool call, and the new images appear
+    only after ``relocate_tool_images`` rewrites them into a trailing
+    ``role: user`` message.
+    """
+    from agent.conversation import ConversationStore
+    from agent.core import ProjectTools
+    from agent.dispatcher import dispatch, process_tool_call
+    from agent.llm_base import relocate_tool_images
+
+    _seed_review_dir(tmp_path)
+    tools = ProjectTools(tmp_path, lambda *args: None)
+    # The system prompt is injected into ``messages`` at LLM-call time
+    # (it is *not* persisted in ``conversation.jsonl`` — see
+    # ``ConversationStore._KEPT_ROLES``). Mirror the real agent loop by
+    # seeding the system message in-memory only.
+    seed_system = {"role": "system", "content": "system-prompt"}
+    seed_user = {"role": "user", "content": "Look at my plate"}
+    seed_assistant = {
+        "role": "assistant",
+        "content": "I'll request a view.",
+        "tool_calls": [
+            {
+                "id": "call_view",
+                "type": "function",
+                "function": {"name": "get_view_images", "arguments": "{}"},
+            }
+        ],
+    }
+    # Persist only the user/assistant turns (system is regenerated each call).
+    ConversationStore.append(tmp_path, seed_user)
+    ConversationStore.append(tmp_path, seed_assistant)
+
+    pre_history = ConversationStore.load(tmp_path)
+    # In-memory snapshot reflects what the agent loop actually carries:
+    # system (in-memory only) + persisted history.
+    pre_snapshot = [deepcopy(seed_system), *pre_history]
+
+    messages: list[dict] = [deepcopy(item) for item in pre_snapshot]
+    dispatch_args = {"images": [{"view": "z_positive"}, {"view": "x_positive"}]}
+    captured: list[dict] = []
+    append_calls: list[dict] = []
+    process_tool_call(
+        tools=tools,
+        project="test",
+        project_dir=tmp_path,
+        call={
+            "id": "call_view",
+            "function": {
+                "name": "get_view_images",
+                "arguments": json.dumps(dispatch_args),
+            },
+        },
+        cad_fix_required=False,
+        prev_preview_id=None,
+        cad_error=None,
+        messages=messages,
+        publish=lambda event, payload: captured.append({"event": event, **payload}),
+        register_preview=lambda *_: "preview-id",
+        append_message=lambda _dir, msg: append_calls.append(deepcopy(msg)),
+    )
+
+    # Pre-existing messages must still be byte-identical to the snapshot
+    # (the dispatcher mutated ``messages`` in-place, but only appended at
+    # the tail).
+    for index, pre in enumerate(pre_snapshot):
+        assert messages[index] == pre, (
+            f"Pre-existing message at index {index} was mutated: "
+            f"role={pre.get('role')}"
+        )
+    # The new tail entry is a tool message carrying the JSON envelope.
+    new_tail = messages[-1]
+    assert new_tail["role"] == "tool"
+    assert new_tail["tool_call_id"] == "call_view"
+    content = new_tail["content"]
+    assert isinstance(content, list)
+    image_parts = [p for p in content if p.get("type") == "image_url"]
+    assert len(image_parts) == 2
+
+    # ``relocate_tool_images`` (the wire-payload stage) must move those
+    # images into a trailing user message without touching any earlier
+    # message (including the system prompt and the assistant turn).
+    relocated = relocate_tool_images(messages)
+    assert relocated[0] == seed_system
+    assert relocated[1] == seed_user
+    # The assistant message survives unchanged (it's not a tool message).
+    assert relocated[2] == seed_assistant
+    # Tool message keeps its text but loses the image parts.
+    assert relocated[3]["role"] == "tool"
+    assert isinstance(relocated[3]["content"], str)
+    # Trailing user message carries the relocated images.
+    tail_user = relocated[-1]
+    assert tail_user["role"] == "user"
+    tail_images = [p for p in tail_user["content"] if p.get("type") == "image_url"]
+    assert len(tail_images) == 2
+
+    # The persisted ``conversation.jsonl`` must include the tool message
+    # with its image_url parts — the on-disk record is the permanent
+    # memory, the relocated version is just the wire payload.
+    # The dispatcher captures append calls in ``append_calls``; replay the
+    # captured tool message through ``ConversationStore.append`` so the
+    # on-disk record mirrors what the real agent loop would persist.
+    persisted_tool_msg = next(msg for msg in append_calls if msg.get("role") == "tool")
+    ConversationStore.append(tmp_path, persisted_tool_msg)
+    post_history = ConversationStore.load(tmp_path)
+    # Pre-existing persisted entries are untouched (system message is not
+    # persisted at all — only user/assistant/tool survive the load filter).
+    assert post_history[:2] == pre_history
+    persisted_tool = post_history[2]
+    assert persisted_tool["role"] == "tool"
+    persisted_images = [
+        p for p in persisted_tool["content"] if p.get("type") == "image_url"
+    ]
+    assert len(persisted_images) == 2
+
+
+def test_get_view_images_falls_back_to_text_when_provider_rejects_images(
+    tmp_path: Path,
+) -> None:
+    """``without_images`` strips the trailing image parts but keeps stored history.
+
+    Even when the provider rejects the inline image, the tool's success
+    envelope is already in ``conversation.jsonl`` and will be re-sent
+    verbatim on the next request.
+    """
+    from agent.conversation import ConversationStore
+    from agent.core import ProjectTools
+    from agent.dispatcher import dispatch, process_tool_call
+    from agent.llm_base import TOOL_IMAGE_PROMPT, without_images
+
+    _seed_review_dir(tmp_path)
+    tools = ProjectTools(tmp_path, lambda *args: None)
+    captured: list[dict] = []
+    append_calls: list[dict] = []
+    messages: list[dict] = []
+    process_tool_call(
+        tools=tools,
+        project="test",
+        project_dir=tmp_path,
+        call={
+            "id": "call_view",
+            "function": {
+                "name": "get_view_images",
+                "arguments": json.dumps(
+                    {"images": [{"view": "isometric_positive"}]}
+                ),
+            },
+        },
+        cad_fix_required=False,
+        prev_preview_id=None,
+        cad_error=None,
+        messages=messages,
+        publish=lambda event, payload: captured.append({"event": event, **payload}),
+        register_preview=lambda *_: "preview-id",
+        append_message=lambda _dir, msg: append_calls.append(deepcopy(msg)),
+    )
+
+    # Strip the trailing image parts as the provider's image rejection
+    # would; the tool text must survive so the model still sees evidence
+    # the call succeeded. ``without_images`` keeps the list-shaped content
+    # with just the text part intact (the str conversion happens later in
+    # ``relocate_tool_images``).
+    stripped, removed = without_images(messages)
+    assert removed is True
+    tool_msg = next(msg for msg in stripped if msg.get("role") == "tool")
+    text_parts = [
+        part for part in tool_msg["content"]
+        if isinstance(part, dict) and part.get("type") == "text"
+    ]
+    assert len(text_parts) == 1
+    payload = json.loads(text_parts[0]["text"])
+    assert payload["ok"] is True
+    # The injected TOOL_IMAGE_PROMPT user message should have been dropped
+    # along with the rejected images so the model isn't told to look at
+    # an attachment that isn't there.
+    assert not any(
+        msg.get("role") == "user"
+        and isinstance(msg.get("content"), list)
+        and any(
+            isinstance(part, dict) and part.get("text") == TOOL_IMAGE_PROMPT
+            for part in msg["content"]
+        )
+        for msg in stripped
+    )
+
+    # The stored history still carries the images — only the wire payload
+    # was stripped.
+    persisted_tool_msg = next(msg for msg in append_calls if msg.get("role") == "tool")
+    ConversationStore.append(tmp_path, persisted_tool_msg)
+    history = ConversationStore.load(tmp_path)
+    tool_history = next(msg for msg in history if msg.get("role") == "tool")
+    history_images = [
+        p for p in tool_history["content"] if p.get("type") == "image_url"
+    ]
+    assert len(history_images) == 1
 

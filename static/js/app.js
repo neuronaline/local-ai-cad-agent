@@ -148,6 +148,7 @@ function addMessage(text, type = 'agent', options = {}) {
 const activityLabels = {
   // Tool schema names published by the backend (agent/tools/tool_schemas.py).
   cad_build_and_verify: 'Building model',
+  get_view_images: 'Retrieving images',
   write_file: 'Updating model',
   edit_file: 'Updating model',
   read_file: 'Reading model',

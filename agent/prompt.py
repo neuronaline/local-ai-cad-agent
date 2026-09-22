@@ -82,6 +82,10 @@ _OPERATIONAL_RULES = """\
   parameters from the initial model.scad parameter block, and produces the
   canonical eight-view visual evidence + contact sheet in one call. Inspect
   the inline evidence and either accept or iterate.
+- Need to look at the current geometry again (check a fit, verify a feature,
+  or inspect a specific area)? Call ``get_view_images`` with the view ids
+  and optional crop areas you need. Returned images stay in the conversation
+  permanently; do not re-request the same area within a turn.
 - Geometric conflict (slot clipping a fastener hole, wall-thickness violation,
   etc.): STOP and call ``question`` with the trade-off. Never silently mutate a
   user-stated dimension to "make it fit" — ask once, then proceed.

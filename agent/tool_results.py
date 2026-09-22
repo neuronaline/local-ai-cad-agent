@@ -130,6 +130,84 @@ def build_cad_build_multimodal_content(
     return {"content": parts, "image_paths": [image_path]}
 
 
+def build_view_image_multimodal_content(
+    raw_result: str,
+    project_dir: Path,
+    *,
+    context_result: str | None = None,
+) -> dict[str, Any] | None:
+    """Build a multimodal tool-result for a successful ``get_view_images``.
+
+    Returns the same shape as :func:`build_cad_build_multimodal_content`::
+
+        {"content": [{"type": "text", "text": "<json envelope>"},
+                     *[as_chat_image(p) for p in image_paths]],
+         "image_paths": [host-relative paths]}
+
+    Returns ``None`` when the envelope is malformed, the success flag is
+    missing, the ``images`` list is empty, or every on-disk artifact
+    fails its manifest hash check. ``relocate_tool_images`` (see
+    :mod:`agent.llm_base`) reuses the same tool->user image handoff as
+    ``cad_build_and_verify`` so no extra wiring is needed for the
+    OpenAI / Gemini vision-less fallback path.
+    """
+    try:
+        payload = json.loads(raw_result)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        return None
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return None
+    raw_items = data.get("images")
+    if not isinstance(raw_items, list) or not raw_items:
+        return None
+
+    parts: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": context_result or compact_for_context("get_view_images", raw_result),
+        }
+    ]
+    image_paths: list[Path] = []
+    review_dir_name = data.get("review_sha256")
+    review_root = (
+        project_dir / ".cad-agent" / "reviews" / review_dir_name
+        if isinstance(review_dir_name, str) and review_dir_name
+        else None
+    )
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        rel_path = item.get("path")
+        expected_sha = item.get("sha256")
+        if not isinstance(rel_path, str) or not rel_path:
+            continue
+        if not isinstance(expected_sha, str) or len(expected_sha) != 64:
+            continue
+        if review_root is None:
+            continue
+        # Refuse paths that try to escape the review directory.
+        if rel_path.startswith("/") or ".." in Path(rel_path).parts:
+            continue
+        abs_path = review_root / rel_path
+        if not _is_png(abs_path, expected_sha):
+            continue
+        try:
+            parts.append(as_chat_image(abs_path))
+        except OSError:
+            _LOG.debug(
+                "view image multimodal content failed for %s", abs_path, exc_info=True
+            )
+            continue
+        image_paths.append(abs_path)
+
+    if not image_paths:
+        return None
+    return {"content": parts, "image_paths": image_paths}
+
+
 def _is_png(path: Path, expected_sha256: str | None = None) -> bool:
     """Fully decode PNG evidence and verify its manifest hash when available."""
     try:
@@ -151,6 +229,20 @@ def _manifest_hash(path: Path, artifact: str) -> str | None:
     entry = payload.get(artifact) if isinstance(payload, dict) else None
     value = entry.get("image_sha256") if isinstance(entry, dict) else None
     return value if isinstance(value, str) and len(value) == 64 else None
+
+
+def _view_hash(manifest: dict, view_id: str) -> str | None:
+    """Return ``image_sha256`` for ``view_id`` from a review manifest dict."""
+    entries = manifest.get("views") if isinstance(manifest, dict) else None
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("view_id") == view_id:
+            value = entry.get("image_sha256")
+            if isinstance(value, str) and len(value) == 64:
+                return value
+            return None
+    return None
 
 
 def _metrics_render_hash(path: Path) -> str | None:

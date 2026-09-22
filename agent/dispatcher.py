@@ -19,6 +19,7 @@ from agent.io import atomic_write_json
 from agent.revisions import MODEL_FILENAME
 from agent.tool_results import (
     build_cad_build_multimodal_content,
+    build_view_image_multimodal_content,
     compact_for_context,
 )
 from agent.tool_results import failure as tool_failure
@@ -206,14 +207,15 @@ def dispatch(
     ``waiting`` is True only for the question tool (the LLM is parked
     until the user replies).
 
-    Only the five model-facing tools published by
+    Only the six model-facing tools published by
     :mod:`agent.tool_schemas` (``cad_build_and_verify``, ``read_file``,
-    ``write_file``, ``edit_file``, and ``question``) are recognised. Tool
-    instances expose a per-call ``with_call_id`` method that propagates
-    the call id into activity-log / debug-log entries; this dispatcher
-    uses an explicit ``if/elif`` table so unknown names surface as a
-    clear ``ValueError`` instead of a bare ``AttributeError`` from a
-    stray ``getattr`` lookup on the ``ProjectTools`` bundle.
+    ``write_file``, ``edit_file``, ``get_view_images``, and ``question``)
+    are recognised. Tool instances expose a per-call ``with_call_id``
+    method that propagates the call id into activity-log / debug-log
+    entries; this dispatcher uses an explicit ``if/elif`` table so
+    unknown names surface as a clear ``ValueError`` instead of a bare
+    ``AttributeError`` from a stray ``getattr`` lookup on the
+    ``ProjectTools`` bundle.
     """
     if name == "cad_build_and_verify":
         cad = tools.cad.with_call_id(call_id)
@@ -260,6 +262,9 @@ def dispatch(
         )
     if name == "edit_file":
         return _dispatch_edit_file(tools.file, args, call_id)
+    if name == "get_view_images":
+        image = tools.image.with_call_id(call_id) if call_id else tools.image
+        return image.get_view_images(args.get("images") or []), False
     if name == "question":
         return _dispatch_question(tools.question, tools.project_dir, project, args)
     raise ValueError(f"Unknown or unsupported tool: {name!r}")
@@ -510,14 +515,11 @@ def process_tool_call(
     context_result = compact_for_context(name, result)
     context_content: str | list = context_result
     image_paths: list[Path] = []
-    if name == "cad_build_and_verify":
-        multimodal = build_cad_build_multimodal_content(
-            result, project_dir, context_result=context_result
-        )
-        if multimodal is not None:
-            context_content = multimodal["content"]
-            image_paths = list(multimodal.get("image_paths") or [])
-        if build_succeeded and image_paths:
+    multimodal = _build_multimodal_for(name, result, project_dir, context_result)
+    if multimodal is not None:
+        context_content = multimodal["content"]
+        image_paths = list(multimodal.get("image_paths") or [])
+        if name == "cad_build_and_verify" and build_succeeded and image_paths:
             # ``cad_build_and_verify`` always materialises
             # ``render.png``; the legacy ``render`` boolean is gone, so
             # ``image_paths`` alone flips ``cad_fix_required`` off.
@@ -547,3 +549,34 @@ def cancel_remaining_tool_calls(
             entry = {"role": "tool", "tool_call_id": cid, "content": cancelled}
             messages.append(entry)
             append_message(project_dir, entry)
+
+
+# Tools whose success envelopes can carry ``image_url`` content parts.
+# Centralised so future image-returning tools only need to be added here
+# (and to ``TOOL_SCHEMAS``) to opt into the same multimodal handoff that
+# ``relocate_tool_images`` and ``without_images`` already know how to
+# handle.
+_MULTIMODAL_BUILDERS: dict[str, Callable[..., dict | None]] = {
+    "cad_build_and_verify": build_cad_build_multimodal_content,
+    "get_view_images": build_view_image_multimodal_content,
+}
+
+
+def _build_multimodal_for(
+    name: str,
+    result: str,
+    project_dir: Path,
+    context_result: str,
+) -> dict | None:
+    """Return the multimodal content payload for ``name`` or ``None``.
+
+    Dispatches to the tool-specific builder registered in
+    :data:`_MULTIMODAL_BUILDERS`. ``get_view_images`` and
+    ``cad_build_and_verify`` both return the same shape
+    (``{"content": [...], "image_paths": [...]}``) so the dispatcher can
+    consume either result uniformly.
+    """
+    builder = _MULTIMODAL_BUILDERS.get(name)
+    if builder is None:
+        return None
+    return builder(result, project_dir, context_result=context_result)

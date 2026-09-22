@@ -50,6 +50,7 @@ from agent.settings import Settings
 from agent.tool_schemas import TOOL_SCHEMAS
 from agent.tools.cad_tool import CadTool
 from agent.tools.file_tool import FileTool
+from agent.tools.image_tool import ImageTool
 from agent.tools.question_tool import QuestionTool
 from agent.tools.question_validator import QuestionValidator
 
@@ -99,6 +100,7 @@ class ProjectTools:
             review_render_workers=(settings.review_render_workers if settings else 4),
             review_required_views=(settings.review_required_views if settings else 8),
         )
+        self.image = ImageTool(project_dir, publish)
         self.question = QuestionTool(publish)
 
     def stop(self) -> None:
