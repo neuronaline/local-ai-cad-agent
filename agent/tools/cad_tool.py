@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +48,34 @@ _REVIEW_VIEWS_DIR = "views"
 _REVIEW_SHEET_NAME = "review-sheet.png"
 
 
+class RenderMode(Enum):
+    """Validated execution modes for :class:`CadTool`.
+
+    The enum is the validated single source of truth: artifact staging
+    paths and runner settings are derived strictly from the resolved
+    mode, so the runner can never reach a state where the rendered
+    PNG exists without the matching review manifest (or vice versa).
+
+    Variants:
+        NONE: metrics + ``preview.stl`` only. No PNG, no manifest.
+        FULL_REVIEW: adds ``render.png`` plus the multi-view manifest
+            (``manifest.json``, ``views/*.png``, ``review-sheet.png``).
+    """
+
+    NONE = "none"
+    FULL_REVIEW = "full"
+
+    @property
+    def produces_render(self) -> bool:
+        """``True`` only for :attr:`FULL_REVIEW` (writes ``render.png``)."""
+        return self is RenderMode.FULL_REVIEW
+
+    @property
+    def produces_manifest(self) -> bool:
+        """Alias for :attr:`produces_render`; kept for semantic clarity."""
+        return self is RenderMode.FULL_REVIEW
+
+
 def _project_name(project_dir: Path) -> str:
     """Return the workspace-relative project name used by SSE payloads."""
     try:
@@ -63,22 +92,16 @@ class CadTool:
         revisions: RevisionStore | None = None,
         review_render_workers: int = 4,
         review_required_views: int = 8,
-        review_enabled: bool = True,
     ) -> None:
         self.project_dir = project_dir.resolve()
         self._publish = publish
         self._revisions = revisions or RevisionStore(project_dir)
         self._review_render_workers = max(1, int(review_render_workers))
         self._review_required_views = max(1, int(review_required_views))
-        self._review_enabled = bool(review_enabled)
-        # ``ProcessSlot`` replaces the old ``self._process: Popen | None``
-        # attribute: passing ``[self._process]`` as a process slot would have
-        # produced a fresh list at every call site that the GC would free as
-        # soon as ``run_sandbox_subprocess`` returned, leaving ``self._process``
-        # permanently ``None`` and turning ``stop()`` into a no-op. The slot
-        # is a long-lived mutable holder, so the helper writes the running
-        # ``Popen`` into ``slot.process`` under the lock and ``stop()`` reads
-        # it back.
+        # ``ProcessSlot`` is a long-lived mutable holder for the running
+        # ``Popen``; passing ``[self._process]`` would produce a fresh
+        # list per call site and the GC would free it before ``stop()``
+        # could read it back.
         self._process = ProcessSlot()
         self._lock = threading.Lock()
         self._call_id = ""
@@ -97,11 +120,9 @@ class CadTool:
     ) -> None:
         """Emit a phase update for the active build tool.
 
-        Used to surface the multi-view rendering phase so the UI activity
-        drawer can label the step (``rendering_views``). The publish callback
-        is optional so tests that instantiate ``CadTool`` without a publish
-        function keep working. Implementation is delegated to the shared
-        :func:`agent.tools.tool_events.publish_tool_phase` helper.
+        Delegates to :func:`agent.tools.tool_events.publish_tool_phase`;
+        the ``publish`` callback is optional so tests can construct
+        ``CadTool`` without one.
         """
         publish_tool_phase(
             self._publish,
@@ -114,38 +135,24 @@ class CadTool:
 
     # ------------------------------------------------------------------ build
 
-    def _runner_settings(self, render: bool) -> dict[str, Any]:
+    def _runner_settings(self, mode: RenderMode) -> dict[str, Any]:
         """JSON-kwarg payload forwarded to ``runner.main`` as ``argv[1]``.
 
-        Replaces the legacy module-level globals (``_RENDER_VIEWS``,
-        ``_WRITE_ISOMETRIC``, ``_RENDER_WORKERS``, ``_REQUIRED_VIEWS``) so
-        ``runner.py`` uses a normal Python function call rather than reading
-        injected globals.
-
-        Coupling invariant: ``render=True`` always implies
-        ``write_isometric=True`` so ``/render`` endpoint's SHA gate
-        (``single_render.image_sha256``) can always find ``render.png``.
-        ``render_views`` alone is gated by :attr:`_review_enabled` so a
-        build-and-verify run with ``review_enabled=False`` still produces
-        the canonical isometric render but skips the eight-view manifest.
+        Replaces the legacy module-level globals in ``runner.py`` so the
+        sub-process uses a normal Python function call rather than reading
+        injected globals. The flags are derived strictly from the validated
+        :class:`RenderMode`.
         """
-        if render:
-            return {
-                "render_views": self._review_enabled,
-                "write_isometric": True,  # see coupling invariant in the docstring above
-                "render_workers": self._review_render_workers,
-                "required_views": self._review_required_views,
-            }
         return {
-            "render_views": False,
-            "write_isometric": False,
+            "render_views": mode.produces_manifest,
+            "write_isometric": mode.produces_render,
             "render_workers": self._review_render_workers,
             "required_views": self._review_required_views,
         }
 
     def _execute(
         self,
-        render: bool = False,
+        mode: RenderMode = RenderMode.NONE,
         call_id: str = "",
     ) -> dict[str, Any]:
         model_path = self.project_dir / MODEL_FILENAME
@@ -153,14 +160,10 @@ class CadTool:
             raise ValueError(f"{MODEL_FILENAME} does not exist yet.")
         model_code = model_path.read_text(encoding="utf-8")
         FileTool.validate_model(model_code)
-        # Copy ``renderer.py`` and ``runner.py`` as siblings into the workspace
-        # so the runner can ``import renderer`` at runtime. Pass the render
-        # settings as a JSON kwargs payload on ``argv[1]`` instead of mutating
-        # module-level globals; this restores a real module boundary between
-        # the host and the sandbox.
-        settings_payload = json.dumps(
-            self._runner_settings(render)
-        )
+        # Copy ``renderer.py`` / ``runner.py`` as siblings into the
+        # workspace and pass render settings as JSON on ``argv[1]`` so
+        # the sandbox stays at arm's length from the host.
+        settings_payload = json.dumps(self._runner_settings(mode))
 
         with tempfile.TemporaryDirectory(prefix="cad-agent-") as temporary:
             workspace = Path(temporary)
@@ -220,10 +223,10 @@ class CadTool:
             self._atomic_copy(preview_path, self.project_dir / "preview.stl")
             review_manifest = (
                 cached.get("review_manifest")
-                if render and self._review_enabled
+                if mode.produces_manifest
                 else None
             )
-            if render:
+            if mode.produces_render:
                 render_path = workspace / "render.png"
                 if not render_path.is_file() or render_path.stat().st_size == 0:
                     error_msg = "CAD execution did not produce a render."
@@ -232,18 +235,13 @@ class CadTool:
                 self._atomic_copy(render_path, self.project_dir / "render.png")
             self._atomic_copy(metrics_path, self.project_dir / ".cad_metrics.json")
             self._record_build_success(metrics)
-            # The temp ``workspace`` is cleaned up when this ``with`` block exits,
-            # so copy the multi-view review artifacts into a stable staging
-            # location under ``project_dir`` before returning. ``promote_review``
-            # reads from ``staging_views_dir``/``staging_sheet_path`` and
-            # verifies each view's SHA against the manifest entry.
+            # Stage multi-view review artifacts outside the temp workspace
+            # so ``promote_review`` can verify them after bubblewrap tears
+            # the workspace down. ``FULL_REVIEW`` only; cheaper modes skip
+            # the rasterisation step.
             staging_views_dir: str | None = None
             staging_sheet_path: str | None = None
-            if render and self._review_enabled:
-                # Surface the multi-view rasterisation phase so the UI can
-                # label the activity drawer ("rendering_views"). The event is
-                # only published when render=True because the cheap
-                # ``CadTool.run`` path skips view rendering entirely.
+            if mode.produces_manifest:
                 self._publish_status(
                     "rendering_views",
                     "Rendering review views…",
@@ -269,23 +267,16 @@ class CadTool:
     ) -> tuple[str, str]:
         """Copy multi-view review artifacts out of the bubblewrap workspace.
 
-        Returns the paths to a unique, per-call staging ``views/``
-        directory and contact sheet PNG. Both paths live under a
-        ``cad-review-staging-<random>/`` directory created next to the
-        project's review folder and removed by the caller (see
-        :meth:`promote_review`).
+        Returns paths to a per-call staging ``views/`` directory and
+        contact sheet PNG. ``promote_review`` reads from these paths
+        and verifies each view's SHA against the manifest entry.
 
-        Each invocation used to reuse the same hard-coded
-        ``<project>/.review-staging`` directory and ``rmtree`` its
-        contents — a real race when two ``cad_build_and_verify`` runs
-        overlapped: a slow first job could see the second job's
-        ``rmtree`` followed by an unrelated ``mkdir`` and either crash
-        with ``FileNotFoundError`` or persist a half-built sheet as the
-        canonical evidence. A ``tempfile.mkdtemp`` per call removes the
-        shared global state; the directory survives the workspace
-        teardown so ``promote_review`` can verify and promote the
-        PNGs, and the helper is responsible for cleanup on its own
-        failure paths.
+        The earlier implementation reused a single
+        ``<project>/.review-staging`` directory — a real race when
+        two ``cad_build_and_verify`` runs overlapped. ``mkdtemp`` per
+        call removes the shared global state; the directory survives
+        bubblewrap teardown so ``promote_review`` can verify and
+        promote the PNGs.
         """
         staging_root = Path(
             tempfile.mkdtemp(prefix="cad-review-staging-", dir=self.project_dir)
@@ -573,15 +564,20 @@ class CadTool:
         return "\n".join(dict.fromkeys(frames))[-2000:]
 
     def run(self) -> dict[str, Any]:
-        """Build once and return the geometry metrics."""
-        payload = self._execute()
+        """Build once and return the geometry metrics.
+
+        Always uses :attr:`RenderMode.NONE` — the cheapest path that
+        skips every visual artifact. Callers that need PNGs or the
+        multi-view manifest should use :meth:`build_and_verify`.
+        """
+        payload = self._execute(mode=RenderMode.NONE)
         return dict(payload.get("metrics") or {})
 
     @staticmethod
     def _summarize_payload(
         metrics: dict[str, Any] | None,
         feature_summary: dict[str, Any],
-        render: bool,
+        mode: RenderMode,
         review_path: str | None,
     ) -> str:
         """Return a one-line human-readable summary for the agent's first glance.
@@ -618,9 +614,15 @@ class CadTool:
             volume_text = f"{volume_cm3:.1f} cm³"
         except (TypeError, ValueError):
             volume_text = "unknown volume"
-        render_state = (
-            "with render" if render and review_path else ("metrics-only" if not render else "no review")
-        )
+        # ``FULL_REVIEW`` produces the contact sheet (so the tag depends on
+        # whether the artifact actually landed); ``NONE`` is the cheap
+        # metrics-only path.
+        if mode is RenderMode.NONE:
+            render_state = "metrics-only"
+        elif review_path:
+            render_state = "with full review"
+        else:
+            render_state = "with render, no review"
         return (
             f"Solid {solid_count} ({validity}); "
             f"bbox {x:.1f}×{y:.1f}×{z:.1f} mm; "
@@ -629,17 +631,18 @@ class CadTool:
 
     def build_and_verify(
         self,
-        render: bool = True,
+        mode: RenderMode = RenderMode.FULL_REVIEW,
     ) -> dict[str, Any]:
-        """Build, validate, and render in one call unless ``render=False``.
+        """Build, validate, and render in one call.
 
-        The normal path renders canonical evidence after the cheap geometry
-        checks pass. ``render=False`` remains available for rapid iterations.
-        Source parameters are extracted from the model AST.
+        ``mode``: :attr:`RenderMode.NONE` for metrics-only builds,
+        :attr:`RenderMode.FULL_REVIEW` (default) for the canonical
+        ``render.png`` + multi-view manifest + contact sheet. Source
+        parameters are extracted from the model AST.
         """
-        if not isinstance(render, bool):
-            raise TypeError("build_and_verify render must be a boolean.")
-        execute_args: dict[str, Any] = {"render": render}
+        if not isinstance(mode, RenderMode):
+            raise TypeError("build_and_verify mode must be a RenderMode.")
+        execute_args: dict[str, Any] = {"mode": mode}
         if self._call_id:
             execute_args["call_id"] = self._call_id
         payload = self._execute(**execute_args)
@@ -655,10 +658,11 @@ class CadTool:
             payload.get("preview_sha256") if isinstance(payload, dict) else None
         )
         result: dict[str, Any] = {
-            "rendered": bool(render),
+            "rendered": mode.produces_render,
+            "mode": mode.value,
             "metrics": metrics,
             "preview": "preview.stl",
-            "render": "render.png" if render else None,
+            "render": "render.png" if mode.produces_render else None,
             "feature_summary": payload.get("feature_summary") or {},
             "declared_parameters": payload.get("declared_parameters") or [],
             "validation_results": payload.get("validation_results") or [],
@@ -667,7 +671,7 @@ class CadTool:
             result["model_sha256"] = model_sha
         if preview_sha:
             result["preview_sha256"] = preview_sha
-        if render:
+        if mode.produces_manifest:
             review_manifest = payload.get("review_manifest")
             review_path: str | None = None
             if review_manifest:
@@ -682,7 +686,7 @@ class CadTool:
         result["summary"] = self._summarize_payload(
             metrics,
             result["feature_summary"],
-            render,
+            mode,
             result.get("review"),
         )
         return result

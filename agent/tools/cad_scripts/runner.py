@@ -90,8 +90,30 @@ def _declared_parameters(model_code: str) -> list[dict[str, Any]]:
     return parameters
 
 
-def _eval_expr(expr_str: str, params: dict[str, float]) -> float | None:
-    """Evaluate simple numeric constant or parameter expression."""
+# Tolerance ratio used by :func:`_extract_scad_features` to classify
+# a cylinder cutout as a "through" hole versus a "blind" pocket. A
+# cutout spanning at least this ratio of the shortest bounding-box
+# dimension is treated as through; ``0.9`` keeps ``h=HEIGHT + EPS``
+# (which overhangs by a single epsilon) classified as through while
+# obviously shallow pockets become blind.
+_THROUGH_HOLE_TOLERANCE_RATIO = 0.9
+
+
+class ExpressionEvaluationError(ValueError):
+    """Raised when an OpenSCAD expression cannot be evaluated.
+
+    Replaces the silent ``0.0`` fallback that previously manufactured
+    zero-diameter cylinders and bypassed the geometry validator.
+    """
+
+
+def _eval_expr(expr_str: str, params: dict[str, float]) -> float:
+    """Evaluate a numeric / parameter expression.
+
+    Raises :class:`ExpressionEvaluationError` for unknown identifiers
+    or non-numeric input; callers must surface the failure instead of
+    accepting a sentinel value.
+    """
     expr_str = expr_str.strip()
     if expr_str in params:
         return float(params[expr_str])
@@ -99,17 +121,30 @@ def _eval_expr(expr_str: str, params: dict[str, float]) -> float | None:
         return float(expr_str)
     except ValueError:
         pass
+    # Identify unresolved identifiers up-front. The pre-refactor path
+    # silently substituted ``0.0`` and shipped the result as a
+    # "valid" number — the source of the zero-diameter cylinder bug.
+    identifiers = set(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", expr_str))
+    unresolved = sorted(identifiers - params.keys())
+    if unresolved:
+        raise ExpressionEvaluationError(
+            f"Unknown identifier(s) in expression {expr_str!r}: {unresolved}"
+        )
     substituted = re.sub(
         r"\b[A-Za-z_][A-Za-z0-9_]*\b",
-        lambda m: str(params.get(m.group(0), 0.0)),
+        lambda m: str(params[m.group(0)]),
         expr_str,
     )
-    if re.match(r"^[\d\.\+\-\*\/\(\)\s]+$", substituted):
-        try:
-            return float(eval(substituted, {"__builtins__": {}}, {}))
-        except (ArithmeticError, ValueError, SyntaxError, TypeError):
-            return None
-    return None
+    if not re.match(r"^[\d\.\+\-\*\/\(\)\s]+$", substituted):
+        raise ExpressionEvaluationError(
+            f"Expression {expr_str!r} contains non-numeric symbols after substitution."
+        )
+    try:
+        return float(eval(substituted, {"__builtins__": {}}, {}))
+    except (ArithmeticError, ValueError, SyntaxError, TypeError) as error:
+        raise ExpressionEvaluationError(
+            f"Failed to evaluate {expr_str!r} after substitution: {error}"
+        ) from error
 
 
 def _count_disconnected_solids(triangles: np.ndarray) -> int:
@@ -185,43 +220,63 @@ def _mesh_metrics(vertices: np.ndarray, triangles: np.ndarray) -> dict[str, Any]
 def _extract_scad_features(
     model_code: str, dims: dict[str, float], params: dict[str, float] | None = None
 ) -> dict[str, Any]:
-    """Detect cylinder cutout features in model.scad difference() blocks."""
+    """Detect cylinder cutout features in model.scad difference() blocks.
+
+    Cylinders whose arguments cannot be evaluated — typically because
+    they reference an unknown parameter — are skipped rather than
+    silently substituted with a default value. The previous heuristic
+    produced zero-diameter geometries that bypassed the dimension
+    validator entirely.
+    """
     if params is None:
         params = {p["name"]: float(p["value"]) for p in _declared_parameters(model_code)}
     candidates: list[dict[str, Any]] = []
-    # Pattern for cylinder invocations: cylinder(h=..., d=... or r=...)
     cyl_pattern = re.compile(
         r"cylinder\s*\(([^)]+)\)",
         re.IGNORECASE,
     )
-    # Check if inside difference
-    in_difference = "difference" in model_code
-    if in_difference:
+    if "difference" in model_code:
         for match in cyl_pattern.finditer(model_code):
             args_str = match.group(1)
             h_val = None
             d_val = None
             r_val = None
+            unresolved_args: list[str] = []
             for part in args_str.split(","):
                 k, v = part.split("=", 1) if "=" in part else (None, part)
                 k = k.strip().lower() if k else None
-                val = _eval_expr(v, params)
-                if val is not None:
-                    if k == "h":
+                # Skip non-dimension keywords (``center=true``,
+                # ``$fn=60``); routing them through ``_eval_expr``
+                # would surface the right error on the wrong operand.
+                if k not in (None, "h", "d", "r"):
+                    continue
+                try:
+                    val = _eval_expr(v, params)
+                except ExpressionEvaluationError as error:
+                    unresolved_args.append(str(error))
+                    continue
+                if k == "h":
+                    h_val = val
+                elif k == "d":
+                    d_val = val
+                elif k == "r":
+                    r_val = val
+                elif k is None:
+                    if h_val is None:
                         h_val = val
-                    elif k == "d":
-                        d_val = val
-                    elif k == "r":
+                    elif r_val is None and d_val is None:
                         r_val = val
-                    elif k is None:
-                        if h_val is None:
-                            h_val = val
-                        elif r_val is None and d_val is None:
-                            r_val = val
+            if unresolved_args:
+                # Skip cylinders with any unresolvable dimension so
+                # the reviewer does not see a partial feature.
+                continue
             diameter = d_val if d_val is not None else (r_val * 2.0 if r_val is not None else None)
             if diameter is not None and h_val is not None:
-                # Compare height with part bounding box to determine through-hole
-                is_through = h_val >= (min(dims.values()) if dims else 0) * 0.9
+                is_through = (
+                    h_val
+                    >= (min(dims.values()) if dims else 0)
+                    * _THROUGH_HOLE_TOLERANCE_RATIO
+                )
                 candidates.append({
                     "diameter_mm": round(diameter, 3),
                     "axis": [0.0, 0.0, 1.0],

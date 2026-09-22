@@ -101,16 +101,11 @@ TOOL_SCHEMAS = [
     ),
     _tool(
         "cad_build_and_verify",
-        "Build the latest model.scad, validate basic geometry, export preview.stl, and "
-        "render canonical eight-view visual evidence + contact sheet inline. Automatically "
-        "reports dimensions, solid count, volume, and numeric UPPER_CASE parameters.",
-        {
-            "render": {
-                "type": "boolean",
-                "default": True,
-                "description": "True (default) renders canonical evidence inline after geometry validation. False returns metrics and preview only for a quick iteration.",
-            },
-        },
+        "Build the latest model.scad, validate basic geometry, export preview.stl, "
+        "and render the canonical isometric PNG plus the eight-view review manifest "
+        "and contact sheet. Automatically reports dimensions, solid count, volume, "
+        "and numeric UPPER_CASE parameters.",
+        {},
         [],
     ),
     _tool(

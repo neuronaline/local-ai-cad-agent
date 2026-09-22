@@ -1,8 +1,8 @@
 import hashlib
 import io
 import json
-from pathlib import Path
 import subprocess
+from pathlib import Path
 
 from PIL import Image
 
@@ -458,4 +458,75 @@ def test_export_endpoints(tmp_path: Path) -> None:
     disp_3mf = res_3mf.headers.get("Content-Disposition", "")
     assert "attachment" in disp_3mf and "export-widget.3mf" in disp_3mf
     assert len(res_3mf.data) > 0
+
+
+# ---------------------------------------------------------------------------
+# Idempotency cache regression tests.
+# ---------------------------------------------------------------------------
+
+
+def test_idempotency_cache_uses_ttl_with_lru_hardcap_fallback(tmp_path: Path) -> None:
+    """The cache must use TTL with an LRU hard-cap fallback.
+
+    The previous count-slicing heuristic dropped 500 in-flight keys
+    whenever the cache exceeded the trigger size, exposing endpoints
+    to replay attacks. The new policy attaches a monotonic timestamp
+    to every entry, evicts expired entries on read *and* write, and
+    only falls back to LRU eviction when the hard memory cap is hit.
+    """
+    import time
+
+    from routes import (
+        _IDEMPOTENCY_CACHE_HARD_CAP,
+        _IDEMPOTENCY_CACHE_TTL_SECONDS,
+        _idempotency_check,
+        _idempotency_expired,
+        _idempotency_forget,
+        _idempotency_record,
+    )
+
+    app = create_app(
+        Settings(tmp_path / "projects", "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    )
+
+    # ``_idempotency_check`` / ``_idempotency_record`` read
+    # ``current_app.config`` so they need an active application
+    # context — the same one Flask pushes for real requests.
+    with app.app_context():
+        # 1. Fresh keys live through the TTL window.
+        _idempotency_record("fresh-1")
+        assert _idempotency_check("fresh-1") is True
+
+        # 2. Expired entries are dropped on read so a stale key cannot
+        #    accidentally de-dupe a fresh request.
+        cache = app.config["IDEMPOTENCY_CACHE"]
+        cache["stale"] = time.monotonic() - (_IDEMPOTENCY_CACHE_TTL_SECONDS + 1.0)
+        assert _idempotency_check("stale") is False
+        assert "stale" not in cache
+
+        # 3. Active expiry guard: timestamp older than TTL is expired.
+        assert _idempotency_expired(time.monotonic() - (_IDEMPOTENCY_CACHE_TTL_SECONDS + 1.0))
+        assert not _idempotency_expired(time.monotonic())
+
+        # 4. TTL sweep on record drops every stale key, even when the
+        #    cap was not reached (the primary eviction path).
+        cache.clear()
+        for i in range(20):
+            cache[f"old-{i}"] = time.monotonic() - (_IDEMPOTENCY_CACHE_TTL_SECONDS + 5.0)
+        _idempotency_record("new-key")
+        assert "new-key" in cache
+        assert all(not k.startswith("old-") for k in cache)
+
+        # 5. LRU fallback only fires at the hard cap; the newest key
+        #    must survive even when many older keys compete for slots.
+        cache.clear()
+        for i in range(_IDEMPOTENCY_CACHE_HARD_CAP + 5):
+            cache[f"k-{i}"] = time.monotonic() - 1000  # all expired
+        _idempotency_record("survivor")
+        assert "survivor" in cache
+        assert len(cache) <= _IDEMPOTENCY_CACHE_HARD_CAP
+
+        # 6. Forget removes the entry so a retry can be accepted.
+        _idempotency_forget("fresh-1")
+        assert _idempotency_check("fresh-1") is False
 

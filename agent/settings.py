@@ -63,11 +63,10 @@ class Settings:
     # provider errors because the log can grow quickly.
     agent_log_tool_activity: bool = False
     # ── Review rendering settings (used by cad_build_and_verify) ──
-    # ``review_enabled`` is preserved for the existing ``cad_build_and_verify``
-    # contract: when False the build skips the canonical eight-view rasteriser
-    # and contact sheet. The structured verdict (the historical dedicated
-    # ``cad_review`` tool) was removed; nothing auto-toggles on this flag.
-    review_enabled: bool = True
+    # Multi-view rasterisation is the canonical eight-view + contact-sheet
+    # output of ``cad_build_and_verify``. The structured verdict (the
+    # historical dedicated ``cad_review`` tool) was removed; nothing
+    # auto-toggles on these flags.
     review_render_workers: int = 4
     review_required_views: int = 8
     # ── 3D preview viewer (Three.js grid plane) ──
@@ -328,7 +327,6 @@ def load_settings(project_root: Path | None = None) -> Settings:
         agent_log_tool_activity=_strict_bool(
             agent.get("log_tool_activity", False), "agent.log_tool_activity"
         ),
-        review_enabled=_strict_bool(review.get("enabled", True), "review.enabled"),
         review_render_workers=_positive_int(
             review.get("render_workers", 4), "review.render_workers"
         ),

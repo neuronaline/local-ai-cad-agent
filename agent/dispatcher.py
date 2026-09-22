@@ -23,6 +23,7 @@ from agent.tool_results import (
 )
 from agent.tool_results import failure as tool_failure
 from agent.tool_results import success as tool_success
+from agent.tools.cad_tool import RenderMode
 
 
 def _is_empty_or_none(val: object) -> bool:
@@ -194,22 +195,6 @@ def is_cad_build(name: str) -> bool:
     return name == "cad_build_and_verify"
 
 
-def _build_render(arguments: dict) -> bool:
-    """Resolve the optional render switch used by CAD build calls."""
-    render = arguments.get("render", True)
-    if isinstance(render, bool):
-        return render
-    if isinstance(render, str):
-        val = render.strip().lower()
-        if val in ("true", "1", "yes"):
-            return True
-        if val in ("false", "0", "no"):
-            return False
-    if isinstance(render, (int, float)):
-        return bool(render)
-    return True
-
-
 def dispatch(
     tools,
     project: str,
@@ -232,7 +217,7 @@ def dispatch(
     """
     if name == "cad_build_and_verify":
         cad = tools.cad.with_call_id(call_id)
-        return cad.build_and_verify(render=_build_render(args)), False
+        return cad.build_and_verify(mode=RenderMode.FULL_REVIEW), False
     if name == "read_file":
         tool = (
             tools.file.with_call_id(call_id) if call_id else tools.file
@@ -532,7 +517,10 @@ def process_tool_call(
         if multimodal is not None:
             context_content = multimodal["content"]
             image_paths = list(multimodal.get("image_paths") or [])
-        if build_succeeded and _build_render(arguments) and image_paths:
+        if build_succeeded and image_paths:
+            # ``cad_build_and_verify`` always materialises
+            # ``render.png``; the legacy ``render`` boolean is gone, so
+            # ``image_paths`` alone flips ``cad_fix_required`` off.
             cad_fix_required = False
     tool_message = {"role": "tool", "tool_call_id": call_id, "content": context_content}
     messages.append(tool_message)

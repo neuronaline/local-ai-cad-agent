@@ -2,6 +2,7 @@ import hashlib
 import io
 import json
 import warnings
+from copy import deepcopy
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -11,6 +12,7 @@ from agent import tool_results
 from agent.conversation import ConversationStore
 from agent.core import AgentRunner
 from agent.llm_base import (
+    ChatCompletionsClient,
     FallbackChatClient,
     RequestCancelled,
     StreamResponseError,
@@ -446,8 +448,10 @@ class _StubChatClient:
         self.activity_logger = None
         self.run_id = None
 
-    def chat(self, messages, tools=None):
-        self.chat_calls.append((messages, tools))
+    def chat(self, messages, tools=None, *, max_attempts=None):
+        # Record the budget the wrapper forwarded so the new retry-budget
+        # tests can assert how the wrapper distributed its attempt cap.
+        self.chat_calls.append((messages, tools, max_attempts))
         if self._chat_error is not None:
             raise self._chat_error
         return self._chat_result
@@ -591,6 +595,195 @@ def test_fallback_wrapper_falls_back_to_fallback_preserve_reasoning() -> None:
 
     wrapper.chat([{"role": "user", "content": "hi"}])
     assert wrapper.preserve_reasoning is False
+
+
+def test_fallback_wrapper_mirrors_all_wrapped_attrs_via_sync() -> None:
+    """Every per-call attr set on the wrapper reaches both inner clients
+    once ``chat()`` triggers ``_sync_state()``.
+
+    The agent runner writes ``stream_callback`` each iteration and
+    ``stop_event`` / ``session_id`` / ``run_id`` once per run; if any of
+    them failed to reach the inner clients the runner would silently
+    stream to the previous callback or miss a stop signal.
+    """
+    primary = _StubChatClient(chat_result={"choices": [{"message": {}}]})
+    fallback = _StubChatClient(chat_result={"choices": [{"message": {}}]})
+    wrapper = FallbackChatClient(primary, fallback, "openai")
+
+    stop = MagicMock()
+    logger = MagicMock()
+    callback = lambda *_args, **_kwargs: None
+    wrapper.stop_event = stop
+    wrapper.session_id = "s-1"
+    wrapper.agent_role = "planner"
+    wrapper.stream_callback = callback
+    wrapper.require_images = True
+    wrapper.activity_logger = logger
+    wrapper.run_id = "run-42"
+
+    wrapper.chat([{"role": "user", "content": "hi"}])
+
+    for client in (primary, fallback):
+        assert client.stop_event is stop
+        assert client.session_id == "s-1"
+        assert client.agent_role == "planner"
+        assert client.stream_callback is callback
+        assert client.require_images is True
+        assert client.activity_logger is logger
+        assert client.run_id == "run-42"
+
+
+def test_fallback_wrapper_init_seeds_mirrored_attrs_from_primary() -> None:
+    """Pre-construction primary attrs are observable on the wrapper.
+
+    A read against the wrapper before any ``chat()`` returns the
+    primary's value (the value it had at wrap time). The inner clients'
+    defaults flow through to the wrapper so external code that
+    introspects the wrapper before any chat does not see ``AttributeError``.
+    """
+    primary = _StubChatClient(chat_result={"choices": [{"message": {}}]})
+    primary.session_id = "session-y"
+    primary.run_id = "run-7"
+    fallback = _StubChatClient(chat_result={"choices": [{"message": {}}]})
+    wrapper = FallbackChatClient(primary, fallback, "openai")
+
+    assert wrapper.session_id == "session-y"
+    assert wrapper.run_id == "run-7"
+
+
+def test_fallback_wrapper_init_seeds_safe_captured_defaults() -> None:
+    """``preserve_reasoning`` and friends default to safe no-op values.
+
+    Without a chat the wrapper must report ``preserve_reasoning = False``
+    (so the agent runner drops reasoning from a stubbed response) and a
+    ``None`` / empty usage payload. Wiring captured attrs to the primary
+    here would silently override stubbed test state, so ``__init__``
+    intentionally seeds the safe defaults and ``_capture_result``
+    overwrites them only after a real ``chat()`` runs.
+    """
+    primary = _StubChatClient(chat_result={"choices": [{"message": {}}]})
+    fallback = _StubChatClient(chat_result={"choices": [{"message": {}}]})
+    wrapper = FallbackChatClient(primary, fallback, "openai")
+
+    assert wrapper.preserve_reasoning is False
+    assert wrapper.last_usage is None
+    assert wrapper.last_image_fallback_used is False
+
+
+def test_fallback_wrapper_passes_none_budget_when_no_caller_cap() -> None:
+    """Without a caller cap, primary/fallback choose their own retry budget.
+
+    The wrapper never invents a cap when the caller did not supply one;
+    each inner client then runs its own default retry loop. This is the
+    historical contract the production code path relies on.
+    """
+    primary = _StubChatClient(chat_result={"choices": [{"message": {}}]})
+    fallback = _StubChatClient(chat_result={"choices": [{"message": {}}]})
+    wrapper = FallbackChatClient(primary, fallback, "openai")
+
+    wrapper.chat([{"role": "user", "content": "hi"}])
+
+    assert primary.chat_calls[-1][2] is None
+    assert fallback.chat_calls == []  # primary succeeded, fallback not called
+
+
+def test_fallback_wrapper_caps_primary_attempts_in_caller_budget() -> None:
+    """A caller-supplied budget must split, not blow past, the cap.
+
+    With ``max_attempts=3`` the wrapper must give primary 2 attempts
+    (so a single transient 5xx still gets one retry) and the fallback 1.
+    Previously the wrapper passed no budget at all and let each inner
+    client run its full 3-attempt loop, so a "3-attempt budget" was
+    really 6 attempts.
+    """
+    primary = _StubChatClient(chat_result={"choices": [{"message": {}}]})
+    fallback = _StubChatClient(chat_result={"choices": [{"message": {}}]})
+    wrapper = FallbackChatClient(primary, fallback, "openai")
+
+    wrapper.chat([{"role": "user", "content": "hi"}], max_attempts=3)
+
+    assert primary.chat_calls[-1][2] == 2
+    assert fallback.chat_calls == []
+
+
+def test_fallback_wrapper_forwards_split_budget_to_fallback_on_primary_error() -> None:
+    """When primary fails, the fallback gets the remaining budget.
+
+    A ``max_attempts=4`` budget must reach the fallback as 2 attempts
+    (not silently collapse to 0 and skip the fallback entirely).
+    """
+    primary = _StubChatClient(chat_error=RuntimeError("primary down"))
+    fallback = _StubChatClient(chat_result={"choices": [{"message": {}}]})
+    wrapper = FallbackChatClient(primary, fallback, "openai")
+
+    wrapper.chat([{"role": "user", "content": "hi"}], max_attempts=4)
+
+    assert primary.chat_calls[-1][2] == 2
+    assert fallback.chat_calls[-1][2] == 2
+    assert primary.chat_calls[-1][2] + fallback.chat_calls[-1][2] == 4
+
+
+def test_fallback_wrapper_skips_fallback_when_budget_exhausted_by_primary() -> None:
+    """A 1-attempt cap must not silently extend into a fallback hop.
+
+    The wrapper refuses to invent retries the caller didn't authorise:
+    with ``max_attempts=1`` the primary gets the single shot and the
+    primary's error propagates without invoking the fallback. This is
+    the boundary case for the retry-budget cap.
+    """
+    primary = _StubChatClient(chat_error=RuntimeError("primary down"))
+    fallback = _StubChatClient(chat_result={"choices": [{"message": {}}]})
+    wrapper = FallbackChatClient(primary, fallback, "openai")
+
+    with pytest.raises(RuntimeError, match="primary down"):
+        wrapper.chat([{"role": "user", "content": "hi"}], max_attempts=1)
+
+    assert primary.chat_calls[-1][2] == 1
+    assert fallback.chat_calls == []
+
+
+def test_fallback_wrapper_tracks_active_client_across_chats() -> None:
+    """``_capture_result`` updates the wrapper's active client pointer.
+
+    ``last_usage`` / ``last_image_fallback_used`` / ``preserve_reasoning``
+    reads after each chat reflect the provider that actually answered.
+    Reading them again before a subsequent chat must still surface the
+    previous successful provider's values — useful for diagnostics when
+    a later iteration crashes before reaching ``_capture_result``.
+    """
+    primary = _StubChatClient(
+        chat_result={"choices": [{"message": {}}]},
+        usage={"prompt_tokens": 5, "completion_tokens": 6},
+    )
+    fallback = _StubChatClient(
+        chat_result={"choices": [{"message": {}}]},
+        usage={"prompt_tokens": 7, "completion_tokens": 8},
+    )
+    wrapper = FallbackChatClient(primary, fallback, "openai")
+
+    wrapper.chat([{"role": "user", "content": "first"}])
+    assert wrapper.last_usage == {"prompt_tokens": 5, "completion_tokens": 6}
+
+    primary._chat_error = RuntimeError("primary offline")
+    wrapper.chat([{"role": "user", "content": "second"}])
+    assert wrapper.last_usage == {"prompt_tokens": 7, "completion_tokens": 8}
+
+
+def test_fallback_wrapper_abort_sets_stop_and_calls_inner_abort() -> None:
+    """``abort()`` propagates the stop signal to both inner clients."""
+    primary = _StubChatClient(chat_result={"choices": [{"message": {}}]})
+    fallback = _StubChatClient(chat_result={"choices": [{"message": {}}]})
+    wrapper = FallbackChatClient(primary, fallback, "openai")
+    stop = MagicMock()
+    wrapper.stop_event = stop
+    primary.abort = MagicMock()
+    fallback.abort = MagicMock()
+
+    wrapper.abort()
+
+    stop.set.assert_called_once()
+    primary.abort.assert_called_once()
+    fallback.abort.assert_called_once()
 
 
 def test_sanitize_messages_preserves_reasoning_across_all_assistant_turns() -> None:
@@ -1416,8 +1609,8 @@ def test_edit_file_whitespace_tolerance(tmp_path: Path) -> None:
 def test_failure_signature_threshold_allows_escalation() -> None:
     """AgentRunner must allow 2 retries (total 3 attempts on same error) before stopping."""
     from agent.core import (
-        AgentRunner,
         _BUILD_FAILURE_PER_SIGNATURE_MAX,
+        AgentRunner,
     )
 
     err_msg = 'CAD execution failed:\n  File "model.scad", line 111\nERROR: Parser error'
@@ -1459,9 +1652,9 @@ def test_failure_signature_threshold_allows_escalation() -> None:
 def test_build_failure_exhausted_total_cap_separate_from_signature() -> None:
     """The total-count cap trips independently of any single signature."""
     from agent.core import (
-        AgentRunner,
         _BUILD_FAILURE_PER_SIGNATURE_MAX,
         _BUILD_FAILURE_TOTAL_MAX,
+        AgentRunner,
     )
 
     # Use several distinct signatures; each stays below the per-sig cap
@@ -1569,4 +1762,461 @@ def test_initial_project_state_immutability(tmp_path: Path) -> None:
     # Second turn: state MUST remain 'does not exist' so the prefix cache is not invalidated
     c2 = runner._context(project_dir, "Drill hole", [])
     assert "model.scad does not exist" in c2[1]["content"]
+
+
+# ---------------------------------------------------------------------------
+# Activity-log payload sanitization
+# ---------------------------------------------------------------------------
+
+
+def test_summarize_llm_messages_replaces_image_payloads_with_structural_metadata() -> None:
+    """Inline image data URLs must not survive sanitization.
+
+    ``llm_request`` activity-log events must never carry base64 image
+    data URLs or raw user text. ``summarize_llm_messages`` rewrites
+    each message to ``{role, content_bytes, image_count}`` plus an
+    optional truncated preview, so the contract can be verified purely
+    from the helper's output without standing up a Chat Completions
+    server.
+    """
+    from agent.activity_log import summarize_llm_messages
+
+    messages = [
+        {"role": "system", "content": "You are a CAD assistant."},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Look at this sketch and build it."},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64," + "A" * 500_000
+                    },
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64," + "B" * 250_000
+                    },
+                },
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "I'll write the model.scad now."}
+            ],
+        },
+        {"role": "user", "content": "Continue."},
+    ]
+
+    summary = summarize_llm_messages(messages)
+
+    # The structure must match the helper's documented contract exactly.
+    assert summary[0] == {
+        "role": "system",
+        "content_bytes": len(b"You are a CAD assistant."),
+        "image_count": 0,
+        "text_preview": "You are a CAD assistant.",
+    }
+    assert summary[1]["role"] == "user"
+    assert summary[1]["image_count"] == 2
+    # The 500 KiB of base64 is excluded from the byte count; only the
+    # textual payload contributes so the operator can still tell how much
+    # *text* the prompt carried.
+    assert summary[1]["content_bytes"] == len(
+        b"Look at this sketch and build it."
+    )
+    # No image data URL may survive — the redaction must strip both ``A``s
+    # and ``B``s entirely. The preview is short and safe.
+    assert summary[1]["text_preview"] == "Look at this sketch and build it."
+    assert "A" * 100 not in json.dumps(summary)
+    assert "B" * 100 not in json.dumps(summary)
+    assert summary[2]["image_count"] == 0
+    assert summary[2]["content_bytes"] == len(
+        b"I'll write the model.scad now."
+    )
+    assert summary[3] == {
+        "role": "user",
+        "content_bytes": len(b"Continue."),
+        "image_count": 0,
+        "text_preview": "Continue.",
+    }
+
+
+def test_summarize_llm_messages_truncates_long_text_preview() -> None:
+    """Text previews are hard-capped at 200 characters with an ellipsis."""
+    from agent.activity_log import (
+        _LLM_MESSAGE_TEXT_PREVIEW_CHARS,
+        summarize_llm_messages,
+    )
+
+    long_text = "X" * (_LLM_MESSAGE_TEXT_PREVIEW_CHARS * 3)
+    summary = summarize_llm_messages([{"role": "user", "content": long_text}])
+
+    assert summary[0]["content_bytes"] == len(long_text.encode("utf-8"))
+    preview = summary[0]["text_preview"]
+    # 200 'X's followed by '...'
+    assert preview.endswith("...")
+    assert preview.count(".") == 3
+    assert preview.startswith("X" * _LLM_MESSAGE_TEXT_PREVIEW_CHARS)
+
+
+def test_summarize_llm_messages_suppresses_preview_for_credential_payloads() -> None:
+    """Messages that look like they contain a credential are preview-stripped.
+
+    ``_LLM_PREVIEW_SECRET_PATTERNS`` is conservative on purpose: a missing
+    preview is a debugging nuisance; a leaked API key on disk is a security
+    incident. The structural summary still records the byte count so the
+    operator can see *that* a credential-shaped payload was sent.
+    """
+    from agent.activity_log import summarize_llm_messages
+
+    cases = [
+        "My api_key=sk-abcdefghijklmnopqrstuvwxyz012345",
+        "Authorization: Bearer sk-or-vwxyz0123456789abcdefghij",
+        "password=hunter2-trustme-please-rotate-me-now",
+        "secret=shhh-this-is-very-private-data-1234567",
+        "api-key: sk-AAAaaa111bbb222ccc333ddd444eee555",
+    ]
+    for text in cases:
+        summary = summarize_llm_messages([{"role": "user", "content": text}])
+        assert "text_preview" not in summary[0], (
+            f"Credential-shaped payload leaked preview: {text!r}"
+        )
+        # The byte count is still reported so the operator can see the prompt
+        # was non-trivial.
+        assert summary[0]["content_bytes"] == len(text.encode("utf-8"))
+        assert summary[0]["role"] == "user"
+        assert summary[0]["image_count"] == 0
+
+
+def test_summarize_llm_messages_image_only_payload_has_no_preview() -> None:
+    """An image-only user turn has no text preview to redact."""
+    from agent.activity_log import summarize_llm_messages
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,iVBOR"},
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64,iVBORw0KGgo="
+                    },
+                },
+            ],
+        }
+    ]
+    summary = summarize_llm_messages(messages)
+    assert summary[0]["role"] == "user"
+    assert summary[0]["image_count"] == 2
+    assert summary[0]["content_bytes"] == 0
+    assert "text_preview" not in summary[0]
+
+
+def test_summarize_llm_messages_handles_non_dict_entries() -> None:
+    """Malformed entries are reported as ``role=None`` rather than crashing."""
+    from agent.activity_log import summarize_llm_messages
+
+    summary = summarize_llm_messages(["not a dict", 42, None])
+    assert summary == [
+        {"role": None, "content_bytes": 0, "image_count": 0},
+        {"role": None, "content_bytes": 0, "image_count": 0},
+        {"role": None, "content_bytes": 0, "image_count": 0},
+    ]
+
+
+class _RecordingActivityLogger:
+    """Stand-in for ``ActivityLogger`` that records every event payload.
+
+    The contract ``chat()`` honours is that ``llm_request`` payloads
+    no longer carry raw messages. Mirroring the production log surface
+    as a lightweight recorder keeps the test honest about which fields
+    the sanitization step touches (the whole payload) and which it
+    leaves alone (headers, model, status, attempt).
+    """
+
+    def __init__(self) -> None:
+        self.events: list[dict] = []
+
+    def log(self, event: str, payload, *, run_id=None):  # type: ignore[no-untyped-def]
+        self.events.append({"event": event, "payload": payload, "run_id": run_id})
+
+
+class _RecordingChatClient(ChatCompletionsClient):
+    """Concrete subclass of ``ChatCompletionsClient`` for sanitization tests.
+
+    The base class declares ``_endpoint``/``_build_headers``/``_build_payload``/
+    ``_post``/``_api_key`` abstract (``pragma: no cover``). Filling them in
+    with no-op stubs lets us drive ``chat()`` end-to-end and observe the
+    payload the activity logger receives without standing up an HTTP server.
+    """
+
+    def __init__(self, settings, *responses):  # type: ignore[no-untyped-def]
+        super().__init__(settings, provider_label="openai")
+        # The base class owns ``activity_logger`` and ``run_id``; we set
+        # them so ``chat()`` takes the logging branch.
+        self._stub_responses = list(responses)
+        self._stub_index = 0
+
+    def _endpoint(self) -> str:
+        return "https://example.test/v1/chat/completions"
+
+    def _build_headers(self, api_key: str) -> dict[str, str]:
+        return {
+            "authorization": f"Bearer {api_key}",
+            "x-api-key": api_key,
+            "content-type": "application/json",
+        }
+
+    def _build_payload(self, messages, tools):  # type: ignore[no-untyped-def]
+        return {"model": "gpt-test", "messages": deepcopy(messages), "tools": tools}
+
+    def _post(self, payload, headers):  # type: ignore[no-untyped-def]
+        # Return a stub streaming response that parses to a valid
+        # chat-completion body. The exact shape is irrelevant — only the
+        # ``status < 500`` path matters because that is where ``llm_request``
+        # is logged.
+        class _StubResponse:
+            status_code = 200
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def __getattr__(self, name):
+                # ``chat()`` checks ``hasattr(response, "iter_lines")`` to
+                # pick between streaming and JSON paths; point it at the
+                # JSON branch so we do not need a full SSE parser.
+                if name == "iter_lines":
+                    raise AttributeError(name)
+                raise AttributeError(name)
+
+            def json(self):
+                return {
+                    "choices": [
+                        {
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+
+        return _StubResponse()
+
+    def _api_key(self) -> str:
+        return "test-api-key"
+
+
+def test_chat_completions_client_logs_sanitized_llm_request(tmp_path: Path) -> None:
+    """End-to-end: the activity log records a structural summary, not raw messages.
+
+    A single ``llm_request`` event in ``activity.jsonl`` must not carry the
+    base64 image data URL of an attached image, nor the raw user prompt.
+    The summary fields exposed by ``summarize_llm_messages`` are the only
+    allowed shape.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    settings = Settings(workspace, "https://example.test", "test-model", 1, "127.0.0.1", 5000)
+    # ``agent_log_tool_activity`` gates activity logging in production.
+    # ``is_enabled`` only inspects this flag, so flipping it on is enough
+    # to drive ``chat()`` down the logging branch.
+    object.__setattr__(settings, "agent_log_tool_activity", True)
+
+    recorder = _RecordingActivityLogger()
+    client = _RecordingChatClient(settings)
+    client.activity_logger = recorder
+    client.run_id = "test-run"
+
+    messages = [
+        {"role": "system", "content": "You are a CAD assistant."},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Build a flange like the attached image."},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64," + "Z" * 200_000
+                    },
+                },
+            ],
+        },
+    ]
+    client.chat(messages, tools=[])
+
+    llm_events = [event for event in recorder.events if event["event"] == "llm_request"]
+    assert len(llm_events) == 1, (
+        f"Expected exactly one llm_request event, got {[e['event'] for e in recorder.events]}"
+    )
+    logged_payload = llm_events[0]["payload"]["payload"]
+    assert isinstance(logged_payload, dict)
+    logged_messages = logged_payload["messages"]
+
+    # The structural summary has two entries (system + user) and *no*
+    # ``image_url`` parts survived.
+    serialized = json.dumps(logged_messages)
+    assert "data:image" not in serialized
+    assert "Z" * 100 not in serialized
+    # The summary helper allows a 200-char preview of textual prompts so a
+    # short prompt legitimately surfaces in ``text_preview`` — but the
+    # raw ``content`` field must never appear, and no image part may
+    # survive. Verify the structure replaced the original payload
+    # wholesale.
+    assert all(
+        isinstance(entry, dict)
+        and set(entry.keys()).issubset(
+            {"role", "content_bytes", "image_count", "text_preview"}
+        )
+        and "content" not in entry
+        for entry in logged_messages
+    ), "Structural summary must replace (not augment) the raw content field"
+    assert logged_messages[0]["role"] == "system"
+    assert logged_messages[0]["content_bytes"] == len(
+        b"You are a CAD assistant."
+    )
+    assert logged_messages[0]["image_count"] == 0
+    assert logged_messages[1]["role"] == "user"
+    assert logged_messages[1]["image_count"] == 1
+    # 200 KiB of base64 must NOT contribute to content_bytes (only text
+    # counts) so the rolling 5 MiB cap cannot be exhausted by an image.
+    assert logged_messages[1]["content_bytes"] == len(
+        b"Build a flange like the attached image."
+    )
+
+    # Headers are redacted by ``_REDACTED_KEYS`` deeper in the logging
+    # pipeline (``activity_log.redact`` walks the entire payload dict).
+    # The recording logger used here captures the *pre-redaction* dict, so
+    # we apply redaction manually to verify the headers are wired up
+    # correctly end-to-end.
+    from agent.activity_log import redact
+
+    logged_headers = redact(llm_events[0]["payload"]["headers"])
+    serialized_headers = json.dumps(logged_headers)
+    assert "test-api-key" not in serialized_headers
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 regression tests.
+# ---------------------------------------------------------------------------
+
+
+def test_eval_expr_raises_on_unknown_identifier() -> None:
+    """The silent 0.0 fallback is gone.
+
+    Unknown identifiers must raise
+    :class:`ExpressionEvaluationError` rather than being silently
+    substituted with ``0.0`` and shipped as a "valid" zero-diameter
+    geometry.
+    """
+    from agent.tools.cad_scripts.runner import ExpressionEvaluationError, _eval_expr
+
+    with pytest.raises(ExpressionEvaluationError) as exc_info:
+        _eval_expr("UNKNOWN_PARAM", {})
+    assert "UNKNOWN_PARAM" in str(exc_info.value)
+
+
+def test_eval_expr_returns_float_for_known_expression() -> None:
+    """Happy path still resolves params and arithmetic."""
+    from agent.tools.cad_scripts.runner import _eval_expr
+
+    assert _eval_expr("5.0", {}) == 5.0
+    assert _eval_expr("HOLE_DIAMETER", {"HOLE_DIAMETER": 6.0}) == 6.0
+    assert _eval_expr("HEIGHT + EPS", {"HEIGHT": 8.0, "EPS": 0.01}) == 8.01
+    # Division must also be evaluated, not rejected as a non-numeric
+    # symbol — OpenSCAD expressions frequently use ratios (e.g.
+    # ``HEIGHT/2``) and the previous regex regression silently broke
+    # every model that scaled a parameter by a divisor.
+    assert _eval_expr("10/4", {}) == 2.5
+    assert _eval_expr("HEIGHT/2", {"HEIGHT": 10.0}) == 5.0
+    assert _eval_expr(
+        "(WIDTH + 2 * RIM) / 2", {"WIDTH": 12.0, "RIM": 1.5}
+    ) == 7.5
+
+
+def test_extract_scad_features_ignores_non_numeric_args() -> None:
+    """``center=true`` / ``$fn`` keywords must not raise.
+
+    OpenSCAD cylinder calls routinely mix numeric dimensions with
+    positioning flags (``center=true``) and fragment counts
+    (``$fn=60``). Those keywords are not numeric expressions; feeding
+    them to ``_eval_expr`` would otherwise raise
+    ``ExpressionEvaluationError`` for the right reason on the wrong
+    operand.
+    """
+    from agent.tools.cad_scripts.runner import _extract_scad_features
+
+    scad = (
+        "difference() {\n"
+        "    cube([10, 10, 10]);\n"
+        "    cylinder(d=5, h=12, center=true, $fn=60);\n"
+        "}\n"
+    )
+    features = _extract_scad_features(scad, {"x": 10, "y": 10, "z": 10})
+    assert len(features["cutouts"]) == 1
+    assert features["cutouts"][0]["radius"] == 2.5
+
+
+def test_through_hole_tolerance_ratio_is_documented_constant() -> None:
+    """``0.9`` must live as a named constant with rationale."""
+    from agent.tools.cad_scripts.runner import (
+        _THROUGH_HOLE_TOLERANCE_RATIO,
+        _extract_scad_features,
+    )
+
+    assert _THROUGH_HOLE_TOLERANCE_RATIO == 0.9
+    # Empirical contract: cylinder spanning >= 90% of the shortest
+    # bounding-box dimension is classified as through.
+    scad_through = (
+        "difference() {\n"
+        "    cube([10, 10, 10]);\n"
+        "    cylinder(d=5, h=10);\n"  # h = 100% of z = through
+        "}\n"
+    )
+    scad_blind = (
+        "difference() {\n"
+        "    cube([10, 10, 10]);\n"
+        "    cylinder(d=5, h=5);\n"  # h = 50% of z = blind
+        "}\n"
+    )
+    through_features = _extract_scad_features(scad_through, {"x": 10, "y": 10, "z": 10})
+    blind_features = _extract_scad_features(scad_blind, {"x": 10, "y": 10, "z": 10})
+    assert through_features["through_hole_count"] == 1
+    assert blind_features["blind_hole_count"] == 1
+
+
+def test_render_mode_enum_properties() -> None:
+    """The enum is the validated source of truth for what artifacts are staged."""
+    from agent.tools.cad_tool import RenderMode
+
+    assert RenderMode.NONE.produces_render is False
+    assert RenderMode.NONE.produces_manifest is False
+    assert RenderMode.FULL_REVIEW.produces_render is True
+    assert RenderMode.FULL_REVIEW.produces_manifest is True
+
+
+def test_runner_settings_are_derived_from_validated_mode() -> None:
+    """Runner flags match :class:`RenderMode`, not booleans.
+
+    ``render_views`` and ``write_isometric`` only fire for
+    ``FULL_REVIEW`` so the ``/render`` endpoint's SHA gate always finds
+    ``render.png`` together with the multi-view manifest.
+    """
+    from agent.tools.cad_tool import CadTool, RenderMode
+
+    tool = CadTool.__new__(CadTool)
+    tool._review_render_workers = 4
+    tool._review_required_views = 8
+    settings = tool._runner_settings(RenderMode.FULL_REVIEW)
+    assert settings["render_views"] is True
+    assert settings["write_isometric"] is True
+
+    settings = tool._runner_settings(RenderMode.NONE)
+    assert settings["render_views"] is False
+    assert settings["write_isometric"] is False
 

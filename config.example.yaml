@@ -57,12 +57,12 @@ server:
 ui:
   show_info_messages: true
 
-# Review rendering settings. ``review.enabled`` controls whether
-# cad_build_and_verify rasterises the canonical eight views + contact sheet
-# (default true). The legacy structured verdict tool has been removed;
-# nothing else auto-toggles on this flag.
+# Review rendering settings. ``review.render_workers`` and
+# ``review.required_views`` control the canonical eight-view rasteriser
+# + contact sheet produced by cad_build_and_verify. The legacy
+# ``review.enabled`` toggle has been removed; ``cad_build_and_verify``
+# always renders the canonical visual evidence.
 review:
-  enabled: true
   render_workers: 4
   required_views: 8
 

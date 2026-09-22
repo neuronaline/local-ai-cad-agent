@@ -26,6 +26,7 @@ from __future__ import annotations
 import fcntl
 import json
 import logging
+import re
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -320,6 +321,117 @@ def _redact_image_url_part(key: Any, value: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# LLM payload sanitization
+# ---------------------------------------------------------------------------
+
+# Truncated text preview attached to redacted ``messages`` entries.
+# 200 chars keeps the preview short enough that a single line cannot
+# exhaust the rolling 5 MiB cap while still preserving a useful
+# operator-readable sample of the prompt.
+_LLM_MESSAGE_TEXT_PREVIEW_CHARS = 200
+
+# Conservative credential patterns used by the preview guard. Any text
+# matching any of these is suppressed so the activity log never echoes
+# a raw secret even when the LLM conversation does. Suppression is the
+# safe default — a missing preview is a nuisance; a leaked credential
+# is a security incident.
+_LLM_PREVIEW_SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bsk-[A-Za-z0-9_\-]{16,}\b"),
+    re.compile(r"\bsk-or-[A-Za-z0-9_\-]{16,}\b"),
+    re.compile(r"(?i)\bapi[_-]?key\b\s*[:=]"),
+    re.compile(r"(?i)\bpassword\b\s*[:=]"),
+    re.compile(r"(?i)\bsecret\b\s*[:=]"),
+    re.compile(r"(?i)\bauthorization\b\s*:\s*bearer\s+"),
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]{16,}"),
+)
+
+
+def _preview_text_is_safe(text: str) -> bool:
+    """Return True when ``text`` does not match any credential pattern."""
+    return not any(pattern.search(text) for pattern in _LLM_PREVIEW_SECRET_PATTERNS)
+
+
+def summarize_llm_messages(
+    messages: list[Any],
+    *,
+    include_preview: bool = True,
+) -> list[dict[str, Any]]:
+    """Return a structural, payload-free description of an LLM request body.
+
+    The activity log stores ``llm_request`` events for debugging; the raw
+    body carries inline image data URLs and arbitrary user text that
+    would bloat the rolling 5 MiB cap and leak prompt content. Each
+    message yields ``{role, content_bytes, image_count, text_preview?}``
+    where ``text_preview`` is the first 200 chars when safe — credential
+    patterns suppress the preview entirely.
+
+    ``content_bytes`` is measured on textual content only so a single
+    multi-megabyte upload does not look identical to a multi-megabyte
+    prompt. Never raises (safe as a final write filter).
+    """
+    summary: list[dict[str, Any]] = []
+    if not isinstance(messages, list):
+        return summary
+    for message in messages:
+        if not isinstance(message, dict):
+            summary.append(
+                {"role": None, "content_bytes": 0, "image_count": 0}
+            )
+            continue
+        role = message.get("role")
+        content = message.get("content")
+        image_count = 0
+        text_chars = 0
+        text_preview_source: str | None = None
+        if isinstance(content, str):
+            text_chars = len(content.encode("utf-8"))
+            text_preview_source = content
+        elif isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                part_type = part.get("type")
+                if part_type == "text":
+                    text_value = part.get("text")
+                    if isinstance(text_value, str):
+                        text_chars += len(text_value.encode("utf-8"))
+                        if text_preview_source is None:
+                            text_preview_source = text_value
+                elif part_type == "image_url":
+                    image_count += 1
+        elif content is None:
+            text_chars = 0
+        else:
+            text_chars = len(str(content).encode("utf-8"))
+        entry: dict[str, Any] = {
+            "role": role,
+            "content_bytes": text_chars,
+            "image_count": image_count,
+        }
+        if (
+            include_preview
+            and text_preview_source is not None
+            and text_preview_source
+            and _preview_text_is_safe(text_preview_source)
+        ):
+            truncated = text_preview_source[:_LLM_MESSAGE_TEXT_PREVIEW_CHARS]
+            if len(text_preview_source) > _LLM_MESSAGE_TEXT_PREVIEW_CHARS:
+                truncated += "..."
+            entry["text_preview"] = truncated
+        summary.append(entry)
+    return summary
+
+
+def get_logger(project_dir: Path) -> ActivityLogger:
+    """Return a fresh per-project logger.
+
+    Each call returns a new instance with its own append-only file
+    handle and per-project write lock.
+    """
+    return ActivityLogger(project_dir)
+
+
+# ---------------------------------------------------------------------------
 # Helpers used by the rest of the agent
 # ---------------------------------------------------------------------------
 
@@ -327,14 +439,3 @@ def _redact_image_url_part(key: Any, value: Any) -> Any:
 def is_enabled(settings: Any) -> bool:
     """Return True when the agent has activity logging turned on."""
     return bool(getattr(settings, "agent_log_tool_activity", False))
-
-
-def get_logger(project_dir: Path) -> ActivityLogger:
-    """Return a fresh per-project logger.
-
-    Each call returns a new instance with its own append-only file handle
-    and per-project write lock. Callers may hold a single instance across
-    runs; this helper exists so the runner can wire one logger without
-    caring about prior state.
-    """
-    return ActivityLogger(project_dir)

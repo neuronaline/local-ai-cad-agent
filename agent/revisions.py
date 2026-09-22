@@ -221,7 +221,7 @@ def model_is_built(project_dir: Path) -> bool:
     Decoupled from the loop's ``cad_fix_required`` flag so the dispatcher
     can gate visual evidence tools (multi-view review / contact sheet) on a
     fresh build of the current revision without forcing a wasteful second
-    rendered build after a cheap ``cad_build_and_verify(render=false)``.
+    rendered build after a cheap metrics-only build.
     Both the agent loop (``_run`` start) and
     :func:`agent.dispatcher.process_tool_call` consult this helper; keeping
     the body here avoids a circular import between ``agent.core`` and

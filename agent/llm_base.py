@@ -16,6 +16,7 @@ from typing import Any
 
 import requests
 
+from agent.activity_log import summarize_llm_messages
 from agent.settings import Settings
 
 PROVIDER_LABELS = {"openrouter": "OpenRouter", "openai": "OpenAI"}
@@ -642,22 +643,29 @@ class FallbackChatClient:
     Any exception from the primary (after its own retry loop is exhausted)
     triggers a single attempt against the fallback — except user
     cancellations, which always propagate so the stop signal is observed
-    cleanly.
-
-    The fallback path is intentionally conservative: one shot, no nested
-    retries, no automatic re-fallback on a fallback failure. Repeated
-    provider outages should be diagnosed, not papered over with deeper
-    retry fanout.
+    cleanly. The fallback path is intentionally conservative: one shot, no
+    nested retries, no automatic re-fallback on a fallback failure.
     """
 
-    # Class default mirrors ``ChatCompletionsClient``; ``_capture_result``
-    # overwrites it with the successful inner client's value so the
-    # runner's response sanitization sees the same ``preserve_reasoning``
-    # flag the inner provider actually needs. ``OpenRouterClient`` now
-    # defaults to ``False`` (drop historical reasoning between turns to
-    # shrink the cacheable prefix), so a freshly-constructed wrapper is a
-    # safe starting state.
-    preserve_reasoning: bool = False
+    # Per-call attributes the agent runner writes on the wrapper; we forward
+    # them to both inner clients at the top of every ``chat()`` call.
+    _MIRRORED_ATTRS = (
+        "stop_event",
+        "session_id",
+        "agent_role",
+        "stream_callback",
+        "require_images",
+        "activity_logger",
+        "run_id",
+    )
+    # Per-call attributes the runner reads back after a successful chat; we
+    # copy them from whichever inner client answered so callers see the
+    # provider that actually responded.
+    _CAPTURED_ATTRS = (
+        "last_usage",
+        "last_image_fallback_used",
+        "preserve_reasoning",
+    )
 
     def __init__(
         self,
@@ -668,83 +676,57 @@ class FallbackChatClient:
         self._primary = primary
         self._fallback = fallback
         self._fallback_label = fallback_label
-        # State mirrored onto both inner clients at the top of every
-        # ``chat()`` call. Initialised with the same defaults as
-        # ``ChatCompletionsClient.__init__`` so a freshly constructed
-        # wrapper is a safe no-op pass-through.
-        self.stop_event: threading.Event | None = None
-        self.session_id: str | None = None
-        self.agent_role: str | None = None
-        self.last_usage: dict[str, Any] | None = None
+        # Mirror the inner clients' defaults so a freshly constructed
+        # wrapper is a safe no-op pass-through (no AttributeError for
+        # callers that read it before any ``chat()`` call).
+        for name in self._MIRRORED_ATTRS:
+            setattr(self, name, getattr(primary, name, None))
+        # Seed captured-attribute defaults so reads return the same
+        # values the legacy class-level ``preserve_reasoning = False``
+        # annotation did. ``_capture_result`` overwrites them after
+        # each successful chat; leaving these here keeps the
+        # pre-chat read contract intact without copying the primary's
+        # values (which would silently override stubbed state).
+        self.last_usage = None
         self.last_image_fallback_used = False
-        self.stream_callback = None
-        self.require_images = False
-        # Optional activity-log hook. The agent runner wires this when
-        # ``agent.log_tool_activity`` is enabled; ``None`` keeps the wire
-        # path inert for tests and review sub-sessions that do not log.
-        # Public on purpose: :class:`agent.core.AgentRunner` writes these
-        # from outside the client, so they are part of the wrapper's
-        # documented surface and mirrored onto the inner clients by
-        # :meth:`_sync_state`.
-        self.activity_logger = None
-        self.run_id: str | None = None
+        self.preserve_reasoning = False
 
     def _sync_state(self) -> None:
-        """Mirror the wrapper's per-call state onto both inner clients.
-
-        ``AgentRunner`` mutates the wrapper's attributes between iterations
-        (``stream_callback``) and once per run (``stop_event``, ``session_id``
-        …). Propagating the values before delegating keeps the inner clients
-        in lock-step without forcing the runner to know about the fallback.
-        """
-        for client in (self._primary, self._fallback):
-            client.stop_event = self.stop_event
-            client.session_id = self.session_id
-            client.agent_role = self.agent_role
-            client.stream_callback = self.stream_callback
-            client.require_images = self.require_images
-            client.activity_logger = self.activity_logger
-            client.run_id = self.run_id
+        """Mirror per-call state onto both inner clients."""
+        for name in self._MIRRORED_ATTRS:
+            value = getattr(self, name)
+            setattr(self._primary, name, value)
+            setattr(self._fallback, name, value)
 
     def abort(self) -> None:
-        if self.stop_event is not None:
-            self.stop_event.set()
+        stop = getattr(self, "stop_event", None)
+        if stop is not None:
+            stop.set()
         for client in (self._primary, self._fallback):
-            if hasattr(client, "abort"):
-                try:
-                    client.abort()
-                except Exception:
-                    pass
+            try:
+                client.abort()
+            except AttributeError:
+                pass
+            except Exception:
+                pass
 
     def _capture_result(self, client: ChatCompletionsClient) -> None:
         """Copy per-call metrics from the successful inner client.
 
-        The agent runner reads ``last_usage`` / ``last_image_fallback_used``
-        / ``preserve_reasoning`` from the wrapper immediately after
-        ``chat()`` returns, so the successful inner client's values must be
-        visible on the wrapper. ``preserve_reasoning`` differs between
-        providers (e.g. ``OpenRouterClient`` defaults to ``False`` so
-        reasoning is dropped between turns, while some other adapters
-        keep it ``True``); copying it avoids stripping reasoning from a
-        response that came back through the fallback path on a
+        ``preserve_reasoning`` differs between providers — copying it
+        from the provider that actually answered avoids stripping
+        reasoning from a successful fallback response on a
         ``True``-using provider.
         """
-        self.last_usage = client.last_usage
-        self.last_image_fallback_used = client.last_image_fallback_used
-        self.preserve_reasoning = client.preserve_reasoning
+        for name in self._CAPTURED_ATTRS:
+            setattr(self, name, getattr(client, name))
 
     def _log_fallback(self, primary_error: BaseException) -> None:
-        """Best-effort record of the fallback hop.
-
-        Mirrors the wire-level events the base client already emits so an
-        operator with ``agent.log_tool_activity: true`` can reconstruct the
-        full provider sequence for a single chat completion. The logger is
-        optional; failures inside ``ActivityLogger.log`` never propagate, so
-        guarding with ``is not None`` is sufficient.
-        """
-        if self.activity_logger is None:
+        """Best-effort record of the fallback hop."""
+        logger = getattr(self, "activity_logger", None)
+        if logger is None:
             return
-        self.activity_logger.log(
+        logger.log(
             "llm_fallback",
             {
                 "from_provider": self._primary.settings.llm_provider,
@@ -757,27 +739,55 @@ class FallbackChatClient:
             run_id=self.run_id,
         )
 
-    def chat(self, messages, tools=None):
+    def _split_attempts(
+        self, max_attempts: int | None
+    ) -> tuple[int, int]:
+        """Distribute ``max_attempts`` between primary and fallback.
+
+        Without a caller cap, each inner client uses its own default
+        retry budget. With a cap, primary gets up to two attempts so a
+        single transient failure still recovers, and fallback takes the
+        remainder. A one-attempt cap skips the fallback hop entirely.
+        """
+        if max_attempts is None:
+            return None, None
+        if max_attempts < 1:
+            return 1, 0
+        primary_attempts = min(2, max_attempts)
+        fallback_attempts = max(0, max_attempts - primary_attempts)
+        return primary_attempts, fallback_attempts
+
+    def chat(
+        self,
+        messages,
+        tools=None,
+        *,
+        max_attempts: int | None = None,
+    ):
         self._sync_state()
+        primary_attempts, fallback_attempts = self._split_attempts(max_attempts)
         try:
-            result = self._primary.chat(messages, tools)
+            result = self._primary.chat(
+                messages, tools, max_attempts=primary_attempts
+            )
         except RequestCancelled:
-            # User pressed stop; the fallback would only delay the cancel.
             raise
         except Exception as primary_error:
             # Stop events raised mid-flight must still win, even if the
             # primary surfaced a different exception first.
-            if self.stop_event is not None and self.stop_event.is_set():
+            stop = getattr(self, "stop_event", None)
+            if stop is not None and stop.is_set():
                 raise
             self._log_fallback(primary_error)
+            if fallback_attempts == 0:
+                raise
             try:
-                result = self._fallback.chat(messages, tools)
+                result = self._fallback.chat(
+                    messages, tools, max_attempts=fallback_attempts
+                )
             except RequestCancelled:
                 raise
             except Exception as fallback_error:
-                # Surface the fallback error so the user sees what really
-                # failed on the last attempt. ``__cause__`` retains the
-                # primary trace for debugging.
                 raise fallback_error from primary_error
             self._capture_result(self._fallback)
             return result
@@ -893,7 +903,18 @@ class ChatCompletionsClient:
             payload["messages"] = messages_without_images
         return removed
 
-    def chat(self, messages, tools=None):
+    # How many attempts the inner retry loop makes when ``chat()`` is
+    # called directly. ``FallbackChatClient`` passes a per-call override
+    # so a primary failure does not burn the wrapper's documented
+    # "one shot" budget on the fallback hop.
+    _DEFAULT_RETRY_ATTEMPTS = 3
+
+    def chat(self, messages, tools=None, *, max_attempts: int | None = None):
+        attempts = (
+            max_attempts
+            if max_attempts is not None
+            else self._DEFAULT_RETRY_ATTEMPTS
+        )
         self.last_usage = None
         self.last_image_fallback_used = False
         api_key = self._api_key()
@@ -904,12 +925,24 @@ class ChatCompletionsClient:
         log_payload = self.activity_logger is not None
 
         image_fallback_used = False
-        for attempt in range(3):
+        for attempt in range(attempts):
+            is_last_attempt = attempt == attempts - 1
             response: requests.Response | None = None
-            # Image fallback mutates the payload between attempts. Record the
-            # body actually sent on this attempt so cache diagnostics do not
-            # compare a rejected image request with a successful text request.
+            # When activity logging is enabled, replace the raw
+            # ``messages`` array with a structural summary so a single
+            # multi-image upload cannot exhaust the 5 MiB rolling cap
+            # and the activity log never echoes prompt content in
+            # plaintext. ``redact()`` already scrubs ``authorization`` /
+            # provider-key headers.
             attempt_payload = deepcopy(payload) if log_payload else None
+            if (
+                log_payload
+                and isinstance(attempt_payload, dict)
+                and isinstance(attempt_payload.get("messages"), list)
+            ):
+                attempt_payload["messages"] = summarize_llm_messages(
+                    attempt_payload["messages"]
+                )
             try:
                 response = self._post(payload, headers)
             except RequestCancelled:
@@ -921,7 +954,7 @@ class ChatCompletionsClient:
                     )
                 raise
             except Exception:
-                if attempt == 2:
+                if is_last_attempt:
                     raise
             else:
                 image_rejection = _is_image_rejection(response)
@@ -977,7 +1010,7 @@ class ChatCompletionsClient:
                         try:
                             return self._stream_response(response)
                         except StreamResponseError as error:
-                            if not error.retryable or attempt == 2:
+                            if not error.retryable or is_last_attempt:
                                 raise
                             if log_payload:
                                 self.activity_logger.log(
@@ -1011,13 +1044,13 @@ class ChatCompletionsClient:
                         },
                         run_id=self.run_id,
                     )
-                if attempt == 2:
+                if is_last_attempt:
                     response.raise_for_status()
             finally:
                 close = getattr(response, "close", None)
                 if callable(close):
                     close()
-            if attempt < 2:
+            if not is_last_attempt:
                 delay = retry_delay(response, attempt)
                 sleep_with_cancel(delay, self.stop_event)
         raise RuntimeError(f"{self._provider_label} retry loop ended unexpectedly.")

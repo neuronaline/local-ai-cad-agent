@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import io
-from pathlib import Path
 import shutil
 import subprocess
-
 import tempfile
+from pathlib import Path
 
 from agent.tools.cad_scripts.renderer import load_stl
 
