@@ -10,6 +10,7 @@ from __future__ import annotations
 import atexit
 import json
 import queue
+import re
 import threading
 import time
 from copy import deepcopy
@@ -441,6 +442,40 @@ def _force_close_response(response: requests.Response | None) -> None:
         pass
 
 
+def extract_think_tags(
+    content: str | None,
+    existing_reasoning: str | None = None,
+) -> tuple[str, str | None]:
+    """Extract <think>...</think> blocks from content if reasoning is absent.
+
+    Handles complete think blocks, multiple blocks, and truncated/unclosed think
+    tags without leaving raw tags in the substantive message content.
+    """
+    if not content:
+        return "", existing_reasoning
+    if existing_reasoning:
+        return content, existing_reasoning
+
+    if "<think>" not in content:
+        return content, None
+
+    # Handle one or more completed <think>...</think> blocks
+    think_blocks = re.findall(r"<think>(.*?)</think>", content, flags=re.DOTALL)
+    if think_blocks:
+        extracted = "\n\n".join(b.strip() for b in think_blocks if b.strip())
+        cleaned_content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+        return cleaned_content, extracted or None
+
+    # Handle truncated/unclosed <think> tag (e.g. generation ended inside think block)
+    if "</think>" not in content:
+        start_idx = content.find("<think>")
+        extracted = content[start_idx + 7 :].strip()
+        cleaned_content = content[:start_idx].strip()
+        return cleaned_content, extracted or None
+
+    return content, None
+
+
 def parse_chat_stream(
     response: requests.Response,
     *,
@@ -508,7 +543,11 @@ def parse_chat_stream(
                 content += text
                 if stream_callback:
                     stream_callback({"type": "content", "delta": text})
-            reasoning = delta.get("reasoning") or delta.get("reasoning_content")
+            reasoning = (
+                delta.get("reasoning")
+                or delta.get("reasoning_content")
+                or delta.get("thinking")
+            )
             details = delta.get("reasoning_details")
             if isinstance(details, list):
                 reasoning_details.extend(
@@ -584,6 +623,11 @@ def parse_chat_stream(
             "no tool calls were executed. Consider increasing 'llm.max_completion_tokens' "
             "in config.yaml or reducing 'reasoning_effort'."
         )
+    # Fallback: extract <think>...</think> from content when reasoning was not in separate delta
+    content, extracted_reasoning = extract_think_tags(content, reasoning_text)
+    if extracted_reasoning:
+        reasoning_text = extracted_reasoning
+
     # Some reasoning-first models (Anthropic extended thinking, OpenAI o-series,
     # Gemini thinking) emit reasoning deltas with no text content and finish
     # cleanly. Surface the reasoning as the assistant's substantive response so
@@ -604,10 +648,10 @@ def parse_chat_stream(
             if not call.get("id"):
                 call["id"] = f"call_{idx}"
         message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
-        if reasoning_details:
-            message["reasoning_details"] = reasoning_details
-        elif reasoning_text:
-            message["reasoning"] = reasoning_text
+    if reasoning_details:
+        message["reasoning_details"] = reasoning_details
+    elif reasoning_text:
+        message["reasoning"] = reasoning_text
     return {"choices": [{"message": message}], "usage": last_usage}
 
 
@@ -947,6 +991,39 @@ class ChatCompletionsClient:
             payload["messages"] = messages_without_images
         return removed
 
+    def _log_llm_response(
+        self,
+        attempt: int,
+        model: Any,
+        call_start: float,
+        body: dict[str, Any] | None,
+    ) -> None:
+        if self.activity_logger is None or not isinstance(body, dict):
+            return
+        total_duration_ms = round((time.perf_counter() - call_start) * 1000, 2)
+        choices = body.get("choices") if isinstance(body.get("choices"), list) else None
+        first_choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+        choice_msg = (
+            first_choice.get("message", {})
+            if isinstance(first_choice.get("message"), dict)
+            else {}
+        )
+        self.activity_logger.log(
+            "llm_response",
+            {
+                "attempt": attempt,
+                "model": model,
+                "duration_ms": total_duration_ms,
+                "usage": self.last_usage,
+                "has_reasoning": bool(
+                    choice_msg.get("reasoning")
+                    or choice_msg.get("reasoning_details")
+                ),
+                "tool_call_count": len(choice_msg.get("tool_calls") or []),
+            },
+            run_id=self.run_id,
+        )
+
     # How many attempts the inner retry loop makes when ``chat()`` is
     # called directly. ``FallbackChatClient`` passes a per-call override
     # so a primary failure does not burn the wrapper's documented
@@ -984,9 +1061,12 @@ class ChatCompletionsClient:
                 and isinstance(attempt_payload, dict)
                 and isinstance(attempt_payload.get("messages"), list)
             ):
+                is_dataset_mode = getattr(self.activity_logger, "log_mode", "") == "dataset"
                 attempt_payload["messages"] = summarize_llm_messages(
-                    attempt_payload["messages"]
+                    attempt_payload["messages"],
+                    lossless=is_dataset_mode,
                 )
+            call_start = time.perf_counter()
             try:
                 response = self._post(payload, headers)
             except RequestCancelled:
@@ -1037,6 +1117,7 @@ class ChatCompletionsClient:
                             f"{self._provider_label} {response.status_code}: {body_preview}"
                         )
                     response.raise_for_status()
+                    duration_ms = round((time.perf_counter() - call_start) * 1000, 2)
                     if log_payload:
                         self.activity_logger.log(
                             "llm_request",
@@ -1047,12 +1128,18 @@ class ChatCompletionsClient:
                                 "headers": dict(headers),
                                 "payload": attempt_payload,
                                 "status": response.status_code,
+                                "duration_ms": duration_ms,
                             },
                             run_id=self.run_id,
                         )
                     if hasattr(response, "iter_lines"):
                         try:
-                            return self._stream_response(response)
+                            stream_res = self._stream_response(response)
+                            if log_payload:
+                                self._log_llm_response(
+                                    attempt, payload.get("model"), call_start, stream_res
+                                )
+                            return stream_res
                         except StreamResponseError as error:
                             if not error.retryable or is_last_attempt:
                                 raise
@@ -1076,6 +1163,21 @@ class ChatCompletionsClient:
                                 "(finish_reason='length'); no tool calls were executed. "
                                 "Consider increasing 'llm.max_completion_tokens' "
                                 "in config.yaml or reducing 'reasoning_effort'."
+                            )
+                        if choices and isinstance(choices[0].get("message"), dict):
+                            msg = choices[0]["message"]
+                            r_content = msg.get("reasoning_content") or msg.get("thinking")
+                            if r_content and not msg.get("reasoning"):
+                                msg["reasoning"] = r_content
+                            clean_text, extracted_r = extract_think_tags(
+                                msg.get("content"), msg.get("reasoning")
+                            )
+                            if extracted_r and not msg.get("reasoning"):
+                                msg["reasoning"] = extracted_r
+                            msg["content"] = clean_text or None
+                        if log_payload:
+                            self._log_llm_response(
+                                attempt, payload.get("model"), call_start, body
                             )
                         return body
                 if log_payload:

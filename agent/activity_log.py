@@ -6,9 +6,10 @@ support post-mortem debugging when a tool loop fails or returns an unexpected
 verdict; complements the narrower ``debug-errors.jsonl`` (recoverable tool
 failures only) with a complete ordered record of everything the agent did.
 
-Activated by ``agent.log_tool_activity`` in ``config.yaml``. The log file is
-append-only with periodic size-based trimming so long-running projects do
-not exhaust disk.
+Activated by ``agent.log_mode`` (or legacy ``agent.log_tool_activity``) in
+``config.yaml``. Supports rolling debug logging and isolated dataset trajectories.
+The log file is append-only with periodic size-based trimming so long-running
+projects do not exhaust disk.
 
 Wire model:
 
@@ -26,8 +27,10 @@ from __future__ import annotations
 import fcntl
 import json
 import logging
+import queue
 import re
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import deepcopy
@@ -101,8 +104,10 @@ class ActivityLogger:
         project_dir: Path,
         *,
         max_bytes: int | None = None,
+        log_mode: str = "debug",
     ) -> None:
         self.project_dir = Path(project_dir).resolve()
+        self.log_mode = log_mode
         self._max_bytes = max_bytes if max_bytes is not None else _DEFAULT_MAX_BYTES
         # Per-process lock so concurrent threads inside one worker do
         # not race. The cross-process guarantee comes from the
@@ -116,10 +121,32 @@ class ActivityLogger:
         # POSIX/Linux primitive so this code path requires the same
         # platform assumption as bwrap/libseccomp (see README).
         self._lockfile: Path | None = None
+        # Non-blocking async queue for background writes
+        self._queue: queue.Queue[tuple[str, str, dict[str, Any] | None, str] | None] = (
+            queue.Queue(maxsize=10000)
+        )
+        self._closed = False
+        if self.log_mode != "off":
+            self._worker_thread: threading.Thread | None = threading.Thread(
+                target=self._worker_loop, daemon=True, name="ActivityLoggerWorker"
+            )
+            self._worker_thread.start()
+        else:
+            self._worker_thread = None
 
     @property
     def log_path(self) -> Path:
         return self.project_dir / _LOG_DIRNAME / _LOG_FILENAME
+
+    @property
+    def trajectories_dir(self) -> Path:
+        return self.project_dir / _LOG_DIRNAME / "trajectories"
+
+    def trajectory_path(self, run_id: str) -> Path:
+        clean_id = Path(re.sub(r"[^\w\-.]", "_", run_id or "")).name
+        if not clean_id or clean_id in {".", ".."}:
+            clean_id = "unknown"
+        return self.trajectories_dir / f"{clean_id}.jsonl"
 
     @property
     def lockfile_path(self) -> Path:
@@ -145,11 +172,6 @@ class ActivityLogger:
         """
         path = self.lockfile_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        # ``"a"`` is atomic on POSIX (writes always land at EOF, never
-        # at byte 0) and ensures we do not truncate an existing lock
-        # file. The descriptor is opened with O_APPEND so a crash
-        # mid-write leaves a contiguous extension of the original
-        # contents rather than a hole.
         handle = path.open("a", encoding="utf-8")
         acquired = False
         try:
@@ -157,7 +179,6 @@ class ActivityLogger:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
                 acquired = True
             except (OSError, AttributeError):
-                # Either flock is unavailable or fcntl itself is missing.
                 pass
             yield
         finally:
@@ -174,54 +195,119 @@ class ActivityLogger:
         payload: dict[str, Any] | None = None,
         *,
         run_id: str | None = None,
+        sync: bool = False,
     ) -> None:
-        """Append a single event line. Best-effort; never raises."""
+        """Append a single event line asynchronously (or synchronously when sync=True). Best-effort; never raises."""
+        if self._closed or self.log_mode == "off":
+            return
+        ts = utc_now_iso()
+        safe_payload = deepcopy(payload) if payload is not None else None
+        if sync:
+            self._write_event(event, safe_payload, run_id=run_id or "", ts=ts)
+            return
+        try:
+            self._queue.put_nowait((event, run_id or "", safe_payload, ts))
+        except queue.Full:
+            self._write_event(event, safe_payload, run_id=run_id or "", ts=ts)
+        except Exception as error:  # noqa: BLE001
+            _LOG.debug("activity log queue failed: %s", error, exc_info=True)
+
+    def flush(self, timeout: float | None = 5.0) -> None:
+        """Wait until all pending entries are written to disk."""
+        if self._closed or self.log_mode == "off":
+            return
+        if timeout is None:
+            try:
+                self._queue.join()
+            except Exception:  # noqa: BLE001, S110
+                pass
+            return
+        end_time = time.monotonic() + timeout
+        try:
+            with self._queue.all_tasks_done:
+                while self._queue.unfinished_tasks:
+                    remaining = end_time - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self._queue.all_tasks_done.wait(timeout=remaining)
+        except Exception as error:  # noqa: BLE001
+            _LOG.debug("activity log flush error: %s", error, exc_info=True)
+
+    def close(self, timeout: float = 5.0) -> None:
+        """Flush remaining events and stop the worker thread."""
+        if self._closed:
+            return
+        self._closed = True
+        if self.log_mode == "off":
+            return
+        try:
+            self.flush(timeout=timeout)
+            try:
+                self._queue.put(None, timeout=max(0.1, timeout))
+            except (queue.Full, Exception):  # noqa: BLE001, S110
+                pass
+            if self._worker_thread is not None and self._worker_thread.is_alive():
+                self._worker_thread.join(timeout=timeout)
+        except Exception as error:  # noqa: BLE001
+            _LOG.debug("activity log close error: %s", error, exc_info=True)
+
+    def _worker_loop(self) -> None:
+        while True:
+            try:
+                item = self._queue.get()
+                if item is None:
+                    break
+                event, run_id, payload, ts = item
+                self._write_event(event, payload, run_id=run_id, ts=ts)
+            except Exception as error:  # noqa: BLE001
+                _LOG.debug("activity log worker error: %s", error, exc_info=True)
+            finally:
+                self._queue.task_done()
+
+    def _write_event(
+        self,
+        event: str,
+        payload: dict[str, Any] | None,
+        *,
+        run_id: str,
+        ts: str,
+    ) -> None:
         try:
             entry = {
-                "ts": utc_now_iso(),
-                "run_id": run_id or "",
+                "ts": ts,
+                "run_id": run_id,
                 "event": event,
             }
             if payload:
                 entry["data"] = redact(payload)
-            line = json.dumps(entry, ensure_ascii=False)
+            line = json.dumps(entry, ensure_ascii=False) + "\n"
+
+            # 1. Rolling activity.jsonl write
             log_dir = self.log_path.parent
             log_dir.mkdir(parents=True, exist_ok=True)
-            # Acquire the cross-process lock first so concurrent workers
-            # (CLI + server, multiple gevent spawns, etc.) cannot
-            # interleave partial lines.
             with self._lock, self._acquire_file_lock():
                 with self.log_path.open("a", encoding="utf-8") as handle:
                     handle.write(line)
-                    handle.write("\n")
                 self._writes_since_trim += 1
-                # Cheap size probe — a single stat() is enough to detect
-                # when trimming is overdue. The actual rewrite happens
-                # at most every ``_TRIM_EVERY`` writes (or sooner when
-                # the cap is dramatically exceeded by a single event).
-                #
-                # ``force=True`` when one append alone blew past
-                # ``2 * max_bytes`` so the cadence never lets the log
-                # grow unboundedly when an unusually large event lands.
                 try:
                     size = self.log_path.stat().st_size
                 except OSError:
                     size = 0
                 force_trim = size > 2 * self._max_bytes
                 self._maybe_trim(force=force_trim)
+
+            # 2. Per-run isolated trajectory (untrimmed for dataset extraction)
+            if self.log_mode == "dataset" and run_id:
+                traj_path = self.trajectory_path(run_id)
+                traj_path.parent.mkdir(parents=True, exist_ok=True)
+                with traj_path.open("a", encoding="utf-8") as handle:
+                    handle.write(line)
         except (OSError, TypeError, ValueError) as error:
-            # Activity logging must never break the agent loop. Surface
-            # the failure at DEBUG so persistent issues (e.g. disk full
-            # or a non-writable project dir) are visible to operators
-            # running with debug logging without spamming the default
-            # log level for transient races.
-            _LOG.debug(
-                "activity log write failed: %s", error, exc_info=True
-            )
-            return
+            _LOG.debug("activity log write failed: %s", error, exc_info=True)
 
     def clear(self) -> bool:
         """Remove the log file. Returns True if anything was removed."""
+        self.flush()
         try:
             self.log_path.unlink(missing_ok=True)
             return True
@@ -307,30 +393,36 @@ def _redact_value(value: Any) -> Any:
 
 
 def _looks_like_image_url_part(key: Any, value: Any) -> bool:
-    """Heuristic: dict-like OpenAI image_url part with a data: URL."""
+    """Heuristic: dict-like OpenAI image_url part or local image payload."""
     if not isinstance(value, dict):
         return False
-    if key != "image_url" and "image_url" not in value:
+    if key != "image_url" and "image_url" not in value and "image_path" not in value:
         return False
     url = value.get("url") if "url" in value else None
-    if not isinstance(url, str):
-        return False
-    return url.startswith("data:")
+    if isinstance(url, str):
+        return url.startswith("data:")
+    return bool(value.get("image_path") or value.get("path") or value.get("name"))
 
 
 def _redact_image_url_part(key: Any, value: Any) -> Any:
-    """Replace a base64 image_url payload with a size-only placeholder."""
+    """Replace a base64 image_url payload with a size placeholder, preserving local path if present."""
     if not isinstance(value, dict):
         return value
     cloned = deepcopy(value)
     url = cloned.get("url")
+    image_path = cloned.get("image_path") or cloned.get("path") or cloned.get("name")
     if isinstance(url, str) and url.startswith("data:"):
         comma = url.find(",")
         if comma != -1:
             size = len(url) - (comma + 1)
-            cloned["url"] = f"[IMAGE_DATA_URL redacted, {size} base64 chars]"
+            if image_path:
+                cloned["url"] = f"[IMAGE_DATA_URL redacted, {size} chars, path={image_path}]"
+            else:
+                cloned["url"] = f"[IMAGE_DATA_URL redacted, {size} base64 chars]"
         else:
             cloned["url"] = "[IMAGE_DATA_URL redacted]"
+    elif image_path:
+        cloned["url"] = f"[LOCAL_IMAGE path={image_path}]"
     return cloned
 
 
@@ -369,23 +461,20 @@ def summarize_llm_messages(
     messages: list[Any],
     *,
     include_preview: bool = True,
+    lossless: bool = False,
 ) -> list[dict[str, Any]]:
-    """Return a structural, payload-free description of an LLM request body.
+    """Return a structural or lossless description of an LLM request body.
 
-    The activity log stores ``llm_request`` events for debugging; the raw
-    body carries inline image data URLs and arbitrary user text that
-    would bloat the rolling 5 MiB cap and leak prompt content. Each
-    message yields ``{role, content_bytes, image_count, text_preview?}``
-    where ``text_preview`` is the first 200 chars when safe — credential
-    patterns suppress the preview entirely.
-
-    ``content_bytes`` is measured on textual content only so a single
-    multi-megabyte upload does not look identical to a multi-megabyte
-    prompt. Never raises (safe as a final write filter).
+    In lossless mode (used when ``log_mode == "dataset"``), full message
+    content, reasoning, and tool calls are preserved for fine-tuning extraction,
+    with credential and image data filtering applied via :func:`redact`.
+    In summary mode (``lossless=False``), text is capped at 200 chars.
     """
-    summary: list[dict[str, Any]] = []
     if not isinstance(messages, list):
-        return summary
+        return []
+    if lossless:
+        return [redact(msg) if isinstance(msg, dict) else msg for msg in messages]
+    summary: list[dict[str, Any]] = []
     for message in messages:
         if not isinstance(message, dict):
             summary.append(
@@ -436,13 +525,13 @@ def summarize_llm_messages(
     return summary
 
 
-def get_logger(project_dir: Path) -> ActivityLogger:
+def get_logger(project_dir: Path, *, log_mode: str = "debug") -> ActivityLogger:
     """Return a fresh per-project logger.
 
     Each call returns a new instance with its own append-only file
     handle and per-project write lock.
     """
-    return ActivityLogger(project_dir)
+    return ActivityLogger(project_dir, log_mode=log_mode)
 
 
 # ---------------------------------------------------------------------------
@@ -452,4 +541,7 @@ def get_logger(project_dir: Path) -> ActivityLogger:
 
 def is_enabled(settings: Any) -> bool:
     """Return True when the agent has activity logging turned on."""
+    mode = getattr(settings, "agent_log_mode", None)
+    if mode is not None:
+        return mode != "off"
     return bool(getattr(settings, "agent_log_tool_activity", False))

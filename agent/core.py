@@ -13,6 +13,7 @@ import logging
 import re
 import shutil
 import threading
+import time
 import traceback
 import uuid
 from collections.abc import Callable
@@ -178,6 +179,12 @@ class _RunState:
     build_failure_count: int = 0
     build_failure_signatures: dict[str, int] = field(default_factory=dict)
     current_message_id: str | None = None
+    total_turns: int = 0
+    tool_call_count: int = 0
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    total_reasoning_tokens: int = 0
+    start_perf_time: float = 0.0
 
 
 class AgentRunner:
@@ -520,7 +527,10 @@ class AgentRunner:
         messages = self._context(project_dir, message, image_paths)
         activity_logger: ActivityLogger | None = None
         if activity_logging_enabled(self.settings):
-            activity_logger = get_logger(project_dir)
+            activity_logger = get_logger(
+                project_dir,
+                log_mode=getattr(self.settings, "agent_log_mode", "debug"),
+            )
             client.activity_logger = activity_logger
             client.run_id = run_id
             # Stash on the runner so the per-call dispatcher wrapper can
@@ -546,6 +556,7 @@ class AgentRunner:
             run_id=run_id,
             cad_fix_required=not model_is_built(project_dir),
             project=project,
+            start_perf_time=time.perf_counter(),
         )
 
     def _build_stream_publisher(
@@ -607,7 +618,15 @@ class AgentRunner:
                 "The model provider rejected the required final render; "
                 "visual verification could not be completed."
             )
-        self._publish_usage(state.project, getattr(state.client, "last_usage", None))
+        state.total_turns += 1
+        usage = getattr(state.client, "last_usage", None)
+        if isinstance(usage, dict):
+            state.total_prompt_tokens += int(usage.get("prompt_tokens") or 0)
+            state.total_completion_tokens += int(usage.get("completion_tokens") or 0)
+            details = usage.get("completion_tokens_details") or {}
+            reasoning_tokens = details.get("reasoning_tokens") or usage.get("reasoning_tokens") or 0
+            state.total_reasoning_tokens += int(reasoning_tokens)
+        self._publish_usage(state.project, usage)
         assistant_message = sanitize_assistant_message(
             response["choices"][0]["message"],
             preserve_reasoning=getattr(state.client, "preserve_reasoning", False),
@@ -615,6 +634,7 @@ class AgentRunner:
         tool_calls = normalize_tool_calls(assistant_message.get("tool_calls"))
         if tool_calls:
             assistant_message["tool_calls"] = tool_calls
+            state.tool_call_count += len(tool_calls)
         else:
             assistant_message.pop("tool_calls", None)
         invalid_final = (
@@ -658,18 +678,28 @@ class AgentRunner:
                     "message": "",
                 },
             )
-            state.messages.append(assistant_message)
-            return
-        self.publish(
-            "agent_stream_end",
-            {
-                "project": state.project,
-                "message_id": state.current_message_id,
-                "message": assistant_message.get("content") or "",
-            },
-        )
+        else:
+            self.publish(
+                "agent_stream_end",
+                {
+                    "project": state.project,
+                    "message_id": state.current_message_id,
+                    "message": assistant_message.get("content") or "",
+                },
+            )
+            self._append_message(state.project_dir, assistant_message)
         state.messages.append(assistant_message)
-        self._append_message(state.project_dir, assistant_message)
+        if state.activity_logger is not None:
+            state.activity_logger.log(
+                "assistant_turn",
+                {
+                    "project": state.project,
+                    "turn": state.total_turns,
+                    "message": assistant_message,
+                    "invalid_final": invalid_final,
+                },
+                run_id=state.run_id,
+            )
 
     def _handle_no_tool_calls(
         self, state: _RunState, assistant_message: dict[str, Any]
@@ -1024,15 +1054,49 @@ class AgentRunner:
             self._run_complete.set()
         self._active_activity_logger = None
         self._active_run_id = None
-        if activity_logger is not None and state is not None:
+        if activity_logger is not None:
             try:
-                activity_logger.log(
-                    "run_end",
-                    {"project": project, "cancelled": self._stop_event.is_set()},
-                    run_id=run_id,
-                )
+                if state is not None:
+                    if self._stop_event.is_set():
+                        outcome = "USER_STOP"
+                    elif state.cad_error:
+                        outcome = "CAD_ERROR"
+                    elif not state.cad_fix_required and state.preview_id:
+                        outcome = "SUCCESS"
+                    elif state.any_tool_used and not state.preview_id:
+                        outcome = "DRAWING_NOT_CREATED"
+                    else:
+                        outcome = "INCOMPLETE"
+
+                    total_duration_ms = (
+                        round((time.perf_counter() - state.start_perf_time) * 1000, 2)
+                        if state.start_perf_time
+                        else 0.0
+                    )
+
+                    activity_logger.log(
+                        "run_end",
+                        {
+                            "project": project,
+                            "outcome": outcome,
+                            "cad_valid": not state.cad_fix_required and bool(state.preview_id),
+                            "preview_id": state.preview_id,
+                            "total_turns": state.total_turns,
+                            "tool_calls": state.tool_call_count,
+                            "duration_ms": total_duration_ms,
+                            "cancelled": self._stop_event.is_set(),
+                            "usage": {
+                                "prompt_tokens": state.total_prompt_tokens,
+                                "completion_tokens": state.total_completion_tokens,
+                                "reasoning_tokens": state.total_reasoning_tokens,
+                            },
+                        },
+                        run_id=run_id,
+                    )
             except Exception:  # noqa: BLE001, S110
                 pass
+            finally:
+                activity_logger.close()
         # Run-scoped inputs are owned by the runner from the moment
         # ``start()`` moves them in; HTTP handlers must never
         # speculatively unlink these files. ``ignore_errors`` because

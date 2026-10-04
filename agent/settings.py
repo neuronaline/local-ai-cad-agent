@@ -66,6 +66,7 @@ class Settings:
     # default; only enable when debugging model behaviour or wire-level
     # provider errors because the log can grow quickly.
     agent_log_tool_activity: bool = False
+    agent_log_mode: str = "off"  # "off", "debug", "dataset"
     # ── Review rendering settings (used by cad_build_and_verify) ──
     # Multi-view rasterisation is the canonical eight-view + contact-sheet
     # output of ``cad_build_and_verify``. The structured verdict (the
@@ -236,6 +237,7 @@ def load_settings(project_root: Path | None = None) -> Settings:
             "revision_retention_count",
             "debug_log_tool_errors",
             "log_tool_activity",
+            "log_mode",
         },
         "agent",
     )
@@ -307,6 +309,10 @@ def load_settings(project_root: Path | None = None) -> Settings:
     # Each provider keeps its own model; ``settings.llm_model`` returns the
     # active one so callers do not need to branch on the provider.
     grid_size, grid_divisions = _parse_grid_extent(viewer_grid)
+    agent_log_tool_activity, agent_log_mode = _validate_log_activity(
+        agent.get("log_mode"),
+        _strict_bool(agent.get("log_tool_activity", False), "agent.log_tool_activity"),
+    )
 
     return Settings(
         workspace_root=Path(config.get("workspace_root", "~/CAD-Agent-Projects")).expanduser(),
@@ -339,9 +345,8 @@ def load_settings(project_root: Path | None = None) -> Settings:
         agent_debug_log_tool_errors=_strict_bool(
             agent.get("debug_log_tool_errors", False), "agent.debug_log_tool_errors"
         ),
-        agent_log_tool_activity=_strict_bool(
-            agent.get("log_tool_activity", False), "agent.log_tool_activity"
-        ),
+        agent_log_tool_activity=agent_log_tool_activity,
+        agent_log_mode=agent_log_mode,
         review_render_workers=_positive_int(
             review.get("render_workers", 4), "review.render_workers"
         ),
@@ -434,3 +439,17 @@ def _optional_positive_int(value: Any, name: str) -> int | None:
     if value is None:
         return None
     return _positive_int(value, name)
+
+
+def _validate_log_activity(
+    log_mode_raw: Any, log_tool_activity: bool
+) -> tuple[bool, str]:
+    if log_mode_raw is None:
+        mode = "debug" if log_tool_activity else "off"
+        return log_tool_activity, mode
+    mode = str(log_mode_raw).strip().lower()
+    if mode not in {"off", "debug", "dataset"}:
+        raise ValueError(
+            f"agent.log_mode must be 'off', 'debug', or 'dataset', got {log_mode_raw!r}."
+        )
+    return mode != "off", mode

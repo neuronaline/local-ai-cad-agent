@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -424,6 +425,7 @@ def process_tool_call(
     waiting = False
     build_succeeded = False
     arguments: dict = {}
+    tool_start_time = time.perf_counter()
     try:
         argument_text = (
             function.get("arguments") if isinstance(function, dict) else ""
@@ -452,6 +454,7 @@ def process_tool_call(
         if is_cad_build(name):
             preview_id = None
         raw_result, waiting = dispatch(tools, project, name, arguments, call_id)
+        duration_ms = round((time.perf_counter() - tool_start_time) * 1000, 2)
         result = tool_success(name, raw_result)
         if is_model_mutation(name):
             preview_id = None
@@ -471,17 +474,22 @@ def process_tool_call(
             {**tool_event, "status": "completed", "result": result},
         )
         if activity_logger is not None:
+            call_result_payload = {
+                "project": project,
+                "call_id": call_id,
+                "tool": name,
+                "result": result,
+                "duration_ms": duration_ms,
+            }
+            if preview_id:
+                call_result_payload["preview_id"] = preview_id
             activity_logger.log(
                 "tool_call_result",
-                {
-                    "project": project,
-                    "call_id": call_id,
-                    "tool": name,
-                    "result": result,
-                },
+                call_result_payload,
                 run_id=run_id,
             )
     except Exception as error:  # noqa: BLE001 - Tool errors are useful LLM context.
+        duration_ms = round((time.perf_counter() - tool_start_time) * 1000, 2)
         result, waiting = tool_failure(name, error), False
         if debug_log is not None:
             debug_log(project_dir, call_id, name, error, result)
@@ -509,6 +517,7 @@ def process_tool_call(
                     "tool": name,
                     "result": result,
                     "error": True,
+                    "duration_ms": duration_ms,
                 },
                 run_id=run_id,
             )
