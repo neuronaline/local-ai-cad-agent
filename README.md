@@ -21,6 +21,10 @@ Built with [OpenSCAD](https://openscad.org/) for solid geometry, [Three.js](http
   <img src="real-simple-example.jpeg" alt="Example CAD model generation" width="850">
 </p>
 
+<p align="center">
+  <img src="real-simple-example-2.jpeg" alt="Example CAD model generation 2" width="850">
+</p>
+
 ---
 
 ## ✨ Highlights & Features
