@@ -78,17 +78,25 @@ if ! "$PYTHON_BIN" -c 'import ctypes; ctypes.CDLL("libseccomp.so.2")' 2>/dev/nul
     warn "Install it with: sudo apt install libseccomp2"
 fi
 
-# ── API key ──
-# Python loads .env via dotenv; this shell only checks the selected provider's key.
-LLM_PROVIDER="$("$PYTHON_BIN" -c 'from agent.settings import load_settings; print(load_settings().llm_provider)')"
-if [ "$LLM_PROVIDER" = "openai" ]; then
-    API_KEY_NAME="OPENAI_API_KEY"
+# ── API key / Provider check ──
+# Python loads .env via dotenv; this shell checks the selected provider.
+read -r LLM_PROVIDER OLLAMA_URL < <("$PYTHON_BIN" -c 'from agent.settings import load_settings; s = load_settings(); print(s.llm_provider, s.ollama_base_url)')
+if [ "$LLM_PROVIDER" = "ollama" ]; then
+    if command -v curl >/dev/null 2>&1; then
+        if ! curl -s -f -m 1 "$OLLAMA_URL/models" >/dev/null 2>&1 && ! curl -s -f -m 1 "${OLLAMA_URL%/v1}/api/tags" >/dev/null 2>&1; then
+            warn "Could not reach Ollama at $OLLAMA_URL. Ensure Ollama is running ('ollama serve')."
+        fi
+    fi
 else
-    API_KEY_NAME="OPENROUTER_API_KEY"
-fi
-if [ -f "$PROJECT_DIR/.env" ] \
-    && ! grep -qE "^[[:space:]]*${API_KEY_NAME}[[:space:]]*=[[:space:]]*[^[:space:]]" "$PROJECT_DIR/.env" 2>/dev/null; then
-    warn "${API_KEY_NAME} is not configured. The setup page will guide you on first launch."
+    if [ "$LLM_PROVIDER" = "openai" ]; then
+        API_KEY_NAME="OPENAI_API_KEY"
+    else
+        API_KEY_NAME="OPENROUTER_API_KEY"
+    fi
+    if [ -f "$PROJECT_DIR/.env" ] \
+        && ! grep -qE "^[[:space:]]*${API_KEY_NAME}[[:space:]]*=[[:space:]]*[^[:space:]]" "$PROJECT_DIR/.env" 2>/dev/null; then
+        warn "${API_KEY_NAME} is not configured. The setup page will guide you on first launch."
+    fi
 fi
 
 # ── Port check ──

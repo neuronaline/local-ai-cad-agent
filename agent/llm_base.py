@@ -20,7 +20,7 @@ import requests
 from agent.activity_log import summarize_llm_messages
 from agent.settings import Settings
 
-PROVIDER_LABELS = {"openrouter": "OpenRouter", "openai": "OpenAI"}
+PROVIDER_LABELS = {"openrouter": "OpenRouter", "openai": "OpenAI", "ollama": "Ollama"}
 TOOL_IMAGE_PROMPT = (
     "The attached image is the visual artifact returned by the latest tool "
     "call. Inspect it and continue the task."
@@ -323,6 +323,9 @@ def _is_image_rejection(response: requests.Response) -> bool:
             "image content",
             "vision",
             "multimodal",
+            "does not support image",
+            "does not support images",
+            "cannot process image",
         )
     )
 
@@ -534,6 +537,8 @@ def parse_chat_stream(
                 )
                 if call_delta.get("id"):
                     call["id"] = call_delta["id"]
+                elif not call["id"]:
+                    call["id"] = f"call_{index}"
                 function = call_delta.get("function") or {}
                 name_delta = function.get("name") or ""
                 arguments_delta = function.get("arguments") or ""
@@ -595,6 +600,9 @@ def parse_chat_stream(
             )
     message: dict[str, Any] = {"role": role, "content": content or None}
     if tool_calls:
+        for idx, call in tool_calls.items():
+            if not call.get("id"):
+                call["id"] = f"call_{idx}"
         message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
         if reasoning_details:
             message["reasoning_details"] = reasoning_details
@@ -624,6 +632,8 @@ def api_key_env(provider: str) -> str:
         return "OPENAI_API_KEY"
     if provider == "openrouter":
         return "OPENROUTER_API_KEY"
+    if provider == "ollama":
+        return "OLLAMA_API_KEY"
     raise ValueError(f"Unknown LLM provider: {provider!r}")
 
 
@@ -661,6 +671,10 @@ def _build_provider_client(provider: str, settings: Settings):
         from agent.openrouter import OpenRouterClient
 
         return OpenRouterClient(settings)
+    if provider == "ollama":
+        from agent.ollama_client import OllamaClient
+
+        return OllamaClient(settings)
     raise ValueError(f"Unknown LLM provider: {provider!r}")
 
 
@@ -848,6 +862,7 @@ class ChatCompletionsClient:
     # of truth for "should we keep reasoning?" rather than two parallel
     # implementations that can drift.
     preserve_reasoning: bool = False
+    requires_api_key: bool = True
 
     def __init__(self, settings: Settings, provider_label: str) -> None:
         self.settings = settings
@@ -947,7 +962,7 @@ class ChatCompletionsClient:
         self.last_usage = None
         self.last_image_fallback_used = False
         api_key = self._api_key()
-        if not api_key:
+        if self.requires_api_key and not api_key:
             raise RuntimeError(f"{api_key_env(self._provider_label.lower())} is not configured.")
         payload = self._build_payload(messages, tools)
         headers = self._build_headers(api_key)

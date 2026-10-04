@@ -146,20 +146,28 @@ echo -e "${GREEN}  Local AI CAD Agent installed successfully!${NC}"
 echo -e "${GREEN}============================================${NC}"
 echo ""
 echo "  Next steps:"
-echo "  1. Set the API key for the provider selected in config.yaml:"
-echo "     OPENROUTER_API_KEY=...  or  OPENAI_API_KEY=..."
-echo ""
-echo "  2. (Optional) Customize the model in config.yaml"
-echo ""
-echo "  3. Start the application:"
-echo "     ${GREEN}./run.sh${NC}"
-echo ""
 LLM_PROVIDER="$("$VENV_PYTHON" -c 'from agent.settings import load_settings; print(load_settings().llm_provider)')"
-if [ "$LLM_PROVIDER" = "openai" ]; then
-    API_KEY_NAME="OPENAI_API_KEY"
+if [ "$LLM_PROVIDER" = "ollama" ]; then
+    echo "  1. Prepare your Ollama model (16k context recommended):"
+    echo "     ${GREEN}./setup_ollama.sh qwen2.5-coder:14b${NC}"
+    echo ""
+    echo "  2. Start the application:"
+    echo "     ${GREEN}./run.sh${NC}"
 else
-    API_KEY_NAME="OPENROUTER_API_KEY"
-fi
-if [ ! -s .env ] || ! grep -qE "^[[:space:]]*${API_KEY_NAME}[[:space:]]*=[[:space:]]*[^[:space:]]" .env; then
-    warn "${API_KEY_NAME} is empty in .env. The setup page will guide you on first launch."
+    if [ "$LLM_PROVIDER" = "openai" ]; then
+        API_KEY_NAME="OPENAI_API_KEY"
+    else
+        API_KEY_NAME="OPENROUTER_API_KEY"
+    fi
+    echo "  1. Set the API key for the provider selected in config.yaml:"
+    echo "     ${API_KEY_NAME}=... in .env"
+    echo ""
+    echo "  2. (Optional) Customize the model in config.yaml"
+    echo ""
+    echo "  3. Start the application:"
+    echo "     ${GREEN}./run.sh${NC}"
+    echo ""
+    if [ ! -s .env ] || ! grep -qE "^[[:space:]]*${API_KEY_NAME}[[:space:]]*=[[:space:]]*[^[:space:]]" .env; then
+        warn "${API_KEY_NAME} is empty in .env. The setup page will guide you on first launch."
+    fi
 fi

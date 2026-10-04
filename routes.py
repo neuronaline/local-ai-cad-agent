@@ -262,6 +262,8 @@ def _active_api_key_env(settings: Settings) -> str:
 
 
 def _api_key_configured(settings: Settings) -> bool:
+    if settings.llm_provider == "ollama":
+        return bool(settings.llm_model.strip())
     key = os.getenv(_active_api_key_env(settings), "")
     return bool(key.strip()) and bool(settings.llm_model.strip())
 
@@ -270,8 +272,11 @@ def _run_preflight(settings: Settings) -> dict[str, Any]:
     from agent.sandbox import _BWRAP, seccomp_filter_fd
 
     checks: dict[str, bool | str] = {}
-    api_key = os.getenv(_active_api_key_env(settings), "").strip()
-    checks["api_key"] = bool(api_key)
+    if settings.llm_provider == "ollama":
+        checks["api_key"] = True
+    else:
+        api_key = os.getenv(_active_api_key_env(settings), "").strip()
+        checks["api_key"] = bool(api_key)
     checks["provider"] = settings.llm_provider
     checks["model_configured"] = bool(settings.llm_model.strip())
     try:
@@ -484,8 +489,8 @@ def delete_project(project_name: str):
         # Drop the per-project advisory lock and the in-memory caches
         # keyed on this directory so a long-running server does not
         # accumulate orphaned resources for deleted projects.
-        from agent.tools.file_tool import invalidate_model_file_lock
         from agent.revisions import invalidate_model_digest_cache
+        from agent.tools.file_tool import invalidate_model_file_lock
 
         invalidate_model_file_lock(project_dir)
         invalidate_model_digest_cache(project_dir)

@@ -396,9 +396,12 @@ class AgentRunner:
                     affected.append(self._active_project)
                 if self.settings.workspace_root.is_dir():
                     for item in self.settings.workspace_root.iterdir():
-                        if item.is_dir() and (item / ".agent_state.json").is_file():
-                            if item.name not in affected:
-                                affected.append(item.name)
+                        if (
+                            item.is_dir()
+                            and (item / ".agent_state.json").is_file()
+                            and item.name not in affected
+                        ):
+                            affected.append(item.name)
                 self._waiting_questions.clear()
             else:
                 self._waiting_questions.pop(project, None)
@@ -1275,12 +1278,27 @@ class AgentRunner:
         if err_type == "RequestCancelled" or "task was cancelled" in lower:
             return "Task was cancelled."
         if "401" in detail or "unauthorized" in lower or "invalid api key" in lower:
+            if provider == "ollama":
+                return "Authentication failed for Ollama. Check your OLLAMA_API_KEY environment variable."
             return f"Invalid {provider_name} API key. Check your key at {key_url}."
         if "429" in detail or "rate limit" in lower:
             return f"{provider_name} rate limit reached. Wait a moment and try again."
-        # Contiguous-token checks for missing-model problems avoid a
-        # decoupled ``"model"`` / ``"not found"`` match that would
-        # misroute unrelated errors (e.g. ``FileNotFoundError: model.scad``).
+        if provider == "ollama":
+            if (
+                "connection refused" in lower
+                or "failed to establish a new connection" in lower
+                or "could not connect" in lower
+                or "max retries exceeded" in lower
+            ):
+                return (
+                    "Could not connect to Ollama server at http://localhost:11434. "
+                    "Ensure Ollama is running (`ollama serve`)."
+                )
+            if "not found" in lower and ("model" in lower or "try pulling" in lower):
+                return (
+                    f"Ollama model not found: {detail}. "
+                    "Make sure the model is pulled (`ollama pull <model>`) or use `./setup_ollama.sh`."
+                )
         if (
             "model not found" in lower
             or "model not available" in lower
@@ -1295,9 +1313,16 @@ class AgentRunner:
             or "seccomp" in lower
         ):
             return "CAD sandbox failed. Ensure bubblewrap and libseccomp2 are installed (sudo apt install bubblewrap libseccomp2)."
-        if ("openrouter" in lower or "openai" in lower) and (
+        if (
+            "openrouter" in lower
+            or "openai" in lower
+            or "ollama" in lower
+            or provider in ("openrouter", "openai", "ollama")
+        ) and (
             "timeout" in lower or "timed out" in lower or "connection" in lower
         ):
+            if provider == "ollama":
+                return "Connection to Ollama server timed out. Check if Ollama is responsive."
             return f"Connection to {provider_name} timed out. Check your internet connection."
         if "timeout" in lower or "timed out" in lower:
             return "CAD code execution timed out. Try simplifying the design or increasing the timeout."

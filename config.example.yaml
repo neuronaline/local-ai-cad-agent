@@ -7,9 +7,9 @@ agent:
   debug_log_tool_errors: false  # Writes recoverable failures to <project>/debug-errors.jsonl
   log_tool_activity: false  # Writes raw tool-loop trace to <project>/.cad-agent/activity.jsonl
 
-# LLM provider selection. Set ``provider`` to either ``openrouter`` or
-# ``openai``; the matching namespace below supplies its model + endpoint.
-# Both namespaces are kept in sync so you can switch providers without
+# LLM provider selection. Set ``provider`` to ``openrouter``, ``openai``,
+# or ``ollama``; the matching namespace below supplies its model + endpoint.
+# All namespaces are kept in sync so you can switch providers without
 # losing either configuration.
 llm:
   provider: openrouter
@@ -49,6 +49,11 @@ openai:
   model: gpt-5.6-terra
   timeout_seconds: 60
   reasoning_effort: ""
+
+ollama:
+  base_url: http://localhost:11434/v1
+  model: qwen2.5-coder:14b-16k
+  timeout_seconds: 120
 
 server:
   host: 127.0.0.1

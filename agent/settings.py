@@ -13,7 +13,7 @@ _LOG = logging.getLogger(__name__)
 _WARNED_KEYS: set[str] = set()
 
 REASONING_EFFORTS = {"minimal", "low", "medium", "high"}
-LLM_PROVIDERS = {"openrouter", "openai"}
+LLM_PROVIDERS = {"openrouter", "openai", "ollama"}
 
 
 @dataclass(frozen=True)
@@ -51,6 +51,10 @@ class Settings:
     openai_model: str = "gpt-4o-mini"
     openai_timeout_seconds: int = 60
     openai_reasoning_effort: str | None = None
+    # Ollama local Chat Completions adapter.
+    ollama_base_url: str = "http://localhost:11434/v1"
+    ollama_model: str = "qwen2.5-coder:14b-16k"
+    ollama_timeout_seconds: int = 120
     # ── end provider selection ──
     show_info_messages: bool = True
     agent_tool_call_limit: int = 12
@@ -81,6 +85,8 @@ class Settings:
         """Return the model name of the active provider."""
         if self.llm_provider == "openai":
             return self.openai_model
+        if self.llm_provider == "ollama":
+            return self.ollama_model
         return self.openrouter_model
 
 
@@ -208,15 +214,21 @@ def _parse_grid_extent(value: Any) -> tuple[float, int]:
 def load_settings(project_root: Path | None = None) -> Settings:
     project_root = project_root or Path(__file__).resolve().parents[1]
     config = _read_yaml(project_root / "config.yaml")
-    llm = config.get("llm", {})
-    openrouter = config.get("openrouter", {})
-    openai = config.get("openai", {})
-    server = config.get("server", {})
-    ui = config.get("ui", {})
-    agent = config.get("agent", {})
-    review = config.get("review", {})
-    viewer = config.get("viewer", {})
-    viewer_grid = viewer.get("grid", {}) if isinstance(viewer, dict) else {}
+    llm = config.get("llm") or {}
+    openrouter = config.get("openrouter") or {}
+    openai = config.get("openai") or {}
+    ollama = config.get("ollama") or {}
+    server = config.get("server") or {}
+    ui = config.get("ui") or {}
+    agent = config.get("agent") or {}
+    review = config.get("review") or {}
+    viewer = config.get("viewer") or {}
+    viewer_grid = viewer.get("grid") or {} if isinstance(viewer, dict) else {}
+    _reject_unknown(
+        ollama,
+        {"base_url", "model", "timeout_seconds"},
+        "ollama",
+    )
     _reject_unknown(
         agent,
         {
@@ -318,6 +330,9 @@ def load_settings(project_root: Path | None = None) -> Settings:
         openai_model=str(openai.get("model", "gpt-4o-mini")),
         openai_timeout_seconds=_validate_timeout_seconds(openai.get("timeout_seconds", 60), "openai.timeout_seconds"),
         openai_reasoning_effort=_optional_effort(openai.get("reasoning_effort")),
+        ollama_base_url=str(ollama.get("base_url") or "http://localhost:11434/v1").rstrip("/"),
+        ollama_model=str(ollama.get("model") or "qwen2.5-coder:14b-16k"),
+        ollama_timeout_seconds=_validate_timeout_seconds(ollama.get("timeout_seconds") or 120, "ollama.timeout_seconds"),
         show_info_messages=_strict_bool(ui.get("show_info_messages", True), "ui.show_info_messages"),
         agent_tool_call_limit=_positive_int(agent.get("tool_call_limit", 12), "agent.tool_call_limit"),
         revision_retention_count=_non_negative_int(agent.get("revision_retention_count", 0), "agent.revision_retention_count"),
