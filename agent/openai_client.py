@@ -54,7 +54,7 @@ class OpenAIClient(ChatCompletionsClient):
             "stream": True,
             "stream_options": {"include_usage": True},
         }
-        if self.settings.openai_model.startswith("gpt-5.6"):
+        if self.settings.openai_model.startswith(("gpt-5.6", "gpt-6")):
             self._mark_stable_system_prefix(wire_messages)
         if tools:
             payload["tools"] = tools

@@ -48,7 +48,7 @@ class Settings:
     llm_fallback_provider: str = ""
     # OpenAI Chat Completions adapter.
     openai_base_url: str = "https://api.openai.com/v1"
-    openai_model: str = "gpt-4o-mini"
+    openai_model: str = ""
     openai_timeout_seconds: int = 60
     openai_reasoning_effort: str | None = None
     # Ollama local Chat Completions adapter.
@@ -317,7 +317,7 @@ def load_settings(project_root: Path | None = None) -> Settings:
     return Settings(
         workspace_root=Path(config.get("workspace_root", "~/CAD-Agent-Projects")).expanduser(),
         openrouter_base_url=str(openrouter.get("base_url", "https://openrouter.ai/api/v1")).rstrip("/"),
-        openrouter_model=str(openrouter.get("model", "openai/gpt-4o-mini")),
+        openrouter_model=str(openrouter.get("model") or ""),
         openrouter_timeout_seconds=_validate_timeout_seconds(openrouter.get("timeout_seconds", 60), "openrouter.timeout_seconds"),
         host=str(server.get("host", "127.0.0.1")),
         port=_validate_port(server.get("port", 5000), "server.port"),
@@ -333,7 +333,7 @@ def load_settings(project_root: Path | None = None) -> Settings:
         llm_provider=llm_provider,
         llm_fallback_provider=llm_fallback_provider,
         openai_base_url=str(openai.get("base_url", "https://api.openai.com/v1")).rstrip("/"),
-        openai_model=str(openai.get("model", "gpt-4o-mini")),
+        openai_model=str(openai.get("model") or ""),
         openai_timeout_seconds=_validate_timeout_seconds(openai.get("timeout_seconds", 60), "openai.timeout_seconds"),
         openai_reasoning_effort=_optional_effort(openai.get("reasoning_effort")),
         ollama_base_url=str(ollama.get("base_url") or "http://localhost:11434/v1").rstrip("/"),
