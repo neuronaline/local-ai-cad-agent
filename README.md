@@ -5,7 +5,7 @@
 [![OpenSCAD](https://img.shields.io/badge/CAD-OpenSCAD-orange.svg)](https://openscad.org/)
 [![Three.js](https://img.shields.io/badge/Preview-Three.js-black.svg)](https://threejs.org/)
 [![Bubblewrap Sandbox](https://img.shields.io/badge/Security-Bubblewrap%20Sandbox-green.svg)](https://github.com/containers/bubblewrap)
-[![Providers](https://img.shields.io/badge/LLM-OpenRouter%20%7C%20OpenAI%20%7C%20Ollama-blueviolet.svg)](#-llm-provider-setup)
+[![Providers](https://img.shields.io/badge/LLM-OpenRouter%20%7C%20OpenAI%20%7C%20Ollama-blueviolet.svg)](#2-configure-your-llm-provider)
 
 A local-first, self-hosted web application that lets you **create and refine parametric 3D CAD models through natural language conversations with an AI agent**.
 
@@ -14,15 +14,15 @@ Built with [OpenSCAD](https://openscad.org/) for solid geometry, [Three.js](http
 > **⚠️ Project Status:** This project is under **active development** and is currently a **hobby project**. It excels at **functional mechanical parts, enclosures, brackets, adapters, and simple-to-intermediate 3D-printable models**. Highly intricate, organic, or sculptural geometry is outside its current scope.
 
 <p align="center">
-  <img src="screenshot.png" alt="Local AI CAD Agent user interface" width="850">
+  <img src="screenshots/screenshot.png" alt="Local AI CAD Agent user interface" width="850">
 </p>
 
 <p align="center">
-  <img src="real-simple-example.jpeg" alt="Example CAD model generation" width="850">
+  <img src="screenshots/real-simple-example.jpeg" alt="Example CAD model generation" width="850">
 </p>
 
 <p align="center">
-  <img src="real-simple-example-2.jpeg" alt="Example CAD model generation 2" width="850">
+  <img src="screenshots/real-simple-example-2.jpeg" alt="Example CAD model generation 2" width="850">
 </p>
 
 ---
@@ -38,7 +38,7 @@ Built with [OpenSCAD](https://openscad.org/) for solid geometry, [Three.js](http
 - 👁️ **Visual Memory (`get_view_images`)** — The agent can retrieve rendered canonical views or zoom into cropped regions of the part to visually inspect geometry and correct defects.
 - ❓ **Interactive Clarification Dialogs** — When critical dimensions or mounting specs are missing, the agent presents structured UI forms (text, numbers, single-choice, or multi-select) before continuing.
 - 🧊 **Interactive 3D Viewport** — Real-time Three.js viewer with orbit controls, standard view presets (Isometric, Front, Top, Right), wireframe toggle, configurable ground grid, and dimension warnings.
-- 📦 **Multi-Format Mesh & CAD Export** — Export models with one click from the UI to **STL**, **OpenSCAD**, **3MF**, **Wavefront OBJ**, **AMF**, **OFF**, or **CSG** with SHA-256 caching.
+- 📦 **Multi-Format Export** — Export models with one click from the UI to **STL**, **OpenSCAD**, **3MF**, **Wavefront OBJ**, **AMF**, **OFF**, or **CSG** with SHA-256 caching.
 - 📜 **Immutable Revision History** — Compare source diffs across every successful build, inspect previous states, and instantly revert to any past revision.
 - 📁 **Project Management** — Create, rename, delete, and switch between isolated projects with fully persisted chat logs and artifacts.
 - 🖼️ **Multimodal Reference Inputs** — Upload up to 5 reference images (PNG, JPEG, WebP, max 10 MB each) to guide the agent visually.
@@ -128,7 +128,7 @@ Choose your preferred provider below:
      provider: openrouter
 
    openrouter:
-     model: anthropic/claude-3.7-sonnet # or your preferred model
+     model: anthropic/claude-sonnet-4.5 # or your preferred model
      reasoning_effort: medium
    ```
 
@@ -147,7 +147,7 @@ Choose your preferred provider below:
      provider: openai
 
    openai:
-     model: gpt-4o # or gpt-4o-mini
+     model: gpt-5.6-terra # or gpt-5-mini
    ```
 
 ---
@@ -181,7 +181,7 @@ Open your browser at **`http://127.0.0.1:8000`** (or your configured `server.hos
 
 ## 📐 Supported Export Formats
 
-Local AI CAD Agent provides direct in-browser export into 7 industry-standard formats:
+Local AI CAD Agent provides direct in-browser multi-format export:
 
 | Format | Extension | Underlying Engine | Primary Use Case |
 |---|---|---|---|
@@ -257,7 +257,7 @@ Settings are loaded from `config.yaml` (git-ignored) at startup. Copy `config.ex
 | Key | Default | Description |
 |---|---|---|
 | `openrouter.base_url` | `https://openrouter.ai/api/v1` | OpenRouter endpoint |
-| `openrouter.model` | *(empty)* | Model slug (e.g. `anthropic/claude-3.7-sonnet`) |
+| `openrouter.model` | *(empty)* | Model slug (e.g. `anthropic/claude-sonnet-4.5`) |
 | `openrouter.timeout_seconds` | `90` | HTTP request timeout in seconds |
 | `openrouter.reasoning_effort` | `medium` | Reasoning level: `minimal`, `low`, `medium`, or `high` |
 | `openrouter.provider_order` | `["google-ai-studio", "google-vertex/global"]` | Priority-ordered upstream routing slugs |
@@ -271,7 +271,7 @@ Settings are loaded from `config.yaml` (git-ignored) at startup. Copy `config.ex
 | Key | Default | Description |
 |---|---|---|
 | `openai.base_url` | `https://api.openai.com/v1` | OpenAI API endpoint |
-| `openai.model` | `gpt-4o-mini` | Direct OpenAI model name (e.g. `gpt-4o`, `gpt-4o-mini`) |
+| `openai.model` | `gpt-5.6-terra` | Direct OpenAI model name (e.g. `gpt-5.6-terra`, `gpt-5-mini`) |
 | `openai.timeout_seconds` | `60` | HTTP request timeout in seconds |
 | `openai.reasoning_effort` | `""` | Reasoning effort for reasoning models (`low`, `medium`, `high`) |
 
