@@ -20,7 +20,7 @@ MAX_READ_LINES = 2000
 # ``_MAX_PROJECT_FILE_LOCKS`` (long-running servers that create + delete
 # many projects otherwise accumulate an unbounded set of stale locks).
 _MAX_PROJECT_FILE_LOCKS = 256
-_MODEL_FILE_LOCKS: "OrderedDict[str, threading.RLock]" = OrderedDict()
+_MODEL_FILE_LOCKS: OrderedDict[str, threading.RLock] = OrderedDict()
 _MODEL_FILE_LOCKS_GUARD: threading.Lock = threading.Lock()
 
 

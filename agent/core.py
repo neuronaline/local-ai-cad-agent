@@ -31,6 +31,7 @@ from agent.conversation import (
 )
 from agent.dispatcher import (
     cancel_remaining_tool_calls,
+    is_cad_build,
     normalize_tool_calls,
     process_tool_call,
 )
@@ -38,10 +39,16 @@ from agent.images import as_chat_image
 from agent.llm_base import (
     RequestCancelled,
     create_llm_client,
+    extract_text_tool_calls,
     provider_label,
     sanitize_assistant_message,
 )
-from agent.prompt import get_system_prompt
+from agent.prompt import (
+    NUDGE_FINAL_VERIFICATION,
+    format_project_state,
+    format_unverified_model_nudge,
+    get_system_prompt,
+)
 from agent.revisions import (
     MODEL_FILENAME,
     RevisionStore,
@@ -55,7 +62,7 @@ from agent.tools.image_tool import ImageTool
 from agent.tools.question_tool import QuestionTool
 from agent.tools.question_validator import QuestionValidator
 
-# Circuit-breaker thresholds for repeated ``cad_build_and_verify`` failures.
+# Circuit-breaker thresholds for repeated ``cad_build`` failures.
 # ``_BUILD_FAILURE_TOTAL_MAX`` stops the agent after a broad burst of mixed
 # errors; ``_BUILD_FAILURE_PER_SIGNATURE_MAX`` stops it earlier when the
 # same logical error keeps repeating (useful for catching repair loops).
@@ -112,7 +119,7 @@ def _synthetic_user(content: str) -> dict[str, object]:
     """Build a ``role: user`` message flagged as agent-generated.
 
     The agent loop occasionally appends a ``role: user`` reminder to nudge the
-    LLM (e.g. "Call cad_build_and_verify now.") without losing the
+    LLM (e.g. "Call cad_build now.") without losing the
     user-role framing the provider expects. The ``synthetic`` flag is the
     durable marker for that provenance:
 
@@ -240,6 +247,7 @@ class AgentRunner:
                 self._thread = None
                 self._run_complete.set()
                 self._active_project = None
+                self._active_run_id = None
                 self._active_tools = None
                 self._active_client = None
                 return False
@@ -254,6 +262,10 @@ class AgentRunner:
     def active_project(self) -> str | None:
         with self._lock:
             return self._active_project
+
+    def active_run_id(self) -> str | None:
+        with self._lock:
+            return self._active_run_id
 
     def waiting_question(self, project: str) -> dict[str, object] | None:
         with self._lock:
@@ -309,6 +321,7 @@ class AgentRunner:
         self._stop_event.clear()
         self._run_complete.clear()
         self._active_project = project
+        self._active_run_id = run_id
         self._thread = threading.Thread(
             target=self._run,
             args=(project, message, image_paths, run_id),
@@ -439,11 +452,16 @@ class AgentRunner:
             thread_to_join = self._thread if stop_active_task else None
 
         if thread_to_join is not None and thread_to_join.is_alive():
-            thread_to_join.join(timeout=2.0)
+            thread_to_join.join(timeout=5.0)
 
         with self._lock:
             if stop_active_task and (self._thread is None or not self._thread.is_alive()):
                 self._active_project = None
+                self._active_run_id = None
+                self._thread = None
+                self._run_complete.set()
+                self._active_tools = None
+                self._active_client = None
 
         for cleared in affected:
             (
@@ -520,6 +538,7 @@ class AgentRunner:
             "agent_status",
             {
                 "project": project,
+                "run_id": run_id,
                 "status": "started",
                 "message": "Planning CAD task...",
             },
@@ -602,14 +621,14 @@ class AgentRunner:
                 sse_name = f"agent_{event_type}_delta"
             publish(
                 sse_name,
-                {"project": project, "message_id": msg_id, **event},
+                {"project": project, "run_id": run_id, "message_id": msg_id, **event},
             )
             if log is not None:
                 # Mirror the SSE stream into the activity log so the
                 # operator has the same content the UI consumed.
                 log(
                     sse_name,
-                    {"message_id": msg_id, **event},
+                    {"run_id": run_id, "message_id": msg_id, **event},
                     run_id=run_id,
                 )
 
@@ -658,6 +677,8 @@ class AgentRunner:
             state.tool_call_count += len(tool_calls)
         else:
             assistant_message.pop("tool_calls", None)
+            if not assistant_message.get("content"):
+                assistant_message["content"] = "Task completed."
         invalid_final = (
             not tool_calls
             and state.any_tool_used
@@ -690,6 +711,7 @@ class AgentRunner:
                 "agent_status",
                 {
                     "project": state.project,
+                    "run_id": state.run_id,
                     "status": "verifying",
                     "message": "Model verification required before finalizing.",
                 },
@@ -698,9 +720,11 @@ class AgentRunner:
                 "agent_stream_end",
                 {
                     "project": state.project,
+                    "run_id": state.run_id,
                     "message_id": state.current_message_id,
                     "message": "",
                     "reasoning": reasoning,
+                    "has_tools": False,
                 },
             )
         else:
@@ -708,9 +732,11 @@ class AgentRunner:
                 "agent_stream_end",
                 {
                     "project": state.project,
+                    "run_id": state.run_id,
                     "message_id": state.current_message_id,
                     "message": assistant_message.get("content") or "",
                     "reasoning": reasoning,
+                    "has_tools": bool(assistant_message.get("tool_calls")),
                 },
             )
             self._append_message(state.project_dir, assistant_message)
@@ -744,10 +770,11 @@ class AgentRunner:
                     "agent_error",
                     {
                         "project": state.project,
+                        "run_id": state.run_id,
                         "message": f"Drawing was not created: {state.cad_error}",
                     },
                 )
-                self._publish_terminal_failure(state.project)
+                self._publish_terminal_failure(state.project, run_id=state.run_id)
                 return _TurnOutcome.DRAWING_NOT_CREATED
             if state.any_tool_used:
                 if not state.nudged_cad and (
@@ -755,8 +782,7 @@ class AgentRunner:
                 ).is_file():
                     state.nudged_cad = True
                     reminder = _synthetic_user(
-                        f"{MODEL_FILENAME} exists but it has not been verified. "
-                        "Call cad_build_and_verify now."
+                        format_unverified_model_nudge(MODEL_FILENAME)
                     )
                     state.messages.append(reminder)
                     self._append_message(state.project_dir, reminder)
@@ -765,24 +791,21 @@ class AgentRunner:
                     "agent_error",
                     {
                         "project": state.project,
+                        "run_id": state.run_id,
                         "message": (
                             "Drawing was not created: the task did not "
                             "produce a new CAD preview."
                         ),
                     },
                 )
-                self._publish_terminal_failure(state.project)
+                self._publish_terminal_failure(state.project, run_id=state.run_id)
                 return _TurnOutcome.DRAWING_NOT_CREATED
-            self._complete(state.project, content, reasoning=full_reasoning)
+            self._complete(state.project, content, reasoning=full_reasoning, run_id=state.run_id)
             return _TurnOutcome.COMPLETED
         if state.cad_fix_required:
             if not state.nudged_final_verification:
                 state.nudged_final_verification = True
-                reminder = _synthetic_user(
-                    "The current model revision has not passed rendered visual "
-                    "verification. Call cad_build_and_verify with its default "
-                    "render=true before finishing."
-                )
+                reminder = _synthetic_user(NUDGE_FINAL_VERIFICATION)
                 state.messages.append(reminder)
                 self._append_message(state.project_dir, reminder)
                 return _TurnOutcome.CONTINUE
@@ -790,14 +813,15 @@ class AgentRunner:
                 "agent_error",
                 {
                     "project": state.project,
+                    "run_id": state.run_id,
                     "message": (
-                        "Task stopped: final visual verification is still missing."
+                        "Task stopped: final CAD verification is still missing."
                     ),
                 },
             )
-            self._publish_terminal_failure(state.project)
+            self._publish_terminal_failure(state.project, run_id=state.run_id)
             return _TurnOutcome.FINAL_VERIFICATION_MISSING
-        self._complete(state.project, content, reasoning=full_reasoning)
+        self._complete(state.project, content, reasoning=full_reasoning, run_id=state.run_id)
         return _TurnOutcome.COMPLETED
 
     def _handle_tool_calls(
@@ -841,7 +865,7 @@ class AgentRunner:
                 state.messages,
             )
             processed_call_ids.add(call_id)
-            if call.get("function", {}).get("name") == "cad_build_and_verify":
+            if is_cad_build(call.get("function", {}).get("name", "")):
                 # Circuit-breaker for repeated CAD build failures; reset
                 # on every successful build so a stale history cannot
                 # trip the breaker on a future invocation.
@@ -905,6 +929,7 @@ class AgentRunner:
             "agent_status",
             {
                 "project": state.project,
+                "run_id": state.run_id,
                 "status": "waiting_for_user",
                 "message": "Waiting for user input.",
             },
@@ -925,6 +950,7 @@ class AgentRunner:
             "agent_status",
             {
                 "project": state.project,
+                "run_id": state.run_id,
                 "status": "stopped",
                 "message": "Task stopped.",
             },
@@ -941,13 +967,14 @@ class AgentRunner:
             "agent_error",
             {
                 "project": state.project,
+                "run_id": state.run_id,
                 "message": (
                     f"Tool-call limit ({self.settings.agent_tool_call_limit}) reached; "
                     "increase agent.tool_call_limit or continue with a narrower request."
                 ),
             },
         )
-        self._publish_terminal_failure(state.project)
+        self._publish_terminal_failure(state.project, run_id=state.run_id)
         # If the final iteration processed at least one tool call, the
         # transcript still ends with ``role: tool``; close the tail so
         # the next user turn has a well-formed prompt prefix.
@@ -976,6 +1003,7 @@ class AgentRunner:
             "agent_status",
             {
                 "project": state.project,
+                "run_id": state.run_id,
                 "status": "stopped",
                 "message": "Task stopped.",
             },
@@ -1023,38 +1051,39 @@ class AgentRunner:
         current_message_id = (
             state.current_message_id if state is not None else None
         )
+        run_id = state.run_id if state is not None else ""
         if current_message_id is not None:
-            self.publish(
-                "agent_stream_end",
-                {
-                    "project": project,
-                    "message_id": current_message_id,
-                    "message": "",
-                },
-            )
-        if self._stop_event.is_set():
-            self.publish(
-                "agent_status",
-                {
-                    "project": project,
-                    "status": "stopped",
-                    "message": "Task stopped.",
-                },
-            )
-            return
-        self.publish(
-            "agent_error",
-            {
+            stream_end_payload: dict[str, Any] = {
                 "project": project,
-                "error_type": err_type,
-                "message": self._user_error_message(
-                    detail,
-                    err_type,
-                    provider=self.settings.llm_provider,
-                ),
-            },
-        )
-        self._publish_terminal_failure(project)
+                "message_id": current_message_id,
+                "message": "",
+            }
+            if run_id:
+                stream_end_payload["run_id"] = run_id
+            self.publish("agent_stream_end", stream_end_payload)
+        if self._stop_event.is_set():
+            stop_payload: dict[str, Any] = {
+                "project": project,
+                "status": "stopped",
+                "message": "Task stopped.",
+            }
+            if run_id:
+                stop_payload["run_id"] = run_id
+            self.publish("agent_status", stop_payload)
+            return
+        err_payload: dict[str, Any] = {
+            "project": project,
+            "error_type": err_type,
+            "message": self._user_error_message(
+                detail,
+                err_type,
+                provider=self.settings.llm_provider,
+            ),
+        }
+        if run_id:
+            err_payload["run_id"] = run_id
+        self.publish("agent_error", err_payload)
+        self._publish_terminal_failure(project, run_id=run_id)
 
     def _finalize_run(
         self,
@@ -1074,13 +1103,13 @@ class AgentRunner:
             self._active_client = None
             if self._active_project == project:
                 self._active_project = None
+                self._active_run_id = None
             # Mark the run finished and drop the thread reference so a
             # subsequent ``start()`` / ``answer()`` never observes a
             # stale ``_thread``.
             self._thread = None
             self._run_complete.set()
         self._active_activity_logger = None
-        self._active_run_id = None
         if activity_logger is not None:
             try:
                 if state is not None:
@@ -1157,35 +1186,60 @@ class AgentRunner:
     def _project_state_message(
         cls, project_dir: Path, history: list[dict] | None = None
     ) -> dict[str, str]:
-        """Provide current workspace state after the cacheable system prefix.
+        """Provide initial workspace state after the cacheable system prefix.
 
-        The state reflects the file system as of this turn so the model is
-        never told a stale answer (e.g. "model.scad does not exist" after a
-        successful ``write_file``). The trade-off is that the user message at
-        index 1 invalidates the provider prompt cache when the file's
-        existence flips, but the system prompt remains byte-stable so
-        provider-side cache breakpoints anchored to the system prompt keep
-        paying off across turns. See :data:`agent.prompt._OPERATIONAL_RULES`
-        for the corresponding instruction the model receives.
+        The state reflects whether model.scad existed at the start of the conversation,
+        frozen across turns so provider prompt caching remains valid.
+        See :data:`agent.prompt._OPERATIONAL_RULES` for the instruction the
+        model receives.
         """
-        existed = (project_dir / MODEL_FILENAME).is_file()
-        if existed:
-            content = (
-                "<project_state>\n"
-                f"{MODEL_FILENAME} exists. Read it before making a targeted edit.\n"
-                "</project_state>"
-            )
-        else:
-            content = (
-                "<project_state>\n"
-                f"{MODEL_FILENAME} does not exist. Create it directly with write_file; do not "
-                "call read_file, edit_file, or cad_build_and_verify first.\n"
-                "</project_state>"
-            )
+        existed = cls._initial_model_existed(project_dir, history)
+        content = format_project_state(existed, MODEL_FILENAME)
         # Gemini normalizes all system messages into an immutable instruction.
         # Keeping workspace state in a later user message lets its
         # explicit system-message cache breakpoint remain reusable.
         return {"role": "user", "content": content}
+
+    @classmethod
+    def _initial_model_existed(
+        cls, project_dir: Path, history: list[dict] | None = None
+    ) -> bool:
+        """Determine whether model.scad existed at the start of this conversation.
+
+        To preserve byte-identical prompt prefixes across all turns (enabling
+        provider-side prompt caching), the initial project state must remain
+        frozen for the duration of the conversation.
+        """
+        state_file = project_dir / ".agent_initial_state.json"
+        if state_file.is_file():
+            try:
+                data = json.loads(state_file.read_text("utf-8"))
+                if isinstance(data, dict) and "existed" in data:
+                    return bool(data["existed"])
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                pass
+
+        if history and len(history) > 1:
+            first_turn_wrote_model = False
+            for m in history:
+                if isinstance(m, dict) and m.get("role") == "assistant":
+                    tool_calls = m.get("tool_calls") or []
+                    if any(
+                        isinstance(tc, dict)
+                        and tc.get("function", {}).get("name") == "write_file"
+                        for tc in tool_calls
+                    ):
+                        first_turn_wrote_model = True
+                    break
+            existed = not first_turn_wrote_model
+        else:
+            existed = (project_dir / MODEL_FILENAME).is_file()
+
+        try:
+            state_file.write_text(json.dumps({"existed": existed}), encoding="utf-8")
+        except OSError:
+            pass
+        return existed
 
     @staticmethod
     def _last_message_has_tool_image(messages: list[dict]) -> bool:
@@ -1263,18 +1317,13 @@ class AgentRunner:
 
         Truncates the canonical ``conversation.jsonl`` log, evicts the
         in-memory history cache entry, and removes the per-project agent
-        state files (``agent_state.json``, plus the legacy
-        ``agent_initial_state.json`` left over from releases that cached
-        the initial workspace state). Returns ``True`` when a log file was
-        removed, ``False`` when the project had no recorded conversation.
-        The model, preview, renders, and revision blobs are left untouched.
+        state files (``agent_state.json`` and ``.agent_initial_state.json``).
+        Returns ``True`` when a log file was removed, ``False`` when the
+        project had no recorded conversation. The model, preview, renders,
+        and revision blobs are left untouched.
         """
         (project_dir / ".agent_state.json").unlink(missing_ok=True)
-        # Legacy cleanup: older releases wrote ``.agent_initial_state.json``
-        # so the cached ``<project_state>`` message could lie about the
-        # file's existence across turns. The new prompt reports the live
-        # state every turn, so the file is dead weight — drop it so a
-        # project upgraded in place resets to a clean state.
+        # Clear the initial state cache so the next conversation run resets cleanly.
         (project_dir / ".agent_initial_state.json").unlink(missing_ok=True)
         return ConversationStore.clear(project_dir)
 
@@ -1447,25 +1496,43 @@ class AgentRunner:
             )
         return uuid.uuid4().hex
 
-    def _publish_terminal_failure(self, project: str) -> None:
+    def _publish_terminal_failure(self, project: str, run_id: str = "") -> None:
         # Mirror ``_complete``'s success-side ``agent_status`` so the UI
         # clears the thinking indicator on every error path; ``stopped``
         # is already published for user-initiated stops. Transient so
         # the ``agent_error`` event that preceded this remains the
         # canonical terminal record.
+        payload: dict[str, Any] = {
+            "project": project,
+            "status": "failed",
+            "message": "Task failed.",
+        }
+        if run_id:
+            payload["run_id"] = run_id
         self.publish(
             "agent_status",
-            {"project": project, "status": "failed", "message": "Task failed."},
+            payload,
             transient=True,
         )
 
-    def _complete(self, project: str, message: str, reasoning: str = "") -> None:
+    def _complete(
+        self,
+        project: str,
+        message: str,
+        reasoning: str = "",
+        run_id: str = "",
+    ) -> None:
         """Persist the final assistant turn and publish it.
 
         Ensures the final user-facing response is recorded even when
         the loop reaches ``_complete`` without persisting the message
         (e.g. a no-tool-calls path that branched earlier).
         """
+        cleaned_msg, _ = extract_text_tool_calls(message)
+        message = cleaned_msg if cleaned_msg is not None else message
+        if reasoning and message.strip() == reasoning.strip():
+            reasoning = ""
+
         project_dir = self.settings.workspace_root / project
         history = self._load_history(project_dir)
         if not history or not (
@@ -1478,18 +1545,23 @@ class AgentRunner:
                 record["reasoning"] = reasoning
             self._append_message(project_dir, record)
         msg_payload: dict[str, Any] = {"project": project, "message": message}
+        if run_id:
+            msg_payload["run_id"] = run_id
         if reasoning:
             msg_payload["reasoning"] = reasoning
         self.publish("agent_message", msg_payload)
         # Transient so the ``agent_message`` above remains the canonical
         # terminal entry in the conversation log.
+        status_payload: dict[str, Any] = {
+            "project": project,
+            "status": "completed",
+            "message": "Task completed.",
+        }
+        if run_id:
+            status_payload["run_id"] = run_id
         self.publish(
             "agent_status",
-            {
-                "project": project,
-                "status": "completed",
-                "message": "Task completed.",
-            },
+            status_payload,
             transient=True,
         )
 

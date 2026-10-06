@@ -2,7 +2,7 @@
 
 Hosts the ``get_view_images`` tool. The tool never runs a sandbox build;
 the rendered per-view PNGs already exist on disk after a successful
-``cad_build_and_verify`` (``<project>/.cad-agent/reviews/<sha256>/views/*.png``
+``cad_build`` (``<project>/.cad-agent/reviews/<sha256>/views/*.png``
 plus ``manifest.json``). The tool validates each requested view against
 the manifest's ``image_sha256`` and, when a ``crop`` is requested, derives a
 cached sub-image with Pillow so repeated requests are free.
@@ -23,6 +23,7 @@ from pathlib import Path
 from PIL import Image
 
 from agent.io import atomic_write_bytes
+from agent.prompt import TOOL_HINTS
 from agent.review_paths import review_dir
 from agent.revisions import compute_model_sha256
 from agent.tool_results import _is_png, _view_hash
@@ -41,6 +42,48 @@ CANONICAL_VIEW_IDS: tuple[str, ...] = (
     "isometric_positive",
     "isometric_negative",
 )
+
+VIEW_ALIASES: dict[str, str] = {
+    "all": "all",
+    "sheet": "all",
+    "contact": "all",
+    "contact_sheet": "all",
+    "review-sheet": "all",
+    "review_sheet": "all",
+    "overview": "all",
+    "isometric": "isometric_positive",
+    "iso": "isometric_positive",
+    "iso+": "isometric_positive",
+    "iso_pos": "isometric_positive",
+    "iso_positive": "isometric_positive",
+    "isometric+": "isometric_positive",
+    "isometric_positive": "isometric_positive",
+    "iso-": "isometric_negative",
+    "iso_neg": "isometric_negative",
+    "iso_negative": "isometric_negative",
+    "isometric-": "isometric_negative",
+    "isometric_negative": "isometric_negative",
+    "top": "z_positive",
+    "+z": "z_positive",
+    "bottom": "z_negative",
+    "-z": "z_negative",
+    "front": "y_negative",
+    "-y": "y_negative",
+    "back": "y_positive",
+    "+y": "y_positive",
+    "right": "x_positive",
+    "+x": "x_positive",
+    "left": "x_negative",
+    "-x": "x_negative",
+    "x_positive": "x_positive",
+    "x_negative": "x_negative",
+    "y_positive": "y_positive",
+    "y_negative": "y_negative",
+    "z_positive": "z_positive",
+    "z_negative": "z_negative",
+}
+
+_MAX_VIEWS_PER_CALL = 8
 
 # Rendered views are always 512x512 per ``renderer.py:_WIDTH``/``_HEIGHT``.
 VIEW_PIXEL_WIDTH = 512
@@ -82,27 +125,27 @@ class ImageTool:
     # ------------------------------------------------------------------
     # Public tool entry point
     # ------------------------------------------------------------------
-    def get_view_images(self, requests: object) -> dict[str, object]:
+    def get_view_images(self, requests: object = None) -> dict[str, object]:
         """Return the success-envelope data for ``get_view_images``.
 
-        ``requests`` is a list of dicts shaped like the JSON-schema items
-        (``{"view": "<id>", "crop": {"x": ..., "y": ..., "width": ...,
-        "height": ...}}`` or the full view without ``crop``). Raises
-        :class:`ValueError` on bad input; the dispatcher converts that
-        into the standard ``ok:false`` envelope via ``tool_failure``.
+        Supports flexible input: empty/None (defaults to 'all' contact sheet),
+        ``{"views": ["all", "top", ...]}``, single strings, raw lists, or
+        legacy ``{"images": [...]}`` crop requests. Raises :class:`ValueError`
+        on bad input; the dispatcher converts that into the standard ``ok:false``
+        envelope via ``tool_failure``.
         """
         items = _coerce_requests(requests)
         review_root = self._current_review_dir()
         if review_root is None:
             raise ValueError(
                 "No review artifacts exist for the current model.scad. "
-                "Run cad_build_and_verify first."
+                f"{TOOL_HINTS['IMAGE_RUN_CAD_BUILD_FIRST']}"
             )
         manifest = _read_manifest(review_root)
         if manifest is None:
             raise ValueError(
                 "Review directory is missing manifest.json. "
-                "Run cad_build_and_verify again."
+                f"{TOOL_HINTS['IMAGE_RUN_CAD_BUILD_AGAIN']}"
             )
 
         # De-duplicate identical (view, crop) requests so the model can
@@ -110,6 +153,10 @@ class ImageTool:
         # duplicate image_url parts (which would inflate every later
         # payload without adding information).
         deduped = _deduplicate(items)
+        if len(deduped) > _MAX_VIEWS_PER_CALL:
+            raise ValueError(
+                f"Too many view requests ({len(deduped)}). At most {_MAX_VIEWS_PER_CALL} views can be requested per call."
+            )
 
         out_images: list[dict[str, object]] = []
         for item in deduped:
@@ -120,7 +167,7 @@ class ImageTool:
         if not out_images:
             raise ValueError(
                 "None of the requested views could be produced. "
-                "Run cad_build_and_verify to refresh the review."
+                f"{TOOL_HINTS['IMAGE_REFRESH_REVIEW']}"
             )
 
         review_sha = review_root.name
@@ -153,12 +200,53 @@ class ImageTool:
         manifest: dict,
         item: dict[str, object],
     ) -> dict[str, object] | None:
-        view_id = str(item.get("view") or "")
-        if view_id not in CANONICAL_VIEW_IDS:
+        raw_view = str(item.get("view") or "").strip().lower()
+        canonical = VIEW_ALIASES.get(raw_view)
+        if canonical is None:
             raise ValueError(
-                f"Unknown view id: {view_id!r}. "
-                f"Must be one of {list(CANONICAL_VIEW_IDS)}."
+                f"Unknown view: {item.get('view')!r}. "
+                "Valid views: 'all', 'isometric', 'top', 'bottom', 'front', 'back', 'left', 'right', 'isometric_negative'."
             )
+
+        if canonical == "all":
+            if item.get("crop") is not None:
+                raise ValueError(
+                    "Cropping is not supported on the composite 'all' view. "
+                    "Request a specific view (e.g. 'isometric', 'top') to crop."
+                )
+            contact_entry = manifest.get("contact_sheet") if isinstance(manifest, dict) else None
+            expected_sha = (
+                contact_entry.get("image_sha256")
+                if isinstance(contact_entry, dict)
+                else None
+            )
+            if not isinstance(expected_sha, str) or len(expected_sha) != 64:
+                expected_sha = None
+            sheet_path = review_root / "review-sheet.png"
+            if not _is_png(sheet_path, expected_sha):
+                return None
+            if not expected_sha:
+                expected_sha = _hash_file(sheet_path)
+            width = (
+                int(contact_entry.get("width", 2048))
+                if isinstance(contact_entry, dict) and "width" in contact_entry
+                else 2048
+            )
+            height = (
+                int(contact_entry.get("height", 1024))
+                if isinstance(contact_entry, dict) and "height" in contact_entry
+                else 1024
+            )
+            return {
+                "view": "all",
+                "cropped": False,
+                "path": "review-sheet.png",
+                "sha256": expected_sha,
+                "width": width,
+                "height": height,
+            }
+
+        view_id = canonical
         view_entry_expected_sha = _view_hash(manifest, view_id)
         if view_entry_expected_sha is None:
             # Manifest does not know about this view id (older review
@@ -191,7 +279,7 @@ class ImageTool:
 
         # Cheap existence probe; a full decode/hash check on a missing
         # file would crash before ``_is_png`` returned False.
-        if not crop_path.is_file() or not _is_png(crop_path, _hash_file(crop_path)):
+        if not crop_path.is_file() or not _is_png(crop_path):
             _write_crop(view_path, crop_box, crop_path)
 
         sha = _hash_file(crop_path)
@@ -218,23 +306,75 @@ class ImageTool:
 # ---------------------------------------------------------------------------
 
 
-def _coerce_requests(requests: object) -> list[dict[str, object]]:
-    if requests is None:
-        return []
-    if not isinstance(requests, list):
-        raise ValueError("'images' must be a list of view requests.")
-    if not requests:
-        raise ValueError("'images' must contain at least one view request.")
-    if len(requests) > 4:
-        raise ValueError("'images' accepts at most 4 view requests per call.")
+def _coerce_list(raw_list: list, label: str) -> list[dict[str, object]]:
     items: list[dict[str, object]] = []
-    for index, raw in enumerate(requests):
-        if not isinstance(raw, dict):
+    for index, item in enumerate(raw_list):
+        if isinstance(item, str):
+            cleaned = item.strip()
+            if cleaned:
+                items.append({"view": cleaned})
+        elif isinstance(item, dict) and "view" in item:
+            items.append(dict(item))
+        else:
             raise ValueError(
-                f"images[{index}] must be an object with a 'view' field."
+                f"{label}[{index}] must be a view name string or object with 'view'."
             )
-        items.append(raw)
-    return items
+    return items if items else [{"view": "all"}]
+
+
+def _coerce_requests(requests: object) -> list[dict[str, object]]:
+    """Coerce various input shapes into a normalized list of view requests."""
+    if requests is None or requests == "" or requests == [] or requests == {}:
+        return [{"view": "all"}]
+
+    if isinstance(requests, str):
+        cleaned = requests.strip()
+        return [{"view": cleaned}] if cleaned else [{"view": "all"}]
+
+    if isinstance(requests, list):
+        return _coerce_list(requests, "Request item")
+
+    if isinstance(requests, dict):
+        if not requests:
+            return [{"view": "all"}]
+
+        # 1. Handle "views" list/string
+        if "views" in requests:
+            raw_views = requests["views"]
+            if raw_views is None or raw_views == [] or raw_views == "":
+                return [{"view": "all"}]
+            if isinstance(raw_views, str):
+                cleaned = raw_views.strip()
+                return [{"view": cleaned}] if cleaned else [{"view": "all"}]
+            if isinstance(raw_views, list):
+                return _coerce_list(raw_views, "views")
+            raise ValueError("'views' must be a list of view names or a single view name.")
+
+        # 2. Handle "images" list (legacy schema compatibility)
+        if "images" in requests:
+            raw_images = requests["images"]
+            if raw_images is None or raw_images == [] or raw_images == "":
+                return [{"view": "all"}]
+            if not isinstance(raw_images, list):
+                raise ValueError("'images' must be a list of view requests.")
+            return _coerce_list(raw_images, "images")
+
+        # 3. Handle single "view" key with optional "crop"
+        if "view" in requests:
+            raw_view = requests["view"]
+            if not isinstance(raw_view, str) or not raw_view.strip():
+                raise ValueError("'view' must be a non-empty string.")
+            entry: dict[str, object] = {"view": raw_view.strip()}
+            crop = requests.get("crop")
+            if isinstance(crop, dict):
+                entry["crop"] = crop
+            return [entry]
+
+        raise ValueError(
+            "Invalid arguments for get_view_images. Pass 'views' array or leave empty for contact sheet."
+        )
+
+    raise ValueError("Invalid request format for get_view_images.")
 
 
 def _deduplicate(items: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -251,17 +391,20 @@ def _deduplicate(items: list[dict[str, object]]) -> list[dict[str, object]]:
 
 def _item_key(item: dict[str, object]) -> tuple:
     crop = item.get("crop")
+    raw_view = str(item.get("view") or "").strip().lower()
+    canonical = VIEW_ALIASES.get(raw_view, raw_view)
     if not isinstance(crop, dict):
-        return (str(item.get("view") or ""), None)
-    return (
-        str(item.get("view") or ""),
-        (
+        return (canonical, None)
+    try:
+        crop_tuple = (
             float(crop.get("x") or 0.0),
             float(crop.get("y") or 0.0),
             float(crop.get("width") or 0.0),
             float(crop.get("height") or 0.0),
-        ),
-    )
+        )
+    except (ValueError, TypeError):
+        crop_tuple = None
+    return (canonical, crop_tuple)
 
 
 def _normalize_crop(
@@ -273,7 +416,7 @@ def _normalize_crop(
     and rejects degenerate rectangles (< 8 px on either side).
     """
     if not isinstance(crop, dict):
-        raise ValueError("crop must be an object with x, y, width, height.")
+        raise TypeError("crop must be an object with x, y, width, height.")
     try:
         x = float(crop.get("x"))
         y = float(crop.get("y"))

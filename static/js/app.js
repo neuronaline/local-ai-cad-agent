@@ -32,6 +32,19 @@ const showInfoMessages = appConfig.showInfoMessages ?? true;
 const currentProject = appConfig.projectName || '';
 const viewer = new CadViewer(document.querySelector('#viewer'), document.querySelector('#dimensions'), appConfig);
 
+try {
+  const savedWidth = parseInt(localStorage.getItem('cad_chat_width'), 10);
+  if (Number.isFinite(savedWidth) && savedWidth >= 360 && savedWidth <= window.innerWidth - 400) {
+    document.documentElement.style.setProperty('--chat-width', `${savedWidth}px`);
+  }
+} catch {}
+
+function generateUUID() {
+  return typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+}
+
 let selectedFiles = [];
 let previewProject = '';
 let loadedPreviewRevision = '';
@@ -77,6 +90,10 @@ function sanitizeHTML(html) {
           el.removeAttribute('href');
         }
       }
+      if (tag === 'a' && el.getAttribute('href')?.startsWith('http')) {
+        el.setAttribute('target', '_blank');
+        el.setAttribute('rel', 'noopener noreferrer');
+      }
     }
   }
   return doc.body.innerHTML;
@@ -91,9 +108,26 @@ marked.setOptions({
   },
 });
 
+function stripToolCallTags(text) {
+  if (!text || typeof text !== 'string') return '';
+  let cleaned = text;
+  if (cleaned.includes('<function=')) {
+    cleaned = cleaned.replace(/<function=[a-zA-Z0-9_-]+>.*?(?:<\/function>|(?=<function=)|$)/gs, '');
+  }
+  if (cleaned.includes('<tool_call')) {
+    cleaned = cleaned.replace(/<tool_call[^>]*>.*?(?:<\/tool_call>|$)/gs, '');
+  }
+  if (cleaned.includes('[TOOL_CALLS]')) {
+    cleaned = cleaned.replace(/\[TOOL_CALLS\].*?(?:\[\/TOOL_CALLS\]|$)/gs, '');
+  }
+  cleaned = cleaned.replace(/<\/?(?:function|parameter|tool_call)[^>]*>/g, '');
+  return cleaned.trim();
+}
+
 function renderAgentContent(item, text) {
-  item.dataset.raw = text;
-  item.querySelector('.message-content').innerHTML = sanitizeHTML(marked.parse(text || ''));
+  const clean = stripToolCallTags(text || '');
+  item.dataset.raw = clean;
+  item.querySelector('.message-content').innerHTML = sanitizeHTML(marked.parse(clean));
 }
 
 function createThoughtDisclosure(reasoningText = '', isOpen = false, isLive = false) {
@@ -119,25 +153,30 @@ function createThoughtDisclosure(reasoningText = '', isOpen = false, isLive = fa
 }
 
 function ensureThoughtDisclosure(card, reasoning, isOpen = false, isLive = false) {
-  if (reasoning === null || reasoning === undefined || reasoning === '') return null;
+  if (reasoning === null || reasoning === undefined) return null;
+  const cleanReasoning = String(reasoning).trim();
+  if (!cleanReasoning) return null;
+  if (!isLive && card.dataset.raw && card.dataset.raw.trim() === cleanReasoning) {
+    const existing = card.querySelector('.thought-disclosure');
+    if (existing) existing.remove();
+    return null;
+  }
   let disclosure = card.querySelector('.thought-disclosure');
   if (!disclosure) {
-    disclosure = createThoughtDisclosure(reasoning, isOpen, isLive);
+    disclosure = createThoughtDisclosure(cleanReasoning, isOpen, isLive);
     const contentEl = card.querySelector('.message-content');
     card.insertBefore(disclosure, contentEl);
   } else {
-    if (isLive) {
-      disclosure.open = true;
-    } else if (isOpen) {
-      disclosure.open = true;
-    }
+    disclosure.open = Boolean(isOpen || isLive);
     const badge = disclosure.querySelector('.thought-badge');
     if (badge) {
       badge.hidden = !isLive;
       badge.textContent = 'Thinking…';
     }
     const content = disclosure.querySelector('.thought-content');
-    if (content) content.textContent = reasoning;
+    if (content && content.textContent !== cleanReasoning) {
+      content.textContent = cleanReasoning;
+    }
   }
   return disclosure;
 }
@@ -179,6 +218,11 @@ function addMessage(text, type = 'agent', options = {}) {
         el.src = img.src;
         el.alt = img.alt || 'attachment';
         el.loading = 'lazy';
+        if (img.src && img.src.startsWith('blob:')) {
+          const revoke = () => URL.revokeObjectURL(img.src);
+          el.addEventListener('load', revoke, { once: true });
+          el.addEventListener('error', revoke, { once: true });
+        }
         strip.appendChild(el);
       }
       item.appendChild(strip);
@@ -198,6 +242,7 @@ function addMessage(text, type = 'agent', options = {}) {
 
 const activityLabels = {
   // Tool schema names published by the backend (agent/tools/tool_schemas.py).
+  cad_build: 'Building model',
   cad_build_and_verify: 'Building model',
   get_view_images: 'Retrieving images',
   write_file: 'Updating model',
@@ -249,14 +294,17 @@ function activityDetail(tool, status, value) {
   if (payload.ok === false) return String(payload.error?.message || 'The step failed.');
   const data = payload.ok === true ? payload.data : payload;
   if (typeof data === 'string') return data;
-  // ``cad_build_and_verify`` returns a compact ``summary`` string alongside
+  // ``cad_build`` / ``cad_build_and_verify`` returns a compact ``summary`` string alongside
   // the structured payload. Prefer it over the legacy fixed message so the
   // UI accurately reflects whether a render/review was produced or skipped
   // (render=false iterations return a metrics-only summary).
-  if (tool === 'cad_build_and_verify' && data && typeof data.summary === 'string' && data.summary.trim()) {
+  if ((tool === 'cad_build' || tool === 'cad_build_and_verify') && data && typeof data.summary === 'string' && data.summary.trim()) {
     return data.summary.trim();
   }
-  if (tool === 'cad_build_and_verify') return 'Model built and review artifacts created.';
+  if (tool === 'cad_build' || tool === 'cad_build_and_verify') return 'Model built and review artifacts created.';
+  if (tool === 'get_view_images' && data && Array.isArray(data.images)) {
+    return `${data.images.length} view(s) retrieved.`;
+  }
   if (data && typeof data === 'object') {
     const output = data.stdout || data.stderr || data.message || data.summary;
     if (typeof output === 'string' && output.trim()) return output.trim();
@@ -264,7 +312,13 @@ function activityDetail(tool, status, value) {
   return status === 'error' ? 'The step failed.' : 'Completed.';
 }
 
+let userManuallyToggled = false;
+activityPanel?.querySelector('summary')?.addEventListener('click', () => {
+  userManuallyToggled = true;
+});
+
 function clearActivity() {
+  userManuallyToggled = false;
   activityItems.clear();
   activityList.replaceChildren();
   activityPanel.hidden = true;
@@ -331,7 +385,9 @@ function updateActivitySummary() {
     : failed.length
       ? `${failed.length} failed ${failed.length === 1 ? 'task' : 'tasks'}`
       : `${items.length} ${items.length === 1 ? 'step' : 'steps'} completed`;
-  activityPanel.open = Boolean(current);
+  if (!userManuallyToggled) {
+    activityPanel.open = Boolean(current);
+  }
   activityPanel.hidden = false;
 }
 
@@ -352,7 +408,7 @@ function markActivityRecovered() {
 }
 
 function addToolMessage(data) {
-  const callId = data.call_id || crypto.randomUUID();
+  const callId = data.call_id || generateUUID();
   const status = data.status || 'running';
   const item = activityItems.get(callId) || {callId, tool: data.tool || 'agent'};
   item.tool = data.tool || item.tool;
@@ -463,26 +519,9 @@ function setThinking(active) {
     if (sendIcon) sendIcon.hidden = active;
     if (stopIcon) stopIcon.hidden = !active;
   }
-  if (active) {
-    if (!document.querySelector('.thinking-indicator')) {
-      const el = document.createElement('div');
-      el.className = 'thinking-indicator';
-      el.innerHTML = '<span></span><span></span><span></span><span>Preparing model</span>';
-      feed.appendChild(el);
-    }
-  } else {
+  if (!active) {
     const existing = document.querySelector('.thinking-indicator');
     if (existing) existing.remove();
-    if (pendingFinalCard) {
-      pendingFinalCard.classList.remove('streaming', 'thinking', 'writing');
-      const state = pendingFinalCard.querySelector('.message-state');
-      if (state) {
-        state.textContent = '';
-        state.className = 'message-state';
-      }
-      const badge = pendingFinalCard.querySelector('.thought-badge');
-      if (badge) badge.hidden = true;
-    }
   }
 }
 
@@ -519,6 +558,7 @@ async function loadCurrentPreview(previewId) {
       if (downloadModelBtn) downloadModelBtn.disabled = false;
       loadReviewGallery();
     } catch (error) {
+      if (error.message?.includes('superseded')) return;
       if (downloadModelBtn) downloadModelBtn.disabled = true;
       addMessage(`Preview failed: ${error.message}`, 'error');
     } finally {
@@ -656,18 +696,23 @@ async function loadCurrentState() {
     if (!questionArea.querySelector('.question-form')) {
       showQuestion({project: currentProject, ...q});
     }
-  } else if (data.status === 'running') {
-    setThinking(true);
-  } else if (data.status === 'idle') {
-    setThinking(false);
-    const agentRunItem = activityItems.get('agent-run');
-    if (agentRunItem && (agentRunItem.status === 'started' || agentRunItem.status === 'running')) {
-      addToolMessage({
-        call_id: 'agent-run',
-        tool: 'agent',
-        status: 'stopped',
-        result: 'Agent is idle.',
-      });
+  } else {
+    if (questionArea.querySelector('.question-form')) {
+      clearQuestionArea();
+    }
+    if (data.status === 'running') {
+      setThinking(true);
+    } else if (data.status === 'idle') {
+      setThinking(false);
+      const agentRunItem = activityItems.get('agent-run');
+      if (agentRunItem && (agentRunItem.status === 'started' || agentRunItem.status === 'running')) {
+        addToolMessage({
+          call_id: 'agent-run',
+          tool: 'agent',
+          status: 'stopped',
+          result: 'Agent is idle.',
+        });
+      }
     }
   }
 }
@@ -704,7 +749,7 @@ async function loadHistory(projectName, options = {}) {
     } else {
       clearActivity();
       target.replaceChildren();
-      questionArea.replaceChildren();
+      clearQuestionArea();
     }
     let renderedAny = false;
     let accumulatedReasoning = '';
@@ -748,11 +793,13 @@ async function loadHistory(projectName, options = {}) {
             ? `${accumulatedReasoning}\n\n${reasoning}`
             : reasoning;
         }
+        displayText = stripToolCallTags(displayText);
         if (!String(displayText).trim()) {
           // Tool-only intermediate turn: preserve accumulated reasoning for final response
           continue;
         }
-        addMessage(displayText, 'agent', {target, reasoning: accumulatedReasoning});
+        const cleanReasoning = (String(displayText).trim() === accumulatedReasoning.trim()) ? '' : accumulatedReasoning;
+        addMessage(displayText, 'agent', {target, reasoning: cleanReasoning});
         accumulatedReasoning = '';
         renderedAny = true;
       } else if (evt.type === 'agent_error') {
@@ -827,13 +874,13 @@ chatForm.addEventListener('submit', async event => {
   }));
   try {
     clearActivity();
-    pendingFinalCard = null;
-    streamingMessages.clear();
+    finalizeAllActiveCards();
     addMessage(text, 'user', {images: imagePayload});
+    getOrCreateRunCard(null, { optimistic: true });
     setThinking(true);
-    scrollFeedToBottom();
+    scrollFeedToBottom(true);
     message.value = '';
-    const idempotencyKey = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const idempotencyKey = generateUUID();
     const body = new FormData();
     body.append('project', currentProject);
     body.append('message', text);
@@ -841,12 +888,16 @@ chatForm.addEventListener('submit', async event => {
     selectedFiles.forEach(file => body.append('attachments', file));
     const response = await api('/api/chat', {method: 'POST', body});
     if (response.duplicate) {
+      if (optimisticCard) {
+        optimisticCard.remove();
+        optimisticCard = null;
+      }
       setThinking(false);
       return;
     }
     if (response.attachments?.length) {
       addToolMessage({
-        call_id: `attachments-${crypto.randomUUID()}`,
+        call_id: `attachments-${generateUUID()}`,
         tool: 'Images',
         status: 'completed',
         result: `${response.attachments.length} reference image(s) uploaded.`,
@@ -854,12 +905,18 @@ chatForm.addEventListener('submit', async event => {
     }
     clearAttachments();
   } catch (error) {
+    if (optimisticCard) {
+      optimisticCard.remove();
+      optimisticCard = null;
+    }
     addMessage(error.message, 'error');
     setThinking(false);
   } finally {
-    if (sendToggle) sendToggle.disabled = false;
-    message.disabled = false;
-    message.focus();
+    if (!isQuestionPending) {
+      if (sendToggle) sendToggle.disabled = false;
+      message.disabled = false;
+      message.focus();
+    }
   }
 });
 
@@ -910,9 +967,25 @@ resetButton.addEventListener('click', async () => {
   }
 });
 
-attachments.addEventListener('change', () => {
-  selectedFiles = Array.from(attachments.files || []);
+const ALLOWED_IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/webp']);
+
+function handleFiles(files) {
+  const valid = files.filter(f => ALLOWED_IMAGE_MIMES.has(f.type?.toLowerCase()));
+  if (files.length > valid.length) {
+    addMessage('Only PNG, JPEG, and WEBP images are supported.', 'error');
+  }
+  if (!valid.length) return;
+  if (selectedFiles.length + valid.length > 5) {
+    addMessage('You can attach at most 5 reference images.', 'error');
+    return;
+  }
+  selectedFiles = [...selectedFiles, ...valid];
   renderAttachmentPreview();
+}
+
+attachments.addEventListener('change', () => {
+  handleFiles(Array.from(attachments.files || []));
+  attachments.value = '';
 });
 
 ['dragenter', 'dragover'].forEach(eventName => {
@@ -921,17 +994,16 @@ attachments.addEventListener('change', () => {
     dropzone.classList.add('is-dragging');
   });
 });
-['dragleave', 'drop'].forEach(eventName => {
-  dropzone.addEventListener(eventName, event => {
-    event.preventDefault();
-    dropzone.classList.remove('is-dragging');
-  });
+dropzone.addEventListener('dragleave', event => {
+  event.preventDefault();
+  dropzone.classList.remove('is-dragging');
 });
 dropzone.addEventListener('drop', event => {
-  const files = Array.from(event.dataTransfer?.files || []).filter(file => file.type.startsWith('image/'));
+  event.preventDefault();
+  dropzone.classList.remove('is-dragging');
+  const files = Array.from(event.dataTransfer?.files || []);
   if (!files.length) return;
-  selectedFiles = [...selectedFiles, ...files];
-  renderAttachmentPreview();
+  handleFiles(files);
 });
 
 function clearAttachments() {
@@ -1039,12 +1111,17 @@ resizer?.addEventListener('pointerdown', event => {
   event.preventDefault();
   resizer.setPointerCapture(event.pointerId);
   document.body.classList.add('is-resizing');
+  let currentWidth = null;
   const onMove = moveEvent => {
     const width = Math.min(Math.max(moveEvent.clientX, 360), window.innerWidth - 400);
+    currentWidth = width;
     document.documentElement.style.setProperty('--chat-width', `${width}px`);
   };
   const onEnd = () => {
     document.body.classList.remove('is-resizing');
+    if (currentWidth) {
+      try { localStorage.setItem('cad_chat_width', `${currentWidth}px`); } catch {}
+    }
     resizer.removeEventListener('pointermove', onMove);
     resizer.removeEventListener('pointerup', onEnd);
     resizer.removeEventListener('pointercancel', onEnd);
@@ -1110,11 +1187,18 @@ async function loadModelPane() {
       restore.textContent = rev.is_active ? 'Active' : 'Restore';
       restore.disabled = rev.is_active;
       restore.addEventListener('click', async () => {
+        restore.disabled = true;
         try {
-          await api(`/api/projects/${encodeURIComponent(currentProject)}/revisions/${rev.id}/restore`, {method: 'POST'});
+          const res = await api(`/api/projects/${encodeURIComponent(currentProject)}/revisions/${rev.id}/restore`, {method: 'POST'});
+          if (res && res.ok === false) {
+            addMessage(`Restore partial failure: ${res.error}`, 'error');
+          }
           historyDrawer.hidden = true;
+          loadModelPane();
         } catch (error) {
           addMessage(error.message, 'error');
+        } finally {
+          restore.disabled = rev.is_active;
         }
       });
       actions.appendChild(restore);
@@ -1128,8 +1212,23 @@ async function loadModelPane() {
 }
 
 // Question rendering (delegated to the existing logic in question_tool).
-function showQuestion(question) {
+let isQuestionPending = false;
+
+function setComposerBlockedForQuestion(blocked) {
+  isQuestionPending = blocked;
+  message.disabled = blocked;
+  if (sendToggle) sendToggle.disabled = blocked;
+  message.placeholder = blocked ? 'Please answer the pending question above…' : 'Describe the part, dimensions, fit, and required features…';
+}
+
+function clearQuestionArea() {
   questionArea.replaceChildren();
+  setComposerBlockedForQuestion(false);
+}
+
+function showQuestion(question) {
+  clearQuestionArea();
+  setComposerBlockedForQuestion(true);
   const form = document.createElement('form');
   form.className = 'question-form';
   const fields = [];
@@ -1211,8 +1310,10 @@ function showQuestion(question) {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({project: currentProject, answers}),
       });
-      questionArea.replaceChildren();
+      clearQuestionArea();
+      finalizeAllActiveCards();
       addMessage(answerLines.join('\n'), 'user');
+      getOrCreateRunCard(null, { optimistic: true });
       setThinking(true);
     } catch (error) {
       addMessage(error.message, 'error');
@@ -1222,38 +1323,69 @@ function showQuestion(question) {
   questionArea.appendChild(form);
 }
 
-// SSE event stream
+// SSE event stream & Run-Card State Machine
 let eventSource = null;
-// Cards currently being filled from streaming deltas. Keyed by message_id so
-// multiple in-flight turns (rare in practice, but the API supports them) do
-// not collide. Cards are removed once agent_message finalizes them.
-const streamingMessages = new Map();
-// The streaming card that has not yet been finalized; used by agent_message
-// to update the canonical final text without duplicating the card.
-let pendingFinalCard = null;
+const runCards = new Map(); // run_id -> message card element
+let optimisticCard = null;  // Card created on user submit, adopted when run_id is known
 
-function scrollFeedToBottom() {
-  if (feed) {
+function scrollFeedToBottom(force = false) {
+  if (!feed) return;
+  const isNearBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight <= 60;
+  if (force || isNearBottom) {
     feed.scrollTop = feed.scrollHeight;
   }
 }
 
-function startStreamingCard(messageId) {
-  if (messageId && streamingMessages.has(messageId)) return streamingMessages.get(messageId);
-  const empty = feed.querySelector('.empty-state');
-  if (empty) empty.remove();
-  const indicator = feed.querySelector('.thinking-indicator');
-  if (indicator) indicator.remove();
-
-  if (pendingFinalCard) {
-    if (messageId) streamingMessages.set(messageId, pendingFinalCard);
-    return pendingFinalCard;
+function finalizeAllActiveCards() {
+  for (const card of runCards.values()) {
+    if (card && card.dataset.state !== 'done') {
+      setCardState(card, 'done');
+    }
   }
+  runCards.clear();
+  if (optimisticCard && optimisticCard.dataset.state !== 'done') {
+    setCardState(optimisticCard, 'done');
+  }
+  optimisticCard = null;
+  if (feed) {
+    feed.querySelectorAll('.message.agent.streaming').forEach(card => {
+      if (card.dataset.state !== 'done') {
+        setCardState(card, 'done');
+      }
+    });
+  }
+}
+
+function getOrCreateRunCard(runId, { target = feed, optimistic = false } = {}) {
+  if (runId && runCards.has(runId)) {
+    return runCards.get(runId);
+  }
+  if (optimisticCard) {
+    if (runId) {
+      optimisticCard.dataset.runId = runId;
+      runCards.set(runId, optimisticCard);
+      const card = optimisticCard;
+      optimisticCard = null;
+      return card;
+    }
+    return optimisticCard;
+  }
+
+  // Finalize any prior active cards before mounting a new card into feed
+  finalizeAllActiveCards();
+
+  const empty = target.querySelector('.empty-state');
+  if (empty) empty.remove();
+  const indicator = target.querySelector('.thinking-indicator');
+  if (indicator) indicator.remove();
 
   const item = document.createElement('div');
   item.className = 'message agent streaming thinking';
+  item.dataset.state = 'thinking';
   item.dataset.raw = '';
-  if (messageId) item.dataset.messageId = messageId;
+  item.dataset.reasoning = '';
+  if (runId) item.dataset.runId = runId;
+
   item.innerHTML = `
     <div class="message-meta">
       <span class="agent-mark">AI</span>
@@ -1262,113 +1394,24 @@ function startStreamingCard(messageId) {
     </div>
     <div class="message-content"></div>
   `;
-  feed.appendChild(item);
-  if (messageId) streamingMessages.set(messageId, item);
-  pendingFinalCard = item;
-  scrollFeedToBottom();
+  target.appendChild(item);
+  if (runId) {
+    runCards.set(runId, item);
+  } else if (optimistic) {
+    optimisticCard = item;
+  }
+  scrollFeedToBottom(true);
   return item;
 }
 
-function appendStreamingReasoningDelta(messageId, delta) {
-  if (!delta) return;
-  let card = (messageId ? streamingMessages.get(messageId) : null) || pendingFinalCard;
-  if (!card) {
-    card = startStreamingCard(messageId);
-  } else if (messageId && !streamingMessages.has(messageId)) {
-    streamingMessages.set(messageId, card);
-  }
+function setCardState(card, state, labelText = null) {
+  if (!card) return;
+  card.dataset.state = state;
+  const stateEl = card.querySelector('.message-state');
+  if (!stateEl) return;
 
-  const indicator = feed ? feed.querySelector('.thinking-indicator') : document.querySelector('.thinking-indicator');
-  if (indicator) indicator.remove();
-
-  if (!card.classList.contains('streaming')) {
-    card.classList.add('streaming');
-  }
-  if (!card.classList.contains('thinking')) {
-    card.classList.remove('writing');
-    card.classList.add('thinking');
-    const state = card.querySelector('.message-state');
-    if (state) {
-      state.className = 'message-state state-thinking';
-      state.textContent = 'Thinking';
-    }
-  }
-
-  if (messageId && card.dataset.lastTurnId && card.dataset.lastTurnId !== messageId && card.dataset.reasoning) {
-    if (!card.dataset.reasoning.endsWith('\n\n')) {
-      card.dataset.reasoning += '\n\n';
-    }
-  }
-  if (messageId) card.dataset.lastTurnId = messageId;
-
-  card.dataset.reasoning = (card.dataset.reasoning || '') + delta;
-  const disclosure = ensureThoughtDisclosure(card, card.dataset.reasoning, true, true);
-  const thoughtContent = disclosure?.querySelector('.thought-content');
-  if (thoughtContent) {
-    thoughtContent.scrollTop = thoughtContent.scrollHeight;
-  }
-  scrollFeedToBottom();
-}
-
-function appendStreamingDelta(messageId, delta) {
-  if (!delta) return;
-  let card = (messageId ? streamingMessages.get(messageId) : null) || pendingFinalCard;
-  if (!card) {
-    card = startStreamingCard(messageId);
-  } else if (messageId && !streamingMessages.has(messageId)) {
-    streamingMessages.set(messageId, card);
-  }
-
-  const indicator = feed ? feed.querySelector('.thinking-indicator') : document.querySelector('.thinking-indicator');
-  if (indicator) indicator.remove();
-
-  if (!card.classList.contains('streaming')) {
-    card.classList.add('streaming');
-  }
-  // Transition from thinking to writing on first content delta
-  if (!card.classList.contains('writing')) {
-    card.classList.remove('thinking');
-    card.classList.add('writing');
-    const state = card.querySelector('.message-state');
-    if (state) {
-      state.className = 'message-state state-writing';
-      state.textContent = 'Writing';
-    }
-    const disclosure = card.querySelector('.thought-disclosure');
-    if (disclosure) {
-      disclosure.open = false; // Auto-collapse to focus on content stream
-      const badge = disclosure.querySelector('.thought-badge');
-      if (badge) badge.hidden = true;
-    }
-  }
-
-  card.dataset.raw = (card.dataset.raw || '') + delta;
-  renderAgentContent(card, card.dataset.raw);
-  scrollFeedToBottom();
-}
-
-function handleStreamingToolDelta(messageId, _data) {
-  let card = (messageId ? streamingMessages.get(messageId) : null) || pendingFinalCard;
-  if (!card) {
-    card = startStreamingCard(messageId);
-  } else if (messageId && !streamingMessages.has(messageId)) {
-    streamingMessages.set(messageId, card);
-  }
-
-  const indicator = feed ? feed.querySelector('.thinking-indicator') : document.querySelector('.thinking-indicator');
-  if (indicator) indicator.remove();
-
-  if (!card.classList.contains('streaming')) {
-    card.classList.add('streaming');
-  }
-  if (!card.classList.contains('writing')) {
-    card.classList.remove('thinking');
-    card.classList.add('writing');
-    const state = card.querySelector('.message-state');
-    if (state) {
-      state.className = 'message-state state-writing';
-      state.textContent = 'Writing code';
-    }
+  // Thought Process closes whenever the card leaves the 'thinking' state
+  if (state !== 'thinking') {
     const disclosure = card.querySelector('.thought-disclosure');
     if (disclosure) {
       disclosure.open = false;
@@ -1376,40 +1419,178 @@ function handleStreamingToolDelta(messageId, _data) {
       if (badge) badge.hidden = true;
     }
   }
+
+  if (state === 'thinking') {
+    card.classList.add('streaming', 'thinking');
+    card.classList.remove('writing');
+    stateEl.className = 'message-state state-thinking';
+    stateEl.textContent = labelText || 'Thinking';
+  } else if (state === 'writing') {
+    card.classList.add('streaming', 'writing');
+    card.classList.remove('thinking');
+    stateEl.className = 'message-state state-writing';
+    stateEl.textContent = labelText || 'Writing';
+  } else if (state === 'done') {
+    card.classList.remove('streaming', 'thinking', 'writing');
+    stateEl.textContent = '';
+    stateEl.className = 'message-state';
+    const badge = card.querySelector('.thought-badge');
+    if (badge) badge.hidden = true;
+  } else if (state === 'error') {
+    card.classList.remove('streaming', 'thinking', 'writing');
+    stateEl.textContent = labelText || 'Failed';
+    stateEl.className = 'message-state';
+  } else if (state === 'stopped') {
+    card.classList.remove('streaming', 'thinking', 'writing');
+    stateEl.textContent = labelText || 'Stopped';
+    stateEl.className = 'message-state';
+  }
 }
 
-function finalizeStreamingCard(messageId, finalText, reasoning) {
-  const card = (messageId ? streamingMessages.get(messageId) : null) || pendingFinalCard;
+let renderRafId = null;
+let pendingRenderCard = null;
+
+function applyCardRender(card) {
+  if (!card) return;
+  const rawClean = stripToolCallTags(card.dataset.raw || '');
+  if (rawClean) {
+    renderAgentContent(card, rawClean);
+  } else {
+    const contentEl = card.querySelector('.message-content');
+    if (contentEl) {
+      contentEl.innerHTML = '';
+    }
+  }
+  if (card.dataset.reasoning) {
+    const isThinking = card.dataset.state === 'thinking';
+    const disclosure = ensureThoughtDisclosure(
+      card,
+      card.dataset.reasoning,
+      isThinking,
+      isThinking
+    );
+    const thoughtContent = disclosure?.querySelector('.thought-content');
+    if (thoughtContent && isThinking) {
+      thoughtContent.scrollTop = thoughtContent.scrollHeight;
+    }
+  }
+  scrollFeedToBottom();
+}
+
+function flushStreamingRender() {
+  if (renderRafId) {
+    cancelAnimationFrame(renderRafId);
+    renderRafId = null;
+  }
+  if (pendingRenderCard) {
+    applyCardRender(pendingRenderCard);
+    pendingRenderCard = null;
+  }
+}
+
+function scheduleStreamingRender(card) {
+  pendingRenderCard = card;
+  if (renderRafId) return;
+  renderRafId = requestAnimationFrame(() => {
+    renderRafId = null;
+    if (pendingRenderCard) {
+      applyCardRender(pendingRenderCard);
+      pendingRenderCard = null;
+    }
+  });
+}
+
+function appendStreamingReasoningDelta(runId, delta, messageId = null) {
+  if (!delta) return;
+  const card = getOrCreateRunCard(runId);
+  if (card.dataset.state !== 'thinking' && card.dataset.state !== 'writing') {
+    setCardState(card, 'thinking');
+  }
+  if (messageId && card.dataset.lastReasoningTurnId && card.dataset.lastReasoningTurnId !== messageId && card.dataset.reasoning) {
+    if (!card.dataset.reasoning.endsWith('\n\n')) {
+      card.dataset.reasoning += '\n\n';
+    }
+  }
+  if (messageId) card.dataset.lastReasoningTurnId = messageId;
+  card.dataset.reasoning = (card.dataset.reasoning || '') + delta;
+  scheduleStreamingRender(card);
+}
+
+function appendStreamingDelta(runId, delta, messageId = null) {
+  if (!delta) return;
+  const card = getOrCreateRunCard(runId);
+  if (card.dataset.state !== 'writing') {
+    setCardState(card, 'writing');
+  }
+  if (messageId && card.dataset.lastContentTurnId && card.dataset.lastContentTurnId !== messageId && card.dataset.raw) {
+    if (!card.dataset.raw.endsWith('\n\n')) {
+      card.dataset.raw += '\n\n';
+    }
+  }
+  if (messageId) card.dataset.lastContentTurnId = messageId;
+  card.dataset.raw = (card.dataset.raw || '') + delta;
+  scheduleStreamingRender(card);
+}
+
+function handleStreamingToolDelta(runId, _data) {
+  const card = getOrCreateRunCard(runId);
+  if (card.dataset.state !== 'writing') {
+    setCardState(card, 'writing');
+  }
+}
+
+function finalizeRunCard(runId, finalText, reasoning) {
+  flushStreamingRender();
+  let card = (runId ? runCards.get(runId) : null) || optimisticCard;
+  if (!card) {
+    for (const c of runCards.values()) {
+      if (c.dataset.state !== 'done') {
+        card = c;
+        break;
+      }
+    }
+  }
+
+  const text = stripToolCallTags(finalText || card?.dataset.raw || '').trim();
+  const finalReasoning = (card?.dataset.reasoning || reasoning || '').trim();
+  const cleanReasoning = (text && text === finalReasoning) ? '' : finalReasoning;
+
   if (card) {
-    if (finalText) {
-      renderAgentContent(card, finalText);
-      card.dataset.raw = finalText;
+    if (text) {
+      renderAgentContent(card, text);
+      card.dataset.raw = text;
+    } else {
+      const contentEl = card.querySelector('.message-content');
+      if (contentEl) contentEl.innerHTML = '';
+      card.dataset.raw = '';
     }
-    card.classList.remove('streaming', 'thinking', 'writing');
-    const state = card.querySelector('.message-state');
-    if (state) {
-      state.textContent = '';
-      state.className = 'message-state';
+    setCardState(card, 'done');
+    if (cleanReasoning) {
+      ensureThoughtDisclosure(card, cleanReasoning, false, false);
+    } else {
+      const existing = card.querySelector('.thought-disclosure');
+      if (existing) existing.remove();
     }
-    const finalReasoning = card.dataset.reasoning || reasoning;
-    if (finalReasoning) {
-      ensureThoughtDisclosure(card, finalReasoning, false, false);
+    if (runId) runCards.delete(runId);
+    if (optimisticCard === card) optimisticCard = null;
+
+    // Safety sweep: ensure any other dangling cards are also set to done and pruned
+    for (const [id, dangling] of runCards.entries()) {
+      if (dangling.dataset.state !== 'done') setCardState(dangling, 'done');
+      runCards.delete(id);
     }
-    for (const [key, value] of streamingMessages) {
-      if (value === card) streamingMessages.delete(key);
-    }
+    optimisticCard = null;
+
     scrollFeedToBottom();
     return card;
   }
-  const item = addMessage(finalText || '', 'agent', { reasoning });
+
+  const item = addMessage(finalText || '', 'agent', { reasoning: cleanReasoning });
   scrollFeedToBottom();
   return item;
 }
 
 async function syncAfterStreamReset() {
-  // Re-fetch the canonical state so events missed during the gap are visible.
-  // Re-rendering the main feed replaces persisted content rather than
-  // appending, which prevents duplicate messages on reconnect.
   if (!currentProject) return;
   await loadHistory(currentProject);
   await loadCurrentState();
@@ -1440,71 +1621,70 @@ function connectStream() {
         setThinking(true);
       } else if (['stopped', 'failed', 'completed', 'waiting_for_user'].includes(data.status)) {
         setThinking(false);
+        finalizeAllActiveCards();
       }
     },
     question: data => {
       if (data.project !== currentProject) return;
       setThinking(false);
       showQuestion(data);
+      finalizeAllActiveCards();
     },
     agent_reasoning_delta: data => {
       if (data.project !== currentProject) return;
       const chunk = data.content ?? data.delta ?? '';
-      if (chunk) appendStreamingReasoningDelta(data.message_id, chunk);
+      const runId = data.run_id || data.message_id;
+      if (chunk) appendStreamingReasoningDelta(runId, chunk, data.message_id);
     },
     agent_content_delta: data => {
       if (data.project !== currentProject) return;
-      // Backend publishes agent_content_delta for content chunks.
       const chunk = data.content ?? data.delta ?? '';
-      if (chunk) appendStreamingDelta(data.message_id, chunk);
+      const runId = data.run_id || data.message_id;
+      if (chunk) appendStreamingDelta(runId, chunk, data.message_id);
     },
     agent_tool_delta: data => {
       if (data.project !== currentProject) return;
-      handleStreamingToolDelta(data.message_id, data);
+      const runId = data.run_id || data.message_id;
+      handleStreamingToolDelta(runId, data);
     },
     agent_stream_end: data => {
       if (data.project !== currentProject) return;
-      const messageId = data.message_id;
-      const finalText = data.message || '';
-      const reasoning = data.reasoning || '';
-      if (!finalText.trim()) {
-        // Intermediate tool turn: do NOT finalize or drop the card!
-        // The agent is executing tools and will continue in the next turn.
-        const card = (messageId ? streamingMessages.get(messageId) : null) || pendingFinalCard;
-        if (card) {
-          card.classList.remove('streaming', 'thinking', 'writing');
-          const state = card.querySelector('.message-state');
-          if (state) {
-            state.textContent = '';
-            state.className = 'message-state';
-          }
-          if (reasoning) {
-            const combined = card.dataset.reasoning || reasoning;
-            ensureThoughtDisclosure(card, combined, false, false);
-          }
+      flushStreamingRender();
+      const runId = data.run_id || data.message_id;
+      const card = (runId ? runCards.get(runId) : null) || optimisticCard;
+      if (card) {
+        const combined = card.dataset.reasoning || data.reasoning || '';
+        if (combined) {
+          ensureThoughtDisclosure(card, combined, false, false);
         }
-        return;
+        const text = stripToolCallTags(data.message || card.dataset.raw || '').trim();
+        if (text) {
+          card.dataset.raw = text;
+          renderAgentContent(card, text);
+        }
+        if (data.has_tools && text) {
+          setCardState(card, 'done');
+          if (runId) runCards.delete(runId);
+          if (optimisticCard === card) optimisticCard = null;
+        }
       }
-      finalizeStreamingCard(messageId, finalText, reasoning);
     },
     agent_message: data => {
       if (data.project !== currentProject) return;
+      const runId = data.run_id || data.message_id;
       const finalText = data.message || '';
       const reasoning = data.reasoning || '';
       if (!finalText.trim() && !reasoning.trim()) {
-        if (pendingFinalCard && !pendingFinalCard.dataset.raw && !pendingFinalCard.dataset.reasoning) {
-          pendingFinalCard.remove();
-          pendingFinalCard = null;
+        const card = (runId ? runCards.get(runId) : null) || optimisticCard;
+        if (card && !card.dataset.raw && !card.dataset.reasoning) {
+          card.remove();
+          if (runId) runCards.delete(runId);
+          if (optimisticCard === card) optimisticCard = null;
         }
         setThinking(false);
         return;
       }
-      if (pendingFinalCard) {
-        finalizeStreamingCard(null, finalText, reasoning);
-        pendingFinalCard = null;
-      } else {
-        addMessage(finalText, 'agent', { reasoning });
-      }
+      finalizeRunCard(runId, finalText, reasoning);
       markActivityRecovered();
       setThinking(false);
       scrollFeedToBottom();
@@ -1568,6 +1748,18 @@ function connectStream() {
     try {
       const data = JSON.parse(event.data);
       if (data.project !== currentProject) return;
+      const runId = data.run_id || data.message_id;
+      const card = (runId ? runCards.get(runId) : null) || optimisticCard;
+      if (card) {
+        if (!card.dataset.raw && !card.dataset.reasoning) {
+          card.remove();
+        } else {
+          setCardState(card, 'error', 'Failed');
+        }
+        if (runId) runCards.delete(runId);
+        if (optimisticCard === card) optimisticCard = null;
+      }
+      finalizeAllActiveCards();
       addMessage(data.message || 'Agent error.', 'error');
       // Errors are terminal; ensure the thinking indicator clears.
       setThinking(false);
@@ -1583,6 +1775,18 @@ function connectStream() {
     try {
       const data = JSON.parse(event.data);
       if (data.project !== currentProject) return;
+      const runId = data.run_id || data.message_id;
+      const card = (runId ? runCards.get(runId) : null) || optimisticCard;
+      if (card) {
+        if (!card.dataset.raw && !card.dataset.reasoning) {
+          card.remove();
+        } else {
+          setCardState(card, 'stopped', 'Stopped');
+        }
+        if (runId) runCards.delete(runId);
+        if (optimisticCard === card) optimisticCard = null;
+      }
+      finalizeAllActiveCards();
       setThinking(false);
       addToolMessage({
         call_id: 'agent-run',
@@ -1612,12 +1816,19 @@ function connectStream() {
 }
 
 function applyConversationReset() {
+  if (renderRafId) {
+    cancelAnimationFrame(renderRafId);
+    renderRafId = null;
+    pendingRenderCard = null;
+  }
+  optimisticCard = null;
+  runCards.clear();
   // Wipe the main feed, dismiss any pending question, and clear activity so
   // the UI matches the freshly truncated conversation.jsonl. The drawer is
   // refreshed lazily the next time it is opened.
   clearActivity();
   feed.replaceChildren();
-  questionArea.replaceChildren();
+  clearQuestionArea();
   const emptyTpl = document.querySelector('#chat-empty');
   if (emptyTpl) feed.appendChild(emptyTpl.content.cloneNode(true));
   else {

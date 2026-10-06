@@ -55,7 +55,7 @@ _MAX_DIGEST_ENTRIES_PER_PROJECT = 8
 # FIFO when a new project enters the cache; callers that need a strict
 # content hash fall back to :func:`compute_model_sha256`.
 _MAX_DIGEST_PROJECTS = 256
-_MODEL_DIGEST_CACHE: "OrderedDict[str, OrderedDict[tuple[int, int], str | None]]" = OrderedDict()
+_MODEL_DIGEST_CACHE: OrderedDict[str, OrderedDict[tuple[int, int], str | None]] = OrderedDict()
 _MODEL_DIGEST_CACHE_GUARD: threading.Lock = threading.Lock()
 
 

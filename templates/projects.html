@@ -13,9 +13,9 @@
         <button id="new-project-btn" class="primary">New Project</button>
       </header>
 
-      <div id="new-project-modal" class="modal hidden">
+      <div id="new-project-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="new-project-title">
         <div class="modal-content">
-          <h3>New Project</h3>
+          <h3 id="new-project-title">New Project</h3>
           <form id="new-project-form">
             <input id="new-project-name" type="text" placeholder="project-name" required
                    pattern="[a-z0-9][a-z0-9-]{0,62}" autocomplete="off">
@@ -28,9 +28,9 @@
         </div>
       </div>
 
-      <div id="rename-modal" class="modal hidden">
+      <div id="rename-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="rename-project-title">
         <div class="modal-content">
-          <h3>Rename Project</h3>
+          <h3 id="rename-project-title">Rename Project</h3>
           <form id="rename-form">
             <input id="rename-name" type="text" placeholder="new-name" required
                    pattern="[a-z0-9][a-z0-9-]{0,62}" autocomplete="off">
@@ -43,9 +43,9 @@
         </div>
       </div>
 
-      <div id="delete-confirm" class="modal hidden">
+      <div id="delete-confirm" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="delete-project-title">
         <div class="modal-content">
-          <h3>Delete Project</h3>
+          <h3 id="delete-project-title">Delete Project</h3>
           <p>Are you sure you want to delete <strong id="delete-project-name"></strong>? This cannot be undone.</p>
           <div class="modal-actions">
             <button type="button" id="cancel-delete" class="quiet">Cancel</button>

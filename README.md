@@ -334,7 +334,7 @@ flowchart TD
     ToolDispatch -->|read_file| ReadSCAD[Read model.scad with line paging]
     ToolDispatch -->|write_file| WriteSCAD[Initialize / Overwrite model.scad]
     ToolDispatch -->|edit_file| EditSCAD[Atomic exact string replacements]
-    ToolDispatch -->|cad_build_and_verify| Sandbox[Bubblewrap Sandbox Execution]
+    ToolDispatch -->|cad_build| Sandbox[Bubblewrap Sandbox Execution]
     ToolDispatch -->|get_view_images| VisualMem[Inspect canonical renders or crop areas]
     ToolDispatch -->|question| UserForm[Prompt user with structured form]
     
@@ -349,8 +349,8 @@ flowchart TD
 - **`read_file`** — Inspect existing `model.scad` content with optional offset/limit paging.
 - **`write_file`** — Perform initial file creation or deliberate full rewrites.
 - **`edit_file`** — Apply single or atomic batch (up to 16) exact replacements to preserve parametric structure.
-- **`cad_build_and_verify`** — Runs OpenSCAD in the Bubblewrap sandbox, verifies manifold geometry and dimensions, extracts uppercase constants, builds `preview.stl`, and produces 8 canonical views.
-- **`get_view_images`** — Fetches rendered views or normalized crops (X±, Y±, Z±, Isometric±) as visual memory to evaluate geometry.
+- **`cad_build`** (aliased as `cad_build_and_verify`) — Runs OpenSCAD in the Bubblewrap sandbox, verifies manifold geometry and dimensions, extracts uppercase constants, builds `preview.stl`, and produces 8 canonical views.
+- **`get_view_images`** — Fetches rendered canonical views, the 8-view contact sheet, or normalized crops as visual memory to evaluate geometry.
 - **`question`** — Halts execution to present structured input fields to the user for clarification.
 
 ---

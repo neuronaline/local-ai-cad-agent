@@ -39,6 +39,8 @@ class OpenRouterClient(ChatCompletionsClient):
         }
         if self.settings.openrouter_app_url:
             headers["HTTP-Referer"] = self.settings.openrouter_app_url
+        if self.session_id:
+            headers["X-Session-ID"] = hashlib.sha256(self.session_id.encode()).hexdigest()[:64]
         return headers
 
     def _apply_provider_payload(self, payload: dict[str, Any]) -> None:

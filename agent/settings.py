@@ -68,9 +68,9 @@ class Settings:
     # provider errors because the log can grow quickly.
     agent_log_tool_activity: bool = False
     agent_log_mode: str = "off"  # "off", "debug", "dataset"
-    # ── Review rendering settings (used by cad_build_and_verify) ──
+    # ── Review rendering settings (used by cad_build) ──
     # Multi-view rasterisation is the canonical eight-view + contact-sheet
-    # output of ``cad_build_and_verify``. The structured verdict (the
+    # output of ``cad_build``. The structured verdict (the
     # historical dedicated ``cad_review`` tool) was removed; nothing
     # auto-toggles on these flags.
     review_render_workers: int = 4

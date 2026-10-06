@@ -127,7 +127,7 @@ class CadTool:
         publish_tool_phase(
             self._publish,
             project=_project_name(self.project_dir),
-            tool="cad_build_and_verify",
+            tool="cad_build",
             call_id=call_id or self._call_id,
             status=status,
             message=message,
@@ -273,7 +273,7 @@ class CadTool:
 
         The earlier implementation reused a single
         ``<project>/.review-staging`` directory — a real race when
-        two ``cad_build_and_verify`` runs overlapped. ``mkdtemp`` per
+        two ``cad_build`` runs overlapped. ``mkdtemp`` per
         call removes the shared global state; the directory survives
         bubblewrap teardown so ``promote_review`` can verify and
         promote the PNGs.
@@ -698,6 +698,10 @@ class CadTool:
             return
         terminate(process, force=False)
         try:
-            process.wait(timeout=2)
+            process.wait(timeout=0.5)
         except subprocess.TimeoutExpired:
             terminate(process, force=True)
+            try:
+                process.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                pass

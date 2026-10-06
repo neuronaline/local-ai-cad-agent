@@ -48,9 +48,9 @@ function cardTemplate(project) {
 }
 
 function escapeHTML(str) {
-  const div = document.createElement('div');
-  div.textContent = str;
-  return div.innerHTML;
+  return String(str ?? '').replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
 }
 
 async function loadProjects() {
@@ -72,17 +72,32 @@ function renderProjects(projects) {
         <button id="empty-cta" class="primary">Get Started</button>
       </div>
     `;
-    document.querySelector('#empty-cta')?.addEventListener('click', openNewProjectModal);
     return;
   }
   grid.innerHTML = projects.map(cardTemplate).join('');
-  grid.querySelectorAll('.rename-btn').forEach(btn => {
-    btn.addEventListener('click', () => openRenameModal(btn.dataset.name));
-  });
-  grid.querySelectorAll('.delete-btn').forEach(btn => {
-    btn.addEventListener('click', () => openDeleteConfirm(btn.dataset.name));
-  });
 }
+
+grid.addEventListener('click', (e) => {
+  const renameBtn = e.target.closest('.rename-btn');
+  if (renameBtn) return openRenameModal(renameBtn.dataset.name);
+  const deleteBtn = e.target.closest('.delete-btn');
+  if (deleteBtn) return openDeleteConfirm(deleteBtn.dataset.name);
+  if (e.target.closest('#empty-cta')) return openNewProjectModal();
+});
+
+/* ── Modal Common (Escape & Backdrop) ── */
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    document.querySelectorAll('.modal:not(.hidden)').forEach(m => m.classList.add('hidden'));
+  }
+});
+
+document.querySelectorAll('.modal').forEach(modal => {
+  modal.addEventListener('click', (e) => {
+    if (e.target === modal) modal.classList.add('hidden');
+  });
+});
 
 /* ── New Project Modal ── */
 
@@ -97,7 +112,6 @@ function openNewProjectModal() {
 }
 
 document.querySelector('#new-project-btn').addEventListener('click', openNewProjectModal);
-document.querySelector('#empty-cta')?.addEventListener('click', openNewProjectModal);
 document.querySelector('#cancel-new-project').addEventListener('click', () => {
   newProjectModal.classList.add('hidden');
 });

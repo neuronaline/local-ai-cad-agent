@@ -11,6 +11,7 @@ import atexit
 import json
 import queue
 import re
+import socket
 import threading
 import time
 from copy import deepcopy
@@ -19,13 +20,10 @@ from typing import Any
 import requests
 
 from agent.activity_log import summarize_llm_messages
+from agent.prompt import TOOL_IMAGE_PROMPT
 from agent.settings import Settings
 
 PROVIDER_LABELS = {"openrouter": "OpenRouter", "openai": "OpenAI", "ollama": "Ollama"}
-TOOL_IMAGE_PROMPT = (
-    "The attached image is the visual artifact returned by the latest tool "
-    "call. Inspect it and continue the task."
-)
 
 
 # Module-level HTTP session. ``requests.Session`` keeps an internal urllib3
@@ -74,6 +72,149 @@ def _stream_error_detail(error: Any) -> str:
     return detail[:500]
 
 
+def extract_text_tool_calls(
+    content: str | None,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Extract embedded tool call markup (e.g. <function=...>, <tool_call>...) from content.
+
+    Returns (cleaned_content, extracted_tool_calls).
+    Handles XML-style function tags (<function=name><parameter=key>value</parameter></function>
+    or unclosed variants), JSON-style <tool_call> blocks, and [TOOL_CALLS] blocks.
+    Strips raw tool-calling tags so internal function syntax never leaks into the user-facing chat.
+    """
+    if not content:
+        return "", []
+
+    extracted_calls: list[dict[str, Any]] = []
+    cleaned = content
+
+    # 1. XML style: <function=name> ... </function> (or unclosed / parameter-delimited)
+    if "<function=" in cleaned:
+        func_matches = list(
+            re.finditer(
+                r"<function=([a-zA-Z0-9_-]+)>(.*?)(?:</function>|(?=<function=)|\Z)",
+                cleaned,
+                re.DOTALL,
+            )
+        )
+        for idx, fm in enumerate(func_matches):
+            tool_name = fm.group(1).strip()
+            body = fm.group(2)
+            args: dict[str, Any] = {}
+            param_matches = list(
+                re.finditer(
+                    r"<parameter=([a-zA-Z0-9_-]+)>(.*?)(?:</parameter>|<parameter=\1>|(?=<parameter=)|\Z)",
+                    body,
+                    re.DOTALL,
+                )
+            )
+            for pm in param_matches:
+                k = pm.group(1).strip()
+                v = pm.group(2).strip()
+                try:
+                    if (
+                        (v.startswith("{") and v.endswith("}"))
+                        or (v.startswith("[") and v.endswith("]"))
+                        or v in ("true", "false", "null")
+                    ):
+                        args[k] = json.loads(v)
+                    else:
+                        args[k] = v
+                except Exception:
+                    args[k] = v
+            extracted_calls.append(
+                {
+                    "id": f"call_text_{idx}",
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": json.dumps(args, ensure_ascii=False)
+                        if isinstance(args, dict)
+                        else "{}",
+                    },
+                }
+            )
+        cleaned = re.sub(
+            r"<function=([a-zA-Z0-9_-]+)>.*?(?:</function>|(?=<function=)|\Z)",
+            "",
+            cleaned,
+            flags=re.DOTALL,
+        ).strip()
+
+    # 2. Tool call tags: <tool_call> ... </tool_call>
+    if "<tool_call>" in cleaned or "<tool_call " in cleaned:
+        tc_matches = list(
+            re.finditer(
+                r"<tool_call[^>]*>(.*?)(?:</tool_call>|\Z)", cleaned, re.DOTALL
+            )
+        )
+        for tcm in tc_matches:
+            raw = tcm.group(1).strip()
+            try:
+                data = json.loads(raw)
+                if isinstance(data, dict) and "name" in data:
+                    call_args = data.get("arguments", {})
+                    extracted_calls.append(
+                        {
+                            "id": f"call_tc_{len(extracted_calls)}",
+                            "type": "function",
+                            "function": {
+                                "name": data["name"],
+                                "arguments": json.dumps(
+                                    call_args, ensure_ascii=False
+                                )
+                                if isinstance(call_args, dict)
+                                else str(call_args),
+                            },
+                        }
+                    )
+            except Exception:
+                pass
+        cleaned = re.sub(
+            r"<tool_call[^>]*>.*?(?:</tool_call>|\Z)", "", cleaned, flags=re.DOTALL
+        ).strip()
+
+    # 3. Mistral / Command R style: [TOOL_CALLS] ... [/TOOL_CALLS]
+    if "[TOOL_CALLS]" in cleaned:
+        tc_matches = list(
+            re.finditer(
+                r"\[TOOL_CALLS\](.*?)(?:\[/TOOL_CALLS\]|\Z)", cleaned, re.DOTALL
+            )
+        )
+        for tcm in tc_matches:
+            raw = tcm.group(1).strip()
+            try:
+                data = json.loads(raw)
+                calls_list = data if isinstance(data, list) else [data]
+                for item in calls_list:
+                    if isinstance(item, dict) and "name" in item:
+                        call_args = item.get("arguments", {})
+                        extracted_calls.append(
+                            {
+                                "id": f"call_tc_{len(extracted_calls)}",
+                                "type": "function",
+                                "function": {
+                                    "name": item["name"],
+                                    "arguments": json.dumps(
+                                        call_args, ensure_ascii=False
+                                    )
+                                    if isinstance(call_args, dict)
+                                    else str(call_args),
+                                },
+                            }
+                        )
+            except Exception:
+                pass
+        cleaned = re.sub(
+            r"\[TOOL_CALLS\].*?(?:\[/TOOL_CALLS\]|\Z)", "", cleaned, flags=re.DOTALL
+        ).strip()
+
+    # Clean up any leftover stray closing tags
+    cleaned = re.sub(r"</?(?:function|parameter|tool_call)[^>]*>", "", cleaned).strip()
+
+    return cleaned, extracted_calls
+
+
 def sanitize_assistant_message(
     message: dict[str, Any],
     *,
@@ -110,6 +251,13 @@ def sanitize_assistant_message(
         details = sanitized.get("reasoning_details")
         if isinstance(details, list) and not details:
             sanitized.pop("reasoning_details", None)
+
+    # Strip any leaked tool-call tags from content in assistant messages
+    if isinstance(sanitized.get("content"), str):
+        cleaned_content, extra_calls = extract_text_tool_calls(sanitized["content"])
+        sanitized["content"] = cleaned_content or None
+        if not sanitized.get("tool_calls") and extra_calls:
+            sanitized["tool_calls"] = extra_calls
 
     for key in list(sanitized):
         if key.startswith("_"):
@@ -206,10 +354,10 @@ def relocate_tool_images(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
     * Google Vertex (Gemini): ``Requests ending with a model turn are not
       supported.`` when the trailing tool message contains image parts.
 
-    ``cad_build_and_verify`` attaches its rendered PNG to the tool message so
-    the agent can inspect the build in-band. Keep each completed tool batch's
-    visual evidence in the subsequent conversation: dropping it after one
-    turn changes the prompt prefix and causes avoidable cache misses (and
+    Tool-role messages produced by tools like ``get_view_images`` may attach
+    rendered PNGs to the message so the agent can inspect geometry in-band. Keep each
+    completed tool batch's visual evidence in the subsequent conversation: dropping it
+    after one turn changes the prompt prefix and causes avoidable cache misses (and
     misleading input-token drops). Images are emitted only after the complete
     tool-result batch so multi-tool assistant responses retain the required
     contiguous tool-result protocol.
@@ -415,13 +563,10 @@ def post_with_cancel(
             raise result
         return result
     except RequestCancelled:
-        # Cancel path: force-close any Response we can see so the
-        # underlying socket (and its keepalive timer) is released
-        # immediately. The daemon worker may still be alive while its
-        # ``requests.post`` is mid-handshake; wait briefly for it to
-        # publish, then drain the queue and close whatever is there
-        #.
-        worker.join(timeout=2.0)
+        # Cancel path: wait briefly for the daemon worker to publish if mid-handshake,
+        # then force-close any active or queued Response so the underlying socket
+        # (and its keepalive timer) is released immediately.
+        worker.join(timeout=0.5)
         _force_close_response(response_holder.get("response"))
         try:
             queued = results.get_nowait()
@@ -435,16 +580,33 @@ def post_with_cancel(
 def _force_close_response(response: requests.Response | None) -> None:
     """Force-close a streaming ``Response``, releasing the underlying socket.
 
-    ``stream=True`` keeps the connection attached to the :class:`Response`
-    until :meth:`Response.close` runs; without this helper the connection
-    pool keeps the socket alive until the read times out, leaking FDs on
-    rapid cancel/restart cycles.
+    In POSIX/Linux, calling ``response.close()`` on a streaming connection
+    does not wake up another thread blocked in ``socket.recv()`` or
+    ``iter_lines()``. Extracting and shutting down the raw socket releases
+    the reader thread immediately.
     """
     if response is None:
         return
     try:
+        raw = getattr(response, "raw", None)
+        if raw is not None:
+            conn = getattr(raw, "_connection", None)
+            sock = getattr(conn, "sock", None) if conn else None
+            if sock is None and hasattr(raw, "_fp") and hasattr(raw._fp, "fp"):
+                r = getattr(raw._fp.fp, "raw", None)
+                if r and hasattr(r, "_sock"):
+                    sock = r._sock
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+            try:
+                raw.close()
+            except Exception:
+                pass
         response.close()
-    except Exception:  # best-effort cleanup; the daemon worker will GC anyway
+    except Exception:
         pass
 
 
@@ -496,7 +658,7 @@ def parse_chat_stream(
     *,
     provider_label: str,
     stop_event: threading.Event | None = None,
-    stream_callback: Any | None,
+    stream_callback: Any | None = None,
 ) -> dict[str, Any]:
     """Consume an SSE Chat Completions stream and rebuild a non-streaming response."""
     content = ""
@@ -508,12 +670,14 @@ def parse_chat_stream(
     reasoning_text = ""
     reasoning_details: list[dict[str, Any]] = []
     in_think_tag = False
+    in_tool_tag = False
     tag_buffer = ""
+    tool_tag_buffer = ""
 
     try:
         for raw_line in response.iter_lines(chunk_size=None):
             if stop_event and stop_event.is_set():
-                response.close()
+                _force_close_response(response)
                 raise RequestCancelled(f"{provider_label} request cancelled.")
             line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
             if not line or not line.startswith("data:"):
@@ -561,8 +725,22 @@ def parse_chat_stream(
                     text = tag_buffer + text
                     tag_buffer = ""
                 while text:
-                    if not in_think_tag:
-                        if "<think>" in text:
+                    if not in_think_tag and not in_tool_tag:
+                        think_pos = text.find("<think>")
+                        tool_tags = (
+                            "<function=",
+                            "<tool_call>",
+                            "<tool_call ",
+                            "[TOOL_CALLS]",
+                            "<function_call>",
+                        )
+                        found_tool_pos = -1
+                        for tt in tool_tags:
+                            p = text.find(tt)
+                            if p != -1 and (found_tool_pos == -1 or p < found_tool_pos):
+                                found_tool_pos = p
+
+                        if think_pos != -1 and (found_tool_pos == -1 or think_pos < found_tool_pos):
                             before, _, text = text.partition("<think>")
                             if before:
                                 content += before
@@ -570,23 +748,43 @@ def parse_chat_stream(
                                     stream_callback({"type": "content", "delta": before})
                             in_think_tag = True
                             continue
+                        elif found_tool_pos != -1:
+                            before = text[:found_tool_pos]
+                            text = text[found_tool_pos:]
+                            if before:
+                                content += before
+                                if stream_callback:
+                                    stream_callback({"type": "content", "delta": before})
+                            in_tool_tag = True
+                            tool_tag_buffer += text
+                            text = ""
+                            break
+
                         matched_prefix = False
-                        for k in range(min(len(text), 6), 0, -1):
-                            if text.endswith("<think>"[:k]):
-                                tag_buffer = text[-k:]
-                                emit_text = text[:-k]
-                                if emit_text:
-                                    content += emit_text
-                                    if stream_callback:
-                                        stream_callback({"type": "content", "delta": emit_text})
-                                matched_prefix = True
+                        for candidate in (
+                            "<think>",
+                            "<function=",
+                            "<tool_call>",
+                            "[TOOL_CALLS]",
+                        ):
+                            for k in range(min(len(text), len(candidate) - 1), 0, -1):
+                                if text.endswith(candidate[:k]):
+                                    tag_buffer = text[-k:]
+                                    emit_text = text[:-k]
+                                    if emit_text:
+                                        content += emit_text
+                                        if stream_callback:
+                                            stream_callback({"type": "content", "delta": emit_text})
+                                    matched_prefix = True
+                                    break
+                            if matched_prefix:
                                 break
                         if not matched_prefix:
                             content += text
                             if stream_callback:
                                 stream_callback({"type": "content", "delta": text})
                         break
-                    else:
+                    elif in_think_tag:
                         if "</think>" in text:
                             think_text, _, text = text.partition("</think>")
                             if think_text:
@@ -610,6 +808,25 @@ def parse_chat_stream(
                             reasoning_text += text
                             if stream_callback:
                                 stream_callback({"type": "reasoning", "delta": text})
+                        break
+                    else:  # in_tool_tag
+                        tool_tag_buffer += text
+                        closing_tags = (
+                            "</function>",
+                            "</tool_call>",
+                            "[/TOOL_CALLS]",
+                            "</function_call>",
+                        )
+                        closed = False
+                        for ct in closing_tags:
+                            if ct in text:
+                                _, _, rem = text.partition(ct)
+                                in_tool_tag = False
+                                text = rem
+                                closed = True
+                                break
+                        if closed:
+                            continue
                         break
             reasoning = (
                 delta.get("reasoning")
@@ -665,17 +882,22 @@ def parse_chat_stream(
                 reasoning_text += tag_buffer
                 if stream_callback:
                     stream_callback({"type": "reasoning", "delta": tag_buffer})
+            elif in_tool_tag:
+                tool_tag_buffer += tag_buffer
             else:
-                content += tag_buffer
-                if stream_callback:
-                    stream_callback({"type": "content", "delta": tag_buffer})
+                if len(tag_buffer) >= 2 and any(
+                    tag_buffer.startswith(tt[: len(tag_buffer)])
+                    for tt in ("<function=", "<tool_call>", "[TOOL_CALLS]")
+                ):
+                    tool_tag_buffer += tag_buffer
+                else:
+                    content += tag_buffer
+                    if stream_callback:
+                        stream_callback({"type": "content", "delta": tag_buffer})
             tag_buffer = ""
-    except (requests.exceptions.RequestException, OSError):
+    except Exception:
         if stop_event and stop_event.is_set():
-            try:
-                response.close()
-            except Exception:
-                pass
+            _force_close_response(response)
             raise RequestCancelled(f"{provider_label} request cancelled.")
         raise
 
@@ -688,7 +910,7 @@ def parse_chat_stream(
         # fired. When partial state was already streamed (text, reasoning,
         # or partial tool_calls) retrying would duplicate tool execution,
         # so we surface the truncation as a non-retryable error instead.
-        had_partial = bool(content or tool_calls or reasoning_text or reasoning_details)
+        had_partial = bool(content or tool_calls or reasoning_text or reasoning_details or tool_tag_buffer)
         message = (
             f"{provider_label} stream ended before the completion marker"
             + ("; partial response preserved." if had_partial else ".")
@@ -704,6 +926,19 @@ def parse_chat_stream(
     content, extracted_reasoning = extract_think_tags(content, reasoning_text)
     if extracted_reasoning:
         reasoning_text = extracted_reasoning
+
+    # Process any tool call tags leaked into content or buffered in tool_tag_buffer
+    cleaned_content, text_calls_from_content = extract_text_tool_calls(content)
+    cleaned_buffer, text_calls_from_buffer = extract_text_tool_calls(tool_tag_buffer)
+    all_extracted_calls = text_calls_from_buffer + text_calls_from_content
+    if cleaned_buffer and not text_calls_from_buffer:
+        cleaned_content = (cleaned_content + " " + cleaned_buffer).strip() if cleaned_content else cleaned_buffer
+    content = cleaned_content
+
+    # If the provider did not supply tool_calls via API, recover them from text
+    if not tool_calls and all_extracted_calls:
+        for idx, call in enumerate(all_extracted_calls):
+            tool_calls[idx] = call
 
     # Some reasoning-first models (Anthropic extended thinking, OpenAI o-series,
     # Gemini thinking) emit reasoning deltas with no text content and finish
@@ -1047,6 +1282,13 @@ class ChatCompletionsClient:
         finally:
             with self._response_lock:
                 self._active_response = None
+            if self.stop_event is not None and self.stop_event.is_set():
+                _force_close_response(response)
+            elif response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
 
     def abort(self) -> None:
         if self.stop_event is not None:
@@ -1054,12 +1296,7 @@ class ChatCompletionsClient:
         with self._response_lock:
             resp = self._active_response
         if resp is not None:
-            try:
-                resp.close()
-                if hasattr(resp, "raw") and resp.raw is not None:
-                    resp.raw.close()
-            except Exception:
-                pass
+            _force_close_response(resp)
 
     def _try_image_fallback(self, payload, response):
         messages_without_images, removed = without_images(payload["messages"])

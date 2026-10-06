@@ -1,8 +1,8 @@
 """Shared SSE status-publish helper for the CAD tools.
 
-The agent exposes a five-tool surface (``read_file``, ``write_file``,
-``edit_file``, ``cad_build_and_verify``, ``question``); the single tool
-that runs sandboxed work — ``cad_build_and_verify`` — is what posts
+The agent exposes a six-tool surface (``read_file``, ``write_file``,
+``edit_file``, ``cad_build``, ``get_view_images``, ``question``); the tool
+that runs sandboxed work — ``cad_build`` — is what posts
 phase events to the live activity panel. Before this module each
 caller reimplemented the same callable-check + try/except boilerplate
 and quietly diverged in field names (``result`` vs ``message``).

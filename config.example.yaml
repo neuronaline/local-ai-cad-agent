@@ -66,8 +66,8 @@ ui:
 
 # Review rendering settings. ``review.render_workers`` and
 # ``review.required_views`` control the canonical eight-view rasteriser
-# + contact sheet produced by cad_build_and_verify. The legacy
-# ``review.enabled`` toggle has been removed; ``cad_build_and_verify``
+# + contact sheet produced by cad_build. The legacy
+# ``review.enabled`` toggle has been removed; ``cad_build``
 # always renders the canonical visual evidence.
 review:
   render_workers: 4

@@ -125,6 +125,10 @@ button[aria-pressed="true"], .view-presets .active { border-color: #5d7ed7; back
   50% { opacity: 0.35; transform: scale(0.8); }
 }
 
+@media (prefers-reduced-motion: reduce) {
+  .message-state::before { animation: none !important; }
+}
+
 /* --- Thought Disclosure Accordion --- */
 .thought-disclosure {
   margin-bottom: 0.65rem;
@@ -275,7 +279,7 @@ input, select, textarea { border: 1px solid var(--line); border-radius: 6px; bac
 .viewer-actions button { padding: .32rem .47rem; font-size: .7rem; }
 .view-presets { display: flex; gap: 2px; padding-right: .2rem; border-right: 1px solid var(--line); }
 .export-group { display: flex; align-items: center; gap: 4px; padding-left: .25rem; border-left: 1px solid var(--line); }
-.export-select { background: var(--bg); border: 1px solid var(--line); color: var(--fg); border-radius: var(--radius-sm); padding: .26rem .38rem; font-size: .7rem; cursor: pointer; outline: none; }
+.export-select { background: var(--bg); border: 1px solid var(--line); color: var(--text); border-radius: var(--radius); padding: .26rem .38rem; font-size: .7rem; cursor: pointer; outline: none; }
 .export-select:focus { border-color: var(--accent); }
 .download-btn { display: inline-flex; align-items: center; gap: .25rem; }
 .download-btn .icon { width: 13px; height: 13px; }

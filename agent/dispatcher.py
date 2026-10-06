@@ -9,6 +9,7 @@ construction, terminal events) instead of re-stating which tool does what.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 import uuid
@@ -19,10 +20,11 @@ from agent.activity_log import ActivityLogger
 from agent.io import atomic_write_json
 from agent.revisions import MODEL_FILENAME
 from agent.tool_results import (
-    build_cad_build_multimodal_content,
     build_view_image_multimodal_content,
     compact_for_context,
 )
+
+_LOG = logging.getLogger(__name__)
 from agent.tool_results import failure as tool_failure
 from agent.tool_results import success as tool_success
 from agent.tools.cad_tool import RenderMode
@@ -37,9 +39,7 @@ def _is_empty_or_none(val: object) -> bool:
         return True
     if isinstance(val, str) and not val.strip():
         return True
-    if isinstance(val, (list, dict, set)) and len(val) == 0:
-        return True
-    return False
+    return isinstance(val, (list, dict, set)) and len(val) == 0
 
 
 def _pick_intended_value(key: str, existing: object, candidate: object) -> object:
@@ -175,10 +175,7 @@ def _parse_tool_arguments(argument_text: str | None) -> dict:
     except ValueError:
         cleaned = _strip_json_trailing_commas(text)
         if cleaned != text:
-            try:
-                parsed = json.loads(cleaned, object_pairs_hook=_deduplicate_tool_keys)
-            except ValueError:
-                raise
+            parsed = json.loads(cleaned, object_pairs_hook=_deduplicate_tool_keys)
         else:
             raise
     if not isinstance(parsed, dict):
@@ -194,7 +191,7 @@ def is_model_mutation(name: str) -> bool:
 
 def is_cad_build(name: str) -> bool:
     """True for the canonical CAD build tool call."""
-    return name == "cad_build_and_verify"
+    return name in {"cad_build", "cad_build_and_verify"}
 
 
 def dispatch(
@@ -209,7 +206,7 @@ def dispatch(
     until the user replies).
 
     Only the six model-facing tools published by
-    :mod:`agent.tool_schemas` (``cad_build_and_verify``, ``read_file``,
+    :mod:`agent.tool_schemas` (``cad_build``, ``read_file``,
     ``write_file``, ``edit_file``, ``get_view_images``, and ``question``)
     are recognised. Tool instances expose a per-call ``with_call_id``
     method that propagates the call id into activity-log / debug-log
@@ -218,9 +215,19 @@ def dispatch(
     ``AttributeError`` from a stray ``getattr`` lookup on the
     ``ProjectTools`` bundle.
     """
-    if name == "cad_build_and_verify":
+    if is_cad_build(name):
         cad = tools.cad.with_call_id(call_id)
-        return cad.build_and_verify(mode=RenderMode.FULL_REVIEW), False
+        raw_build = cad.build_and_verify(mode=RenderMode.FULL_REVIEW)
+        views = args.get("views") if isinstance(args, dict) else None
+        if views:
+            try:
+                raw_views = tools.image.with_call_id(call_id).get_view_images({"views": views})
+                if isinstance(raw_views, dict):
+                    raw_build["images"] = raw_views.get("images", [])
+                    raw_build["review_sha256"] = raw_views.get("review_sha256")
+            except Exception as error:  # noqa: BLE001 - Non-blocking view resolution fallback.
+                _LOG.warning("Failed to resolve views for cad_build: %s", error)
+        return raw_build, False
     if name == "read_file":
         tool = (
             tools.file.with_call_id(call_id) if call_id else tools.file
@@ -265,7 +272,7 @@ def dispatch(
         return _dispatch_edit_file(tools.file, args, call_id)
     if name == "get_view_images":
         image = tools.image.with_call_id(call_id) if call_id else tools.image
-        return image.get_view_images(args.get("images") or []), False
+        return image.get_view_images(args), False
     if name == "question":
         return _dispatch_question(tools.question, tools.project_dir, project, args)
     raise ValueError(f"Unknown or unsupported tool: {name!r}")
@@ -364,7 +371,7 @@ def _dispatch_question(
 
 
 def normalize_tool_calls(raw_calls: object) -> list[dict]:
-    """Ensure persisted tool calls remain valid protocol messages."""
+    """Ensure persisted tool calls remain valid protocol messages with clean arguments."""
     if not isinstance(raw_calls, list):
         return []
     normalized: list[dict] = []
@@ -374,6 +381,15 @@ def normalize_tool_calls(raw_calls: object) -> list[dict]:
         function = function if isinstance(function, dict) else {}
         name = function.get("name")
         arguments = function.get("arguments")
+        clean_args_str = "{}"
+        if isinstance(arguments, str) and arguments.strip():
+            try:
+                parsed = _parse_tool_arguments(arguments)
+                clean_args_str = json.dumps(parsed, ensure_ascii=False)
+            except (ValueError, TypeError, json.JSONDecodeError):
+                clean_args_str = arguments
+        elif isinstance(arguments, dict):
+            clean_args_str = json.dumps(arguments, ensure_ascii=False)
         normalized.append(
             {
                 "id": str(call.get("id") or f"invalid-{uuid.uuid4().hex}"),
@@ -382,7 +398,7 @@ def normalize_tool_calls(raw_calls: object) -> list[dict]:
                     "name": name
                     if isinstance(name, str) and name
                     else "unknown_tool",
-                    "arguments": arguments if isinstance(arguments, str) else "{}",
+                    "arguments": clean_args_str,
                 },
             }
         )
@@ -433,12 +449,14 @@ def process_tool_call(
         arguments = _parse_tool_arguments(
             argument_text if isinstance(argument_text, str) else ""
         )
-        tool_event = {
+        tool_event: dict[str, object] = {
             "project": project,
             "call_id": call_id,
             "tool": name,
             "arguments": arguments,
         }
+        if run_id:
+            tool_event["run_id"] = run_id
         publish("tool_status", {**tool_event, "status": "running"})
         if activity_logger is not None:
             activity_logger.log(
@@ -497,17 +515,17 @@ def process_tool_call(
             cad_error = str(error)
             cad_fix_required = True
             preview_id = None
-        publish(
-            "tool_status",
-            {
-                "project": project,
-                "call_id": call_id,
-                "tool": name,
-                "arguments": arguments,
-                "status": "error",
-                "result": result,
-            },
-        )
+        err_event: dict[str, object] = {
+            "project": project,
+            "call_id": call_id,
+            "tool": name,
+            "arguments": arguments,
+            "status": "error",
+            "result": result,
+        }
+        if run_id:
+            err_event["run_id"] = run_id
+        publish("tool_status", err_event)
         if activity_logger is not None:
             activity_logger.log(
                 "tool_call_result",
@@ -523,16 +541,11 @@ def process_tool_call(
             )
     context_result = compact_for_context(name, result)
     context_content: str | list = context_result
-    image_paths: list[Path] = []
     multimodal = _build_multimodal_for(name, result, project_dir, context_result)
     if multimodal is not None:
         context_content = multimodal["content"]
-        image_paths = list(multimodal.get("image_paths") or [])
-        if name == "cad_build_and_verify" and build_succeeded and image_paths:
-            # ``cad_build_and_verify`` always materialises
-            # ``render.png``; the legacy ``render`` boolean is gone, so
-            # ``image_paths`` alone flips ``cad_fix_required`` off.
-            cad_fix_required = False
+    if is_cad_build(name) and build_succeeded:
+        cad_fix_required = False
     tool_message = {"role": "tool", "tool_call_id": call_id, "content": context_content}
     messages.append(tool_message)
     append_message(project_dir, tool_message)
@@ -565,9 +578,11 @@ def cancel_remaining_tool_calls(
 # (and to ``TOOL_SCHEMAS``) to opt into the same multimodal handoff that
 # ``relocate_tool_images`` and ``without_images`` already know how to
 # handle.
+# cad_build returns images when requested via 'views'; otherwise text/JSON metrics.
 _MULTIMODAL_BUILDERS: dict[str, Callable[..., dict | None]] = {
-    "cad_build_and_verify": build_cad_build_multimodal_content,
     "get_view_images": build_view_image_multimodal_content,
+    "cad_build": build_view_image_multimodal_content,
+    "cad_build_and_verify": build_view_image_multimodal_content,
 }
 
 
@@ -580,10 +595,8 @@ def _build_multimodal_for(
     """Return the multimodal content payload for ``name`` or ``None``.
 
     Dispatches to the tool-specific builder registered in
-    :data:`_MULTIMODAL_BUILDERS`. ``get_view_images`` and
-    ``cad_build_and_verify`` both return the same shape
-    (``{"content": [...], "image_paths": [...]}``) so the dispatcher can
-    consume either result uniformly.
+    :data:`_MULTIMODAL_BUILDERS` (e.g. ``get_view_images`` returning
+    ``{"content": [...], "image_paths": [...]}``).
     """
     builder = _MULTIMODAL_BUILDERS.get(name)
     if builder is None:

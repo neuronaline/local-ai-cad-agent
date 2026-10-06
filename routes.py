@@ -41,6 +41,7 @@ from agent.converter import (
 from agent.core import AgentRunner
 from agent.images import store_images
 from agent.io import utc_now_iso
+from agent.prompt import UI_EXAMPLE_PROMPTS
 from agent.review_paths import review_dir
 from agent.revisions import (
     MODEL_FILENAME,
@@ -118,7 +119,7 @@ def _redact_history_event(event: dict[str, Any]) -> dict[str, Any]:
     blobs through the History endpoint makes responses unnecessarily large
     and exposes content the UI does not need; substitute a lightweight
     ``[Reference image N]`` marker instead. Tool-role messages produced by
-    ``cad_build_and_verify`` may carry inline render evidence; redact those
+    ``cad_build`` or ``get_view_images`` may carry inline render evidence; redact those
     with the same shield so the History view never echoes base64.
     """
     role = event.get("role")
@@ -433,6 +434,7 @@ def project_view(name: str) -> str:
         viewer_grid_size=current_app.config["SETTINGS"].viewer_grid_size,
         viewer_grid_divisions=current_app.config["SETTINGS"].viewer_grid_divisions,
         cache_bust=int(time.time()),
+        example_prompts=UI_EXAMPLE_PROMPTS,
     )
 
 
@@ -673,13 +675,21 @@ def stop():
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
     runner: AgentRunner = current_app.config["AGENT_RUNNER"]
+    active_proj = runner.active_project()
+    active_run = runner.active_run_id() if (active_proj == project_name or project_name is None) else None
     affected = runner.stop(project_name)
-    event_project = project_name or runner.active_project()
+    event_project = project_name or active_proj
     if event_project is None and affected:
         event_project = affected[0]
+    stop_event_payload: dict[str, Any] = {
+        "project": event_project,
+        "affected_projects": affected,
+    }
+    if active_run:
+        stop_event_payload["run_id"] = active_run
     current_app.config["EVENT_BUS"].publish(
         "agent_stopped",
-        {"project": event_project, "affected_projects": affected},
+        stop_event_payload,
     )
     return jsonify({"stopped": True, "affected_projects": affected})
 
@@ -695,7 +705,7 @@ def project_state(project_name: str):
     if question:
         return jsonify({"status": "waiting_for_user", "question": question})
     if runner.is_running() and runner.active_project() == project_name:
-        return jsonify({"status": "running"})
+        return jsonify({"status": "running", "run_id": runner.active_run_id()})
     return jsonify({"status": "idle"})
 
 

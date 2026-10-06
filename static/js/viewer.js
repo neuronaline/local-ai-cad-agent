@@ -50,6 +50,8 @@ export class CadViewer {
     this.cadDimensions = null;
     this.wireframe = false;
     this.loadSequence = 0;
+    this._needsRender = true;
+    this.controls.addEventListener('change', () => { this._needsRender = true; });
     new ResizeObserver(() => this.resize()).observe(container);
     this.resize();
     this.animate();
@@ -105,12 +107,17 @@ export class CadViewer {
     this.camera.aspect = width / Math.max(height, 1);
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(width, height, false);
+    this._needsRender = true;
   }
 
   animate() {
     requestAnimationFrame(() => this.animate());
-    this.controls.update();
-    this.renderer.render(this.scene, this.camera);
+    if (this.container.clientWidth === 0 || this.container.clientHeight === 0) return;
+    const isDamping = this.controls.update();
+    if (isDamping || this._needsRender) {
+      this.renderer.render(this.scene, this.camera);
+      this._needsRender = false;
+    }
   }
 
   clear(message = 'No preview yet') {
@@ -131,6 +138,7 @@ export class CadViewer {
     this.emptyState.querySelector('strong').textContent = message;
     this.emptyState.hidden = false;
     this._refreshGridWarning();
+    this._needsRender = true;
   }
 
   hasModel() {
@@ -209,6 +217,7 @@ export class CadViewer {
     this.controls.update();
     const dimensions = this.cadDimensions || size;
     this.dimensions.textContent = `${dimensions.x.toFixed(1)} × ${dimensions.y.toFixed(1)} × ${dimensions.z.toFixed(1)} mm`;
+    this._needsRender = true;
   }
 
   setView(view) {
@@ -227,16 +236,19 @@ export class CadViewer {
     this.camera.position.copy(center).addScaledVector(direction.normalize(), distance);
     this.controls.target.copy(center);
     this.controls.update();
+    this._needsRender = true;
   }
 
   toggleWireframe() {
     this.wireframe = !this.wireframe;
     if (this.model) this.model.material.wireframe = this.wireframe;
+    this._needsRender = true;
     return this.wireframe;
   }
 
   toggleGrid() {
     this.gridHelper.visible = !this.gridHelper.visible;
+    this._needsRender = true;
     return this.gridHelper.visible;
   }
 

@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from agent.prompt import TOOL_DESCRIPTIONS
+
 
 def _tool(
     name: str, description: str, properties: dict[str, Any], required: list[str]
@@ -33,52 +35,51 @@ def _tool(
 TOOL_SCHEMAS = [
     _tool(
         "read_file",
-        "Read the current model.scad. Returns whether the file exists and its contents. "
-        "Optionally provide offset and limit to inspect specific line ranges.",
+        TOOL_DESCRIPTIONS["read_file"]["description"],
         {
             "offset": {
                 "type": "integer",
                 "minimum": 1,
                 "default": 1,
-                "description": "1-indexed starting line number (defaults to 1).",
+                "description": TOOL_DESCRIPTIONS["read_file"]["offset"],
             },
             "limit": {
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 2000,
-                "description": "Maximum number of lines to return (1-2000).",
+                "description": TOOL_DESCRIPTIONS["read_file"]["limit"],
             },
         },
         [],
     ),
     _tool(
         "write_file",
-        "Create model.scad, or deliberately replace its entire contents. Use this "
-        "ONLY for the initial creation of model.scad or a deliberate full rewrite; "
-        "for localized changes, prefer edit_file.",
+        TOOL_DESCRIPTIONS["write_file"]["description"],
         {
-            "content": {"type": "string", "description": "Complete file contents."},
+            "content": {
+                "type": "string",
+                "description": TOOL_DESCRIPTIONS["write_file"]["content"],
+            },
         },
         ["content"],
     ),
     _tool(
         "edit_file",
-        "Apply exact replacements to model.scad. Pass either old_string and new_string "
-        "for a single replacement, or an edits array for multiple atomic replacements.",
+        TOOL_DESCRIPTIONS["edit_file"]["description"],
         {
             "old_string": {
                 "type": "string",
-                "description": "Exact text to find, copied verbatim from read_file. Used for single edit.",
+                "description": TOOL_DESCRIPTIONS["edit_file"]["old_string"],
             },
             "new_string": {
                 "type": "string",
-                "description": "Replacement text for old_string (may be empty to delete).",
+                "description": TOOL_DESCRIPTIONS["edit_file"]["new_string"],
             },
             "edits": {
                 "type": "array",
                 "minItems": 1,
                 "maxItems": 16,
-                "description": "Optional atomic edit list for multiple replacements at once. Each entry must have old_string and new_string.",
+                "description": TOOL_DESCRIPTIONS["edit_file"]["edits"],
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
@@ -86,11 +87,11 @@ TOOL_SCHEMAS = [
                         "old_string": {
                             "type": "string",
                             "minLength": 1,
-                            "description": "Exact text to find, copied verbatim from read_file. Must occur exactly once across the file.",
+                            "description": TOOL_DESCRIPTIONS["edit_file"]["edit_old_string"],
                         },
                         "new_string": {
                             "type": "string",
-                            "description": "Replacement text; may be empty to delete the block.",
+                            "description": TOOL_DESCRIPTIONS["edit_file"]["edit_new_string"],
                         },
                     },
                     "required": ["old_string", "new_string"],
@@ -100,70 +101,70 @@ TOOL_SCHEMAS = [
         [],
     ),
     _tool(
-        "cad_build_and_verify",
-        "Build the latest model.scad, validate basic geometry, export preview.stl, "
-        "and render the canonical isometric PNG plus the eight-view review manifest "
-        "and contact sheet. Automatically reports dimensions, solid count, volume, "
-        "and numeric UPPER_CASE parameters.",
-        {},
+        "cad_build",
+        TOOL_DESCRIPTIONS["cad_build"]["description"],
+        {
+            "views": {
+                "type": "array",
+                "maxItems": 8,
+                "items": {
+                    "type": "string",
+                    "enum": [
+                        "all",
+                        "isometric",
+                        "top",
+                        "bottom",
+                        "front",
+                        "back",
+                        "left",
+                        "right",
+                        "isometric_negative",
+                    ],
+                },
+                "description": TOOL_DESCRIPTIONS["cad_build"]["views"],
+            },
+        },
         [],
     ),
     _tool(
         "get_view_images",
-        "Retrieve rendered image(s) of the current model for permanent visual memory. "
-        "Each request selects one canonical view and optionally a cropped area within "
-        "it (normalized 0-1 coordinates, origin top-left). Request all areas you need "
-        "in one call (max 4). Requires a successful cad_build_and_verify first.",
+        TOOL_DESCRIPTIONS["get_view_images"]["description"],
         {
-            "images": {
+            "views": {
                 "type": "array",
-                "minItems": 1,
-                "maxItems": 4,
-                "description": "Images to retrieve in this call.",
+                "maxItems": 8,
                 "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "view": {
-                            "type": "string",
-                            "enum": [
-                                "x_positive", "x_negative",
-                                "y_positive", "y_negative",
-                                "z_positive", "z_negative",
-                                "isometric_positive", "isometric_negative",
-                            ],
-                            "description": "Canonical rendered view to take the image from.",
-                        },
-                        "crop": {
-                            "type": "object",
-                            "additionalProperties": False,
-                            "description": "Optional sub-area of the 512x512 view. "
-                                           "Omit for the full view.",
-                            "properties": {
-                                "x":      {"type": "number", "minimum": 0, "maximum": 1},
-                                "y":      {"type": "number", "minimum": 0, "maximum": 1},
-                                "width":  {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
-                                "height": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
-                            },
-                            "required": ["x", "y", "width", "height"],
-                        },
-                    },
-                    "required": ["view"],
+                    "type": "string",
+                    "enum": [
+                        "all",
+                        "isometric",
+                        "top",
+                        "bottom",
+                        "front",
+                        "back",
+                        "left",
+                        "right",
+                        "isometric_negative",
+                    ],
                 },
+                "description": TOOL_DESCRIPTIONS["get_view_images"]["views"],
             },
         },
-        ["images"],
+        [],
     ),
     _tool(
         "question",
-        "Ask all blocking clarification questions together, then stop and wait. ``input_type`` defaults to ``text``; pass ``select`` or ``multiselect`` for choice questions. ``required`` defaults to ``true``.",
+        TOOL_DESCRIPTIONS["question"]["description"],
         {
-            "title": {"type": "string", "description": "Optional short heading."},
+            "title": {
+                "type": "string",
+                "description": TOOL_DESCRIPTIONS["question"]["title"],
+            },
             "questions": {
                 "type": "array",
                 "minItems": 1,
                 "maxItems": 3,
-                "description": "Blocking questions to present in one form (max 3 per batch).",
+                "description": TOOL_DESCRIPTIONS["question"]["questions"],
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
@@ -171,27 +172,27 @@ TOOL_SCHEMAS = [
                         "id": {
                             "type": "string",
                             "minLength": 1,
-                            "description": "Short key, such as hole_diameter.",
+                            "description": TOOL_DESCRIPTIONS["question"]["id"],
                         },
                         "question": {
                             "type": "string",
                             "minLength": 1,
-                            "description": "Direct user-facing question.",
+                            "description": TOOL_DESCRIPTIONS["question"]["question"],
                         },
                         "input_type": {
                             "type": "string",
                             "enum": ["text", "select", "number", "multiselect"],
-                            "description": "Answer control; defaults to text.",
+                            "description": TOOL_DESCRIPTIONS["question"]["input_type"],
                         },
                         "options": {
                             "type": "array",
                             "items": {"type": "string", "minLength": 1},
                             "minItems": 2,
-                            "description": "Required for select and multiselect.",
+                            "description": TOOL_DESCRIPTIONS["question"]["options"],
                         },
                         "required": {
                             "type": "boolean",
-                            "description": "Whether an answer is mandatory; defaults to true.",
+                            "description": TOOL_DESCRIPTIONS["question"]["required"],
                         },
                     },
                     "required": ["id", "question"],

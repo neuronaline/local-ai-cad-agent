@@ -279,7 +279,6 @@ def _extract_scad_features(
                 )
                 candidates.append({
                     "diameter_mm": round(diameter, 3),
-                    "axis": [0.0, 0.0, 1.0],
                     "area_mm2": round(math.pi * (diameter / 2.0) ** 2, 3),
                     "is_through_hole": bool(is_through),
                 })
@@ -370,7 +369,6 @@ def _run_model(
     declared_parameters = _declared_parameters(model_code)
     features = _extract_scad_features(model_code, dims)
     features["disconnected_solid_count"] = metrics["disconnected_solid_count"]
-    metrics["feature_summary"] = features
 
     # 4. Verification payload (spec compatibility)
     evidence_path = Path(".cad_validation.json")

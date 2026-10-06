@@ -56,36 +56,35 @@ _OPERATIONAL_RULES = """\
 - This app previews a single STL at a time. For multi-variant requests (Front /
   Rear, Left / Right, cap / body, etc.) build and ship each variant in its own
   iteration: declare a top-level ``PART_TYPE = "FRONT";`` (or similar) at the
-  top of model.scad as a self-documenting marker, run ``cad_build_and_verify``
+  top of model.scad as a self-documenting marker, run ``cad_build``
   on that variant, then start a fresh build for the next one. Do not stack
   variants into one scene — the bounding box and contact sheet all assume a
   single part.
 - Resolve blocking ambiguity first (ask one batched ``question`` if needed),
-  then iterate: edit model.scad → ``cad_build_and_verify`` → inspect metrics and
-  inline render → fix or finish.
+  then iterate: edit model.scad → ``cad_build`` → inspect metrics (call
+  ``get_view_images`` if visual inspection needed) → fix or finish.
 - model.scad layout: parameter block first (see Golden Rules), geometry in
   named modules below, every major block marked with a module or short header
   comment. Comments must stay in sync with the code.
-- The current ``<project_state>`` user message after the cacheable system
-  prefix reports whether ``model.scad`` exists on disk right now. Trust it
-  on every turn; if the message flips (e.g. from "does not exist" to
-  "exists" after a ``write_file``), follow the new instruction. If the
-  state is ambiguous or stale, call ``read_file`` on ``model.scad`` to
-  confirm its contents before editing.
+- The initial ``<project_state>`` user message indicates whether ``model.scad``
+  exists on disk at the start of the task. If missing, create it directly
+  with ``write_file``. Once created, your own tool execution results are the
+  definitive source of truth; never repeat ``write_file`` unless explicitly
+  intending a full rewrite. Proceed directly to ``cad_build`` after creating
+  the model.
 - Use the right tool for the job. ``read_file`` is for content you don't
   already know; skip it when your own previous ``write_file``/``edit_file``
   already returned the post-state. Use ``write_file`` only for the initial
   model.scad or a deliberate full rewrite. Use ``edit_file`` for all incremental
   modifications (pass ``old_string`` and ``new_string`` for a single edit, or
   an ``edits`` array for multiple related changes).
-- ``cad_build_and_verify`` validates geometry, extracts numeric UPPER_CASE
-  parameters from the initial model.scad parameter block, and produces the
-  canonical eight-view visual evidence + contact sheet in one call. Inspect
-  the inline evidence and either accept or iterate.
-- Need to look at the current geometry again (check a fit, verify a feature,
-  or inspect a specific area)? Call ``get_view_images`` with the view ids
-  and optional crop areas you need. Returned images stay in the conversation
-  permanently; do not re-request the same area within a turn.
+- ``cad_build`` compiles model.scad in the sandbox, validates geometry
+  (manifold, volume, bounding box), and extracts parameters. Pass optional
+  ``views`` (e.g. ``views=['isometric']`` or ``views=['all']``) to inspect
+  the rendered design in the same turn. If ``views`` is omitted, it returns
+  geometric metrics without images.
+- ``get_view_images`` retrieves additional or zoomed render views after a build
+  if further visual inspection is required (defaults to the 8-view sheet).
 - Geometric conflict (slot clipping a fastener hole, wall-thickness violation,
   etc.): STOP and call ``question`` with the trade-off. Never silently mutate a
   user-stated dimension to "make it fit" — ask once, then proceed.
@@ -96,8 +95,9 @@ _OPERATIONAL_RULES = """\
   most once per task, and only when the missing dimension creates a
   physically impossible contradiction — never for preferences.
 - A geometry-changing task is ready only after the latest model.scad revision
-  passes the default rendered ``cad_build_and_verify`` AND the inline contact sheet
-  confirms the design. Do not claim success from source inspection alone.
+  passes ``cad_build`` without errors and satisfies all dimensions and functional
+  requirements. Use ``views`` in ``cad_build`` or ``get_view_images`` whenever
+  visual confirmation of alignment, proportions, or complex contours is required.
 - Final reply: a concise description of the produced part, its confirmed
   dimensions, and any notable assumptions. No separate summary file."""
 
@@ -239,3 +239,173 @@ def get_prompt_cache_key(namespace: str | None = None) -> str:
         session_hash = hashlib.sha256(namespace.encode("utf-8")).hexdigest()[:16]
         key = f"{key}:{session_hash}"
     return key
+
+
+# ---------------------------------------------------------------------------
+# Centralized Prompt Catalog: Dynamic state, nudges, hints & tool schemas
+# ---------------------------------------------------------------------------
+
+# Dynamic Workspace State Templates (injected as role: user after system prompt)
+PROJECT_STATE_EXISTS_TEMPLATE = (
+    "<project_state>\n"
+    "{filename} exists. Read it before making a targeted edit.\n"
+    "</project_state>"
+)
+
+PROJECT_STATE_MISSING_TEMPLATE = (
+    "<project_state>\n"
+    "{filename} does not exist. Create it directly with write_file; do not "
+    "call read_file, edit_file, or cad_build first.\n"
+    "</project_state>"
+)
+
+
+def format_project_state(exists: bool, filename: str = "model.scad") -> str:
+    """Format the workspace state message appended after the cacheable system prefix."""
+    template = PROJECT_STATE_EXISTS_TEMPLATE if exists else PROJECT_STATE_MISSING_TEMPLATE
+    return template.format(filename=filename)
+
+
+# Synthetic Nudges & Reminders (role: user nudges during agent loop)
+NUDGE_UNVERIFIED_MODEL_TEMPLATE = (
+    "{filename} exists but it has not been verified. Call cad_build now."
+)
+NUDGE_FINAL_VERIFICATION = (
+    "Verification required before finalizing. Call cad_build."
+)
+
+
+def format_unverified_model_nudge(filename: str = "model.scad") -> str:
+    """Format synthetic reminder when model file exists but cad_build was not run."""
+    return NUDGE_UNVERIFIED_MODEL_TEMPLATE.format(filename=filename)
+
+
+# Multimodal Visual Inspection Prompt (wrapped around relocated tool images)
+TOOL_IMAGE_PROMPT = (
+    "The attached image is the visual artifact returned by the latest tool "
+    "call. Inspect it and continue the task."
+)
+
+
+# Model-facing Tool Execution and Recovery Hints
+TOOL_HINTS = {
+    "INVALID_TOOL_ARGUMENTS": "Send one valid JSON object matching the tool schema.",
+    "REVISION_INTEGRITY": "Do not retry the same edit; revision history needs user attention.",
+    "TIMEOUT": "Simplify the operation before retrying.",
+    "MODEL_MISSING": "Create {filename} first.",
+    "CAD_BUILD_FAILED": "Fix {filename} using the reported location and cause, then rebuild.",
+    "VALIDATION_ERROR": "Correct the arguments or source named in the message.",
+    "FILE_NOT_FOUND": "Create the required project file first.",
+    "TOOL_EXECUTION_FAILED": "Use the message to correct the request before retrying.",
+    "IMAGE_RUN_CAD_BUILD_FIRST": "Run cad_build first.",
+    "IMAGE_RUN_CAD_BUILD_AGAIN": "Run cad_build again.",
+    "IMAGE_REFRESH_REVIEW": "Run cad_build to refresh the review.",
+}
+
+
+# Tool Schemas Prompts and Parameter Descriptions
+TOOL_DESCRIPTIONS = {
+    "read_file": {
+        "description": (
+            "Read model.scad. Returns the code content and line count. "
+            "Optional offset and limit for line ranges."
+        ),
+        "offset": "1-indexed starting line number (defaults to 1).",
+        "limit": "Maximum number of lines to return (1-2000).",
+    },
+    "write_file": {
+        "description": (
+            "Write or replace the complete content of model.scad. "
+            "Use for initial model creation or complete rewrites."
+        ),
+        "content": "Complete file contents.",
+    },
+    "edit_file": {
+        "description": (
+            "Search and replace exact code in model.scad. Provide old_string and new_string "
+            "for a single replacement, or an edits array for multiple simultaneous replacements."
+        ),
+        "old_string": "Exact text in model.scad to replace.",
+        "new_string": "Replacement text (use empty string to delete).",
+        "edits": "Optional batch of multiple replacements to apply atomically.",
+        "edit_old_string": (
+            "Exact text to find, copied verbatim from read_file. Must occur exactly once across the file."
+        ),
+        "edit_new_string": "Replacement text; may be empty to delete the block.",
+    },
+    "cad_build": {
+        "description": (
+            "Build and validate model.scad in the sandbox. Checks manifold validity, "
+            "solid count, bounding box dimensions, and volume. Extracts declared "
+            "UPPER_CASE parameters. Pass optional 'views' to inspect renders in the same turn."
+        ),
+        "views": (
+            "Optional view list to return immediately (e.g. ['isometric'], ['all']). "
+            "If omitted, returns only geometric metrics."
+        ),
+    },
+    "get_view_images": {
+        "description": (
+            "Retrieve visual render image(s) of the model. Options: 'all' (composite "
+            "contact sheet showing all 8 views, default), 'isometric', 'top', 'bottom', "
+            "'front', 'back', 'left', 'right'. Requires a successful cad_build."
+        ),
+        "views": "List of views to inspect. Defaults to ['all'].",
+    },
+    "question": {
+        "description": (
+            "Ask all blocking clarification questions together, then stop and wait. "
+            "``input_type`` defaults to ``text``; pass ``select`` or ``multiselect`` "
+            "for choice questions. ``required`` defaults to ``true``."
+        ),
+        "title": "Optional short heading.",
+        "questions": "Blocking questions to present in one form (max 3 per batch).",
+        "id": "Short key, such as hole_diameter.",
+        "question": "Direct user-facing question.",
+        "input_type": "Answer control; defaults to text.",
+        "options": "Required for select and multiselect.",
+        "required": "Whether an answer is mandatory; defaults to true.",
+    },
+}
+
+
+# UI Example Prompts (presented on landing page)
+UI_EXAMPLE_PROMPTS = [
+    {
+        "title": "Mounting plate with four holes",
+        "prompt": "Create a 60 × 30 × 4 mm mounting plate with four 3 mm corner holes.",
+    },
+    {
+        "title": "Wheel for a 6 mm D shaft",
+        "prompt": "Create a 50 mm diameter wheel, 12 mm thick, for a 6 mm D-shaft motor.",
+    },
+    {
+        "title": "Cube with a centered through-hole",
+        "prompt": "Create a 40 mm cube with a centered 20 mm through-hole.",
+    },
+    {
+        "title": "U-bracket with mounting holes",
+        "prompt": "Create a 60 × 40 × 30 mm U-shaped mounting bracket with two holes.",
+    },
+    {
+        "title": "Spoked servo horn",
+        "prompt": "Create a 50 mm servo horn with six radial spokes and a center bore.",
+    },
+    {
+        "title": "Cable management tray",
+        "prompt": "Create a 100 × 50 mm cable tray with side walls and cable slots.",
+    },
+    {
+        "title": "Pipe saddle clamp",
+        "prompt": "Create a pipe saddle clamp for a 50 mm tube with two mounting ears.",
+    },
+    {
+        "title": "Quick-release camera plate",
+        "prompt": "Create a 70 × 40 × 8 mm quick-release camera plate with a center slot.",
+    },
+    {
+        "title": "Snap-fit test coupon",
+        "prompt": "Create a snap-fit test coupon with two flexible cantilever arms.",
+    },
+]
+
