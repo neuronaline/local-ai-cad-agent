@@ -169,6 +169,7 @@ def create_app(settings: Settings | None = None) -> Flask:
     settings = settings or load_settings()
     settings.workspace_root.mkdir(parents=True, exist_ok=True)
     app = Flask(__name__)
+    app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
     app.config["MAX_CONTENT_LENGTH"] = 52 * 1024 * 1024
     app.config["SETTINGS"] = settings
     bus = EventBus(settings, app)

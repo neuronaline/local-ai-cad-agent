@@ -96,6 +96,52 @@ function renderAgentContent(item, text) {
   item.querySelector('.message-content').innerHTML = sanitizeHTML(marked.parse(text || ''));
 }
 
+function createThoughtDisclosure(reasoningText = '', isOpen = false, isLive = false) {
+  const details = document.createElement('details');
+  details.className = 'thought-disclosure';
+  if (isOpen) details.open = true;
+
+  const summary = document.createElement('summary');
+  summary.className = 'thought-summary';
+  summary.innerHTML = `
+    <span class="thought-title">Thought Process</span>
+    <span class="thought-badge" ${isLive ? '' : 'hidden'}>Thinking…</span>
+    <span class="thought-chevron">▼</span>
+  `;
+
+  const content = document.createElement('div');
+  content.className = 'thought-content';
+  content.textContent = reasoningText;
+
+  details.appendChild(summary);
+  details.appendChild(content);
+  return details;
+}
+
+function ensureThoughtDisclosure(card, reasoning, isOpen = false, isLive = false) {
+  if (reasoning === null || reasoning === undefined || reasoning === '') return null;
+  let disclosure = card.querySelector('.thought-disclosure');
+  if (!disclosure) {
+    disclosure = createThoughtDisclosure(reasoning, isOpen, isLive);
+    const contentEl = card.querySelector('.message-content');
+    card.insertBefore(disclosure, contentEl);
+  } else {
+    if (isLive) {
+      disclosure.open = true;
+    } else if (isOpen) {
+      disclosure.open = true;
+    }
+    const badge = disclosure.querySelector('.thought-badge');
+    if (badge) {
+      badge.hidden = !isLive;
+      badge.textContent = 'Thinking…';
+    }
+    const content = disclosure.querySelector('.thought-content');
+    if (content) content.textContent = reasoning;
+  }
+  return disclosure;
+}
+
 function addMessage(text, type = 'agent', options = {}) {
   const target = options.target || feed;
   const empty = target.querySelector('.empty-state');
@@ -105,14 +151,19 @@ function addMessage(text, type = 'agent', options = {}) {
   item.dataset.raw = text;
   if (options.messageId) item.dataset.messageId = options.messageId;
   if (type === 'agent') {
+    const isStreaming = Boolean(options.streaming);
+    if (isStreaming) {
+      item.classList.add('streaming', 'thinking');
+    }
     item.innerHTML = `
       <div class="message-meta">
         <span class="agent-mark">AI</span>
         <span class="message-author">Agent</span>
-        <span class="message-state">${options.streaming ? 'Responding' : ''}</span>
+        <span class="message-state ${isStreaming ? 'state-thinking' : ''}">${isStreaming ? 'Thinking' : ''}</span>
       </div>
       <div class="message-content"></div>
     `;
+    ensureThoughtDisclosure(item, options.reasoning, false, false);
     target.appendChild(item);
     renderAgentContent(item, text || '');
     return item;
@@ -422,6 +473,16 @@ function setThinking(active) {
   } else {
     const existing = document.querySelector('.thinking-indicator');
     if (existing) existing.remove();
+    if (pendingFinalCard) {
+      pendingFinalCard.classList.remove('streaming', 'thinking', 'writing');
+      const state = pendingFinalCard.querySelector('.message-state');
+      if (state) {
+        state.textContent = '';
+        state.className = 'message-state';
+      }
+      const badge = pendingFinalCard.querySelector('.thought-badge');
+      if (badge) badge.hidden = true;
+    }
   }
 }
 
@@ -646,16 +707,53 @@ async function loadHistory(projectName, options = {}) {
       questionArea.replaceChildren();
     }
     let renderedAny = false;
+    let accumulatedReasoning = '';
     for (const evt of data.events) {
       const role = evt.role || '';
       const raw = evt.content;
       const text = normalizeHistoryContent(raw);
       if (role === 'user') {
+        accumulatedReasoning = '';
         addMessage(text, 'user', {target});
         renderedAny = true;
       } else if (role === 'assistant' || role === 'agent') {
-        if (!String(text).trim()) continue;
-        addMessage(text, 'agent', {target});
+        let reasoning = evt.reasoning || '';
+        let displayText = text;
+        if (!reasoning && Array.isArray(evt.reasoning_details)) {
+          reasoning = evt.reasoning_details
+            .map(d => (d && typeof d === 'object' && d.text ? d.text : ''))
+            .join('');
+        }
+        if (!reasoning && typeof displayText === 'string' && displayText.includes('<think>')) {
+          const blocks = [];
+          displayText = displayText.replace(/<think>([\s\S]*?)<\/think>/g, (_, b) => {
+            if (b.trim()) blocks.push(b.trim());
+            return '';
+          }).trim();
+          if (displayText.includes('<think>')) {
+            const startIdx = displayText.indexOf('<think>');
+            const unclosed = displayText.slice(startIdx + 7).trim();
+            if (unclosed) blocks.push(unclosed);
+            displayText = displayText.slice(0, startIdx).trim();
+          }
+          if (displayText.includes('</think>')) {
+            displayText = displayText.replace(/<\/think>/g, '').trim();
+          }
+          if (blocks.length > 0) {
+            reasoning = blocks.join('\n\n');
+          }
+        }
+        if (reasoning) {
+          accumulatedReasoning = accumulatedReasoning
+            ? `${accumulatedReasoning}\n\n${reasoning}`
+            : reasoning;
+        }
+        if (!String(displayText).trim()) {
+          // Tool-only intermediate turn: preserve accumulated reasoning for final response
+          continue;
+        }
+        addMessage(displayText, 'agent', {target, reasoning: accumulatedReasoning});
+        accumulatedReasoning = '';
         renderedAny = true;
       } else if (evt.type === 'agent_error') {
         addMessage(evt.data?.message || text, 'error', {target});
@@ -663,6 +761,10 @@ async function loadHistory(projectName, options = {}) {
       } else if (!intoDrawer && showInfoMessages) {
         addInfoMessage(evt.type, evt.data);
       }
+    }
+    if (accumulatedReasoning) {
+      addMessage('', 'agent', {target, reasoning: accumulatedReasoning});
+      renderedAny = true;
     }
     if (!renderedAny && !intoDrawer) {
       // Project with no conversation → restore the empty state from the
@@ -725,8 +827,11 @@ chatForm.addEventListener('submit', async event => {
   }));
   try {
     clearActivity();
+    pendingFinalCard = null;
+    streamingMessages.clear();
     addMessage(text, 'user', {images: imagePayload});
     setThinking(true);
+    scrollFeedToBottom();
     message.value = '';
     const idempotencyKey = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const body = new FormData();
@@ -1127,65 +1232,178 @@ const streamingMessages = new Map();
 // to update the canonical final text without duplicating the card.
 let pendingFinalCard = null;
 
+function scrollFeedToBottom() {
+  if (feed) {
+    feed.scrollTop = feed.scrollHeight;
+  }
+}
+
 function startStreamingCard(messageId) {
-  if (!messageId || streamingMessages.has(messageId)) return streamingMessages.get(messageId);
+  if (messageId && streamingMessages.has(messageId)) return streamingMessages.get(messageId);
   const empty = feed.querySelector('.empty-state');
   if (empty) empty.remove();
+  const indicator = feed.querySelector('.thinking-indicator');
+  if (indicator) indicator.remove();
+
+  if (pendingFinalCard) {
+    if (messageId) streamingMessages.set(messageId, pendingFinalCard);
+    return pendingFinalCard;
+  }
+
   const item = document.createElement('div');
-  item.className = 'message agent';
+  item.className = 'message agent streaming thinking';
   item.dataset.raw = '';
-  item.dataset.messageId = messageId;
+  if (messageId) item.dataset.messageId = messageId;
   item.innerHTML = `
     <div class="message-meta">
       <span class="agent-mark">AI</span>
       <span class="message-author">Agent</span>
-      <span class="message-state">Responding</span>
+      <span class="message-state state-thinking">Thinking</span>
     </div>
     <div class="message-content"></div>
   `;
   feed.appendChild(item);
-  streamingMessages.set(messageId, item);
+  if (messageId) streamingMessages.set(messageId, item);
   pendingFinalCard = item;
+  scrollFeedToBottom();
   return item;
+}
+
+function appendStreamingReasoningDelta(messageId, delta) {
+  if (!delta) return;
+  let card = (messageId ? streamingMessages.get(messageId) : null) || pendingFinalCard;
+  if (!card) {
+    card = startStreamingCard(messageId);
+  } else if (messageId && !streamingMessages.has(messageId)) {
+    streamingMessages.set(messageId, card);
+  }
+
+  const indicator = feed ? feed.querySelector('.thinking-indicator') : document.querySelector('.thinking-indicator');
+  if (indicator) indicator.remove();
+
+  if (!card.classList.contains('streaming')) {
+    card.classList.add('streaming');
+  }
+  if (!card.classList.contains('thinking')) {
+    card.classList.remove('writing');
+    card.classList.add('thinking');
+    const state = card.querySelector('.message-state');
+    if (state) {
+      state.className = 'message-state state-thinking';
+      state.textContent = 'Thinking';
+    }
+  }
+
+  if (messageId && card.dataset.lastTurnId && card.dataset.lastTurnId !== messageId && card.dataset.reasoning) {
+    if (!card.dataset.reasoning.endsWith('\n\n')) {
+      card.dataset.reasoning += '\n\n';
+    }
+  }
+  if (messageId) card.dataset.lastTurnId = messageId;
+
+  card.dataset.reasoning = (card.dataset.reasoning || '') + delta;
+  const disclosure = ensureThoughtDisclosure(card, card.dataset.reasoning, true, true);
+  const thoughtContent = disclosure?.querySelector('.thought-content');
+  if (thoughtContent) {
+    thoughtContent.scrollTop = thoughtContent.scrollHeight;
+  }
+  scrollFeedToBottom();
 }
 
 function appendStreamingDelta(messageId, delta) {
-  if (!messageId || !delta) return;
-  let card = streamingMessages.get(messageId);
-  if (!card) card = startStreamingCard(messageId);
-  card.dataset.raw = (card.dataset.raw || '') + delta;
-  renderAgentContent(card, card.dataset.raw);
-}
+  if (!delta) return;
+  let card = (messageId ? streamingMessages.get(messageId) : null) || pendingFinalCard;
+  if (!card) {
+    card = startStreamingCard(messageId);
+  } else if (messageId && !streamingMessages.has(messageId)) {
+    streamingMessages.set(messageId, card);
+  }
 
-function finalizeStreamingCard(messageId, finalText) {
-  if (messageId) {
-    const card = streamingMessages.get(messageId);
-    if (card) {
-      renderAgentContent(card, finalText || '');
-      card.dataset.raw = finalText || '';
-      const state = card.querySelector('.message-state');
-      if (state) state.textContent = '';
-      streamingMessages.delete(messageId);
-      // Keep pendingFinalCard pointing at this card so the subsequent
-      // agent_message event can replace its content with the canonical
-      // final message without creating a duplicate card.
-      return card;
+  const indicator = feed ? feed.querySelector('.thinking-indicator') : document.querySelector('.thinking-indicator');
+  if (indicator) indicator.remove();
+
+  if (!card.classList.contains('streaming')) {
+    card.classList.add('streaming');
+  }
+  // Transition from thinking to writing on first content delta
+  if (!card.classList.contains('writing')) {
+    card.classList.remove('thinking');
+    card.classList.add('writing');
+    const state = card.querySelector('.message-state');
+    if (state) {
+      state.className = 'message-state state-writing';
+      state.textContent = 'Writing';
+    }
+    const disclosure = card.querySelector('.thought-disclosure');
+    if (disclosure) {
+      disclosure.open = false; // Auto-collapse to focus on content stream
+      const badge = disclosure.querySelector('.thought-badge');
+      if (badge) badge.hidden = true;
     }
   }
-  // No streaming card — happens when content arrived before stream_start
-  // (or the user reloaded mid-run). Create a new card with the canonical text.
-  const item = addMessage(finalText || '', 'agent');
-  pendingFinalCard = item;
-  return item;
+
+  card.dataset.raw = (card.dataset.raw || '') + delta;
+  renderAgentContent(card, card.dataset.raw);
+  scrollFeedToBottom();
 }
 
-function discardEmptyStreamingCard(messageId) {
-  if (!messageId) return;
-  const card = streamingMessages.get(messageId);
-  if (!card) return;
-  streamingMessages.delete(messageId);
-  if (pendingFinalCard === card) pendingFinalCard = null;
-  card.remove();
+function handleStreamingToolDelta(messageId, _data) {
+  let card = (messageId ? streamingMessages.get(messageId) : null) || pendingFinalCard;
+  if (!card) {
+    card = startStreamingCard(messageId);
+  } else if (messageId && !streamingMessages.has(messageId)) {
+    streamingMessages.set(messageId, card);
+  }
+
+  const indicator = feed ? feed.querySelector('.thinking-indicator') : document.querySelector('.thinking-indicator');
+  if (indicator) indicator.remove();
+
+  if (!card.classList.contains('streaming')) {
+    card.classList.add('streaming');
+  }
+  if (!card.classList.contains('writing')) {
+    card.classList.remove('thinking');
+    card.classList.add('writing');
+    const state = card.querySelector('.message-state');
+    if (state) {
+      state.className = 'message-state state-writing';
+      state.textContent = 'Writing code';
+    }
+    const disclosure = card.querySelector('.thought-disclosure');
+    if (disclosure) {
+      disclosure.open = false;
+      const badge = disclosure.querySelector('.thought-badge');
+      if (badge) badge.hidden = true;
+    }
+  }
+}
+
+function finalizeStreamingCard(messageId, finalText, reasoning) {
+  const card = (messageId ? streamingMessages.get(messageId) : null) || pendingFinalCard;
+  if (card) {
+    if (finalText) {
+      renderAgentContent(card, finalText);
+      card.dataset.raw = finalText;
+    }
+    card.classList.remove('streaming', 'thinking', 'writing');
+    const state = card.querySelector('.message-state');
+    if (state) {
+      state.textContent = '';
+      state.className = 'message-state';
+    }
+    const finalReasoning = card.dataset.reasoning || reasoning;
+    if (finalReasoning) {
+      ensureThoughtDisclosure(card, finalReasoning, false, false);
+    }
+    for (const [key, value] of streamingMessages) {
+      if (value === card) streamingMessages.delete(key);
+    }
+    scrollFeedToBottom();
+    return card;
+  }
+  const item = addMessage(finalText || '', 'agent', { reasoning });
+  scrollFeedToBottom();
+  return item;
 }
 
 async function syncAfterStreamReset() {
@@ -1229,55 +1447,67 @@ function connectStream() {
       setThinking(false);
       showQuestion(data);
     },
+    agent_reasoning_delta: data => {
+      if (data.project !== currentProject) return;
+      const chunk = data.content ?? data.delta ?? '';
+      if (chunk) appendStreamingReasoningDelta(data.message_id, chunk);
+    },
     agent_content_delta: data => {
       if (data.project !== currentProject) return;
-      // Backend publishes agent_content_delta for content chunks. The delta
-      // payload may carry the chunk under `content` or `delta`; accept either.
+      // Backend publishes agent_content_delta for content chunks.
       const chunk = data.content ?? data.delta ?? '';
       if (chunk) appendStreamingDelta(data.message_id, chunk);
+    },
+    agent_tool_delta: data => {
+      if (data.project !== currentProject) return;
+      handleStreamingToolDelta(data.message_id, data);
     },
     agent_stream_end: data => {
       if (data.project !== currentProject) return;
       const messageId = data.message_id;
       const finalText = data.message || '';
+      const reasoning = data.reasoning || '';
       if (!finalText.trim()) {
-        // Tool-only turn — drop any empty placeholder card so the chat does
-        // not show empty assistant messages.
-        discardEmptyStreamingCard(messageId);
+        // Intermediate tool turn: do NOT finalize or drop the card!
+        // The agent is executing tools and will continue in the next turn.
+        const card = (messageId ? streamingMessages.get(messageId) : null) || pendingFinalCard;
+        if (card) {
+          card.classList.remove('streaming', 'thinking', 'writing');
+          const state = card.querySelector('.message-state');
+          if (state) {
+            state.textContent = '';
+            state.className = 'message-state';
+          }
+          if (reasoning) {
+            const combined = card.dataset.reasoning || reasoning;
+            ensureThoughtDisclosure(card, combined, false, false);
+          }
+        }
         return;
       }
-      finalizeStreamingCard(messageId, finalText);
+      finalizeStreamingCard(messageId, finalText, reasoning);
     },
     agent_message: data => {
       if (data.project !== currentProject) return;
       const finalText = data.message || '';
-      if (!finalText.trim()) {
-        // No user-visible content (e.g. transient terminal notification).
+      const reasoning = data.reasoning || '';
+      if (!finalText.trim() && !reasoning.trim()) {
+        if (pendingFinalCard && !pendingFinalCard.dataset.raw && !pendingFinalCard.dataset.reasoning) {
+          pendingFinalCard.remove();
+          pendingFinalCard = null;
+        }
         setThinking(false);
         return;
       }
-      // Prefer the active streaming card so the final message replaces the
-      // streamed text instead of appending a duplicate card. If there is no
-      // streaming card (e.g. events were missed over a reset, or the
-      // backend published a non-streamed final answer), fall back to a new
-      // card.
       if (pendingFinalCard) {
-        renderAgentContent(pendingFinalCard, finalText);
-        pendingFinalCard.dataset.raw = finalText;
-        const state = pendingFinalCard.querySelector('.message-state');
-        if (state) state.textContent = '';
-        for (const [key, value] of streamingMessages) {
-          if (value === pendingFinalCard) streamingMessages.delete(key);
-        }
+        finalizeStreamingCard(null, finalText, reasoning);
         pendingFinalCard = null;
       } else {
-        addMessage(finalText, 'agent');
+        addMessage(finalText, 'agent', { reasoning });
       }
       markActivityRecovered();
-      // Defensive: every terminal turn publishes agent_message, so the
-      // thinking indicator must clear here even if the matching
-      // agent_status event was missed (or never published for this path).
       setThinking(false);
+      scrollFeedToBottom();
     },
     tool_status: data => {
       if (data.project !== currentProject) return;

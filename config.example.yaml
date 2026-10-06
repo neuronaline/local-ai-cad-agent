@@ -55,6 +55,7 @@ ollama:
   base_url: http://localhost:11434/v1
   model: qwen2.5-coder:14b-16k
   timeout_seconds: 120
+  reasoning_effort: ""
 
 server:
   host: 127.0.0.1

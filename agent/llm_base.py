@@ -75,28 +75,31 @@ def _stream_error_detail(error: Any) -> str:
 
 
 def sanitize_assistant_message(
-    message: dict[str, Any], *, preserve_reasoning: bool = False
+    message: dict[str, Any],
+    *,
+    preserve_reasoning: bool = False,
+    for_storage: bool = False,
 ) -> dict[str, Any]:
     """Copy a model response while retaining supported continuation fields.
 
-    When ``preserve_reasoning`` is True, reasoning and reasoning_details are
-    retained across all assistant turns (both tool-calling turns and conversational
-    responses) so the model's reasoning memory is never dropped and prompt prefixes
-    remain strictly append-only. Non-whitelisted fields (audio, logprobs, etc.)
-    are dropped.
+    When ``preserve_reasoning`` or ``for_storage`` is True, reasoning and
+    reasoning_details are retained. Storage records preserve thoughts for
+    historical sessions and UI display, while outgoing wire requests can
+    safely omit previous reasoning to prevent provider schema rejection.
     """
     sanitized = deepcopy(message)
+    keep_reasoning = preserve_reasoning or for_storage
     # Normalize reasoning_content alias to reasoning if reasoning is not already present
     reasoning_content = sanitized.pop("reasoning_content", None)
     if (
-        preserve_reasoning
+        keep_reasoning
         and isinstance(reasoning_content, str)
         and reasoning_content.strip()
         and not sanitized.get("reasoning")
     ):
         sanitized["reasoning"] = reasoning_content
 
-    if not preserve_reasoning:
+    if not keep_reasoning:
         sanitized.pop("reasoning", None)
         sanitized.pop("reasoning_details", None)
     else:
@@ -115,7 +118,7 @@ def sanitize_assistant_message(
     # provider-specific metadata that the canonical assistant record
     # (and the LLM context) does not carry.
     allowed = {"role", "content", "tool_calls"}
-    if preserve_reasoning:
+    if keep_reasoning:
         allowed.update({"reasoning", "reasoning_details"})
     for key in list(sanitized):
         if key not in allowed:
@@ -376,9 +379,12 @@ def post_with_cancel(
 
     def request_worker() -> None:
         try:
+            req_headers = dict(headers)
+            req_headers.setdefault("Accept", "text/event-stream")
+            req_headers.setdefault("Accept-Encoding", "identity")
             response = _HTTP_SESSION.post(
                 url,
-                headers=headers,
+                headers=req_headers,
                 json=payload,
                 stream=True,
                 timeout=timeout_seconds,
@@ -446,41 +452,50 @@ def extract_think_tags(
     content: str | None,
     existing_reasoning: str | None = None,
 ) -> tuple[str, str | None]:
-    """Extract <think>...</think> blocks from content if reasoning is absent.
+    """Extract <think>...</think> blocks from content.
 
     Handles complete think blocks, multiple blocks, and truncated/unclosed think
     tags without leaving raw tags in the substantive message content.
     """
     if not content:
         return "", existing_reasoning
-    if existing_reasoning:
-        return content, existing_reasoning
 
-    if "<think>" not in content:
-        return content, None
+    if "<think>" not in content and "</think>" not in content:
+        return content, existing_reasoning or None
 
-    # Handle one or more completed <think>...</think> blocks
-    think_blocks = re.findall(r"<think>(.*?)</think>", content, flags=re.DOTALL)
+    cleaned_content = content
+    extracted_parts: list[str] = []
+
+    # 1. Extract any completed <think>...</think> blocks
+    think_blocks = re.findall(r"<think>(.*?)</think>", cleaned_content, flags=re.DOTALL)
     if think_blocks:
-        extracted = "\n\n".join(b.strip() for b in think_blocks if b.strip())
-        cleaned_content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-        return cleaned_content, extracted or None
+        extracted_parts.extend(b.strip() for b in think_blocks if b.strip())
+        cleaned_content = re.sub(r"<think>.*?</think>", "", cleaned_content, flags=re.DOTALL).strip()
 
-    # Handle truncated/unclosed <think> tag (e.g. generation ended inside think block)
-    if "</think>" not in content:
-        start_idx = content.find("<think>")
-        extracted = content[start_idx + 7 :].strip()
-        cleaned_content = content[:start_idx].strip()
-        return cleaned_content, extracted or None
+    # 2. Extract any remaining unclosed <think> tag
+    if "<think>" in cleaned_content:
+        start_idx = cleaned_content.find("<think>")
+        unclosed = cleaned_content[start_idx + 7 :].strip()
+        if unclosed:
+            extracted_parts.append(unclosed)
+        cleaned_content = cleaned_content[:start_idx].strip()
 
-    return content, None
+    # 3. Strip any stray closing tags
+    if "</think>" in cleaned_content:
+        cleaned_content = cleaned_content.replace("</think>", "").strip()
+
+    extracted = "\n\n".join(extracted_parts) if extracted_parts else None
+    if existing_reasoning and extracted:
+        combined = f"{existing_reasoning}\n\n{extracted}".strip()
+        return cleaned_content, combined or None
+    return cleaned_content, (extracted or existing_reasoning or None)
 
 
 def parse_chat_stream(
     response: requests.Response,
     *,
     provider_label: str,
-    stop_event: threading.Event | None,
+    stop_event: threading.Event | None = None,
     stream_callback: Any | None,
 ) -> dict[str, Any]:
     """Consume an SSE Chat Completions stream and rebuild a non-streaming response."""
@@ -492,9 +507,11 @@ def parse_chat_stream(
     last_usage: dict[str, Any] | None = None
     reasoning_text = ""
     reasoning_details: list[dict[str, Any]] = []
+    in_think_tag = False
+    tag_buffer = ""
 
     try:
-        for raw_line in response.iter_lines():
+        for raw_line in response.iter_lines(chunk_size=None):
             if stop_event and stop_event.is_set():
                 response.close()
                 raise RequestCancelled(f"{provider_label} request cancelled.")
@@ -540,28 +557,78 @@ def parse_chat_stream(
             role = delta.get("role") or role
             text = delta.get("content")
             if isinstance(text, str) and text:
-                content += text
-                if stream_callback:
-                    stream_callback({"type": "content", "delta": text})
+                if tag_buffer:
+                    text = tag_buffer + text
+                    tag_buffer = ""
+                while text:
+                    if not in_think_tag:
+                        if "<think>" in text:
+                            before, _, text = text.partition("<think>")
+                            if before:
+                                content += before
+                                if stream_callback:
+                                    stream_callback({"type": "content", "delta": before})
+                            in_think_tag = True
+                            continue
+                        matched_prefix = False
+                        for k in range(min(len(text), 6), 0, -1):
+                            if text.endswith("<think>"[:k]):
+                                tag_buffer = text[-k:]
+                                emit_text = text[:-k]
+                                if emit_text:
+                                    content += emit_text
+                                    if stream_callback:
+                                        stream_callback({"type": "content", "delta": emit_text})
+                                matched_prefix = True
+                                break
+                        if not matched_prefix:
+                            content += text
+                            if stream_callback:
+                                stream_callback({"type": "content", "delta": text})
+                        break
+                    else:
+                        if "</think>" in text:
+                            think_text, _, text = text.partition("</think>")
+                            if think_text:
+                                reasoning_text += think_text
+                                if stream_callback:
+                                    stream_callback({"type": "reasoning", "delta": think_text})
+                            in_think_tag = False
+                            continue
+                        matched_prefix = False
+                        for k in range(min(len(text), 7), 0, -1):
+                            if text.endswith("</think>"[:k]):
+                                tag_buffer = text[-k:]
+                                emit_text = text[:-k]
+                                if emit_text:
+                                    reasoning_text += emit_text
+                                    if stream_callback:
+                                        stream_callback({"type": "reasoning", "delta": emit_text})
+                                matched_prefix = True
+                                break
+                        if not matched_prefix:
+                            reasoning_text += text
+                            if stream_callback:
+                                stream_callback({"type": "reasoning", "delta": text})
+                        break
             reasoning = (
                 delta.get("reasoning")
                 or delta.get("reasoning_content")
                 or delta.get("thinking")
             )
             details = delta.get("reasoning_details")
+            details_text = ""
             if isinstance(details, list):
-                reasoning_details.extend(
-                    deepcopy(detail) for detail in details if isinstance(detail, dict)
-                )
-                # ``reasoning_details`` is the authoritative source for structured
-                # thinking content. Do not also accumulate ``.text`` into
-                # ``reasoning_text`` — that path is reserved for providers that emit
-                # only a plain ``reasoning`` string per delta and would otherwise
-                # double-count the same text into both the structured list and the
-                # fallback string.
-                reasoning_delta_text: str | None = None
-            elif isinstance(reasoning, str) and reasoning:
+                for detail in details:
+                    if isinstance(detail, dict):
+                        reasoning_details.append(deepcopy(detail))
+                        t = detail.get("text")
+                        if isinstance(t, str) and t:
+                            details_text += t
+            if isinstance(reasoning, str) and reasoning:
                 reasoning_delta_text = reasoning
+            elif details_text:
+                reasoning_delta_text = details_text
             else:
                 reasoning_delta_text = None
             if reasoning_delta_text:
@@ -593,6 +660,16 @@ def parse_chat_stream(
                             "arguments_delta": arguments_delta,
                         }
                     )
+        if tag_buffer:
+            if in_think_tag:
+                reasoning_text += tag_buffer
+                if stream_callback:
+                    stream_callback({"type": "reasoning", "delta": tag_buffer})
+            else:
+                content += tag_buffer
+                if stream_callback:
+                    stream_callback({"type": "content", "delta": tag_buffer})
+            tag_buffer = ""
     except (requests.exceptions.RequestException, OSError):
         if stop_event and stop_event.is_set():
             try:
@@ -650,7 +727,7 @@ def parse_chat_stream(
         message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
     if reasoning_details:
         message["reasoning_details"] = reasoning_details
-    elif reasoning_text:
+    if reasoning_text:
         message["reasoning"] = reasoning_text
     return {"choices": [{"message": message}], "usage": last_usage}
 

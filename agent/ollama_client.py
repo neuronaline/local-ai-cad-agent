@@ -56,6 +56,9 @@ class OllamaClient(ChatCompletionsClient):
         if self.settings.llm_max_completion_tokens:
             # Ollama supports max_tokens (max_completion_tokens is often ignored)
             payload["max_tokens"] = self.settings.llm_max_completion_tokens
+        if self.settings.ollama_reasoning_effort:
+            payload["reasoning_effort"] = self.settings.ollama_reasoning_effort
+            payload["think"] = True
         return payload
 
     def _post(self, payload, headers):

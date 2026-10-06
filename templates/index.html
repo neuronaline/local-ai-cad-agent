@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Local AI CAD Agent</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}?v={{ cache_bust }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='vendor/highlight/styles/github-dark.min.css') }}">
   </head>
   <body data-mobile-view="chat">
@@ -176,6 +176,6 @@
     </script>
     <script src="{{ url_for('static', filename='vendor/marked/marked.min.js') }}"></script>
     <script src="{{ url_for('static', filename='vendor/highlight/highlight.min.js') }}"></script>
-    <script type="module" src="{{ url_for('static', filename='js/app.js') }}"></script>
+    <script type="module" src="{{ url_for('static', filename='js/app.js') }}?v={{ cache_bust }}"></script>
   </body>
 </html>

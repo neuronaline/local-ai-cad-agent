@@ -55,6 +55,7 @@ class Settings:
     ollama_base_url: str = "http://localhost:11434/v1"
     ollama_model: str = "qwen2.5-coder:14b-16k"
     ollama_timeout_seconds: int = 120
+    ollama_reasoning_effort: str | None = None
     # ── end provider selection ──
     show_info_messages: bool = True
     agent_tool_call_limit: int = 12
@@ -227,7 +228,7 @@ def load_settings(project_root: Path | None = None) -> Settings:
     viewer_grid = viewer.get("grid") or {} if isinstance(viewer, dict) else {}
     _reject_unknown(
         ollama,
-        {"base_url", "model", "timeout_seconds"},
+        {"base_url", "model", "timeout_seconds", "reasoning_effort", "think"},
         "ollama",
     )
     _reject_unknown(
@@ -314,6 +315,14 @@ def load_settings(project_root: Path | None = None) -> Settings:
         _strict_bool(agent.get("log_tool_activity", False), "agent.log_tool_activity"),
     )
 
+    ollama_reasoning_effort = _optional_effort(ollama.get("reasoning_effort"))
+    if ollama_reasoning_effort is None and "think" in ollama:
+        think_val = ollama.get("think")
+        if isinstance(think_val, bool):
+            ollama_reasoning_effort = "high" if think_val else None
+        elif think_val is not None:
+            ollama_reasoning_effort = _optional_effort(think_val)
+
     return Settings(
         workspace_root=Path(config.get("workspace_root", "~/CAD-Agent-Projects")).expanduser(),
         openrouter_base_url=str(openrouter.get("base_url", "https://openrouter.ai/api/v1")).rstrip("/"),
@@ -339,6 +348,7 @@ def load_settings(project_root: Path | None = None) -> Settings:
         ollama_base_url=str(ollama.get("base_url") or "http://localhost:11434/v1").rstrip("/"),
         ollama_model=str(ollama.get("model") or "qwen2.5-coder:14b-16k"),
         ollama_timeout_seconds=_validate_timeout_seconds(ollama.get("timeout_seconds") or 120, "ollama.timeout_seconds"),
+        ollama_reasoning_effort=ollama_reasoning_effort,
         show_info_messages=_strict_bool(ui.get("show_info_messages", True), "ui.show_info_messages"),
         agent_tool_call_limit=_positive_int(agent.get("tool_call_limit", 12), "agent.tool_call_limit"),
         revision_retention_count=_non_negative_int(agent.get("revision_retention_count", 0), "agent.revision_retention_count"),

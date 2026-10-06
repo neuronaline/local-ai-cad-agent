@@ -184,7 +184,21 @@ class _RunState:
     total_prompt_tokens: int = 0
     total_completion_tokens: int = 0
     total_reasoning_tokens: int = 0
+    run_reasonings: list[str] = field(default_factory=list)
     start_perf_time: float = 0.0
+
+
+def _extract_reasoning(message: dict[str, Any]) -> str:
+    """Extract plain text reasoning from reasoning or reasoning_details."""
+    reasoning = message.get("reasoning")
+    if isinstance(reasoning, str) and reasoning:
+        return reasoning
+    details = message.get("reasoning_details")
+    if isinstance(details, list):
+        return "".join(
+            d.get("text", "") for d in details if isinstance(d, dict) and d.get("text")
+        )
+    return ""
 
 
 class AgentRunner:
@@ -580,15 +594,21 @@ class AgentRunner:
         def publish_stream(event: dict[str, Any]) -> None:
             event_type = event.pop("type")
             msg_id = state.current_message_id
+            if event_type in ("content", "reasoning"):
+                sse_name = f"agent_{event_type}_delta"
+            elif event_type == "tool_call":
+                sse_name = "agent_tool_delta"
+            else:
+                sse_name = f"agent_{event_type}_delta"
             publish(
-                f"agent_{event_type}_delta",
+                sse_name,
                 {"project": project, "message_id": msg_id, **event},
             )
             if log is not None:
                 # Mirror the SSE stream into the activity log so the
                 # operator has the same content the UI consumed.
                 log(
-                    f"agent_{event_type}_delta",
+                    sse_name,
                     {"message_id": msg_id, **event},
                     run_id=run_id,
                 )
@@ -630,6 +650,7 @@ class AgentRunner:
         assistant_message = sanitize_assistant_message(
             response["choices"][0]["message"],
             preserve_reasoning=getattr(state.client, "preserve_reasoning", False),
+            for_storage=True,
         )
         tool_calls = normalize_tool_calls(assistant_message.get("tool_calls"))
         if tool_calls:
@@ -661,6 +682,9 @@ class AgentRunner:
         append (a History reload would surface a ghost turn) but keep
         the message in ``state.messages`` for prompt-prefix stability.
         """
+        reasoning = _extract_reasoning(assistant_message)
+        if reasoning:
+            state.run_reasonings.append(reasoning)
         if invalid_final:
             self.publish(
                 "agent_status",
@@ -676,6 +700,7 @@ class AgentRunner:
                     "project": state.project,
                     "message_id": state.current_message_id,
                     "message": "",
+                    "reasoning": reasoning,
                 },
             )
         else:
@@ -685,6 +710,7 @@ class AgentRunner:
                     "project": state.project,
                     "message_id": state.current_message_id,
                     "message": assistant_message.get("content") or "",
+                    "reasoning": reasoning,
                 },
             )
             self._append_message(state.project_dir, assistant_message)
@@ -711,6 +737,7 @@ class AgentRunner:
         gets a synthetic reminder (``CONTINUE``) or the run completes.
         """
         content = assistant_message.get("content") or "Task completed."
+        full_reasoning = "\n\n".join(state.run_reasonings)
         if not state.preview_id:
             if state.cad_error:
                 self.publish(
@@ -746,7 +773,7 @@ class AgentRunner:
                 )
                 self._publish_terminal_failure(state.project)
                 return _TurnOutcome.DRAWING_NOT_CREATED
-            self._complete(state.project, content)
+            self._complete(state.project, content, reasoning=full_reasoning)
             return _TurnOutcome.COMPLETED
         if state.cad_fix_required:
             if not state.nudged_final_verification:
@@ -770,7 +797,7 @@ class AgentRunner:
             )
             self._publish_terminal_failure(state.project)
             return _TurnOutcome.FINAL_VERIFICATION_MISSING
-        self._complete(state.project, content)
+        self._complete(state.project, content, reasoning=full_reasoning)
         return _TurnOutcome.COMPLETED
 
     def _handle_tool_calls(
@@ -1432,7 +1459,7 @@ class AgentRunner:
             transient=True,
         )
 
-    def _complete(self, project: str, message: str) -> None:
+    def _complete(self, project: str, message: str, reasoning: str = "") -> None:
         """Persist the final assistant turn and publish it.
 
         Ensures the final user-facing response is recorded even when
@@ -1446,10 +1473,14 @@ class AgentRunner:
             and history[-1].get("role") == "assistant"
             and history[-1].get("content") == message
         ):
-            self._append_message(
-                project_dir, {"role": "assistant", "content": message}
-            )
-        self.publish("agent_message", {"project": project, "message": message})
+            record: dict[str, Any] = {"role": "assistant", "content": message}
+            if reasoning:
+                record["reasoning"] = reasoning
+            self._append_message(project_dir, record)
+        msg_payload: dict[str, Any] = {"project": project, "message": message}
+        if reasoning:
+            msg_payload["reasoning"] = reasoning
+        self.publish("agent_message", msg_payload)
         # Transient so the ``agent_message`` above remains the canonical
         # terminal entry in the conversation log.
         self.publish(

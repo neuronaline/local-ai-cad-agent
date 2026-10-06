@@ -53,7 +53,7 @@ from agent.settings import Settings
 PROJECT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 INFO_EVENT_TYPES = frozenset({"agent_status", "tool_status", "agent_usage", "agent_stopped"})
 HISTORY_EVENT_TYPES = INFO_EVENT_TYPES | {"agent_error"}
-SSE_QUEUE_SIZE = 512
+SSE_QUEUE_SIZE = 4096
 _MAX_DIFF_LINES = 500
 
 
@@ -432,6 +432,7 @@ def project_view(name: str) -> str:
         show_info_messages=current_app.config["SETTINGS"].show_info_messages,
         viewer_grid_size=current_app.config["SETTINGS"].viewer_grid_size,
         viewer_grid_divisions=current_app.config["SETTINGS"].viewer_grid_divisions,
+        cache_bust=int(time.time()),
     )
 
 
@@ -746,7 +747,16 @@ def stream():
         finally:
             bus.unsubscribe(subscriber)
 
-    return Response(generate(), mimetype="text/event-stream", headers={"Cache-Control": "no-cache"})
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Content-Encoding": "identity",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
