@@ -70,6 +70,15 @@ def compact_for_context(tool: str, result: str) -> str:
     features = data.get("feature_summary")
     if isinstance(features, dict) and features:
         compact_data["feature_summary"] = features
+    verif = data.get("verification")
+    if isinstance(verif, dict) and verif:
+        compact_data["verification"] = {
+            "status": verif.get("status"),
+            "risk_score": verif.get("risk_score"),
+            "risk_level": verif.get("risk_level"),
+            "findings": verif.get("findings", []),
+            "watertight": (verif.get("mesh_integrity") or {}).get("watertight"),
+        }
     raw_images = data.get("images")
     if isinstance(raw_images, list) and raw_images:
         compact_data["images"] = [

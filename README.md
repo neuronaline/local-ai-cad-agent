@@ -50,7 +50,7 @@ Built with [OpenSCAD](https://openscad.org/) for solid geometry, [Three.js](http
 - 🧠 **Live Streaming & Reasoning** — Watch the model's chain-of-thought and tool invocations stream in real time via Server-Sent Events (SSE).
 - 🦙 **Local & Cloud LLMs** — Full support for **Ollama** (offline, private, no API keys), alongside **OpenRouter** and **OpenAI**, with optional automatic secondary fallback.
 - 🛡️ **Sandboxed Code Execution** — OpenSCAD runs inside an isolated [Bubblewrap](https://github.com/containers/bubblewrap) container with detached networking and read-only host mounts.
-- 🔍 **Deterministic Build Verification** — Automatically validates manifold topology, non-zero volume, bounding box bounds, and uppercase parametric constants before marking builds successful.
+- 🔍 **Deterministic Build & Mesh Verification** — Automatically validates code syntax, manifold mesh topology, non-zero volume, bounds, and parametric conventions with categorized risk scoring on every build.
 - 📸 **Multi-View Visual Inspection** — Parallel rendering of 8 canonical camera views plus an assembled contact sheet, allowing the agent to visually inspect geometry and correct defects (`get_view_images`).
 - ❓ **Interactive Clarification Dialogs** — When critical dimensions are ambiguous, the agent presents structured UI forms (text, numbers, choices) before proceeding.
 - 🧊 **Interactive 3D Viewport** — Real-time Three.js viewer with orbit controls, standard viewpoint presets (Isometric, Front, Top, Right), wireframe toggle, and build-plate grid warnings.
@@ -339,17 +339,17 @@ flowchart TD
     ToolDispatch -->|question| UserForm[Prompt user with structured form]
     
     Sandbox --> OpenSCAD[OpenSCAD compilation]
-    OpenSCAD --> Verification[Validate manifold geometry, volume, dimensions]
-    Verification --> MultiView[Render 8 canonical views + review sheet]
+    OpenSCAD --> MultiView[Render 8 canonical views + review sheet]
     MultiView --> Artifacts[preview.stl + render.png + manifests]
     
-    Artifacts --> UI3D[Three.js 3D Viewport & History]
+    Artifacts --> Verifier[Deterministic code & mesh verification]
+    Verifier --> UI3D[Three.js 3D Viewport & History]
 ```
 
 - **`read_file`** — Inspect existing `model.scad` content with optional offset/limit paging.
 - **`write_file`** — Perform initial file creation or deliberate full rewrites.
 - **`edit_file`** — Apply single or atomic batch (up to 16) exact replacements to preserve parametric structure.
-- **`cad_build`** (aliased as `cad_build_and_verify`) — Runs OpenSCAD in the Bubblewrap sandbox, verifies manifold geometry and dimensions, extracts uppercase constants, builds `preview.stl`, and produces 8 canonical views.
+- **`cad_build`** (legacy alias `cad_build_and_verify`) — Compiles `model.scad` in the Bubblewrap sandbox, produces 8 canonical views and the review contact sheet, and runs deterministic code and mesh verification (manifoldness, watertightness, volume, solid count, $fn/EPS rules, risk score).
 - **`get_view_images`** — Fetches rendered canonical views, the 8-view contact sheet, or normalized crops as visual memory to evaluate geometry.
 - **`question`** — Halts execution to present structured input fields to the user for clarification.
 
@@ -452,7 +452,8 @@ Settings are loaded from `config.yaml` (git-ignored) at startup. Copy `config.ex
 | `agent.tool_call_limit` | `15` | Maximum tool iterations allowed per user prompt |
 | `agent.revision_retention_count` | `0` | Number of previous model revisions to keep (`0` keeps all) |
 | `agent.debug_log_tool_errors` | `false` | Log recoverable tool failures to `<project>/debug-errors.jsonl` |
-| `agent.log_tool_activity` | `false` | Log full tool execution trace to `<project>/.cad-agent/activity.jsonl` |
+| `agent.log_mode` | `off` | Activity logging mode: `off`, `debug` (rolling `activity.jsonl`), or `dataset` (untrimmed `trajectories/<run_id>.jsonl`) |
+| `agent.log_tool_activity` | `false` | Legacy boolean flag; alias for `agent.log_mode: debug` |
 
 ### LLM Provider Settings
 
@@ -492,6 +493,7 @@ Settings are loaded from `config.yaml` (git-ignored) at startup. Copy `config.ex
 | `ollama.base_url` | `http://localhost:11434/v1` | Ollama OpenAI-compatible endpoint |
 | `ollama.model` | `qwen2.5-coder:14b-16k` | Name of your locally hosted model |
 | `ollama.timeout_seconds` | `120` | Request timeout in seconds (allows for local inference latency) |
+| `ollama.reasoning_effort` | `""` | Reasoning effort for thinking models (`low`, `medium`, `high`, or empty) |
 
 ### Server & UI Settings
 
@@ -525,6 +527,7 @@ When a project is created, its directory is initialized under `workspace_root`:
     ├── exports/                       # Cached exports (SHA256.stl, SHA256.obj, etc.)
     ├── history/                       # Immutable revision manifests & source blobs
     ├── reviews/<model_sha>/           # 8 canonical views + review-sheet.png
+    ├── trajectories/                  # Optional untrimmed run traces (dataset mode)
     └── activity.jsonl                 # Optional tool-level debug trace
 ```
 

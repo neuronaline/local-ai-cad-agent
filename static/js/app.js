@@ -281,6 +281,7 @@ const activityLabels = {
   running: 'In progress',
   rendering: 'Rendering',
   rendering_views: 'Rendering review views',
+  verifying: 'Verifying geometry',
   reviewing: 'Reviewing',
   started: 'Starting',
   completed: 'Completed',
@@ -428,6 +429,12 @@ function markActivityRecovered() {
 function addToolMessage(data) {
   const callId = data.call_id || generateUUID();
   const status = data.status || 'running';
+  if (callId !== 'agent-run' && activityItems.has('agent-run')) {
+    const placeholder = activityList.querySelector('[data-call-id="agent-run"]');
+    placeholder?.remove();
+    activityItems.delete('agent-run');
+  }
+
   const item = activityItems.get(callId) || {callId, tool: data.tool || 'agent'};
   item.tool = data.tool || item.tool;
   item.status = status;
@@ -1694,12 +1701,14 @@ function connectStream() {
   const handlers = {
     agent_status: data => {
       if (data.project !== currentProject) return;
-      addToolMessage({
-        call_id: 'agent-run',
-        tool: 'agent',
-        status: data.status || 'running',
-        result: data.message,
-      });
+      if (!(data.status === 'completed' && activityItems.size > 0 && !activityItems.has('agent-run'))) {
+        addToolMessage({
+          call_id: 'agent-run',
+          tool: 'agent',
+          status: data.status || 'running',
+          result: data.message,
+        });
+      }
       const runId = data.run_id;
       const card = getActiveCard(runId);
 

@@ -835,7 +835,7 @@ class AgentRunner:
                     "project": state.project,
                     "run_id": state.run_id,
                     "message": (
-                        "Task stopped: final CAD verification is still missing."
+                        "Task stopped: final CAD build and verification is still missing."
                     ),
                 },
             )

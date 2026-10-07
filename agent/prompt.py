@@ -61,8 +61,8 @@ _OPERATIONAL_RULES = """\
   variants into one scene — the bounding box and contact sheet all assume a
   single part.
 - Resolve blocking ambiguity first (ask one batched ``question`` if needed),
-  then iterate: edit model.scad → ``cad_build`` → inspect metrics (call
-  ``get_view_images`` if visual inspection needed) → fix or finish.
+  then iterate: edit model.scad → ``cad_build`` → inspect metrics and renders
+  (call ``get_view_images`` if visual inspection needed) → fix or finish.
 - model.scad layout: parameter block first (see Golden Rules), geometry in
   named modules below, every major block marked with a module or short header
   comment. Comments must stay in sync with the code.
@@ -78,11 +78,11 @@ _OPERATIONAL_RULES = """\
   model.scad or a deliberate full rewrite. Use ``edit_file`` for all incremental
   modifications (pass ``old_string`` and ``new_string`` for a single edit, or
   an ``edits`` array for multiple related changes).
-- ``cad_build`` compiles model.scad in the sandbox, validates geometry
-  (manifold, volume, bounding box), and extracts parameters. Pass optional
-  ``views`` (e.g. ``views=['isometric']`` or ``views=['all']``) to inspect
-  the rendered design in the same turn. If ``views`` is omitted, it returns
-  geometric metrics without images.
+- ``cad_build`` compiles model.scad in the sandbox into a 3D preview STL,
+  renders canonical camera views, and runs deterministic code and mesh quality
+  verification (checking manifoldness, watertightness, volume, solid count, $fn,
+  EPS usage, and risk score). Pass optional ``views`` (e.g. ``views=['isometric']``
+  or ``views=['all']``) to inspect the rendered design in the same turn.
 - ``get_view_images`` retrieves additional or zoomed render views after a build
   if further visual inspection is required (defaults to the 8-view sheet).
 - Geometric conflict (slot clipping a fastener hole, wall-thickness violation,
@@ -95,9 +95,10 @@ _OPERATIONAL_RULES = """\
   most once per task, and only when the missing dimension creates a
   physically impossible contradiction — never for preferences.
 - A geometry-changing task is ready only after the latest model.scad revision
-  passes ``cad_build`` without errors and satisfies all dimensions and functional
-  requirements. Use ``views`` in ``cad_build`` or ``get_view_images`` whenever
-  visual confirmation of alignment, proportions, or complex contours is required.
+  passes ``cad_build`` without critical verification errors and satisfies all
+  dimensions and functional requirements. Use ``views`` in ``cad_build`` or
+  ``get_view_images`` whenever visual confirmation of alignment, proportions,
+  or complex contours is required.
 - Final reply: a concise description of the produced part, its confirmed
   dimensions, and any notable assumptions. No separate summary file."""
 
@@ -268,10 +269,10 @@ def format_project_state(exists: bool, filename: str = "model.scad") -> str:
 
 # Synthetic Nudges & Reminders (role: user nudges during agent loop)
 NUDGE_UNVERIFIED_MODEL_TEMPLATE = (
-    "{filename} exists but it has not been verified. Call cad_build now."
+    "{filename} exists but has not been built. Call cad_build now."
 )
 NUDGE_FINAL_VERIFICATION = (
-    "Verification required before finalizing. Call cad_build."
+    "Build and verification required before finalizing. Call cad_build."
 )
 
 
@@ -335,9 +336,10 @@ TOOL_DESCRIPTIONS = {
     },
     "cad_build": {
         "description": (
-            "Build and validate model.scad in the sandbox. Checks manifold validity, "
-            "solid count, bounding box dimensions, and volume. Extracts declared "
-            "UPPER_CASE parameters. Pass optional 'views' to inspect renders in the same turn."
+            "Compile model.scad into 3D preview (STL), render images, and verify geometry in the sandbox. "
+            "Produces physical dimensions, volume, and deterministic quality validation (manifoldness, "
+            "watertightness, $fn, EPS rules, risk score). Pass optional 'views' (e.g. ['isometric'], ['all']) "
+            "to inspect renders in the same turn."
         ),
         "views": (
             "Optional view list to return immediately (e.g. ['isometric'], ['all']). "

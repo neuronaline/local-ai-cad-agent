@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import shutil
 import subprocess
 import tempfile
@@ -16,6 +15,7 @@ from agent.io import atomic_write_bytes
 from agent.review_paths import review_dir
 from agent.revisions import MODEL_FILENAME, RevisionIntegrityError, RevisionStore
 from agent.sandbox import command as sandbox_command
+from agent.tools.cad_verifier import CadVerifier
 from agent.tools.file_tool import FileTool
 from agent.tools.process_runner import (
     MAX_SANDBOX_TIMEOUT_SECONDS,
@@ -36,9 +36,7 @@ _RENDERER_FILENAME = "renderer.py"
 
 # Hard validation bounds shared with the runner; enforced here so callers see
 # a useful error before the sandbox subprocess spins up.
-_MIN_DIMENSION_MM = 0.001
 _MAX_DIMENSION_MM = 1_000_000.0
-_MIN_VOLUME_MM3 = 0.0
 
 # Review artifacts live under <project>/.cad-agent/reviews/<model_sha256>/.
 # A new manifest only invalidates the previous review when ``preview_sha256``
@@ -304,48 +302,23 @@ class CadTool:
         return str(views_target), str(sheet_target)
 
     def _enforce_basic_geometry(self, metrics: dict[str, Any]) -> None:
-        """Apply the basic geometry checks the runner pre-validates.
-
-        Keeps the simple "valid geometry, at least one solid, positive volume,
-        plausible bounding box" contract even when the quality verifiers are
-        no longer in the loop.
-
-        Flat parts (one dimension effectively zero — sheet metal, gaskets,
-        planar faces) are explicitly out of scope: the multi-view rasteriser
-        and STL preview are meaningless for 2D-projection geometry, so the
-        ``math.isclose`` tolerance is anchored to ``_MIN_DIMENSION_MM``.
-        """
+        """Verify that OpenSCAD produced basic geometry data without failing on quality warnings."""
         try:
             solid_count = int(metrics.get("solid_count", 0) or 0)
-            is_valid = bool(metrics.get("is_valid"))
             dimensions = metrics.get("dimensions_mm") or {}
-            volume = float(metrics.get("volume_mm3", 0.0) or 0.0)
         except (TypeError, ValueError):
             raise ValueError("CAD geometry metrics are malformed.") from None
         if solid_count < 1:
-            raise ValueError("Build did not produce a solid.")
-        if not is_valid:
-            raise ValueError("CAD geometry is not valid.")
+            raise ValueError("Build did not produce any 3D geometry.")
         try:
             dim_values = [float(dimensions[axis]) for axis in ("x", "y", "z")]
         except (KeyError, TypeError, ValueError):
             raise ValueError("CAD dimensions are missing or malformed.") from None
         for axis, value in zip(("x", "y", "z"), dim_values):
-            # Use ``math.isclose`` so a tiny but non-zero thickness is accepted
-            # while still rejecting genuine flat / negative parts. The
-            # tolerance is the same as ``_MIN_DIMENSION_MM`` so the runner
-            # (which uses the same constant) stays the source of truth.
-            if math.isclose(value, 0.0, abs_tol=_MIN_DIMENSION_MM):
-                raise ValueError(
-                    f"CAD dimension {axis}={value} mm is effectively zero; "
-                    "flat / 2D-projection parts are not supported."
-                )
-            if value < _MIN_DIMENSION_MM or value > _MAX_DIMENSION_MM:
+            if value <= 0 or value > _MAX_DIMENSION_MM:
                 raise ValueError(
                     f"CAD dimension {axis}={value} mm is outside the plausible range."
                 )
-        if not (volume > _MIN_VOLUME_MM3):
-            raise ValueError("CAD volume must be positive.")
 
     def _record_build_success(self, metrics: dict[str, Any]) -> None:
         """Record a successful build against the active revision."""
@@ -568,7 +541,7 @@ class CadTool:
 
         Always uses :attr:`RenderMode.NONE` — the cheapest path that
         skips every visual artifact. Callers that need PNGs or the
-        multi-view manifest should use :meth:`build_and_verify`.
+        multi-view manifest should use :meth:`build`.
         """
         payload = self._execute(mode=RenderMode.NONE)
         return dict(payload.get("metrics") or {})
@@ -576,17 +549,11 @@ class CadTool:
     @staticmethod
     def _summarize_payload(
         metrics: dict[str, Any] | None,
-        feature_summary: dict[str, Any],
         mode: RenderMode,
         review_path: str | None,
+        verification: dict[str, Any] | None = None,
     ) -> str:
-        """Return a one-line human-readable summary for the agent's first glance.
-
-        The full structured payload (metrics, feature_summary, review_manifest)
-        is still included below — the agent only needs this summary to decide
-        whether to read further or move on, which keeps the first 1-2 turns
-        after a build cheap.
-        """
+        """Return a one-line human-readable summary for the agent's first glance."""
         if not isinstance(metrics, dict):
             return "Build produced no metrics."
         dims = metrics.get("dimensions_mm") or {}
@@ -599,58 +566,45 @@ class CadTool:
             z = float(dims.get("z", 0))
         except (TypeError, ValueError):
             x = y = z = 0.0
-        feature_count = sum(
-            int(feature_summary.get(key, 0) or 0)
-            for key in (
-                "through_hole_count",
-                "blind_hole_count",
-                "fillet_count",
-                "chamfer_count",
-            )
-        )
         validity = "valid" if is_valid else "INVALID"
         try:
             volume_cm3 = float(volume_mm3 or 0.0) / 1000.0
             volume_text = f"{volume_cm3:.1f} cm³"
         except (TypeError, ValueError):
             volume_text = "unknown volume"
-        # ``FULL_REVIEW`` produces the contact sheet (so the tag depends on
-        # whether the artifact actually landed); ``NONE`` is the cheap
-        # metrics-only path.
         if mode is RenderMode.NONE:
             render_state = "metrics-only"
         elif review_path:
             render_state = "with full review"
         else:
             render_state = "with render, no review"
-        return (
+        summary_core = (
             f"Solid {solid_count} ({validity}); "
             f"bbox {x:.1f}×{y:.1f}×{z:.1f} mm; "
-            f"{volume_text}; {feature_count} features; {render_state}."
+            f"{volume_text}; {render_state}."
         )
+        if isinstance(verification, dict):
+            v_status = verification.get("status")
+            v_risk = verification.get("risk_score")
+            mesh_meta = verification.get("mesh_integrity") or {}
+            is_watertight = mesh_meta.get("watertight")
+            watertight_text = "watertight" if is_watertight else "non-manifold"
+            if v_status:
+                summary_core += f" Verification: {v_status} (risk {v_risk}/100, {watertight_text})."
+        return summary_core
 
-    def build_and_verify(
+    def build(
         self,
         mode: RenderMode = RenderMode.FULL_REVIEW,
     ) -> dict[str, Any]:
-        """Build, validate, and render in one call.
-
-        ``mode``: :attr:`RenderMode.NONE` for metrics-only builds,
-        :attr:`RenderMode.FULL_REVIEW` (default) for the canonical
-        ``render.png`` + multi-view manifest + contact sheet. Source
-        parameters are extracted from the model AST.
-        """
+        """Compile model.scad, generate render artifacts, and verify geometry deterministically."""
         if not isinstance(mode, RenderMode):
-            raise TypeError("build_and_verify mode must be a RenderMode.")
+            raise TypeError("build mode must be a RenderMode.")
         execute_args: dict[str, Any] = {"mode": mode}
         if self._call_id:
             execute_args["call_id"] = self._call_id
         payload = self._execute(**execute_args)
         metrics = payload.get("metrics") if isinstance(payload, dict) else None
-        # Surface the model + preview SHAs once at the top level instead of
-        # nesting them inside ``review_manifest``. The agent does not need
-        # to re-parse a full manifest just to correlate a build with its
-        # result.
         model_sha = (
             payload.get("model_sha256") if isinstance(payload, dict) else None
         )
@@ -683,13 +637,28 @@ class CadTool:
                 review_path = promoted.get("artifact_dir")
             if review_path:
                 result["review"] = review_path
+
+        # Run deterministic verification directly on compiled model and preview mesh
+        verifier = CadVerifier(self.project_dir, self._publish)
+        if self._call_id:
+            verifier.with_call_id(self._call_id)
+        verification = verifier.verify()
+        result["verification"] = verification
+
         result["summary"] = self._summarize_payload(
             metrics,
-            result["feature_summary"],
             mode,
             result.get("review"),
+            verification,
         )
         return result
+
+    def build_and_verify(
+        self,
+        mode: RenderMode = RenderMode.FULL_REVIEW,
+    ) -> dict[str, Any]:
+        """Legacy alias for :meth:`build`."""
+        return self.build(mode=mode)
 
     def stop(self) -> None:
         with self._lock:

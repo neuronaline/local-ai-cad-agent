@@ -217,7 +217,7 @@ def dispatch(
     """
     if is_cad_build(name):
         cad = tools.cad.with_call_id(call_id)
-        raw_build = cad.build_and_verify(mode=RenderMode.FULL_REVIEW)
+        raw_build = cad.build(mode=RenderMode.FULL_REVIEW)
         views = args.get("views") if isinstance(args, dict) else None
         if views:
             try:
@@ -545,7 +545,11 @@ def process_tool_call(
     if multimodal is not None:
         context_content = multimodal["content"]
     if is_cad_build(name) and build_succeeded:
-        cad_fix_required = False
+        verif = raw_result.get("verification") if isinstance(raw_result, dict) else None
+        if isinstance(verif, dict) and verif.get("status") == "FAILED":
+            cad_fix_required = True
+        else:
+            cad_fix_required = False
     tool_message = {"role": "tool", "tool_call_id": call_id, "content": context_content}
     messages.append(tool_message)
     append_message(project_dir, tool_message)
