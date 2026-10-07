@@ -42,6 +42,7 @@ from agent.llm_base import (
     extract_text_tool_calls,
     provider_label,
     sanitize_assistant_message,
+    strip_encrypted_reasoning,
 )
 from agent.prompt import (
     NUDGE_FINAL_VERIFICATION,
@@ -199,12 +200,19 @@ def _extract_reasoning(message: dict[str, Any]) -> str:
     """Extract plain text reasoning from reasoning or reasoning_details."""
     reasoning = message.get("reasoning")
     if isinstance(reasoning, str) and reasoning:
-        return reasoning
+        return strip_encrypted_reasoning(reasoning)
     details = message.get("reasoning_details")
     if isinstance(details, list):
-        return "".join(
-            d.get("text", "") for d in details if isinstance(d, dict) and d.get("text")
-        )
+        parts: list[str] = []
+        for d in details:
+            if not isinstance(d, dict) or d.get("type") == "reasoning.encrypted":
+                continue
+            for field in ("text", "summary"):
+                val = d.get(field)
+                if isinstance(val, str) and val:
+                    parts.append(val)
+                    break
+        return strip_encrypted_reasoning("".join(parts))
     return ""
 
 
@@ -455,13 +463,14 @@ class AgentRunner:
             thread_to_join.join(timeout=5.0)
 
         with self._lock:
-            if stop_active_task and (self._thread is None or not self._thread.is_alive()):
+            if stop_active_task:
                 self._active_project = None
                 self._active_run_id = None
-                self._thread = None
-                self._run_complete.set()
-                self._active_tools = None
-                self._active_client = None
+                if self._thread is None or not self._thread.is_alive():
+                    self._thread = None
+                    self._run_complete.set()
+                    self._active_tools = None
+                    self._active_client = None
 
         for cleared in affected:
             (
@@ -642,6 +651,17 @@ class AgentRunner:
         circuit-breaker / question-parking rules.
         """
         awaiting_tool_render = self._last_message_has_tool_image(state.messages)
+        if state.total_turns > 0:
+            self.publish(
+                "agent_status",
+                {
+                    "project": state.project,
+                    "run_id": state.run_id,
+                    "status": "started",
+                    "message": "Thinking...",
+                },
+                transient=True,
+            )
         response = state.client.chat(state.messages, TOOL_SCHEMAS)
         if (
             awaiting_tool_render

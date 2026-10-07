@@ -53,12 +53,7 @@ class ConversationStore:
     #: new project reads/writes through the store.
     CACHE_MAX: ClassVar[int] = 32
 
-    #: Maximum entries returned by :meth:`load` to keep the LLM context
-    #: window bounded. None disables truncation so full conversation history
-    #: is permanently preserved in memory without prompt prefix invalidation.
-    MAX_HISTORY: ClassVar[int | None] = None
-
-    #: Roles kept when truncating the log on load.
+    #: Roles loaded as active LLM conversation turns (filters out non-chat event records).
     _KEPT_ROLES: ClassVar[set[str]] = {"user", "assistant", "tool"}
 
     _cache: ClassVar[dict[str, list[dict[str, Any]]]] = {}

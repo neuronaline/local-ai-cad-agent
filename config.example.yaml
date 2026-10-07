@@ -27,7 +27,9 @@ openrouter:
   app_title: Local AI CAD Agent
   app_url: ""
   session_prefix: local-ai-cad-agent
-  reasoning_effort: "medium"
+  # Optional reasoning effort ("low", "medium", "high"). Leave blank ("")
+  # for models that do not support reasoning tokens.
+  reasoning_effort: ""
   # OpenRouter provider routing order, highest priority first. OpenRouter
   # walks this list and only falls back to its internal pool if every named
   # upstream is unavailable. Use ``"<provider>/<quantization>"`` slugs such

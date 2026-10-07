@@ -15,10 +15,10 @@ from agent.settings import Settings
 
 
 class OpenRouterClient(ChatCompletionsClient):
-    # Drop historical reasoning between turns. Reasoning is useful in a single
-    # decision but bloats the prompt prefix over multi-step CAD runs, so the
-    # agent only ever sees the current file + build state at each step.
-    preserve_reasoning = False
+    # Preserving reasoning blocks is critical for tool use continuity on OpenRouter,
+    # specifically for models like Claude and OpenAI reasoning models where multi-turn
+    # tool calling requires preserving the reasoning chain across tool responses.
+    preserve_reasoning = True
 
     def __init__(self, settings: Settings) -> None:
         super().__init__(settings, provider_label="OpenRouter")
@@ -35,12 +35,19 @@ class OpenRouterClient(ChatCompletionsClient):
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            "X-Title": self.settings.openrouter_app_title,
             "X-OpenRouter-Title": self.settings.openrouter_app_title,
         }
         if self.settings.openrouter_app_url:
             headers["HTTP-Referer"] = self.settings.openrouter_app_url
         if self.session_id:
             headers["X-Session-ID"] = hashlib.sha256(self.session_id.encode()).hexdigest()[:64]
+        if (
+            self.settings.openrouter_model.startswith("anthropic/")
+            or "anthropic" in self.settings.openrouter_model.lower()
+        ):
+            headers["anthropic-beta"] = "interleaved-thinking-2025-05-14"
+            headers["x-anthropic-beta"] = "interleaved-thinking-2025-05-14"
         return headers
 
     def _apply_provider_payload(self, payload: dict[str, Any]) -> None:
@@ -83,7 +90,6 @@ class OpenRouterClient(ChatCompletionsClient):
         if self.settings.openrouter_reasoning_effort:
             payload["reasoning"] = {
                 "effort": self.settings.openrouter_reasoning_effort,
-                "exclude": False,
             }
         if provider_order:
             if self.settings.openrouter_force_provider:
@@ -160,7 +166,6 @@ class OpenRouterClient(ChatCompletionsClient):
             "model": self.settings.openrouter_model,
             "messages": self.sanitize_messages(messages),
             "stream": True,
-            "stream_options": {"include_usage": True},
         }
         if tools:
             payload["tools"] = tools

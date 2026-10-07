@@ -17,7 +17,9 @@ import time
 from copy import deepcopy
 from typing import Any
 
+import httpx
 import requests
+import requests.adapters
 
 from agent.activity_log import summarize_llm_messages
 from agent.prompt import TOOL_IMAGE_PROMPT
@@ -49,6 +51,17 @@ _HTTP_SESSION.mount(
     requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=16),
 )
 atexit.register(_HTTP_SESSION.close)
+
+# Module-level HTTP/2 client for streaming Chat Completions without HTTP/1.1
+# chunk-size reassembly buffering. HTTP/2 binary DATA frames multiplex over
+# a persistent connection, eliminating the standard library chunked transfer
+# accumulation defect (http.client._read_chunked with amt=None).
+_HTTP_CLIENT: httpx.Client = httpx.Client(
+    http2=True,
+    limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
+    timeout=None,
+)
+atexit.register(_HTTP_CLIENT.close)
 
 
 class RequestCancelled(RuntimeError):
@@ -251,6 +264,11 @@ def sanitize_assistant_message(
         details = sanitized.get("reasoning_details")
         if isinstance(details, list) and not details:
             sanitized.pop("reasoning_details", None)
+        # OpenRouter specification: echo back either reasoning_details (preferred)
+        # or reasoning (plaintext fallback), never both in the same assistant turn.
+        if not for_storage and sanitized.get("reasoning_details"):
+            sanitized.pop("reasoning", None)
+            sanitized.pop("reasoning_content", None)
 
     # Strip any leaked tool-call tags from content in assistant messages
     if isinstance(sanitized.get("content"), str):
@@ -450,9 +468,14 @@ def without_images(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
     return stripped, removed
 
 
-def _response_text(response: requests.Response) -> str:
+def _response_text(response: Any) -> str:
     """Return an error body from real and test response objects."""
     try:
+        if hasattr(response, "read") and callable(response.read):
+            try:
+                response.read()
+            except Exception:
+                pass
         value = response.text
         if callable(value):
             value = value()
@@ -461,7 +484,7 @@ def _response_text(response: requests.Response) -> str:
         return ""
 
 
-def _is_image_rejection(response: requests.Response) -> bool:
+def _is_image_rejection(response: Any) -> bool:
     """Whether a client error specifically rejects visual input."""
     if response.status_code not in {400, 404}:
         return False
@@ -482,7 +505,7 @@ def _is_image_rejection(response: requests.Response) -> bool:
     )
 
 
-def retry_delay(response: requests.Response | None, attempt: int) -> float:
+def retry_delay(response: Any | None, attempt: int) -> float:
     """Honor ``Retry-After`` when present, otherwise exponential backoff."""
     if response is not None:
         retry_after = response.headers.get("Retry-After")
@@ -501,48 +524,31 @@ def post_with_cancel(
     headers: dict[str, str],
     timeout_seconds: int,
     stop_event: threading.Event | None,
-) -> requests.Response:
+) -> Any:
     """Run a blocking ``POST`` that can be cancelled by ``stop_event``.
 
-    The HTTP call is dispatched to a daemon thread so the agent-loop stop
-    signal can interrupt it within ``~100 ms`` instead of waiting for the
-    underlying socket timeout. The daemon uses the module-level
-    :data:`_HTTP_SESSION` (a thread-safe ``requests.Session`` with an
-    internal urllib3 connection pool) so successive calls reuse the
-    previous TLS handshake instead of re-doing DNS resolution, the
-    TCP 3-way handshake, and the TLS 1.3 negotiation on every request.
-
-    The worker publishes its :class:`requests.Response` to ``response_holder``
-    *before* queueing it so the main thread can force-close the socket on
-    the cancel path. Without that hook a rapid stop/restart cycle leaks a
-    pooled keepalive connection every time the user cancels before the
-    worker has finished draining the response stream — the daemon thread
-    keeps the underlying connection alive in the pool until process exit.
+    Dispatches the HTTP call to a daemon worker thread and streams via
+    the module-level :data:`_HTTP_CLIENT` (using HTTP/2 multiplexing) to
+    eliminate HTTP/1.1 chunk-size reassembly buffering and token coalescing.
     """
-    results: queue.Queue[requests.Response | BaseException] = queue.Queue(maxsize=1)
-    # Mutable slot for the in-flight Response. ``dict``-based rather than
-    # a list so ``setdefault``/``get`` give us atomic single-key access
-    # without an extra lock.
-    response_holder: dict[str, requests.Response] = {}
+    results: queue.Queue[Any | BaseException] = queue.Queue(maxsize=1)
+    response_holder: dict[str, Any] = {}
 
     def request_worker() -> None:
         try:
             req_headers = dict(headers)
             req_headers.setdefault("Accept", "text/event-stream")
-            req_headers.setdefault("Accept-Encoding", "identity")
-            response = _HTTP_SESSION.post(
+            req = _HTTP_CLIENT.build_request(
+                "POST",
                 url,
                 headers=req_headers,
                 json=payload,
-                stream=True,
-                timeout=timeout_seconds,
+                timeout=httpx.Timeout(timeout_seconds, connect=15.0),
             )
+            response = _HTTP_CLIENT.send(req, stream=True)
         except BaseException as error:  # Propagate worker failures unchanged.
             results.put(error)
             return
-        # Publish the Response *before* queueing it so a concurrent
-        # cancel can close the socket even if the worker has not yet
-        # finished its ``put`` call.
         response_holder["response"] = response
         results.put(response)
 
@@ -555,36 +561,24 @@ def post_with_cancel(
             worker.join(timeout=0.1)
             if stop_event and stop_event.is_set():
                 raise RequestCancelled("LLM request cancelled.")
-        # ``worker.join`` returned without timing out — the worker has
-        # already put something on the queue, but ``get`` is bounded so
-        # a stray stop between ``join`` and ``get`` cannot wedge us.
         result = results.get(timeout=5)
         if isinstance(result, BaseException):
             raise result
         return result
     except RequestCancelled:
-        # Cancel path: wait briefly for the daemon worker to publish if mid-handshake,
-        # then force-close any active or queued Response so the underlying socket
-        # (and its keepalive timer) is released immediately.
         worker.join(timeout=0.5)
         _force_close_response(response_holder.get("response"))
         try:
             queued = results.get_nowait()
         except queue.Empty:
             queued = None
-        if isinstance(queued, requests.Response):
+        if queued is not None and not isinstance(queued, BaseException):
             _force_close_response(queued)
         raise
 
 
-def _force_close_response(response: requests.Response | None) -> None:
-    """Force-close a streaming ``Response``, releasing the underlying socket.
-
-    In POSIX/Linux, calling ``response.close()`` on a streaming connection
-    does not wake up another thread blocked in ``socket.recv()`` or
-    ``iter_lines()``. Extracting and shutting down the raw socket releases
-    the reader thread immediately.
-    """
+def _force_close_response(response: Any | None) -> None:
+    """Force-close a streaming ``Response``, releasing the underlying socket."""
     if response is None:
         return
     try:
@@ -605,9 +599,22 @@ def _force_close_response(response: requests.Response | None) -> None:
                 raw.close()
             except Exception:
                 pass
-        response.close()
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
     except Exception:
         pass
+
+
+def strip_encrypted_reasoning(text: str | None) -> str:
+    """Strip leaked base64 encrypted reasoning / signature blobs from human-readable text."""
+    if not text:
+        return ""
+    s = text.strip()
+    if len(s) >= 50 and bool(re.fullmatch(r"[A-Za-z0-9+/=]+", s)):
+        return ""
+    # Strip any trailing base64 signature/encrypted ciphertext block (>= 40 chars, possibly newline/space separated)
+    return re.sub(r"(?:\r?\n|\s)+(?:[A-Za-z0-9+/=]{40,}(?:\r?\n|\s)*)+$", "", text)
 
 
 def extract_think_tags(
@@ -619,6 +626,8 @@ def extract_think_tags(
     Handles complete think blocks, multiple blocks, and truncated/unclosed think
     tags without leaving raw tags in the substantive message content.
     """
+    if existing_reasoning:
+        existing_reasoning = strip_encrypted_reasoning(existing_reasoning) or None
     if not content:
         return "", existing_reasoning
 
@@ -654,7 +663,7 @@ def extract_think_tags(
 
 
 def parse_chat_stream(
-    response: requests.Response,
+    response: Any,
     *,
     provider_label: str,
     stop_event: threading.Event | None = None,
@@ -669,18 +678,23 @@ def parse_chat_stream(
     last_usage: dict[str, Any] | None = None
     reasoning_text = ""
     reasoning_details: list[dict[str, Any]] = []
+    reasoning_details_map: dict[Any, dict[str, Any]] = {}
+    active_detail_key: Any = None
     in_think_tag = False
     in_tool_tag = False
     tag_buffer = ""
     tool_tag_buffer = ""
 
     try:
-        for raw_line in response.iter_lines(chunk_size=None):
+        for raw_line in response.iter_lines():
             if stop_event and stop_event.is_set():
                 _force_close_response(response)
                 raise RequestCancelled(f"{provider_label} request cancelled.")
             line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
-            if not line or not line.startswith("data:"):
+            if not line:
+                continue
+            line = line.strip()
+            if not line.startswith("data:"):
                 continue
             payload = line[5:].strip()
             if payload == "[DONE]":
@@ -838,10 +852,36 @@ def parse_chat_stream(
             if isinstance(details, list):
                 for detail in details:
                     if isinstance(detail, dict):
-                        reasoning_details.append(deepcopy(detail))
-                        t = detail.get("text")
-                        if isinstance(t, str) and t:
-                            details_text += t
+                        # Only extract human-readable thought text. Never treat
+                        # encrypted ciphertext ('data', type='reasoning.encrypted')
+                        # or verification signatures ('signature') as display text.
+                        if detail.get("type") != "reasoning.encrypted":
+                            t = detail.get("text") or detail.get("summary")
+                            if isinstance(t, str) and t:
+                                details_text += t
+                        idx = detail.get("index")
+                        detail_id = detail.get("id")
+                        if idx is not None:
+                            key = idx
+                        elif detail_id is not None:
+                            key = detail_id
+                        elif reasoning_details and not (detail.get("type") and detail.get("type") != reasoning_details[-1].get("type")):
+                            key = active_detail_key
+                        else:
+                            key = len(reasoning_details)
+                            active_detail_key = key
+                        if key in reasoning_details_map:
+                            target = reasoning_details_map[key]
+                            for field in ("text", "summary", "data"):
+                                if field in detail and isinstance(detail[field], str):
+                                    target[field] = target.get(field, "") + detail[field]
+                            for field in ("signature", "id", "type", "format"):
+                                if field in detail and detail[field] is not None:
+                                    target[field] = detail[field]
+                        else:
+                            target = deepcopy(detail)
+                            reasoning_details_map[key] = target
+                            reasoning_details.append(target)
             if isinstance(reasoning, str) and reasoning:
                 reasoning_delta_text = reasoning
             elif details_text:
@@ -849,9 +889,11 @@ def parse_chat_stream(
             else:
                 reasoning_delta_text = None
             if reasoning_delta_text:
-                reasoning_text += reasoning_delta_text
-                if stream_callback:
-                    stream_callback({"type": "reasoning", "delta": reasoning_delta_text})
+                clean_delta = strip_encrypted_reasoning(reasoning_delta_text)
+                if clean_delta:
+                    reasoning_text += clean_delta
+                    if stream_callback:
+                        stream_callback({"type": "reasoning", "delta": clean_delta})
             for call_delta in delta.get("tool_calls") or []:
                 index = int(call_delta.get("index", 0))
                 call = tool_calls.setdefault(
@@ -873,6 +915,7 @@ def parse_chat_stream(
                             "type": "tool_call",
                             "index": index,
                             "id": call["id"],
+                            "name": call["function"]["name"],
                             "name_delta": name_delta,
                             "arguments_delta": arguments_delta,
                         }
@@ -962,8 +1005,9 @@ def parse_chat_stream(
         message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
     if reasoning_details:
         message["reasoning_details"] = reasoning_details
-    if reasoning_text:
-        message["reasoning"] = reasoning_text
+    clean_reasoning = strip_encrypted_reasoning(reasoning_text)
+    if clean_reasoning:
+        message["reasoning"] = clean_reasoning
     return {"choices": [{"message": message}], "usage": last_usage}
 
 
@@ -1245,7 +1289,7 @@ class ChatCompletionsClient:
         # surface and consumed by ``chat()`` directly.
         self.activity_logger = None
         self.run_id: str | None = None
-        self._active_response: requests.Response | None = None
+        self._active_response: Any | None = None
         self._response_lock = threading.Lock()
 
     def _endpoint(self) -> str:  # pragma: no cover — overridden by subclass
@@ -1362,7 +1406,7 @@ class ChatCompletionsClient:
         image_fallback_used = False
         for attempt in range(attempts):
             is_last_attempt = attempt == attempts - 1
-            response: requests.Response | None = None
+            response: Any | None = None
             # When activity logging is enabled, replace the raw
             # ``messages`` array with a structural summary so a single
             # multi-image upload cannot exhaust the 5 MiB rolling cap
@@ -1421,15 +1465,12 @@ class ChatCompletionsClient:
                     if body_preview:
                         raise RuntimeError(f"{self._provider_label} {response.status_code}: {body_preview}")
                 if response.status_code not in {408, 429} and response.status_code < 500:
-                    # Surface the upstream body so the caller sees the real
-                    # reason (e.g. OpenRouter's "No endpoints found that can
-                    # handle the requested parameters" 404) instead of just
-                    # ``requests``' generic ``HTTPError``.
-                    body_preview = _response_text(response)[:500]
-                    if 400 <= response.status_code < 500 and body_preview:
-                        raise RuntimeError(
-                            f"{self._provider_label} {response.status_code}: {body_preview}"
-                        )
+                    if 400 <= response.status_code < 500:
+                        body_preview = _response_text(response)[:500]
+                        if body_preview:
+                            raise RuntimeError(
+                                f"{self._provider_label} {response.status_code}: {body_preview}"
+                            )
                     response.raise_for_status()
                     duration_ms = round((time.perf_counter() - call_start) * 1000, 2)
                     if log_payload:
@@ -1468,6 +1509,11 @@ class ChatCompletionsClient:
                                     run_id=self.run_id,
                                 )
                     else:
+                        if hasattr(response, "read") and callable(response.read):
+                            try:
+                                response.read()
+                            except Exception:
+                                pass
                         body = response.json()
                         self.last_usage = body.get("usage") if isinstance(body.get("usage"), dict) else None
                         choices = body.get("choices") if isinstance(body, dict) else None
