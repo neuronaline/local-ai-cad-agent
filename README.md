@@ -314,7 +314,7 @@ While frontier LLMs can generate raw OpenSCAD syntax, programmatic CAD behaves f
 | Capability | Generic CLI Agents (Typical Out-of-the-Box Setup) | `local-ai-cad-agent` |
 | :--- | :--- | :--- |
 | Geometric Verification | Compiler exit status only; requires external geometric test harnesses to detect non-manifold solids | Deterministic topology, volume, manifold, and discrete solid count validation |
-| Visual Inspection | Manual setup required; ad-hoc headless inspection loops can incur high token overhead | Automated 8-view canonical contact sheet with targeted sub-region image crops |
+| Visual Inspection | Manual setup required; ad-hoc headless inspection loops can incur high token overhead | Automated 8-view canonical contact sheet with multi-angle renders |
 | Execution Security | Standard host user permissions by default; sandboxing requires custom external configuration | Isolated Bubblewrap sandbox with dropped network privileges, read-only system mounts, and seccomp filtering |
 | Offline / Local LLMs | High context overhead from environment troubleshooting often strains smaller models | Offloads spatial checks to Python runtime, enabling compact local models via Ollama |
 | Workflow & History | Terminal text output and manual file tracking; requires external 3D viewer | Integrated Three.js 3D viewport, SSE streaming, line diffs, and revision rollbacks |
@@ -335,7 +335,7 @@ flowchart TD
     ToolDispatch -->|write_file| WriteSCAD[Initialize / Overwrite model.scad]
     ToolDispatch -->|edit_file| EditSCAD[Atomic exact string replacements]
     ToolDispatch -->|cad_build| Sandbox[Bubblewrap Sandbox Execution]
-    ToolDispatch -->|get_view_images| VisualMem[Inspect canonical renders or crop areas]
+    ToolDispatch -->|get_view_images| VisualMem[Inspect canonical renders & contact sheet]
     ToolDispatch -->|question| UserForm[Prompt user with structured form]
     
     Sandbox --> OpenSCAD[OpenSCAD compilation]
@@ -350,7 +350,7 @@ flowchart TD
 - **`write_file`** — Perform initial file creation or deliberate full rewrites.
 - **`edit_file`** — Apply single or atomic batch (up to 16) exact replacements to preserve parametric structure.
 - **`cad_build`** (legacy alias `cad_build_and_verify`) — Compiles `model.scad` in the Bubblewrap sandbox, produces 8 canonical views and the review contact sheet, and runs deterministic code and mesh verification (manifoldness, watertightness, volume, solid count, $fn/EPS rules, risk score).
-- **`get_view_images`** — Fetches rendered canonical views, the 8-view contact sheet, or normalized crops as visual memory to evaluate geometry.
+- **`get_view_images`** — Fetches rendered canonical views or the 8-view contact sheet as visual memory to evaluate geometry.
 - **`question`** — Halts execution to present structured input fields to the user for clarification.
 
 ---

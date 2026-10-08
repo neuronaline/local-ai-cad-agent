@@ -123,7 +123,7 @@ def _count_disconnected_solids(triangles: np.ndarray) -> int:
     return max(0, len(roots) - 1)
 
 
-def _mesh_metrics(vertices: np.ndarray, triangles: np.ndarray) -> dict[str, Any]:
+def mesh_metrics(vertices: np.ndarray, triangles: np.ndarray) -> dict[str, Any]:
     """Calculate exact bounding box, volume, solid count, and manifold validity."""
     if len(vertices) == 0 or len(triangles) == 0:
         raise ValueError("The generated CAD mesh contains no vertices or triangles.")
@@ -141,7 +141,22 @@ def _mesh_metrics(vertices: np.ndarray, triangles: np.ndarray) -> dict[str, Any]
     v1 = vertices[triangles[:, 1]]
     v2 = vertices[triangles[:, 2]]
     cross = np.cross(v0, v1)
-    volume = float(abs(np.sum(cross * v2)) / 6.0)
+    raw_volume = float(np.sum(cross * v2) / 6.0)
+    volume = abs(raw_volume)
+
+    # Watertight Manifold Edge-sharing Check
+    non_degenerate_triangles = [
+        tri for tri in triangles
+        if tri[0] != tri[1] and tri[1] != tri[2] and tri[2] != tri[0]
+    ]
+    edges: dict[tuple[int, int], int] = {}
+    for tri in non_degenerate_triangles:
+        t0, t1, t2 = int(tri[0]), int(tri[1]), int(tri[2])
+        for u, v in ((min(t0, t1), max(t0, t1)), (min(t1, t2), max(t1, t2)), (min(t2, t0), max(t2, t0))):
+            edges[(u, v)] = edges.get((u, v), 0) + 1
+
+    boundary_edges = sum(1 for count in edges.values() if count == 1)
+    multi_face_edges = sum(1 for count in edges.values() if count > 2)
 
     disconnected_count = _count_disconnected_solids(triangles)
     solid_count = max(1, disconnected_count + 1)
@@ -151,13 +166,21 @@ def _mesh_metrics(vertices: np.ndarray, triangles: np.ndarray) -> dict[str, Any]
         "solid_count": solid_count,
         "is_valid": is_valid,
         "volume_mm3": round(volume, 3),
+        "raw_volume": round(raw_volume, 3),
         "dimensions_mm": {
             "x": round(dim_x, 3),
             "y": round(dim_y, 3),
             "z": round(dim_z, 3),
         },
         "disconnected_solid_count": disconnected_count,
+        "boundary_edges": boundary_edges,
+        "multi_face_edges": multi_face_edges,
+        "vertex_count": len(vertices),
+        "triangle_count": len(triangles),
     }
+
+
+_mesh_metrics = mesh_metrics
 
 
 # ---------------------------------------------------------------------------

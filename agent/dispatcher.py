@@ -94,19 +94,17 @@ def _clean_code_fences(code: str) -> str:
     if not isinstance(code, str):
         return ""
     text = code.strip()
-    if not text.startswith("```"):
-        return code
+    if not text:
+        return ""
+    if text.startswith("```") and text.endswith("```") and len(text) >= 6 and "\n" not in text:
+        inner = text[3:-3].strip()
+        m = re.match(r"^[a-zA-Z0-9_-]+\s+(.*)$", inner)
+        return m.group(1) if m else inner
+    match = re.search(r"```(?:[a-zA-Z0-9_-]+)?\s*\r?\n(.*)\r?\n```", text, re.DOTALL)
+    if match:
+        return match.group(1)
     lines = text.splitlines()
-    if len(lines) == 1:
-        line = lines[0]
-        if line.endswith("```") and len(line) >= 6:
-            inner = line[3:-3].strip()
-            m = re.match(r"^[a-zA-Z0-9_-]+\s+(.*)$", inner)
-            if m:
-                return m.group(1)
-            return inner
-        return code
-    if lines[0].startswith("```"):
+    if lines and lines[0].startswith("```"):
         lines = lines[1:]
     if lines and lines[-1].strip() == "```":
         lines = lines[:-1]
@@ -307,35 +305,17 @@ def _dispatch_edit_file(file_tool, args: dict, call_id: str) -> tuple[object, bo
         )
     if not isinstance(edits, list):
         raise ValueError("edit_file 'edits' must be a list of objects.")
-    if len(edits) == 1:
-        entry = edits[0]
+    cleaned_edits = []
+    for index, entry in enumerate(edits):
         if not isinstance(entry, dict):
             raise ValueError("edit_file 'edits' must be a list of objects.")
-        old_str = entry.get("old_string")
-        new_str = entry.get("new_string")
-        clean_new = _clean_code_fences(
-            new_str if isinstance(new_str, str) else ("" if new_str is None else str(new_str))
-        )
-        return (
-            tool.edit_file(
-                MODEL_FILENAME,
-                "" if old_str is None else old_str,
-                clean_new,
+        ns = entry.get("new_string")
+        cleaned_edits.append({
+            **entry,
+            "new_string": _clean_code_fences(
+                ns if isinstance(ns, str) else ("" if ns is None else str(ns))
             ),
-            False,
-        )
-    cleaned_edits = []
-    for entry in edits:
-        if isinstance(entry, dict):
-            ns = entry.get("new_string")
-            cleaned_edits.append({
-                **entry,
-                "new_string": _clean_code_fences(
-                    ns if isinstance(ns, str) else ("" if ns is None else str(ns))
-                ),
-            })
-        else:
-            cleaned_edits.append(entry)
+        })
     return (
         tool.edit_file_atomic(MODEL_FILENAME, cleaned_edits),
         False,

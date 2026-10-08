@@ -61,12 +61,14 @@ export class CadViewer {
     // THREE.GridHelper's first argument is the total size (the helper centres
     // itself on the origin) and the second is the number of divisions per
     // side. Both come from the parsed viewer.grid config.
-    return new THREE.GridHelper(
+    const grid = new THREE.GridHelper(
       this.grid.size,
       this.grid.divisions,
       '#2b3c5c',
       '#18243a',
     );
+    grid.position.y = -0.05;
+    return grid;
   }
 
   _describeGrid() {

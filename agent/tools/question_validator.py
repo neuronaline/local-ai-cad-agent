@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from typing import Any
 
 
 class QuestionValidator:
@@ -65,18 +66,19 @@ class QuestionValidator:
                     if required:
                         return False
                     continue
-                if not all(v in options for v in selected):
+                str_options = {str(o) for o in options} | set(options)
+                if not all(v in str_options for v in selected):
                     return False
                 continue
 
-            # Numeric questions may arrive as JSON numbers (e.g. ``25`` or
+            # Numeric questions and selections may arrive as JSON numbers (e.g. ``25`` or
             # ``3.14``) when the web UI or API client serialises the
-            # payload. Normalise those to strings so the unit-aware regex
-            # below can process them; ``bool`` is rejected because Python
+            # payload. Normalise those to strings so the downstream validators
+            # can process them; ``bool`` is rejected because Python
             # treats it as an ``int`` subclass and ``True`` / ``False`` are
             # never legitimate numeric answers here.
             if (
-                input_type == "number"
+                input_type in ("number", "select")
                 and isinstance(value, (int, float))
                 and not isinstance(value, bool)
             ):
@@ -95,7 +97,10 @@ class QuestionValidator:
 
             if input_type == "select":
                 options = q.get("options", [])
-                if not isinstance(options, list) or value not in options:
+                if not isinstance(options, list):
+                    return False
+                str_options = {str(o) for o in options} | set(options)
+                if value not in str_options:
                     return False
             elif input_type == "number":
                 if not QuestionValidator._is_valid_number_with_unit(value):
@@ -105,18 +110,30 @@ class QuestionValidator:
         return True
 
     @staticmethod
-    def _validate_single(question: dict[str, object], answer: str) -> bool:
-        """Validate a raw text answer against a single question's schema."""
+    def _validate_single(question: dict[str, object], answer: Any) -> bool:
+        """Validate an answer against a single question's schema."""
         input_type = question.get("input_type", "text")
+        if (
+            input_type in ("number", "select")
+            and isinstance(answer, (int, float))
+            and not isinstance(answer, bool)
+        ):
+            answer = str(answer)
         if input_type == "select":
             options = question.get("options", [])
-            return isinstance(options, list) and answer in options
+            if not isinstance(options, list):
+                return False
+            str_options = {str(o) for o in options} | set(options)
+            return answer in str_options
+        if not isinstance(answer, str):
+            return False
         if input_type == "multiselect":
             options = question.get("options", [])
             if not isinstance(options, list):
                 return False
+            str_options = {str(o) for o in options} | set(options)
             selected = [value.strip() for value in answer.split(",") if value.strip()]
-            return bool(selected) and all(value in options for value in selected)
+            return bool(selected) and all(v in str_options for v in selected)
         if input_type == "number":
             return QuestionValidator._is_valid_number_with_unit(answer)
         return bool(answer.strip())

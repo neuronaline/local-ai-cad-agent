@@ -47,7 +47,7 @@ def is_failure(value: str) -> bool:
 
 def compact_for_context(tool: str, result: str) -> str:
     """Compact verbose tool envelopes for LLM context while keeping essential metrics."""
-    if tool not in {"cad_build", "cad_build_and_verify"}:
+    if tool not in {"cad_build", "cad_build_and_verify", "get_view_images"}:
         return result
     try:
         payload = json.loads(result)
@@ -58,6 +58,25 @@ def compact_for_context(tool: str, result: str) -> str:
     data = payload.get("data")
     if not isinstance(data, dict):
         return result
+
+    if tool == "get_view_images":
+        raw_images = data.get("images")
+        compact_images = [
+            {"view": img.get("view")}
+            for img in raw_images
+            if isinstance(img, dict) and "view" in img
+        ] if isinstance(raw_images, list) else []
+        return json.dumps(
+            {
+                "ok": True,
+                "tool": tool,
+                "data": {
+                    "images": compact_images,
+                    "review_sha256": data.get("review_sha256"),
+                },
+            },
+            ensure_ascii=False,
+        )
 
     metrics = data.get("metrics") or {}
     compact_data: dict[str, Any] = {
@@ -82,7 +101,7 @@ def compact_for_context(tool: str, result: str) -> str:
     raw_images = data.get("images")
     if isinstance(raw_images, list) and raw_images:
         compact_data["images"] = [
-            {"view": img.get("view"), "cropped": bool(img.get("cropped"))}
+            {"view": img.get("view")}
             for img in raw_images
             if isinstance(img, dict) and "view" in img
         ]
@@ -212,18 +231,22 @@ def _classify(tool: str, error: Exception, message: str) -> tuple[str, str, bool
         )
     if "timed out" in lower or "timeout" in lower:
         return "TIMEOUT", "execution", True, TOOL_HINTS["TIMEOUT"]
+    if isinstance(error, FileNotFoundError) or (
+        "does not exist" in lower and "model.scad" in lower
+    ):
+        return (
+            "MODEL_MISSING",
+            "build" if tool in {"cad_build", "cad_build_and_verify"} else "validation",
+            True,
+            TOOL_HINTS["MODEL_MISSING"].format(filename="model.scad"),
+        )
     if tool in {"cad_build", "cad_build_and_verify"}:
-        code = (
-            "MODEL_MISSING"
-            if "model.scad does not exist" in lower
-            else "CAD_BUILD_FAILED"
+        return (
+            "CAD_BUILD_FAILED",
+            "build",
+            True,
+            TOOL_HINTS["CAD_BUILD_FAILED"].format(filename="model.scad"),
         )
-        hint = (
-            TOOL_HINTS["MODEL_MISSING"].format(filename="model.scad")
-            if code == "MODEL_MISSING"
-            else TOOL_HINTS["CAD_BUILD_FAILED"].format(filename="model.scad")
-        )
-        return code, "build", True, hint
     if isinstance(error, (ValueError, TypeError, KeyError)):
         return (
             "VALIDATION_ERROR",

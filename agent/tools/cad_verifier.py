@@ -5,16 +5,17 @@ exact mathematical mesh topology validation without hallucination or fuzzy guess
 """
 from __future__ import annotations
 
+import json
 import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-
 from agent.revisions import MODEL_FILENAME, model_is_built
 from agent.tools.cad_scripts.renderer import load_stl
+from agent.tools.cad_scripts.runner import mesh_metrics
+from agent.tools.file_tool import OpenScadPreflight
 from agent.tools.tool_events import publish_tool_phase
 
 
@@ -126,119 +127,19 @@ class CadVerifier:
         findings: list[Finding] = []
 
         # 1. Delimiter & Syntax checking
-        pairs = {"{": "}", "[": "]", "(": ")"}
-        stack: list[tuple[str, int]] = []
-        in_line_comment = False
-        in_block_comment = False
-        in_string = False
-
-        lineno = 1
-        i = 0
-        n = len(code)
-        syntax_error = False
-
-        while i < n:
-            char = code[i]
-            if char == "\n":
-                lineno += 1
-                in_line_comment = False
-                i += 1
-                continue
-            if in_line_comment:
-                i += 1
-                continue
-            if in_block_comment:
-                if code[i : i + 2] == "*/":
-                    in_block_comment = False
-                    i += 2
-                else:
-                    i += 1
-                continue
-            if in_string:
-                if char == "\\" and i + 1 < n:
-                    i += 2
-                elif char == '"':
-                    in_string = False
-                    i += 1
-                else:
-                    i += 1
-                continue
-            if code[i : i + 2] == "//":
-                in_line_comment = True
-                i += 2
-                continue
-            if code[i : i + 2] == "/*":
-                in_block_comment = True
-                i += 2
-                continue
-            if char == '"':
-                in_string = True
-                i += 1
-                continue
-
-            if char in pairs:
-                stack.append((char, lineno))
-            elif char in pairs.values():
-                if not stack:
-                    findings.append(
-                        Finding(
-                            category="CRITICAL",
-                            code="UNMATCHED_CLOSING_DELIMITER",
-                            message=f"Unmatched closing '{char}' at line {lineno}.",
-                            line=lineno,
-                            impact="OpenSCAD compiler parse error.",
-                        )
-                    )
-                    syntax_error = True
-                    break
-                top, top_line = stack.pop()
-                if pairs[top] != char:
-                    findings.append(
-                        Finding(
-                            category="CRITICAL",
-                            code="MISMATCHED_DELIMITER",
-                            message=f"Mismatched delimiter: opened '{top}' at line {top_line} but closed with '{char}' at line {lineno}.",
-                            line=lineno,
-                            impact="OpenSCAD compiler parse error.",
-                        )
-                    )
-                    syntax_error = True
-                    break
-            i += 1
-
-        if not syntax_error:
-            if in_string:
-                findings.append(
-                    Finding(
-                        category="CRITICAL",
-                        code="UNCLOSED_STRING",
-                        message="Unclosed string literal in model.scad.",
-                        impact="OpenSCAD compiler parse error.",
-                    )
+        delimiter_err = OpenScadPreflight.check_delimiters(code)
+        syntax_error = bool(delimiter_err)
+        if delimiter_err:
+            err_code, err_msg, lineno = delimiter_err
+            findings.append(
+                Finding(
+                    category="CRITICAL",
+                    code=err_code,
+                    message=err_msg,
+                    line=lineno,
+                    impact="OpenSCAD compiler parse error.",
                 )
-                syntax_error = True
-            elif in_block_comment:
-                findings.append(
-                    Finding(
-                        category="CRITICAL",
-                        code="UNCLOSED_BLOCK_COMMENT",
-                        message="Unclosed block comment (/* ... */) in model.scad.",
-                        impact="OpenSCAD compiler parse error.",
-                    )
-                )
-                syntax_error = True
-            elif stack:
-                unclosed, start_line = stack[-1]
-                findings.append(
-                    Finding(
-                        category="CRITICAL",
-                        code="UNCLOSED_DELIMITER",
-                        message=f"Unclosed delimiter '{unclosed}' opened at line {start_line}.",
-                        line=start_line,
-                        impact="OpenSCAD compiler parse error.",
-                    )
-                )
-                syntax_error = True
+            )
 
         # 2. Python syntax & banned ops checks with line-number preservation
         clean_code = _clean_code_preserve_lines(code)
@@ -409,20 +310,69 @@ class CadVerifier:
             )
             return findings, {"exists": False}
 
-        try:
-            vertices, triangles = load_stl(stl_path)
-        except Exception as err:  # noqa: BLE001
-            findings.append(
-                Finding(
-                    category="CRITICAL",
-                    code="CORRUPT_STL",
-                    message=f"Failed to load STL mesh: {err}",
-                    impact="STL file is malformed or unreadable.",
-                )
-            )
-            return findings, {"exists": True, "valid": False}
+        metrics_file = self.project_dir / ".cad_metrics.json"
+        cached_metrics: dict[str, Any] | None = None
+        if metrics_file.is_file():
+            try:
+                cached_data = json.loads(metrics_file.read_text(encoding="utf-8"))
+                if isinstance(cached_data, dict) and isinstance(cached_data.get("metrics"), dict):
+                    m = cached_data["metrics"]
+                    if "dimensions_mm" in m and "volume_mm3" in m and "boundary_edges" in m:
+                        cached_metrics = m
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                pass
 
-        if len(vertices) == 0 or len(triangles) == 0:
+        if cached_metrics is None:
+            try:
+                vertices, triangles = load_stl(stl_path)
+            except Exception as err:  # noqa: BLE001
+                findings.append(
+                    Finding(
+                        category="CRITICAL",
+                        code="CORRUPT_STL",
+                        message=f"Failed to load STL mesh: {err}",
+                        impact="STL file is malformed or unreadable.",
+                    )
+                )
+                return findings, {"exists": True, "valid": False}
+
+            if len(vertices) == 0 or len(triangles) == 0:
+                findings.append(
+                    Finding(
+                        category="CRITICAL",
+                        code="EMPTY_MESH",
+                        message="The compiled mesh contains zero vertices or triangles.",
+                        impact="OpenSCAD produced an empty shape.",
+                    )
+                )
+                return findings, {"exists": True, "valid": False}
+
+            try:
+                cached_metrics = mesh_metrics(vertices, triangles)
+            except Exception as err:  # noqa: BLE001
+                findings.append(
+                    Finding(
+                        category="CRITICAL",
+                        code="CORRUPT_STL",
+                        message=f"Failed to calculate mesh metrics: {err}",
+                        impact="STL mesh topology calculation failed.",
+                    )
+                )
+                return findings, {"exists": True, "valid": False}
+
+        dims = cached_metrics.get("dimensions_mm", {})
+        dim_x = float(dims.get("x", 0))
+        dim_y = float(dims.get("y", 0))
+        dim_z = float(dims.get("z", 0))
+        volume = float(cached_metrics.get("volume_mm3", 0.0))
+        raw_volume = float(cached_metrics.get("raw_volume", volume))
+        boundary_edges = int(cached_metrics.get("boundary_edges", 0))
+        multi_face_edges = int(cached_metrics.get("multi_face_edges", 0))
+        solid_count = int(cached_metrics.get("solid_count", 1))
+        vertex_count = int(cached_metrics.get("vertex_count", 0))
+        triangle_count = int(cached_metrics.get("triangle_count", 0))
+
+        if vertex_count == 0 or triangle_count == 0:
             findings.append(
                 Finding(
                     category="CRITICAL",
@@ -434,11 +384,6 @@ class CadVerifier:
             return findings, {"exists": True, "valid": False}
 
         # 1. Bounding box & non-zero dimensions
-        min_pt = np.min(vertices, axis=0)
-        max_pt = np.max(vertices, axis=0)
-        dims = max_pt - min_pt
-        dim_x, dim_y, dim_z = float(dims[0]), float(dims[1]), float(dims[2])
-
         if not all(math.isfinite(d) for d in (dim_x, dim_y, dim_z)):
             findings.append(
                 Finding(
@@ -468,13 +413,6 @@ class CadVerifier:
             )
 
         # 2. Signed Polyhedron Volume
-        v0 = vertices[triangles[:, 0]]
-        v1 = vertices[triangles[:, 1]]
-        v2 = vertices[triangles[:, 2]]
-        cross = np.cross(v0, v1)
-        raw_volume = float(np.sum(cross * v2) / 6.0)
-        volume = abs(raw_volume)
-
         if volume <= 0.0001:
             findings.append(
                 Finding(
@@ -495,20 +433,6 @@ class CadVerifier:
             )
 
         # 3. Watertight Manifold Edge-sharing Check
-        # Filter degenerate triangles first
-        non_degenerate_triangles = [
-            tri for tri in triangles
-            if tri[0] != tri[1] and tri[1] != tri[2] and tri[2] != tri[0]
-        ]
-        edges: dict[tuple[int, int], int] = {}
-        for tri in non_degenerate_triangles:
-            t0, t1, t2 = int(tri[0]), int(tri[1]), int(tri[2])
-            for u, v in ((min(t0, t1), max(t0, t1)), (min(t1, t2), max(t1, t2)), (min(t2, t0), max(t2, t0))):
-                edges[(u, v)] = edges.get((u, v), 0) + 1
-
-        boundary_edges = sum(1 for count in edges.values() if count == 1)
-        multi_face_edges = sum(1 for count in edges.values() if count > 2)
-
         is_watertight = boundary_edges == 0 and multi_face_edges == 0
         if boundary_edges > 0:
             findings.append(
@@ -530,31 +454,6 @@ class CadVerifier:
             )
 
         # 4. Disconnected Solid Components
-        edges_to_tris: dict[tuple[int, int], list[int]] = {}
-        for idx, tri in enumerate(triangles):
-            t0, t1, t2 = int(tri[0]), int(tri[1]), int(tri[2])
-            for e in ((min(t0, t1), max(t0, t1)), (min(t1, t2), max(t1, t2)), (min(t2, t0), max(t2, t0))):
-                edges_to_tris.setdefault(e, []).append(idx)
-
-        parent = list(range(len(triangles)))
-
-        def find(x: int) -> int:
-            while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
-            return x
-
-        for tri_list in edges_to_tris.values():
-            if len(tri_list) > 1:
-                first = tri_list[0]
-                for other in tri_list[1:]:
-                    root_a, root_b = find(first), find(other)
-                    if root_a != root_b:
-                        parent[root_a] = root_b
-
-        roots = {find(i) for i in range(len(triangles))}
-        solid_count = len(roots)
-
         if solid_count > 1:
             findings.append(
                 Finding(
@@ -575,8 +474,8 @@ class CadVerifier:
                 "y": round(dim_y, 2),
                 "z": round(dim_z, 2),
             },
-            "triangle_count": len(triangles),
-            "vertex_count": len(vertices),
+            "triangle_count": triangle_count,
+            "vertex_count": vertex_count,
             "boundary_edge_count": boundary_edges,
             "non_manifold_edge_count": multi_face_edges,
         }

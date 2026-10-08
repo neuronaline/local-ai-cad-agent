@@ -45,7 +45,7 @@ from agent.llm_base import (
     strip_encrypted_reasoning,
 )
 from agent.prompt import (
-    NUDGE_FINAL_VERIFICATION,
+    NUDGE_CAD_FIX_REQUIRED,
     format_project_state,
     format_unverified_model_nudge,
     get_system_prompt,
@@ -825,7 +825,7 @@ class AgentRunner:
         if state.cad_fix_required:
             if not state.nudged_final_verification:
                 state.nudged_final_verification = True
-                reminder = _synthetic_user(NUDGE_FINAL_VERIFICATION)
+                reminder = _synthetic_user(NUDGE_CAD_FIX_REQUIRED)
                 state.messages.append(reminder)
                 self._append_message(state.project_dir, reminder)
                 return _TurnOutcome.CONTINUE
@@ -835,7 +835,8 @@ class AgentRunner:
                     "project": state.project,
                     "run_id": state.run_id,
                     "message": (
-                        "Task stopped: final CAD build and verification is still missing."
+                        "Task stopped: CAD build succeeded but critical verification "
+                        "issues were not resolved."
                     ),
                 },
             )
@@ -1213,8 +1214,8 @@ class AgentRunner:
         See :data:`agent.prompt._OPERATIONAL_RULES` for the instruction the
         model receives.
         """
-        existed = cls._initial_model_existed(project_dir, history)
-        content = format_project_state(existed, MODEL_FILENAME)
+        existed, code = cls._initial_model_state(project_dir, history)
+        content = format_project_state(existed, MODEL_FILENAME, code)
         # Gemini normalizes all system messages into an immutable instruction.
         # Keeping workspace state in a later user message lets its
         # explicit system-message cache breakpoint remain reusable.
@@ -1224,7 +1225,15 @@ class AgentRunner:
     def _initial_model_existed(
         cls, project_dir: Path, history: list[dict] | None = None
     ) -> bool:
-        """Determine whether model.scad existed at the start of this conversation.
+        """Determine whether model.scad existed at the start of this conversation."""
+        existed, _ = cls._initial_model_state(project_dir, history)
+        return existed
+
+    @classmethod
+    def _initial_model_state(
+        cls, project_dir: Path, history: list[dict] | None = None
+    ) -> tuple[bool, str]:
+        """Determine whether model.scad existed and its content at the start of this conversation.
 
         To preserve byte-identical prompt prefixes across all turns (enabling
         provider-side prompt caching), the initial project state must remain
@@ -1235,10 +1244,19 @@ class AgentRunner:
             try:
                 data = json.loads(state_file.read_text("utf-8"))
                 if isinstance(data, dict) and "existed" in data:
-                    return bool(data["existed"])
+                    existed = bool(data["existed"])
+                    content = str(data.get("content", ""))
+                    if existed and not content and (not history or len(history) <= 1):
+                        model_file = project_dir / MODEL_FILENAME
+                        if model_file.is_file() and model_file.stat().st_size <= 100_000:
+                            content = model_file.read_text("utf-8", errors="replace")
+                    return existed, content
             except (OSError, json.JSONDecodeError, UnicodeDecodeError):
                 pass
 
+        model_file = project_dir / MODEL_FILENAME
+        existed = False
+        content = ""
         if history and len(history) > 1:
             first_turn_wrote_model = False
             for m in history:
@@ -1253,13 +1271,23 @@ class AgentRunner:
                     break
             existed = not first_turn_wrote_model
         else:
-            existed = (project_dir / MODEL_FILENAME).is_file()
+            existed = model_file.is_file()
+
+        if existed and model_file.is_file():
+            try:
+                if model_file.stat().st_size <= 100_000:
+                    content = model_file.read_text("utf-8", errors="replace")
+            except OSError:
+                pass
 
         try:
-            state_file.write_text(json.dumps({"existed": existed}), encoding="utf-8")
+            state_file.write_text(
+                json.dumps({"existed": existed, "content": content}),
+                encoding="utf-8",
+            )
         except OSError:
             pass
-        return existed
+        return existed, content
 
     @staticmethod
     def _last_message_has_tool_image(messages: list[dict]) -> bool:

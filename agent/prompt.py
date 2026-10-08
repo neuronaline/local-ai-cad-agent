@@ -24,32 +24,17 @@ invent decorative details or enlarge the part for appearance. When a reference
 image is provided, use it for shape and proportion while treating stated
 dimensions as authoritative. State any important assumption in the final reply."""
 
-# Single source of truth for the recurring OpenSCAD requirements. These six
-# items are the only place ``$fn``, ``EPS``, the UPPER_CASE parameter rule,
-# the EPS cutter rule, the ``difference()`` trap, and the semicolon rule
-# live. ``_OPERATIONAL_RULES`` and ``_OPENSCAD_RULES`` refer back here instead
-# of restating them, which keeps the cacheable prefix short and stops the
-# model from receiving three slightly-different copies of the same rule.
+# Single source of truth for parameter formatting and units.
+# OpenSCAD syntax, EPS cutter conventions, manifold union, and difference rules
+# are fully defined in the attached Playbook.
 _GOLDEN_RULES = """\
 - Units: millimetres for linear dimensions, degrees for angles. Never mix.
 - Parameters: every numeric dimension, angle, clearance, and count goes at the
   top of model.scad as an UPPER_CASE parameter with a unit-and-purpose comment
   (e.g. ``PLATE_LENGTH = 120.0; // mm, X span of the base plate``). No bare
   magic numbers inside the geometry body.
-- Declare ``$fn = 60;`` and ``EPS = 0.01;`` once near the top of model.scad.
-  ``$fn = 60`` smooths every circle, cylinder, and fillet; small fastener
-  holes can drop to ``$fn = 32`` locally if needed.
-- The EPS cutter rule: in every ``difference()``, extend the cutter ``EPS``
-  past the boundary on both ends (e.g. ``translate([x, y, -EPS]) cylinder(
-  h = H + 2*EPS, d = D);``). Missing overshoot causes non-manifold coincident
-  faces and Z-fighting. In ``union()``, overlap joined parts by at least
-  ``EPS`` for a watertight manifold.
-- The ``difference()`` trap: ``difference()`` subtracts every 2nd+ child from
-  the first child only. When the base has multiple bodies, wrap them in
-  ``union()`` as the first child — otherwise stray bodies get subtracted
-  along with the cutter.
-- Semicolons: every statement, every assignment, every module call ends with
-  ``;``. Missing semicolons are the single most common parse error."""
+- Geometry & syntax rules: follow all syntax traps, EPS cutter rules, manifold
+  union, and difference rules defined in the attached Playbook."""
 
 _OPERATIONAL_RULES = """\
 - Edit only the active project's model.scad. Everything else is read-only.
@@ -61,8 +46,9 @@ _OPERATIONAL_RULES = """\
   variants into one scene — the bounding box and contact sheet all assume a
   single part.
 - Resolve blocking ambiguity first (ask one batched ``question`` if needed),
-  then iterate: edit model.scad → ``cad_build`` → inspect metrics and renders
-  (call ``get_view_images`` if visual inspection needed) → fix or finish.
+  then iterate: edit model.scad → ``cad_build(views=['isometric'])`` (or
+  ``views=['all']``) to inspect metrics and renders in a single turn → fix or finish.
+  Use ``get_view_images`` only when inspecting other camera angles without rebuilding.
 - model.scad layout: parameter block first (see Golden Rules), geometry in
   named modules below, every major block marked with a module or short header
   comment. Comments must stay in sync with the code.
@@ -76,15 +62,14 @@ _OPERATIONAL_RULES = """\
   already know; skip it when your own previous ``write_file``/``edit_file``
   already returned the post-state. Use ``write_file`` only for the initial
   model.scad or a deliberate full rewrite. Use ``edit_file`` for all incremental
-  modifications (pass ``old_string`` and ``new_string`` for a single edit, or
-  an ``edits`` array for multiple related changes).
+  modifications (pass ``old_string`` and ``new_string`` for targeted replacements).
 - ``cad_build`` compiles model.scad in the sandbox into a 3D preview STL,
   renders canonical camera views, and runs deterministic code and mesh quality
   verification (checking manifoldness, watertightness, volume, solid count, $fn,
   EPS usage, and risk score). Pass optional ``views`` (e.g. ``views=['isometric']``
   or ``views=['all']``) to inspect the rendered design in the same turn.
-- ``get_view_images`` retrieves additional or zoomed render views after a build
-  if further visual inspection is required (defaults to the 8-view sheet).
+- ``get_view_images`` retrieves additional render views after a build
+  if further visual inspection from other angles is required without rebuilding.
 - Geometric conflict (slot clipping a fastener hole, wall-thickness violation,
   etc.): STOP and call ``question`` with the trade-off. Never silently mutate a
   user-stated dimension to "make it fit" — ask once, then proceed.
@@ -247,6 +232,16 @@ def get_prompt_cache_key(namespace: str | None = None) -> str:
 # ---------------------------------------------------------------------------
 
 # Dynamic Workspace State Templates (injected as role: user after system prompt)
+PROJECT_STATE_EXISTS_WITH_CONTENT_TEMPLATE = (
+    "<project_state>\n"
+    "{filename} exists with initial content:\n"
+    "```scad\n"
+    "{content}\n"
+    "```\n"
+    "Inspect it directly. Do not call read_file unless needed.\n"
+    "</project_state>"
+)
+
 PROJECT_STATE_EXISTS_TEMPLATE = (
     "<project_state>\n"
     "{filename} exists. Read it before making a targeted edit.\n"
@@ -261,10 +256,17 @@ PROJECT_STATE_MISSING_TEMPLATE = (
 )
 
 
-def format_project_state(exists: bool, filename: str = "model.scad") -> str:
+def format_project_state(
+    exists: bool, filename: str = "model.scad", content: str = ""
+) -> str:
     """Format the workspace state message appended after the cacheable system prefix."""
-    template = PROJECT_STATE_EXISTS_TEMPLATE if exists else PROJECT_STATE_MISSING_TEMPLATE
-    return template.format(filename=filename)
+    if not exists:
+        return PROJECT_STATE_MISSING_TEMPLATE.format(filename=filename)
+    if content.strip():
+        return PROJECT_STATE_EXISTS_WITH_CONTENT_TEMPLATE.format(
+            filename=filename, content=content.rstrip()
+        )
+    return PROJECT_STATE_EXISTS_TEMPLATE.format(filename=filename)
 
 
 # Synthetic Nudges & Reminders (role: user nudges during agent loop)
@@ -273,6 +275,10 @@ NUDGE_UNVERIFIED_MODEL_TEMPLATE = (
 )
 NUDGE_FINAL_VERIFICATION = (
     "Build and verification required before finalizing. Call cad_build."
+)
+NUDGE_CAD_FIX_REQUIRED = (
+    "CAD build succeeded, but geometry verification reported critical issues. "
+    "Inspect the verification findings, edit model.scad to fix them, and call cad_build again."
 )
 
 
@@ -324,15 +330,10 @@ TOOL_DESCRIPTIONS = {
     "edit_file": {
         "description": (
             "Search and replace exact code in model.scad. Provide old_string and new_string "
-            "for a single replacement, or an edits array for multiple simultaneous replacements."
+            "for a replacement."
         ),
         "old_string": "Exact text in model.scad to replace.",
         "new_string": "Replacement text (use empty string to delete).",
-        "edits": "Optional batch of multiple replacements to apply atomically.",
-        "edit_old_string": (
-            "Exact text to find, copied verbatim from read_file. Must occur exactly once across the file."
-        ),
-        "edit_new_string": "Replacement text; may be empty to delete the block.",
     },
     "cad_build": {
         "description": (

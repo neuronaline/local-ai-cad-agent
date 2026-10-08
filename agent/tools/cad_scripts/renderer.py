@@ -231,11 +231,16 @@ def rasterize_view(
     screen_x_axis: Sequence[float],
     light: Sequence[float] | None = None,
 ) -> np.ndarray:
-    """Render one orthographic view of the mesh to an HxWx3 RGB array."""
-    light_vec = np.array(light or (0.35, -0.25, 0.9), dtype=np.float64)
-    light_vec /= np.linalg.norm(light_vec)
     camera = np.array(camera_axis, dtype=np.float64)
     screen_x = np.array(screen_x_axis, dtype=np.float64)
+    if light is not None:
+        light_vec = np.array(light, dtype=np.float64)
+    else:
+        cam_dir = camera / max(np.linalg.norm(camera), 1e-12)
+        sx_dir = screen_x / max(np.linalg.norm(screen_x), 1e-12)
+        sy_dir = np.cross(cam_dir, sx_dir)
+        light_vec = cam_dir + 0.35 * sx_dir + 0.45 * sy_dir
+    light_vec /= np.linalg.norm(light_vec)
     projected_xy, depths = _project(vertices, camera, screen_x)
     scale, offset, _span = _frame(projected_xy)
     screen_vertices = projected_xy * scale + offset
@@ -265,7 +270,8 @@ def load_stl(stl_path: Path) -> tuple[np.ndarray, np.ndarray]:
         ])
         records = np.frombuffer(data[84:], dtype=dtype, count=num_triangles)
         tri_coords = np.stack([records["v0"], records["v1"], records["v2"]], axis=1).reshape(-1, 3)
-        unique_verts, inverse_indices = np.unique(tri_coords, axis=0, return_inverse=True)
+        tri_coords_snapped = np.round(tri_coords, decimals=5)
+        unique_verts, inverse_indices = np.unique(tri_coords_snapped, axis=0, return_inverse=True)
         triangles = inverse_indices.reshape(-1, 3).astype(np.int32)
         return unique_verts.astype(np.float64), triangles
 
@@ -282,7 +288,8 @@ def load_stl(stl_path: Path) -> tuple[np.ndarray, np.ndarray]:
     if not coords or len(coords) % 3 != 0:
         raise ValueError("Invalid STL: no renderable triangles found.")
     tri_coords = np.array(coords, dtype=np.float32)
-    unique_verts, inverse_indices = np.unique(tri_coords, axis=0, return_inverse=True)
+    tri_coords_snapped = np.round(tri_coords, decimals=5)
+    unique_verts, inverse_indices = np.unique(tri_coords_snapped, axis=0, return_inverse=True)
     triangles = inverse_indices.reshape(-1, 3).astype(np.int32)
     return unique_verts.astype(np.float64), triangles
 

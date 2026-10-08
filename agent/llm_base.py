@@ -11,46 +11,18 @@ import atexit
 import json
 import queue
 import re
-import socket
 import threading
 import time
 from copy import deepcopy
 from typing import Any
 
 import httpx
-import requests
-import requests.adapters
 
 from agent.activity_log import summarize_llm_messages
 from agent.prompt import TOOL_IMAGE_PROMPT
 from agent.settings import Settings
 
 PROVIDER_LABELS = {"openrouter": "OpenRouter", "openai": "OpenAI", "ollama": "Ollama"}
-
-
-# Module-level HTTP session. ``requests.Session`` keeps an internal urllib3
-# connection pool so every LLM call to the same provider reuses the
-# previous TCP/TLS handshake instead of re-doing DNS resolution, the
-# 3-way handshake, and the TLS 1.3 negotiation. ``session.post`` is
-# thread-safe in urllib3 (the per-host pools take their own locks) so
-# the existing ``request_worker`` daemon thread in
-# :func:`post_with_cancel` can hand the work off without a second lock.
-_HTTP_SESSION: requests.Session = requests.Session()
-# Size the urllib3 connection pool per scheme. The default is 10/10
-# connections, which is enough for a single in-flight LLM call but tight
-# once the orchestrator fans out reviewer + dispatcher requests in
-# parallel. 8 hosts / 16 connections leaves headroom for those bursts
-# without unbounded growth — ``atexit`` closes the session so the
-# descriptors are released on shutdown.
-_HTTP_SESSION.mount(
-    "https://",
-    requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=16),
-)
-_HTTP_SESSION.mount(
-    "http://",
-    requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=16),
-)
-atexit.register(_HTTP_SESSION.close)
 
 # Module-level HTTP/2 client for streaming Chat Completions without HTTP/1.1
 # chunk-size reassembly buffering. HTTP/2 binary DATA frames multiplex over
@@ -578,27 +550,10 @@ def post_with_cancel(
 
 
 def _force_close_response(response: Any | None) -> None:
-    """Force-close a streaming ``Response``, releasing the underlying socket."""
+    """Force-close a streaming ``Response``, releasing the underlying stream/socket."""
     if response is None:
         return
     try:
-        raw = getattr(response, "raw", None)
-        if raw is not None:
-            conn = getattr(raw, "_connection", None)
-            sock = getattr(conn, "sock", None) if conn else None
-            if sock is None and hasattr(raw, "_fp") and hasattr(raw._fp, "fp"):
-                r = getattr(raw._fp.fp, "raw", None)
-                if r and hasattr(r, "_sock"):
-                    sock = r._sock
-            if sock is not None:
-                try:
-                    sock.shutdown(socket.SHUT_RDWR)
-                except Exception:
-                    pass
-            try:
-                raw.close()
-            except Exception:
-                pass
         close = getattr(response, "close", None)
         if callable(close):
             close()
@@ -985,12 +940,13 @@ def parse_chat_stream(
 
     # Some reasoning-first models (Anthropic extended thinking, OpenAI o-series,
     # Gemini thinking) emit reasoning deltas with no text content and finish
-    # cleanly. Surface the reasoning as the assistant's substantive response so
-    # the caller can still complete its turn instead of crashing the loop on
-    # an opaque "empty completion" error.
+    # cleanly. Set a safe placeholder message instead of leaking raw internal
+    # monologue into the user chat bubble.
     if not content and not tool_calls:
         if reasoning_text.strip() and finish_reason in (None, "stop"):
-            content = reasoning_text.strip()
+            content = (
+                "Model completed its reasoning process but did not produce an action or final response."
+            )
         else:
             reason = finish_reason or "unknown"
             raise RuntimeError(

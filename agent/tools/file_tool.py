@@ -99,6 +99,26 @@ class OpenScadPreflight:
                 return
 
         # 3. Check balanced delimiters
+        delimiter_err = self.check_delimiters(code)
+        if delimiter_err:
+            _err_code, err_msg, _lineno = delimiter_err
+            self.blocked_errors.append(err_msg)
+            return
+
+        # 4. Check for UPPER_CASE parameter definition
+        has_params = bool(re.search(r"^[ \t]*[A-Z][A-Z0-9_]*[ \t]*=", code, re.MULTILINE))
+        if not has_params:
+            self.warnings.append(
+                "PRE-FLIGHT WARNING: No UPPER_CASE parameters declared at top of model.scad. "
+                "Define numeric parameters at top (e.g. WIDTH = 50;)."
+            )
+
+    @staticmethod
+    def check_delimiters(code: str) -> tuple[str, str, int | None] | None:
+        """Validate delimiter balance and unclosed literals in OpenSCAD code.
+
+        Returns (error_code, error_message, lineno) if an error is found, or None.
+        """
         pairs = {"{": "}", "[": "]", "(": ")"}
         stack: list[tuple[str, int]] = []
         in_line_comment = False
@@ -157,36 +177,31 @@ class OpenScadPreflight:
                 stack.append((char, lineno))
             elif char in pairs.values():
                 if not stack:
-                    self.blocked_errors.append(f"Unmatched closing '{char}' at line {lineno}.")
-                    return
+                    return (
+                        "UNMATCHED_CLOSING_DELIMITER",
+                        f"Unmatched closing '{char}' at line {lineno}.",
+                        lineno,
+                    )
                 top, top_line = stack.pop()
                 if pairs[top] != char:
-                    self.blocked_errors.append(
-                        f"Mismatched delimiter: opened '{top}' at line {top_line} but closed with '{char}' at line {lineno}."
+                    return (
+                        "MISMATCHED_DELIMITER",
+                        f"Mismatched delimiter: opened '{top}' at line {top_line} but closed with '{char}' at line {lineno}.",
+                        lineno,
                     )
-                    return
             i += 1
 
         if in_string:
-            self.blocked_errors.append("Unclosed string literal.")
-            return
+            return ("UNCLOSED_STRING", "Unclosed string literal in model.scad.", None)
 
         if in_block_comment:
-            self.blocked_errors.append("Unclosed block comment.")
-            return
+            return ("UNCLOSED_BLOCK_COMMENT", "Unclosed block comment (/* ... */) in model.scad.", None)
 
         if stack:
             unclosed, start_line = stack[-1]
-            self.blocked_errors.append(f"Unclosed delimiter '{unclosed}' opened at line {start_line}.")
-            return
+            return ("UNCLOSED_DELIMITER", f"Unclosed delimiter '{unclosed}' opened at line {start_line}.", start_line)
 
-        # 4. Check for UPPER_CASE parameter definition
-        has_params = bool(re.search(r"^[ \t]*[A-Z][A-Z0-9_]*[ \t]*=", code, re.MULTILINE))
-        if not has_params:
-            self.warnings.append(
-                "PRE-FLIGHT WARNING: No UPPER_CASE parameters declared at top of model.scad. "
-                "Define numeric parameters at top (e.g. WIDTH = 50;)."
-            )
+        return None
 
 
 class MatchError(ValueError):
@@ -359,7 +374,8 @@ class FileTool:
             return ((start, end), old_string, new_string)
         if matches > 1:
             raise MatchError(
-                f"expected one exact match, found {matches}; file was not changed."
+                f"expected one exact match, found {matches}; file was not changed. "
+                "Call read_file to inspect the current file and find a larger unique context block."
             )
 
         # 2. Whitespace-tolerant match (only when exact match found 0 matches)
@@ -368,7 +384,8 @@ class FileTool:
         k = len(old_lines)
         if k == 0 or len(file_lines) < k:
             raise MatchError(
-                "expected one exact match, found 0; file was not changed."
+                "expected one exact match, found 0; file was not changed. "
+                "Call read_file to inspect the current file content."
             )
 
         # Attempt A: Trailing-whitespace/line-ending normalization (indent matches)
@@ -413,11 +430,13 @@ class FileTool:
 
         if len(candidates) > 1:
             raise MatchError(
-                f"expected one match, found {len(candidates)} after whitespace normalization; file was not changed."
+                f"expected one match, found {len(candidates)} after whitespace normalization; file was not changed. "
+                "Call read_file to inspect the current file and find a larger unique context block."
             )
 
         raise MatchError(
-            "expected one exact match, found 0; file was not changed."
+            "expected one exact match, found 0; file was not changed. "
+            "Call read_file to inspect the current file content."
         )
 
     def edit_file(
@@ -426,44 +445,14 @@ class FileTool:
         old_string: str,
         new_string: str = "",
     ) -> str:
+        """Replace a unique occurrence of ``old_string`` with ``new_string``."""
         if not isinstance(old_string, str) or not old_string:
             raise ValueError("old_string must not be empty.")
-        if new_string is None:
-            new_string = ""
-        elif not isinstance(new_string, str):
+        if new_string is not None and not isinstance(new_string, str):
             raise ValueError("new_string must be a string.")
-        path = self._path(filename)
-        with _file_lock(path):
-            if not path.exists():
-                raise ValueError(
-                    f"{filename} does not exist; use write_file to create it."
-                )
-            current = path.read_text(encoding="utf-8")
-            try:
-                (start, end), old_match, replacement = self._resolve_match(
-                    current, old_string, new_string
-                )
-            except MatchError as err:
-                # MatchError messages are formatted in lowercase (intended
-                # to slot into compound sentences). Capitalise the first
-                # letter for end-user display — this branch is reached
-                # only when we *know* the exception came from our own
-                # resolver, so the casing assumption is safe.
-                msg = str(err)
-                if msg and msg[0].islower():
-                    msg = msg[0].upper() + msg[1:]
-                raise ValueError(msg) from None
-            updated = current[:start] + replacement + current[end:]
-            start_line = current[:start].count("\n") + 1
-            old_lines = len(old_match.splitlines()) or 1
-            end_line = start_line + old_lines - 1
-            new_lines = len(replacement.splitlines()) or 1
-            new_end_line = start_line + new_lines - 1
-            base = self._write_model(updated, "edit_file")
-        return (
-            f"{base} "
-            f"(replaced lines {start_line}-{end_line} with lines "
-            f"{start_line}-{new_end_line})."
+        return self.edit_file_atomic(
+            filename,
+            [{"old_string": old_string, "new_string": new_string if new_string is not None else ""}],
         )
 
     def edit_file_atomic(
@@ -498,7 +487,7 @@ class FileTool:
         path = self._path(filename)
         with _file_lock(path):
             if not path.exists():
-                raise ValueError(
+                raise FileNotFoundError(
                     f"{filename} does not exist; use write_file to create it."
                 )
             current = path.read_text(encoding="utf-8")
@@ -512,7 +501,11 @@ class FileTool:
                         current, old_string, new_string
                     )
                 except ValueError as err:
-                    raise ValueError(f"edits[{index}] {err}") from None
+                    prefix = f"edits[{index}] " if len(normalised) > 1 else ""
+                    msg = str(err)
+                    if not prefix and msg and msg[0].islower():
+                        msg = msg[0].upper() + msg[1:]
+                    raise ValueError(f"{prefix}{msg}") from None
                 resolved.append(((start, end), old_match, replacement))
             # Reject any pair of edits whose resolved byte ranges overlap.
             ordered = sorted(resolved, key=lambda entry: entry[0][0])
