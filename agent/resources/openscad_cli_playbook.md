@@ -3,7 +3,7 @@
 ## 1. Global Setup & Syntax Traps
 
 ```scad
-$fn = 60;     // Circle resolution (clamp to <= 60 to prevent timeouts)
+$fn = 32;     // Circle resolution (keep 24-32 for drafting/fast iteration, <= 60 for final)
 EPS = 0.01;   // Manifold clearance for cutters/overlaps
 ```
 
@@ -43,7 +43,7 @@ EPS = 0.01;   // Manifold clearance for cutters/overlaps
 
 * **2D-Only Children:** `linear_extrude()` and `rotate_extrude()` accept **strictly 2D children** (`circle`, `square`, `polygon`, `offset()`). Passing 3D objects causes a fatal error.
 * **Revolve Rule ($X \ge 0$):** In `rotate_extrude()`, the entire 2D profile must sit at $X \ge 0$. Crossing $X = 0$ crashes the compiler.
-* **Minkowski Ban:** **Never use 3D `minkowski()`** (causes compiler lockup). Use `hull()` or 2D `offset()` before extrusion.
+* **Minkowski Ban & Hull Scaling:** **Never use 3D `minkowski()`** (causes compiler lockup). Use `hull()` or 2D `offset()` before extrusion. Avoid chaining hundreds of `hull()` calls in loops for continuous geometries (e.g. threads); use `linear_extrude(twist=...)` or `polyhedron()` to prevent CGAL compiler freezing.
 * **Transforms:** Evaluate right-to-left (innermost executes first):
   ```scad
   translate([x, y, z]) rotate([ax, ay, az]) shape(); // Rotate locally, then translate

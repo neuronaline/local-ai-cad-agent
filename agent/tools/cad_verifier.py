@@ -261,33 +261,38 @@ class CadVerifier:
         # 4. Golden Rules: $fn check
         fn_match = re.search(r"\$fn\s*=\s*([0-9]+)\s*;", clean_code)
         fn_val = int(fn_match.group(1)) if fn_match else None
-        if fn_val is None:
+        fa_match = re.search(r"\$fa\s*=\s*([0-9\.]+)\s*;", clean_code)
+        fs_match = re.search(r"\$fs\s*=\s*([0-9\.]+)\s*;", clean_code)
+        has_adaptive_facets = bool(fa_match and fs_match)
+
+        if fn_val is None and not has_adaptive_facets:
             findings.append(
                 Finding(
                     category="WARNING",
                     code="MISSING_FN",
-                    message="No global $fn declared at top of model.scad (e.g. $fn = 60;).",
+                    message="No global $fn declared at top of model.scad (e.g. $fn = 32; or $fa = 6; $fs = 1;).",
                     impact="Circles and cylinders will render with coarse, unpredictable default facets.",
                 )
             )
-        elif fn_val > 100:
-            findings.append(
-                Finding(
-                    category="WARNING",
-                    code="EXCESSIVE_FN",
-                    message=f"$fn is set to {fn_val} (> 100).",
-                    impact="Excessive triangle count causes slow rendering and sandbox timeouts.",
+        elif fn_val is not None:
+            if fn_val > 100:
+                findings.append(
+                    Finding(
+                        category="WARNING",
+                        code="EXCESSIVE_FN",
+                        message=f"$fn is set to {fn_val} (> 100).",
+                        impact="Excessive triangle count causes slow rendering and sandbox timeouts.",
+                    )
                 )
-            )
-        elif fn_val < 20:
-            findings.append(
-                Finding(
-                    category="WARNING",
-                    code="LOW_FN",
-                    message=f"$fn is set to {fn_val} (< 20).",
-                    impact="Cylindrical surfaces will have noticeable polygonal faceting.",
+            elif fn_val < 16:
+                findings.append(
+                    Finding(
+                        category="WARNING",
+                        code="LOW_FN",
+                        message=f"$fn is set to {fn_val} (< 16).",
+                        impact="Cylindrical surfaces will have noticeable polygonal faceting.",
+                    )
                 )
-            )
 
         # 5. Golden Rules: EPS constant & difference() cutter overshoot rule
         eps_match = re.search(r"\bEPS\s*=\s*([0-9\.]+(?:[eE][-+]?[0-9]+)?)\s*;", clean_code)

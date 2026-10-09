@@ -338,7 +338,7 @@ def _worker_render(args: tuple[str, dict[str, object]]) -> dict[str, object]:
     ) as buffer:
         buffer_path = Path(buffer.name)
     try:
-        image.save(buffer_path, "PNG", optimize=True)
+        image.save(buffer_path, "PNG", compress_level=1)
         data = buffer_path.read_bytes()
     finally:
         buffer_path.unlink(missing_ok=True)
@@ -356,6 +356,47 @@ def _max_workers(requested: int) -> int:
     return min(bounded, cpu)
 
 
+_VIEW_ALIASES: dict[str, str] = {
+    "all": "all",
+    "sheet": "all",
+    "contact": "all",
+    "contact_sheet": "all",
+    "review-sheet": "all",
+    "review_sheet": "all",
+    "overview": "all",
+    "isometric": "isometric_positive",
+    "iso": "isometric_positive",
+    "iso+": "isometric_positive",
+    "iso_pos": "isometric_positive",
+    "iso_positive": "isometric_positive",
+    "isometric+": "isometric_positive",
+    "isometric_positive": "isometric_positive",
+    "iso-": "isometric_negative",
+    "iso_neg": "isometric_negative",
+    "iso_negative": "isometric_negative",
+    "isometric-": "isometric_negative",
+    "isometric_negative": "isometric_negative",
+    "top": "z_positive",
+    "+z": "z_positive",
+    "bottom": "z_negative",
+    "-z": "z_negative",
+    "front": "y_negative",
+    "-y": "y_negative",
+    "back": "y_positive",
+    "+y": "y_positive",
+    "right": "x_positive",
+    "+x": "x_positive",
+    "left": "x_negative",
+    "-x": "x_negative",
+    "x_positive": "x_positive",
+    "x_negative": "x_negative",
+    "y_positive": "y_positive",
+    "y_negative": "y_negative",
+    "z_positive": "z_positive",
+    "z_negative": "z_negative",
+}
+
+
 def render_views(
     source_shape=None,
     output_dir: Path | None = None,
@@ -364,8 +405,9 @@ def render_views(
     required_views: int = _DEFAULT_VIEW_COUNT,
     vertices: np.ndarray | None = None,
     triangles: np.ndarray | None = None,
+    requested_views: Sequence[str] | None = None,
 ) -> dict[str, object]:
-    """Render every required canonical view and persist them under ``output_dir``.
+    """Render required canonical views and persist them under ``output_dir``.
 
     The caller must supply either ``source_shape`` (which can provide
     vertices/triangles) or the pre-tessellated ``vertices``/``triangles`` pair.
@@ -383,7 +425,24 @@ def render_views(
         )
     if vertices is None or triangles is None:
         vertices, triangles = _tessellate(source_shape)
-    selected = tuple(VIEWS[: max(1, int(required_views))])
+
+    if requested_views:
+        resolved_ids: set[str] = set()
+        use_all = False
+        for raw_view in requested_views:
+            alias = _VIEW_ALIASES.get(str(raw_view).lower(), str(raw_view))
+            if alias == "all":
+                use_all = True
+                break
+            resolved_ids.add(alias)
+        if use_all:
+            selected = tuple(VIEWS[: max(1, int(required_views))])
+        else:
+            selected = tuple(spec for spec in VIEWS if spec.view_id in resolved_ids)
+            if not selected:
+                selected = tuple(VIEWS[: max(1, int(required_views))])
+    else:
+        selected = tuple(VIEWS[: max(1, int(required_views))])
     workers = _max_workers(max_workers)
 
     # The mesh is small (<= a few MB); pickle it once for every worker.
@@ -486,7 +545,7 @@ def render_iso(vertices: np.ndarray, triangles: np.ndarray, output_path: Path) -
         camera_axis=spec.camera_axis,
         screen_x_axis=spec.screen_x_axis,
     )
-    Image.fromarray(pixels, "RGB").save(output_path, "PNG", optimize=True)
+    Image.fromarray(pixels, "RGB").save(output_path, "PNG", compress_level=1)
 
 
 def build_contact_sheet(view_dir: Path, output_path: Path) -> dict[str, object]:
@@ -523,7 +582,7 @@ def build_contact_sheet(view_dir: Path, output_path: Path) -> dict[str, object]:
             f"{spec.label} ({spec.view_id})",
             fill=(210, 220, 240),
         )
-    sheet.save(output_path, "PNG", optimize=True)
+    sheet.save(output_path, "PNG", compress_level=1)
     return {
         "path": "review-sheet.png",
         "width": sheet.size[0],

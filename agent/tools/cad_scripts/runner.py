@@ -201,6 +201,7 @@ def _run_model(
     should_write_iso = bool(settings.get("write_isometric", False))
     render_workers = int(settings.get("render_workers", 4) or 4)
     required_views = int(settings.get("required_views", 8) or 8)
+    enable_manifold = bool(settings.get("enable_manifold", False))
 
     # 1. Compile model.scad to binary STL (headless CGAL/CSG evaluation)
     preview_stl = Path("preview.stl")
@@ -210,8 +211,10 @@ def _run_model(
         str(preview_stl),
         "--export-format",
         "binstl",
-        str(model_path),
     ]
+    if enable_manifold:
+        compile_cmd.append("--enable=manifold")
+    compile_cmd.append(str(model_path))
     try:
         proc = subprocess.run(
             compile_cmd,
@@ -272,17 +275,7 @@ def _run_model(
     review_dir = Path(".review-views")
     review_manifest_payload: dict[str, Any] = {}
     single_render_payload: dict[str, Any] = {}
-
-    if should_write_iso:
-        render_path = Path("render.png")
-        _write_isometric_artifact(vertices, triangles)
-        single_render_payload = {
-            "path": "render.png",
-            "width": _WIDTH,
-            "height": _HEIGHT,
-            "image_sha256": hashlib.sha256(render_path.read_bytes()).hexdigest(),
-            "image_bytes": render_path.stat().st_size,
-        }
+    requested_views = settings.get("requested_views")
 
     if should_render:
         review_manifest = render_views(
@@ -292,11 +285,27 @@ def _run_model(
             required_views=required_views,
             vertices=vertices,
             triangles=triangles,
+            requested_views=requested_views,
         )
         review_sheet_path = Path(".review-sheet.png")
         sheet_info = build_contact_sheet(review_dir, review_sheet_path)
 
         views_list = review_manifest.get("views", [])
+        if should_write_iso:
+            render_path = Path("render.png")
+            iso_view_path = review_dir / "isometric_positive.png"
+            if iso_view_path.is_file() and iso_view_path.stat().st_size > 0:
+                shutil.copyfile(iso_view_path, render_path)
+            else:
+                _write_isometric_artifact(vertices, triangles)
+            single_render_payload = {
+                "path": "render.png",
+                "width": _WIDTH,
+                "height": _HEIGHT,
+                "image_sha256": hashlib.sha256(render_path.read_bytes()).hexdigest(),
+                "image_bytes": render_path.stat().st_size,
+            }
+
         review_manifest_payload = {
             "model_sha256": hashlib.sha256(model_code.encode("utf-8")).hexdigest(),
             "preview_sha256": preview_sha256,
@@ -308,6 +317,16 @@ def _run_model(
             "views": views_list,
             "contact_sheet": sheet_info,
             "single_render": single_render_payload,
+        }
+    elif should_write_iso:
+        render_path = Path("render.png")
+        _write_isometric_artifact(vertices, triangles)
+        single_render_payload = {
+            "path": "render.png",
+            "width": _WIDTH,
+            "height": _HEIGHT,
+            "image_sha256": hashlib.sha256(render_path.read_bytes()).hexdigest(),
+            "image_bytes": render_path.stat().st_size,
         }
 
     # 6. Save .cad_metrics.json

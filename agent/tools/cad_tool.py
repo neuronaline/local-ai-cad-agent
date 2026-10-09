@@ -46,6 +46,29 @@ _REVIEW_VIEWS_DIR = "views"
 _REVIEW_SHEET_NAME = "review-sheet.png"
 
 
+_MANIFOLD_SUPPORTED: bool | None = None
+
+
+def _supports_manifold() -> bool:
+    """Return True if the host OpenSCAD installation supports the fast Manifold CSG engine."""
+    global _MANIFOLD_SUPPORTED
+    if _MANIFOLD_SUPPORTED is not None:
+        return _MANIFOLD_SUPPORTED
+    try:
+        proc = subprocess.run(
+            ["openscad", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        out = (proc.stdout or "") + (proc.stderr or "")
+        _MANIFOLD_SUPPORTED = "--enable=manifold" in out
+    except Exception:
+        _MANIFOLD_SUPPORTED = False
+    return _MANIFOLD_SUPPORTED
+
+
 class RenderMode(Enum):
     """Validated execution modes for :class:`CadTool`.
 
@@ -133,7 +156,11 @@ class CadTool:
 
     # ------------------------------------------------------------------ build
 
-    def _runner_settings(self, mode: RenderMode) -> dict[str, Any]:
+    def _runner_settings(
+        self,
+        mode: RenderMode,
+        requested_views: list[str] | None = None,
+    ) -> dict[str, Any]:
         """JSON-kwarg payload forwarded to ``runner.main`` as ``argv[1]``.
 
         Replaces the legacy module-level globals in ``runner.py`` so the
@@ -146,22 +173,102 @@ class CadTool:
             "write_isometric": mode.produces_render,
             "render_workers": self._review_render_workers,
             "required_views": self._review_required_views,
+            "requested_views": requested_views,
+            "enable_manifold": _supports_manifold(),
         }
 
     def _execute(
         self,
         mode: RenderMode = RenderMode.NONE,
         call_id: str = "",
+        requested_views: list[str] | None = None,
     ) -> dict[str, Any]:
         model_path = self.project_dir / MODEL_FILENAME
         if not model_path.exists():
             raise ValueError(f"{MODEL_FILENAME} does not exist yet.")
         model_code = model_path.read_text(encoding="utf-8")
         FileTool.validate_model(model_code)
+
+        model_sha = hashlib.sha256(model_code.encode("utf-8")).hexdigest()
+        cache_dir = self.project_dir / ".cad-agent" / "cache" / model_sha
+        cached_stl = cache_dir / "preview.stl"
+        cached_metrics_path = cache_dir / ".cad_metrics.json"
+
+        # Check whether cache can satisfy this build
+        can_use_cache = (
+            cached_stl.is_file()
+            and cached_stl.stat().st_size > 0
+            and cached_metrics_path.is_file()
+            and cached_metrics_path.stat().st_size > 0
+        )
+        if can_use_cache and mode.produces_render:
+            can_use_cache = (cache_dir / "render.png").is_file() and (cache_dir / "render.png").stat().st_size > 0
+
+        cached_review_manifest = None
+        if can_use_cache and mode.produces_manifest:
+            review_dir_path = self._review_dir(model_sha)
+            manifest = self._read_review_manifest(review_dir_path)
+            if manifest and self._review_is_fresh(
+                review_dir_path,
+                manifest.get("preview_sha256", ""),
+                manifest.get("contact_sheet", {}).get("image_sha256"),
+            ):
+                from agent.tools.image_tool import VIEW_ALIASES
+                cached_views = {
+                    v.get("view_id") for v in manifest.get("views", []) if isinstance(v, dict)
+                }
+                views_to_check = requested_views if requested_views is not None else ["all"]
+                all_views_present = True
+                for rv in views_to_check:
+                    canonical = VIEW_ALIASES.get(str(rv).lower(), str(rv))
+                    if canonical == "all":
+                        if len(cached_views) < self._review_required_views:
+                            all_views_present = False
+                            break
+                    elif canonical not in cached_views:
+                        all_views_present = False
+                        break
+                if all_views_present:
+                    cached_review_manifest = manifest
+                else:
+                    can_use_cache = False
+            else:
+                can_use_cache = False
+
+        if can_use_cache:
+            try:
+                cached = json.loads(cached_metrics_path.read_text(encoding="utf-8"))
+                metrics = cached.get("metrics")
+                if isinstance(metrics, dict):
+                    self._enforce_basic_geometry(metrics)
+                    self._atomic_copy(cached_stl, self.project_dir / "preview.stl")
+                    self._atomic_copy(cached_metrics_path, self.project_dir / ".cad_metrics.json")
+                    if mode.produces_render:
+                        self._atomic_copy(cache_dir / "render.png", self.project_dir / "render.png")
+                    self._record_build_success(metrics)
+                    preview_sha = (
+                        cached.get("preview_sha256")
+                        or hashlib.sha256(cached_stl.read_bytes()).hexdigest()
+                    )
+                    return {
+                        "metrics": metrics,
+                        "feature_summary": cached.get("feature_summary") or {},
+                        "declared_parameters": cached.get("declared_parameters") or [],
+                        "validation_results": cached.get("validation_results") or [],
+                        "model_sha256": model_sha,
+                        "preview_sha256": preview_sha,
+                        "review_manifest": cached_review_manifest or cached.get("review_manifest"),
+                        "review_views_dir": None,
+                        "review_sheet_path": None,
+                        "cached": True,
+                    }
+            except Exception:
+                pass  # Fall back to normal sandbox execution on cache read issue
+
         # Copy ``renderer.py`` / ``runner.py`` as siblings into the
         # workspace and pass render settings as JSON on ``argv[1]`` so
         # the sandbox stays at arm's length from the host.
-        settings_payload = json.dumps(self._runner_settings(mode))
+        settings_payload = json.dumps(self._runner_settings(mode, requested_views=requested_views))
 
         with tempfile.TemporaryDirectory(prefix="cad-agent-") as temporary:
             workspace = Path(temporary)
@@ -414,6 +521,17 @@ class CadTool:
         staging.mkdir(parents=True, exist_ok=True)
         views_target = staging / _REVIEW_VIEWS_DIR
         views_target.mkdir(exist_ok=True)
+        existing_manifest = self._read_review_manifest(review_dir)
+        merged_views: dict[str, Any] = {}
+        if existing_manifest and existing_manifest.get("preview_sha256") == preview_sha256:
+            existing_views_dir = review_dir / _REVIEW_VIEWS_DIR
+            for ev in existing_manifest.get("views", []) or []:
+                vid = ev.get("view_id")
+                src = existing_views_dir / f"{vid}.png"
+                if vid and src.is_file():
+                    merged_views[vid] = ev
+                    shutil.copyfile(src, views_target / f"{vid}.png")
+
         try:
             for entry in views:
                 view_id = entry.get("view_id")
@@ -438,19 +556,36 @@ class CadTool:
                         f"Review view {view_id} hash mismatch: "
                         f"expected {expected_sha[:12]}, got {actual_sha[:12]}."
                     )
-            sheet_target = staging / _REVIEW_SHEET_NAME
-            shutil.copyfile(sheet_path, sheet_target)
-            actual_sheet_sha = hashlib.sha256(sheet_target.read_bytes()).hexdigest()
-            expected_sheet_sha = contact_sheet.get("image_sha256")
-            if (
-                expected_sheet_sha
-                and actual_sheet_sha != expected_sheet_sha
-            ):
-                raise RuntimeError("Review contact sheet hash mismatch.")
+                merged_views[view_id] = entry
 
             persisted_manifest = dict(review_manifest)
+            sheet_target = staging / _REVIEW_SHEET_NAME
+            kept_existing_sheet = False
+            if (
+                existing_manifest
+                and existing_manifest.get("preview_sha256") == preview_sha256
+                and len(existing_manifest.get("views", []) or []) > len(views)
+                and (review_dir / _REVIEW_SHEET_NAME).is_file()
+            ):
+                shutil.copyfile(review_dir / _REVIEW_SHEET_NAME, sheet_target)
+                persisted_manifest["contact_sheet"] = existing_manifest.get("contact_sheet") or contact_sheet
+                kept_existing_sheet = True
+
+            if not kept_existing_sheet:
+                shutil.copyfile(sheet_path, sheet_target)
+                actual_sheet_sha = hashlib.sha256(sheet_target.read_bytes()).hexdigest()
+                expected_sheet_sha = contact_sheet.get("image_sha256")
+                if (
+                    expected_sheet_sha
+                    and actual_sheet_sha != expected_sheet_sha
+                ):
+                    raise RuntimeError("Review contact sheet hash mismatch.")
+                persisted_manifest["contact_sheet"] = contact_sheet
+
             persisted_manifest["artifact_dir"] = review_dir.name
             persisted_manifest["preview_sha256"] = preview_sha256
+            persisted_manifest["views"] = list(merged_views.values())
+            persisted_manifest["view_count"] = len(merged_views)
             (staging / _REVIEW_MANIFEST_NAME).write_text(
                 json.dumps(persisted_manifest, ensure_ascii=False, indent=2),
                 encoding="utf-8",
@@ -605,11 +740,20 @@ class CadTool:
     def build(
         self,
         mode: RenderMode = RenderMode.FULL_REVIEW,
+        requested_views: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Compile model.scad, generate render artifacts, and verify geometry deterministically."""
+        """Compile model.scad, generate render artifacts, and verify geometry deterministically.
+
+        :param mode: RenderMode (NONE for fast preview STL + metrics, FULL_REVIEW for rendered views).
+        :param requested_views: Optional list of view names or aliases (e.g. ['isometric_positive', 'front'])
+            to selectively render instead of generating all canonical views.
+        """
         if not isinstance(mode, RenderMode):
             raise TypeError("build mode must be a RenderMode.")
-        execute_args: dict[str, Any] = {"mode": mode}
+        execute_args: dict[str, Any] = {
+            "mode": mode,
+            "requested_views": requested_views,
+        }
         if self._call_id:
             execute_args["call_id"] = self._call_id
         payload = self._execute(**execute_args)
@@ -634,16 +778,23 @@ class CadTool:
             result["model_sha256"] = model_sha
         if preview_sha:
             result["preview_sha256"] = preview_sha
+        if payload.get("cached"):
+            result["cached"] = True
         if mode.produces_manifest:
             review_manifest = payload.get("review_manifest")
             review_path: str | None = None
             if review_manifest:
-                promoted = self.promote_review(
-                    review_manifest,
-                    sandbox_views_dir=payload.get("review_views_dir") or "",
-                    sandbox_sheet_path=payload.get("review_sheet_path") or "",
-                )
-                review_path = promoted.get("artifact_dir")
+                if payload.get("cached"):
+                    review_path = review_manifest.get("artifact_dir") or (
+                        self._review_dir(model_sha).name if model_sha else None
+                    )
+                else:
+                    promoted = self.promote_review(
+                        review_manifest,
+                        sandbox_views_dir=payload.get("review_views_dir") or "",
+                        sandbox_sheet_path=payload.get("review_sheet_path") or "",
+                    )
+                    review_path = promoted.get("artifact_dir")
             if review_path:
                 result["review"] = review_path
 
@@ -665,9 +816,10 @@ class CadTool:
     def build_and_verify(
         self,
         mode: RenderMode = RenderMode.FULL_REVIEW,
+        requested_views: list[str] | None = None,
     ) -> dict[str, Any]:
         """Legacy alias for :meth:`build`."""
-        return self.build(mode=mode)
+        return self.build(mode=mode, requested_views=requested_views)
 
     def stop(self) -> None:
         with self._lock:

@@ -69,12 +69,103 @@ button[aria-pressed="true"] { border-color: #5d7ed7; background: #233966; color:
 .chat-feed::-webkit-scrollbar, .drawer-content::-webkit-scrollbar { width: 7px; }
 .chat-feed::-webkit-scrollbar-thumb, .drawer-content::-webkit-scrollbar-thumb { border-radius: 99px; background: #33435f; }
 .message { max-width: 100%; border: 1px solid var(--line); border-radius: var(--radius); padding: .5rem .6rem; font-size: .85rem; line-height: 1.45; }
-.message.user { align-self: flex-end; max-width: 88%; border-color: #5474cf; background: #1b3263; white-space: pre-wrap; }
+.message.user { align-self: flex-end; max-width: 88%; min-width: 110px; border-color: #5474cf; background: #1b3263; word-break: break-word; }
 .message.agent { background: var(--surface-raised); border-left: 2px solid var(--accent); }
 .message.error { border-color: #703844; background: #331f29; color: #ffd4da; white-space: pre-wrap; }
-.message-meta { display: flex; align-items: center; gap: .35rem; margin-bottom: .28rem; color: var(--muted); font-size: .66rem; }
+.message-meta { display: flex; align-items: center; gap: .35rem; margin-bottom: .28rem; color: var(--muted); font-size: .66rem; white-space: nowrap; }
 .agent-mark { display: grid; width: 19px; height: 16px; place-items: center; border-radius: 4px; background: #2d4780; color: #dfe7ff; font-size: .56rem; font-weight: 800; }
+.user-mark { display: grid; width: 19px; height: 16px; place-items: center; border-radius: 4px; background: #2b467e; color: #d0e1fd; font-size: .56rem; font-weight: 800; }
+.user-meta { color: #9cb3db; }
 .message-author { color: #cbd7ee; font-weight: 700; }
+.message-copy-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.15rem 0.35rem;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.65rem;
+  cursor: pointer;
+  opacity: 0.65;
+  transition: all 0.15s ease;
+}
+.message:hover .message-copy-btn,
+.message-copy-btn:focus-visible,
+.message-copy-btn.copied {
+  opacity: 1;
+}
+.message-copy-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: var(--line);
+  color: var(--text);
+}
+.message.user .message-copy-btn {
+  color: #9cb3db;
+}
+.message.user .message-copy-btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(255, 255, 255, 0.2);
+  color: #ffffff;
+}
+.message-copy-btn.copied,
+.message.user .message-copy-btn.copied {
+  background: rgba(52, 211, 153, 0.15);
+  border-color: rgba(52, 211, 153, 0.4);
+  color: #34d399;
+}
+.message-copy-btn .icon {
+  width: 12px;
+  height: 12px;
+}
+.message.user .message-copy-btn,
+.message.agent .message-state:empty + .message-copy-btn,
+.message.agent .message-copy-btn:only-child {
+  margin-left: auto;
+}
+.message-state:empty {
+  display: none;
+}
+.message.user .message-text {
+  color: #e8f0fe;
+  line-height: 1.5;
+}
+.message.user .message-text > :first-child { margin-top: 0; }
+.message.user .message-text > :last-child { margin-bottom: 0; }
+.message.user p { margin: 0.25rem 0; }
+.message.user ul, .message.user ol { margin: 0.3rem 0; padding-left: 1.4rem; }
+.message.user li { margin: 0.15rem 0; }
+.message.user li::marker { color: #8bb2ff; font-weight: 600; }
+.message.user pre {
+  margin: 0.35rem 0;
+  padding: 0.5rem;
+  border-radius: 6px;
+  background: #0d1a33;
+  border: 1px solid rgba(84, 116, 207, 0.4);
+}
+.message.user code {
+  padding: 0.08rem 0.25rem;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.14);
+  color: #ffffff;
+  font-size: 0.85em;
+}
+.message.user pre code {
+  padding: 0;
+  background: none;
+  color: inherit;
+}
+.message.user a {
+  color: #9ec2ff;
+  text-decoration: underline;
+}
+.message.user blockquote {
+  margin: 0.35rem 0;
+  padding-left: 0.6rem;
+  border-left: 3px solid #5474cf;
+  color: #b7cceb;
+}
 .message-state {
   margin-left: auto;
   font-size: 0.68rem;
@@ -182,6 +273,35 @@ button[aria-pressed="true"] { border-color: #5d7ed7; background: #233966; color:
   flex: 1;
   letter-spacing: 0.02em;
 }
+.thought-copy-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.1rem 0.35rem;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: #c084fc;
+  font-size: 0.65rem;
+  cursor: pointer;
+  opacity: 0.7;
+  transition: all 0.15s ease;
+}
+.thought-copy-btn:hover {
+  background: rgba(192, 132, 252, 0.15);
+  border-color: rgba(192, 132, 252, 0.3);
+  opacity: 1;
+}
+.thought-copy-btn.copied {
+  background: rgba(52, 211, 153, 0.15);
+  border-color: rgba(52, 211, 153, 0.4);
+  color: #34d399;
+  opacity: 1;
+}
+.thought-copy-btn .icon {
+  width: 12px;
+  height: 12px;
+}
 .thought-chevron {
   color: #a855f7;
   font-size: 0.7rem;
@@ -194,13 +314,40 @@ button[aria-pressed="true"] { border-color: #5d7ed7; background: #233966; color:
   padding: 0.5rem 0.7rem;
   border-top: 1px solid rgba(192, 132, 252, 0.15);
   color: #cbd5e1;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 0.72rem;
-  line-height: 1.5;
-  white-space: pre-wrap;
+  font-size: 0.76rem;
+  line-height: 1.55;
   word-break: break-word;
   max-height: 280px;
   overflow-y: auto;
+}
+.thought-content > :first-child { margin-top: 0; }
+.thought-content > :last-child { margin-bottom: 0; }
+.thought-content p { margin: 0.35rem 0; }
+.thought-content ul, .thought-content ol { margin: 0.35rem 0; padding-left: 1.4rem; }
+.thought-content li { margin: 0.15rem 0; }
+.thought-content li::marker { color: #c084fc; }
+.thought-content pre {
+  margin: 0.35rem 0;
+  padding: 0.45rem;
+  border-radius: 5px;
+  background: rgba(10, 16, 28, 0.85);
+  border: 1px solid rgba(192, 132, 252, 0.2);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+.thought-content code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.82em;
+  background: rgba(192, 132, 252, 0.15);
+  color: #e9d5ff;
+}
+.thought-content pre code {
+  background: none;
+  color: inherit;
+}
+.thought-content h1, .thought-content h2, .thought-content h3, .thought-content h4 {
+  color: #e9d5ff;
+  font-size: 0.82rem;
+  margin: 0.5rem 0 0.25rem;
 }
 
 .message-content { color: #e3eafa; }

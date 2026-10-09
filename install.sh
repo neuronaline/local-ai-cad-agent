@@ -83,7 +83,7 @@ info "Python dependencies installed."
 # ── Ensure OpenSCAD is available ──
 if ! command -v openscad >/dev/null 2>&1 && [ ! -x "$PROJECT_DIR/.venv/bin/openscad" ]; then
     info "OpenSCAD is not available in system PATH. Setting up standalone OpenSCAD in .venv…"
-    OPENSCAD_APPIMAGE_URL="https://github.com/openscad/openscad/releases/download/openscad-2021.01/OpenSCAD-2021.01-x86_64.AppImage"
+    OPENSCAD_APPIMAGE_URL="${OPENSCAD_APPIMAGE_URL:-https://github.com/openscad/openscad/releases/download/openscad-2021.01/OpenSCAD-2021.01-x86_64.AppImage}"
     OPENSCAD_TMP_APPIMAGE="/tmp/openscad-$$.AppImage"
     if command -v curl >/dev/null 2>&1; then
         curl -fsSL -o "$OPENSCAD_TMP_APPIMAGE" "$OPENSCAD_APPIMAGE_URL" || true

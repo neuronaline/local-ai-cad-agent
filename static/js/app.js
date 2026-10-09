@@ -159,6 +159,47 @@ function stripEncryptedReasoning(text) {
   return text.replace(/(?:\r?\n|\s)+(?:[A-Za-z0-9+/=]{40,}(?:\r?\n|\s)*)+$/g, '').trim();
 }
 
+const COPY_ICON_SVG = `
+  <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+    <rect x="9" y="9" width="13" height="13" rx="2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>
+`;
+
+async function copyTextToClipboard(text, buttonEl = null) {
+  if (!text) return false;
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.focus();
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    if (buttonEl) {
+      const label = buttonEl.querySelector('.copy-label');
+      buttonEl.classList.add('copied');
+      if (label) label.textContent = 'Copied!';
+      if (buttonEl._copiedTimeout) clearTimeout(buttonEl._copiedTimeout);
+      buttonEl._copiedTimeout = setTimeout(() => {
+        buttonEl.classList.remove('copied');
+        if (label) label.textContent = 'Copy';
+        buttonEl._copiedTimeout = null;
+      }, 1500);
+    }
+    return true;
+  } catch (err) {
+    console.error('Failed to copy to clipboard:', err);
+    return false;
+  }
+}
+
 function createThoughtDisclosure(reasoningText = '', isOpen = false, isLive = false) {
   const details = document.createElement('details');
   details.className = 'thought-disclosure';
@@ -168,12 +209,21 @@ function createThoughtDisclosure(reasoningText = '', isOpen = false, isLive = fa
   summary.className = 'thought-summary';
   summary.innerHTML = `
     <span class="thought-title">Thought Process</span>
+    <button type="button" class="thought-copy-btn" title="Copy thought process" aria-label="Copy thought process">
+      ${COPY_ICON_SVG}
+      <span class="copy-label">Copy</span>
+    </button>
     <span class="thought-chevron">▼</span>
   `;
 
   const content = document.createElement('div');
   content.className = 'thought-content';
-  content.textContent = reasoningText;
+  content.dataset.raw = reasoningText;
+  if (reasoningText && reasoningText.trim()) {
+    content.innerHTML = sanitizeHTML(marked.parse(reasoningText));
+  } else {
+    content.innerHTML = '';
+  }
 
   details.appendChild(summary);
   details.appendChild(content);
@@ -199,8 +249,9 @@ function ensureThoughtDisclosure(card, reasoning, isOpen = false, isLive = false
       disclosure.open = true;
     }
     const content = disclosure.querySelector('.thought-content');
-    if (content && content.textContent !== cleanReasoning) {
-      content.textContent = cleanReasoning;
+    if (content && content.dataset.raw !== cleanReasoning) {
+      content.dataset.raw = cleanReasoning;
+      content.innerHTML = cleanReasoning.trim() ? sanitizeHTML(marked.parse(cleanReasoning)) : '';
     }
   }
   return disclosure;
@@ -213,6 +264,7 @@ function addMessage(text, type = 'agent', options = {}) {
   const item = document.createElement('div');
   item.className = `message ${type}`;
   item.dataset.raw = text;
+  item._rawMessage = text;
   if (options.messageId) item.dataset.messageId = options.messageId;
   if (type === 'agent') {
     const isStreaming = Boolean(options.streaming);
@@ -224,6 +276,10 @@ function addMessage(text, type = 'agent', options = {}) {
         <span class="agent-mark">AI</span>
         <span class="message-author">Agent</span>
         <span class="message-state ${isStreaming ? 'state-thinking' : ''}">${isStreaming ? 'Thinking' : ''}</span>
+        <button type="button" class="message-copy-btn" title="Copy message" aria-label="Copy message">
+          ${COPY_ICON_SVG}
+          <span class="copy-label">Copy</span>
+        </button>
       </div>
       <div class="message-content"></div>
     `;
@@ -234,6 +290,18 @@ function addMessage(text, type = 'agent', options = {}) {
   }
   if (type === 'user') {
     item.classList.add('user-message');
+    const meta = document.createElement('div');
+    meta.className = 'message-meta user-meta';
+    meta.innerHTML = `
+      <span class="user-mark">You</span>
+      <span class="message-author">You</span>
+      <button type="button" class="message-copy-btn" title="Copy message" aria-label="Copy message">
+        ${COPY_ICON_SVG}
+        <span class="copy-label">Copy</span>
+      </button>
+    `;
+    item.appendChild(meta);
+
     if (Array.isArray(options.images) && options.images.length) {
       const strip = document.createElement('div');
       strip.className = 'message-attachments';
@@ -250,7 +318,11 @@ function addMessage(text, type = 'agent', options = {}) {
     }
     const textNode = document.createElement('div');
     textNode.className = 'message-text';
-    textNode.textContent = text || '';
+    if (text && text.trim()) {
+      textNode.innerHTML = sanitizeHTML(marked.parse(text));
+    } else {
+      textNode.textContent = text || '';
+    }
     item.appendChild(textNode);
     target.appendChild(item);
     return item;
@@ -1867,6 +1939,10 @@ function getOrCreateRunCard(runId, { target = feed, optimistic = false } = {}) {
       <span class="agent-mark">AI</span>
       <span class="message-author">Agent</span>
       <span class="message-state state-thinking">Thinking</span>
+      <button type="button" class="message-copy-btn" title="Copy message" aria-label="Copy message">
+        ${COPY_ICON_SVG}
+        <span class="copy-label">Copy</span>
+      </button>
     </div>
     <div class="message-content">
       <div class="message-skeleton" aria-label="Waiting for response">
@@ -2019,6 +2095,7 @@ function appendStreamingDelta(runId, delta, messageId = null) {
   }
   if (messageId) card.dataset.lastContentTurnId = messageId;
   card.dataset.raw = (card.dataset.raw || '') + delta;
+  card._rawMessage = card.dataset.raw;
   scheduleStreamingRender(card);
 }
 
@@ -2049,6 +2126,7 @@ function finalizeRunCard(runId, finalText, reasoning) {
     }
     renderAgentContent(card, text);
     card.dataset.raw = text;
+    card._rawMessage = text;
     setCardState(card, 'done');
     if (cleanReasoning) {
       ensureThoughtDisclosure(card, cleanReasoning, false, false);
@@ -2396,6 +2474,36 @@ document.addEventListener('click', event => {
   if (!target) return;
   message.value = target.dataset.prompt || message.value;
   message.focus();
+});
+
+// Event delegation for message and thought copy buttons
+document.addEventListener('click', async event => {
+  const thoughtCopyBtn = event.target.closest('.thought-copy-btn');
+  if (thoughtCopyBtn) {
+    event.preventDefault();
+    event.stopPropagation();
+    const disclosure = thoughtCopyBtn.closest('.thought-disclosure');
+    const content = disclosure?.querySelector('.thought-content');
+    const rawReasoning = content?.dataset.raw || '';
+    if (!rawReasoning.trim()) return;
+    await copyTextToClipboard(rawReasoning, thoughtCopyBtn);
+    return;
+  }
+
+  const messageCopyBtn = event.target.closest('.message-copy-btn');
+  if (messageCopyBtn) {
+    event.preventDefault();
+    event.stopPropagation();
+    const messageEl = messageCopyBtn.closest('.message');
+    if (!messageEl) return;
+    let rawText = messageEl.dataset.raw || messageEl._rawMessage || '';
+    if (messageEl.classList.contains('agent')) {
+      rawText = stripToolCallTags(rawText);
+    }
+    if (!rawText.trim()) return;
+    await copyTextToClipboard(rawText, messageCopyBtn);
+    return;
+  }
 });
 
 (async function init() {

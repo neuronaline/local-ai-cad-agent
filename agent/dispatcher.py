@@ -215,9 +215,16 @@ def dispatch(
     """
     if is_cad_build(name):
         cad = tools.cad.with_call_id(call_id)
-        views = args.get("views") if isinstance(args, dict) else None
+        raw_views = args.get("views") if isinstance(args, dict) else None
+        if isinstance(raw_views, str):
+            views: list[str] | None = [raw_views]
+        elif isinstance(raw_views, (list, tuple)):
+            views = [str(v) for v in raw_views if v]
+        else:
+            views = None
+        views = views or None
         mode = RenderMode.FULL_REVIEW if views else RenderMode.NONE
-        raw_build = cad.build(mode=mode)
+        raw_build = cad.build(mode=mode, requested_views=views)
         if views:
             try:
                 raw_views = tools.image.with_call_id(call_id).get_view_images({"views": views})
