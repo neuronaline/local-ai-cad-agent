@@ -807,19 +807,13 @@ function normalizeHistoryContent(content) {
   return lines.join('\n');
 }
 
-async function loadHistory(projectName, options = {}) {
-  const target = options.target === 'drawer' ? historyContent : feed;
-  const intoDrawer = options.target === 'drawer';
+async function loadHistory(projectName) {
+  const target = feed;
   try {
     const data = await api(`/api/projects/${encodeURIComponent(projectName)}/history`);
-    if (intoDrawer) {
-      // Drawer mode must NEVER mutate the main chat feed.
-      target.replaceChildren();
-    } else {
-      clearActivity();
-      target.replaceChildren();
-      clearQuestionArea();
-    }
+    clearActivity();
+    target.replaceChildren();
+    clearQuestionArea();
     let renderedAny = false;
     let accumulatedReasoning = '';
     for (const evt of data.events) {
@@ -880,7 +874,7 @@ async function loadHistory(projectName, options = {}) {
       } else if (evt.type === 'agent_error') {
         addMessage(evt.data?.message || text, 'error', {target});
         renderedAny = true;
-      } else if (!intoDrawer && showInfoMessages) {
+      } else if (showInfoMessages) {
         addInfoMessage(evt.type, evt.data);
       }
     }
@@ -888,7 +882,7 @@ async function loadHistory(projectName, options = {}) {
       addMessage('', 'agent', {target, reasoning: accumulatedReasoning});
       renderedAny = true;
     }
-    if (!renderedAny && !intoDrawer) {
+    if (!renderedAny) {
       // Project with no conversation → restore the empty state from the
       // template (preserves the project name and example prompts).
       const emptyTpl = document.querySelector('#chat-empty');
@@ -1643,61 +1637,95 @@ resizer?.addEventListener('keydown', event => {
   try { localStorage.setItem('cad_chat_width', `${applied}px`); } catch {}
 });
 
-// History drawer
+// Revisions drawer
 const historyDrawer = document.querySelector('#history-drawer');
-const historyContent = document.querySelector('#history-content');
-const modelContent = document.querySelector('#model-content');
-const historyTab = document.querySelector('#history-tab');
-const modelTab = document.querySelector('#model-tab');
+const revisionsContent = document.querySelector('#revisions-content');
+const historyBtn = document.querySelector('#history-btn');
 
-function setDrawerTab(active) {
-  const isHistory = active === 'history';
-  historyTab.setAttribute('aria-pressed', String(isHistory));
-  modelTab.setAttribute('aria-pressed', String(!isHistory));
-  historyContent.hidden = !isHistory;
-  modelContent.hidden = isHistory;
+function closeRevisionsDrawer() {
+  if (historyDrawer) historyDrawer.hidden = true;
+  historyBtn?.setAttribute('aria-pressed', 'false');
+  historyBtn?.setAttribute('aria-expanded', 'false');
 }
 
-document.querySelector('#history-btn')?.addEventListener('click', () => {
+function openRevisionsDrawer() {
+  if (!historyDrawer) return;
   historyDrawer.hidden = false;
-  setDrawerTab('history');
-  loadHistory(currentProject, {target: 'drawer'});
-  loadModelPane();
-});
-document.querySelector('#history-close')?.addEventListener('click', () => {
-  historyDrawer.hidden = true;
-});
-historyTab?.addEventListener('click', () => setDrawerTab('history'));
-modelTab?.addEventListener('click', () => setDrawerTab('model'));
+  historyBtn?.setAttribute('aria-pressed', 'true');
+  historyBtn?.setAttribute('aria-expanded', 'true');
+  loadRevisions();
+}
 
-async function loadModelPane() {
-  if (!currentProject || !modelContent) return;
-  modelContent.replaceChildren();
+historyBtn?.addEventListener('click', () => {
+  if (!historyDrawer) return;
+  if (historyDrawer.hidden) {
+    openRevisionsDrawer();
+  } else {
+    closeRevisionsDrawer();
+  }
+});
+
+document.querySelector('#history-close')?.addEventListener('click', closeRevisionsDrawer);
+
+window.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && historyDrawer && !historyDrawer.hidden) {
+    closeRevisionsDrawer();
+  }
+});
+
+async function loadRevisions() {
+  if (!currentProject || !revisionsContent) return;
+  revisionsContent.replaceChildren();
+  const loading = document.createElement('div');
+  loading.className = 'revision-loading';
+  loading.textContent = 'Loading revisions…';
+  revisionsContent.appendChild(loading);
+
   try {
     const data = await api(`/api/projects/${encodeURIComponent(currentProject)}/revisions?limit=25`);
+    const revisions = data.revisions || [];
+    revisionsContent.replaceChildren();
+    if (revisions.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'revision-empty';
+      empty.textContent = 'No revisions yet. Revisions are created as the model is generated or edited.';
+      revisionsContent.appendChild(empty);
+      return;
+    }
     const list = document.createElement('ul');
     list.className = 'revision-list';
-    for (const rev of data.revisions || []) {
+    for (const rev of revisions) {
       const item = document.createElement('li');
       item.className = 'revision-item';
+      if (rev.is_active) item.classList.add('active');
+
       const header = document.createElement('div');
       header.className = 'revision-header';
-      header.innerHTML = `
-        <span class="revision-id">${rev.id.slice(0, 8)}</span>
-        <span class="revision-status">${rev.build_status || 'not_run'}</span>
-      `;
+
+      const revId = document.createElement('span');
+      revId.className = 'revision-id';
+      revId.textContent = (rev.id || '').slice(0, 8);
+
+      const revStatus = document.createElement('span');
+      revStatus.className = 'revision-status';
+      revStatus.dataset.status = rev.build_status || 'not_run';
+      revStatus.textContent = rev.build_status || 'not_run';
+
+      header.append(revId, revStatus);
       item.appendChild(header);
+
       const meta = document.createElement('div');
       meta.className = 'revision-meta';
-      meta.textContent = new Date(rev.created_at).toLocaleString();
+      meta.textContent = rev.created_at ? new Date(rev.created_at).toLocaleString() : '';
       item.appendChild(meta);
+
       const actions = document.createElement('div');
       actions.className = 'revision-actions';
       const restore = document.createElement('button');
       restore.type = 'button';
       restore.className = 'quiet';
       restore.textContent = rev.is_active ? 'Active' : 'Restore';
-      restore.disabled = rev.is_active;
+      restore.disabled = Boolean(rev.is_active);
       restore.addEventListener('click', async () => {
         restore.disabled = true;
         try {
@@ -1705,23 +1733,27 @@ async function loadModelPane() {
           if (res && res.ok === false) {
             addMessage(`Restore partial failure: ${res.error}`, 'error');
           }
-          historyDrawer.hidden = true;
-          loadModelPane();
+          closeRevisionsDrawer();
+          await syncCurrentPreview();
           codeDirty = false;
           await loadModelCode();
         } catch (error) {
           addMessage(error.message, 'error');
         } finally {
-          restore.disabled = rev.is_active;
+          restore.disabled = Boolean(rev.is_active);
         }
       });
       actions.appendChild(restore);
       item.appendChild(actions);
       list.appendChild(item);
     }
-    modelContent.appendChild(list);
+    revisionsContent.appendChild(list);
   } catch (error) {
-    addMessage(error.message, 'error');
+    revisionsContent.replaceChildren();
+    const errorEl = document.createElement('div');
+    errorEl.className = 'revision-empty';
+    errorEl.textContent = `Failed to load revisions: ${error.message}`;
+    revisionsContent.appendChild(errorEl);
   }
 }
 
@@ -2340,6 +2372,7 @@ function connectStream() {
       if (data.project !== currentProject) return;
       syncCurrentPreview();
       if (!codeDirty) loadModelCode();
+      if (historyDrawer && !historyDrawer.hidden) loadRevisions();
     },
     // Phase-complete events from the split cad_screenshot / cad_review tools.
     // The intermediate ``tool_status`` events already drive the running rows;
@@ -2460,8 +2493,7 @@ function applyConversationReset() {
   optimisticCard = null;
   runCards.clear();
   // Wipe the main feed, dismiss any pending question, and clear activity so
-  // the UI matches the freshly truncated conversation.jsonl. The drawer is
-  // refreshed lazily the next time it is opened.
+  // the UI matches the freshly truncated conversation.jsonl.
   clearActivity();
   feed.replaceChildren();
   clearQuestionArea();
@@ -2473,7 +2505,6 @@ function applyConversationReset() {
     empty.textContent = `Project "${currentProject}" selected. Describe a part to begin.`;
     feed.appendChild(empty);
   }
-  historyContent.replaceChildren();
   setThinking(false);
 }
 

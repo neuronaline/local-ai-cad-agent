@@ -615,18 +615,18 @@ input, select, textarea { border: 1px solid var(--line); border-radius: 6px; bac
 
 /* History */
 .history-drawer { position: fixed; top: 0; right: 0; z-index: 20; display: flex; width: min(400px, 94vw); height: 100dvh; flex-direction: column; border-left: 1px solid var(--line); background: var(--surface); box-shadow: -16px 0 40px #03071280; }
-.drawer-header, .drawer-tabs { display: flex; align-items: center; padding: .55rem .7rem; border-bottom: 1px solid var(--line); }
-.drawer-header { justify-content: space-between; }
+.drawer-header { display: flex; align-items: center; justify-content: space-between; padding: .55rem .7rem; border-bottom: 1px solid var(--line); }
 .drawer-header h2 { margin: 0; font-size: .9rem; }
-.drawer-tabs { gap: .35rem; }
-.drawer-tab { padding: .3rem .5rem; background: transparent; color: var(--muted); }
-.drawer-tab[aria-pressed="true"] { border-color: #5272c7; background: #1a2d55; color: #dce6ff; }
 .drawer-content { display: flex; min-height: 0; flex: 1; flex-direction: column; gap: .45rem; overflow-y: auto; padding: .6rem; }
+.revision-empty, .revision-loading { padding: 1.5rem 1rem; text-align: center; color: var(--muted); font-size: .8rem; line-height: 1.4; border: 1px dashed var(--line); border-radius: var(--radius); background: #0c142240; }
 .revision-list { display: grid; gap: .45rem; margin: 0; padding: 0; list-style: none; }
-.revision-item { border: 1px solid var(--line); border-radius: var(--radius); padding: .55rem; background: #101b2d; }
+.revision-item { border: 1px solid var(--line); border-radius: var(--radius); padding: .55rem; background: #101b2d; transition: border-color .15s ease, background .15s ease; }
+.revision-item.active { border-color: #4a68af; background: #14233e; }
 .revision-header { display: flex; align-items: center; justify-content: space-between; gap: .4rem; }
 .revision-id { color: #cbd8ed; font: .72rem ui-monospace, SFMono-Regular, Menlo, monospace; }
 .revision-status { width: fit-content; border-radius: 999px; padding: .15rem .38rem; background: #263653; color: #b9c8e5; font-size: .62rem; font-weight: 750; text-transform: uppercase; }
+.revision-status[data-status="success"] { background: #143525; color: #72e5a8; }
+.revision-status[data-status="failed"] { background: #351a24; color: #ff8fa0; }
 .revision-meta { margin-top: .3rem; color: var(--muted); font-size: .68rem; }
 .revision-actions { display: flex; gap: .35rem; margin-top: .45rem; }
 .revision-actions button { padding: .3rem .45rem; font-size: .68rem; }

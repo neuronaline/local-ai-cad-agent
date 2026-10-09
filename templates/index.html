@@ -60,11 +60,6 @@
             </label>
             <span id="attachment-label" class="sr-only">Attach reference images</span>
             <span class="composer-hint">Enter sends · Shift+Enter adds a line · / for commands</span>
-            <button id="history-btn" type="button" class="quiet icon-only" title="History" aria-label="History">
-              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                <path d="M3 12a9 9 0 1 0 3.6-7.2M3 4v5h5M12 8v5l3 2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
-              </svg>
-            </button>
             <button id="send-toggle" type="button" class="send-toggle" title="Send" aria-label="Send">
               <span class="send-toggle-icon" data-mode="send">
                 <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
@@ -110,6 +105,12 @@
                 <path d="M3 3h18v18H3zM3 9h18M3 15h18M9 3v18M15 3v18" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
               </svg>
               <span>Grid</span>
+            </button>
+            <button id="history-btn" type="button" class="quiet toolbar-pill" title="Revision history" aria-label="Revision history" aria-expanded="false" aria-controls="history-drawer">
+              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <path d="M3 12a9 9 0 1 0 3.6-7.2M3 4v5h5M12 8v5l3 2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              <span>Revisions</span>
             </button>
             <div class="export-combo" role="group" aria-label="Export model">
               <select id="export-format" class="export-select" title="Export format" aria-label="Export format">
@@ -170,15 +171,10 @@
     </main>
     <aside id="history-drawer" class="history-drawer" hidden>
       <header class="drawer-header">
-        <h2>History</h2>
-        <button id="history-close" type="button" class="quiet">✕</button>
+        <h2>Revisions</h2>
+        <button id="history-close" type="button" class="quiet" title="Close" aria-label="Close">✕</button>
       </header>
-      <nav class="drawer-tabs">
-        <button id="history-tab" type="button" class="drawer-tab" aria-pressed="true">Conversation</button>
-        <button id="model-tab" type="button" class="drawer-tab" aria-pressed="false">Model</button>
-      </nav>
-      <div id="history-content" class="drawer-content"></div>
-      <div id="model-content" class="drawer-content" hidden></div>
+      <div id="revisions-content" class="drawer-content"></div>
     </aside>
     <div id="image-preview-modal" class="modal hidden" aria-hidden="true" role="dialog" aria-label="Image preview">
       <div class="image-modal-content">
