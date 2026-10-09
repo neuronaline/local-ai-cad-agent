@@ -2033,19 +2033,31 @@ function finalizeRunCard(runId, finalText, reasoning) {
   flushStreamingRender();
   let card = getActiveCard(runId);
 
-  const text = stripToolCallTags(finalText || card?.dataset.raw || '').trim();
-  const finalReasoning = stripEncryptedReasoning(card?.dataset.reasoning || reasoning || '').trim();
+  const rawText = stripToolCallTags(card?.dataset.raw || '').trim();
+  const cleanFinal = stripToolCallTags(finalText || '').trim();
+  let text = cleanFinal || rawText;
+  if (rawText && cleanFinal && rawText !== cleanFinal && rawText.endsWith(cleanFinal)) {
+    text = rawText;
+  }
+
+  const cardReasoning = stripEncryptedReasoning(card?.dataset.reasoning || '').trim();
+  const incomingReasoning = stripEncryptedReasoning(reasoning || '').trim();
+  let finalReasoning = incomingReasoning || cardReasoning;
+  if (cardReasoning && incomingReasoning && cardReasoning !== incomingReasoning && cardReasoning.endsWith(incomingReasoning)) {
+    finalReasoning = cardReasoning;
+  }
   const cleanReasoning = (text && text === finalReasoning) ? '' : finalReasoning;
 
   if (card) {
-    if (text) {
-      renderAgentContent(card, text);
-      card.dataset.raw = text;
-    } else {
-      const contentEl = card.querySelector('.message-content');
-      if (contentEl) contentEl.innerHTML = '';
-      card.dataset.raw = '';
+    if (!text && !cleanReasoning) {
+      card.remove();
+      if (runId) runCards.delete(runId);
+      if (optimisticCard === card) optimisticCard = null;
+      scrollFeedToBottom();
+      return null;
     }
+    renderAgentContent(card, text);
+    card.dataset.raw = text;
     setCardState(card, 'done');
     if (cleanReasoning) {
       ensureThoughtDisclosure(card, cleanReasoning, false, false);
@@ -2068,9 +2080,12 @@ function finalizeRunCard(runId, finalText, reasoning) {
     return card;
   }
 
-  const item = addMessage(finalText || '', 'agent', { reasoning: cleanReasoning });
-  scrollFeedToBottom();
-  return item;
+  if (cleanFinal || cleanReasoning) {
+    const item = addMessage(cleanFinal || '', 'agent', { reasoning: cleanReasoning });
+    scrollFeedToBottom();
+    return item;
+  }
+  return null;
 }
 
 async function syncAfterStreamReset() {
@@ -2178,13 +2193,29 @@ function connectStream() {
           card.dataset.reasoning = combined;
           ensureThoughtDisclosure(card, combined, false, false);
         }
-        const text = stripToolCallTags(data.message || card.dataset.raw || '').trim();
+        const rawText = stripToolCallTags(card.dataset.raw || '').trim();
+        const msgText = stripToolCallTags(data.message || '').trim();
+        let text = msgText || rawText;
+        if (rawText && msgText && rawText !== msgText && rawText.endsWith(msgText)) {
+          text = rawText;
+        }
         if (text) {
           card.dataset.raw = text;
           renderAgentContent(card, text);
         }
         if (data.has_tools) {
-          setCardState(card, 'working', 'Running tools');
+          if (text) {
+            // Intermediate turn with user-facing message: finalize this turn's card
+            // so it stays permanently in the feed, and create a fresh card for the
+            // tool execution and subsequent turns.
+            setCardState(card, 'done');
+            if (runId) runCards.delete(runId);
+            if (optimisticCard === card) optimisticCard = null;
+            const nextCard = getOrCreateRunCard(runId);
+            setCardState(nextCard, 'working', 'Running tools');
+          } else {
+            setCardState(card, 'working', 'Running tools');
+          }
         }
       }
     },
