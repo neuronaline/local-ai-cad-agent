@@ -60,8 +60,8 @@ function cardTemplate(project) {
         <div class="card-actions">
           <button type="button" class="icon-btn rename-btn" title="Rename" data-name="${name}" aria-label="Rename ${name}">
             <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-              <path d="M16.862 4.487l1.687-1.688a1.875 1.875 0 1 1 2.652 2.652L10.582 16.07a4.5 4.5 0 0 1-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 0 1 1.13-1.897l10.932-10.931z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
-              <path d="M19.5 7.125L16.875 4.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="m15 5 4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
             </svg>
           </button>
           <button type="button" class="icon-btn delete-btn" title="Delete" data-name="${name}" aria-label="Delete ${name}">

@@ -205,8 +205,14 @@ button[aria-pressed="true"] { border-color: #5d7ed7; background: #233966; color:
 
 .message-content { color: #e3eafa; }
 .message-content:empty { display: none; }
-.message p { margin: .2rem 0; }
-.message ul, .message ol { margin: .25rem 0; padding-left: 1.2rem; }
+.message p { margin: .25rem 0; }
+.message ul, .message ol { margin: .35rem 0; padding-left: 1.6rem; }
+.message ol:not([type]) { list-style-type: decimal; }
+.message ul:not([type]) { list-style-type: disc; }
+.message li { margin: .2rem 0; line-height: 1.5; }
+.message li > p { margin: .2rem 0; }
+.message li > ul, .message li > ol { margin: .15rem 0; }
+.message li::marker { color: var(--accent); font-weight: 600; }
 .message pre { overflow-x: auto; margin: .35rem 0; padding: .5rem; border-radius: 6px; background: #0a1120; }
 .message code { padding: .08rem .25rem; border-radius: 4px; background: #273552; font-size: .85em; }
 .message pre code { padding: 0; background: none; }
@@ -322,8 +328,10 @@ button[aria-pressed="true"] { border-color: #5d7ed7; background: #233966; color:
 .send-toggle .icon { width: 18px; height: 18px; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .attachment-preview { display: flex; flex-wrap: wrap; gap: .35rem; padding: 0 .25rem .2rem; }
-.attachment-item { display: flex; max-width: 185px; align-items: center; gap: .35rem; border: 1px solid var(--line); border-radius: 6px; padding: .2rem; color: var(--muted); font-size: .66rem; }
-.attachment-item img { width: 28px; height: 28px; border-radius: 4px; object-fit: cover; }
+.attachment-item { display: flex; max-width: 185px; align-items: center; gap: .35rem; border: 1px solid var(--line); border-radius: 6px; padding: .2rem; color: var(--muted); font-size: .66rem; cursor: pointer; transition: border-color .15s ease; }
+.attachment-item:hover { border-color: #4a68af; color: var(--text); }
+.attachment-item img { width: 28px; height: 28px; border-radius: 4px; object-fit: cover; transition: transform .15s ease, filter .15s ease; }
+.attachment-item:hover img { filter: brightness(1.15); transform: scale(1.08); }
 .attachment-item span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .attachment-item button { margin-left: auto; flex: 0 0 auto; }
 
@@ -331,7 +339,8 @@ button[aria-pressed="true"] { border-color: #5d7ed7; background: #233966; color:
    language as the composer thumbnails so the user immediately sees what
    they attached before the model acknowledges it. */
 .message-attachments { display: flex; flex-wrap: wrap; gap: .35rem; margin-bottom: .35rem; }
-.message-attachments .attachment-thumb { width: 88px; height: 88px; border: 1px solid var(--line); border-radius: 6px; object-fit: cover; background: #06080d; }
+.message-attachments .attachment-thumb { width: 88px; height: 88px; border: 1px solid var(--line); border-radius: 6px; object-fit: cover; background: #06080d; cursor: pointer; transition: transform .15s ease, border-color .15s ease; }
+.message-attachments .attachment-thumb:hover { border-color: var(--accent); transform: scale(1.03); }
 
 .question-form { display: grid; gap: .5rem; border: 1px solid #465f91; border-radius: var(--radius); padding: .65rem; background: #15233b; }
 .question-form label { display: grid; gap: .25rem; color: #cbd7ee; font-size: .78rem; }
@@ -460,7 +469,7 @@ input, select, textarea { border: 1px solid var(--line); border-radius: 6px; bac
 .icon-btn:hover { background: #1b2940; color: var(--text); border-color: var(--line); }
 .icon-btn.rename-btn:hover { background: #172742; color: #a9c6ff; border-color: #355380; }
 .icon-btn.delete-btn:hover { background: #351a24; color: #ff8fa0; border-color: #6a2a38; }
-.icon-btn .icon { width: 15px; height: 15px; }
+.icon-btn .icon { width: 16px; height: 16px; }
 
 .empty-projects { display: grid; gap: .55rem; justify-items: center; grid-column: 1 / -1; padding: 3.5rem 1rem; color: var(--muted); text-align: center; }
 .empty-projects h2 { margin: 0; color: var(--text); font-size: 1.05rem; font-weight: 700; }
@@ -477,6 +486,50 @@ input, select, textarea { border: 1px solid var(--line); border-radius: 6px; bac
 .hint { color: var(--muted); font-size: .72rem; }
 .modal-error { margin: .4rem 0 0; color: var(--danger); font-size: .74rem; line-height: 1.35; }
 .modal-actions { display: flex; justify-content: flex-end; gap: .45rem; margin-top: .9rem; }
+
+.image-modal-content {
+  width: auto;
+  max-width: min(92vw, 960px);
+  max-height: 92vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: 0 24px 60px #020712cc;
+}
+.image-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.45rem 0.75rem;
+  border-bottom: 1px solid var(--line);
+  background: #111a2a;
+}
+.image-modal-title {
+  font-size: 0.76rem;
+  font-weight: 700;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.image-modal-body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.5rem;
+  overflow: auto;
+  background: #070d18;
+}
+.image-modal-body img {
+  max-width: 100%;
+  max-height: 80vh;
+  object-fit: contain;
+  border-radius: 4px;
+}
 
 @media (max-width: 900px) {
   body { overflow-y: auto; }

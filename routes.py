@@ -112,18 +112,15 @@ def _resolve_project_or_404(
 
 
 def _redact_history_event(event: dict[str, Any]) -> dict[str, Any]:
-    """Replace inline image data URLs in history responses with a placeholder.
+    """Replace tool inline image data URLs in history responses with a placeholder.
 
-    The persisted ``conversation.jsonl`` stores the full base64 payload on
-    user-image attachments so the LLM can still consume it. Returning those
-    blobs through the History endpoint makes responses unnecessarily large
-    and exposes content the UI does not need; substitute a lightweight
-    ``[Reference image N]`` marker instead. Tool-role messages produced by
-    ``cad_build`` or ``get_view_images`` may carry inline render evidence; redact those
-    with the same shield so the History view never echoes base64.
+    User-uploaded reference images are preserved so the UI can display them
+    when loading conversation history. Tool-role messages produced by
+    cad_build or get_view_images may carry inline render evidence; redact those
+    with a lightweight placeholder to prevent unnecessary bandwidth consumption.
     """
     role = event.get("role")
-    if role not in {"user", "tool"}:
+    if role != "tool":
         return event
     content = event.get("content")
     if not isinstance(content, list):
@@ -131,13 +128,12 @@ def _redact_history_event(event: dict[str, Any]) -> dict[str, Any]:
     redacted = False
     parts: list[Any] = []
     image_index = 0
-    placeholder = "[Reference image {n}]" if role == "user" else "[Inline render {n}]"
     for part in content:
         if isinstance(part, dict) and part.get("type") == "image_url":
             redacted = True
             image_index += 1
             parts.append(
-                {"type": "text", "text": placeholder.format(n=image_index)}
+                {"type": "text", "text": f"[Inline render {image_index}]"}
             )
         else:
             parts.append(part)

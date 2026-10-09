@@ -167,6 +167,17 @@
       <div id="history-content" class="drawer-content"></div>
       <div id="model-content" class="drawer-content" hidden></div>
     </aside>
+    <div id="image-preview-modal" class="modal hidden" aria-hidden="true" role="dialog" aria-label="Image preview">
+      <div class="image-modal-content">
+        <div class="image-modal-header">
+          <span id="image-modal-title" class="image-modal-title">Reference Image</span>
+          <button id="image-modal-close" type="button" class="quiet icon-only" title="Close" aria-label="Close">✕</button>
+        </div>
+        <div class="image-modal-body">
+          <img id="image-modal-img" src="" alt="Preview">
+        </div>
+      </div>
+    </div>
     <script id="app-config" type="application/json">
       {{ {
         'projectName': project_name,

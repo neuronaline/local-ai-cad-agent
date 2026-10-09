@@ -72,7 +72,11 @@ const ALLOWED_TAGS = new Set([
   'table', 'thead', 'tbody', 'tr', 'th', 'td',
   'span', 'div', 'details', 'summary',
 ]);
-const ALLOWED_ATTRS = new Set(['href', 'title', 'class', 'id']);
+const ALLOWED_ATTRS = new Set([
+  'href', 'title', 'class', 'id',
+  'start', 'value', 'type', 'reversed',
+  'open', 'colspan', 'rowspan', 'target', 'rel'
+]);
 const DROP_TAGS = new Set(['script', 'style', 'iframe', 'object', 'embed', 'link', 'meta', 'base', 'noscript', 'template']);
 
 function isSafeHref(value) {
@@ -112,6 +116,8 @@ function sanitizeHTML(html) {
 }
 
 marked.setOptions({
+  gfm: true,
+  breaks: true,
   highlight: (code, lang) => {
     if (lang && hljs.getLanguage(lang)) {
       return hljs.highlight(code, { language: lang }).value;
@@ -247,12 +253,8 @@ function addMessage(text, type = 'agent', options = {}) {
         el.className = 'attachment-thumb';
         el.src = img.src;
         el.alt = img.alt || 'attachment';
+        el.title = 'Click to preview';
         el.loading = 'lazy';
-        if (img.src && img.src.startsWith('blob:')) {
-          const revoke = () => URL.revokeObjectURL(img.src);
-          el.addEventListener('load', revoke, { once: true });
-          el.addEventListener('error', revoke, { once: true });
-        }
         strip.appendChild(el);
       }
       item.appendChild(strip);
@@ -757,22 +759,29 @@ async function loadCurrentState() {
   }
 }
 
-// Extract readable text from a History entry's `content` field. The
-// backend persists image attachments as structured parts (text + image_url),
-// and the History endpoint redacts the image data, leaving a
-// `[Reference image N]` text placeholder for each part.
+function extractHistoryImages(content) {
+  if (!Array.isArray(content)) return [];
+  const images = [];
+  for (const part of content) {
+    if (part && typeof part === 'object' && part.type === 'image_url' && part.image_url?.url) {
+      images.push({
+        src: part.image_url.url,
+        alt: 'reference image',
+      });
+    }
+  }
+  return images;
+}
+
+// Extract readable text from a History entry's `content` field.
 function normalizeHistoryContent(content) {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
   const lines = [];
-  let imageIndex = 0;
   for (const part of content) {
     if (!part || typeof part !== 'object') continue;
     if (part.type === 'text' && typeof part.text === 'string') {
       lines.push(part.text);
-    } else if (part.type === 'image_url') {
-      imageIndex += 1;
-      lines.push(`[Reference image ${imageIndex}]`);
     }
   }
   return lines.join('\n');
@@ -799,7 +808,8 @@ async function loadHistory(projectName, options = {}) {
       const text = normalizeHistoryContent(raw);
       if (role === 'user') {
         accumulatedReasoning = '';
-        addMessage(text, 'user', {target});
+        const userImages = extractHistoryImages(raw);
+        addMessage(text, 'user', {target, images: userImages});
         renderedAny = true;
       } else if (role === 'assistant' || role === 'agent') {
         let reasoning = evt.reasoning || '';
@@ -914,7 +924,7 @@ chatForm.addEventListener('submit', async event => {
   // Snapshot attached files and their preview URLs so we can render the
   // images inline in the chat feed before sending them to the server.
   const imagePayload = selectedFiles.map((file) => ({
-    src: URL.createObjectURL(file),
+    src: file._previewUrl || URL.createObjectURL(file),
     alt: file.name,
   }));
   try {
@@ -1072,10 +1082,12 @@ function renderAttachmentPreview() {
     const item = document.createElement('div');
     item.className = 'attachment-item';
     const image = document.createElement('img');
-    const url = URL.createObjectURL(file);
-    image.src = url;
+    if (!file._previewUrl) {
+      file._previewUrl = URL.createObjectURL(file);
+    }
+    image.src = file._previewUrl;
     image.alt = file.name;
-    image.addEventListener('load', () => URL.revokeObjectURL(url), {once: true});
+    image.title = 'Click to preview';
     const name = document.createElement('span');
     name.textContent = file.name;
     const remove = document.createElement('button');
@@ -1083,14 +1095,88 @@ function renderAttachmentPreview() {
     remove.className = 'quiet icon-only';
     remove.textContent = '×';
     remove.title = `Remove ${file.name}`;
-    remove.addEventListener('click', () => {
-      selectedFiles.splice(index, 1);
+    remove.addEventListener('click', (event) => {
+      event.stopPropagation();
+      const [removed] = selectedFiles.splice(index, 1);
+      if (removed?._previewUrl) URL.revokeObjectURL(removed._previewUrl);
       renderAttachmentPreview();
     });
     item.append(image, name, remove);
     attachmentPreview.appendChild(item);
   });
 }
+
+// Paste handling (CTRL + V)
+function handlePaste(event) {
+  if (event.target && event.target !== message && (event.target.tagName === 'INPUT' || event.target.tagName === 'TEXTAREA')) {
+    return;
+  }
+  const items = event.clipboardData?.items;
+  if (!items || !items.length) return;
+  const imageFiles = [];
+  for (const item of items) {
+    if (item.kind === 'file' && item.type.startsWith('image/')) {
+      const file = item.getAsFile();
+      if (file) {
+        const ext = file.type.split('/')[1] === 'jpeg' ? 'jpg' : (file.type.split('/')[1] || 'png');
+        const renamed = new File([file], `pasted-${Date.now()}.${ext}`, { type: file.type });
+        imageFiles.push(renamed);
+      }
+    }
+  }
+  if (imageFiles.length > 0) {
+    event.preventDefault();
+    handleFiles(imageFiles);
+  }
+}
+
+window.addEventListener('paste', handlePaste);
+
+// Image preview modal (lightbox)
+const imagePreviewModal = document.querySelector('#image-preview-modal');
+const imageModalImg = document.querySelector('#image-modal-img');
+const imageModalTitle = document.querySelector('#image-modal-title');
+const imageModalClose = document.querySelector('#image-modal-close');
+
+function openImageModal(src, title = 'Reference Image') {
+  if (!imagePreviewModal || !imageModalImg) return;
+  imageModalImg.src = src;
+  if (imageModalTitle) imageModalTitle.textContent = title;
+  imagePreviewModal.classList.remove('hidden');
+  imagePreviewModal.setAttribute('aria-hidden', 'false');
+  imageModalClose?.focus();
+}
+
+function closeImageModal() {
+  if (!imagePreviewModal) return;
+  imagePreviewModal.classList.add('hidden');
+  imagePreviewModal.setAttribute('aria-hidden', 'true');
+  if (imageModalImg) imageModalImg.src = '';
+}
+
+imageModalClose?.addEventListener('click', closeImageModal);
+imagePreviewModal?.addEventListener('click', (event) => {
+  if (event.target === imagePreviewModal) closeImageModal();
+});
+window.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && imagePreviewModal && !imagePreviewModal.classList.contains('hidden')) {
+    closeImageModal();
+  }
+});
+
+// Delegate click on thumbnails to preview in modal
+document.addEventListener('click', (event) => {
+  if (event.target.closest('.attachment-item button')) return;
+  const item = event.target.closest('.attachment-thumb, .attachment-item');
+  if (!item) return;
+  const img = item.tagName === 'IMG' ? item : item.querySelector('img');
+  if (!img) return;
+  const src = img.currentSrc || img.src;
+  if (src) {
+    const title = img.alt || 'Reference Image';
+    openImageModal(src, title);
+  }
+});
 
 renderToggle.addEventListener('click', () => {
   const expanded = renderToggle.getAttribute('aria-expanded') === 'true';

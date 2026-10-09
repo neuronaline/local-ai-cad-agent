@@ -380,12 +380,9 @@ class AgentRunner:
         try:
             for source in image_paths:
                 target = run_inputs_dir / source.name
-                shutil.move(str(source), str(target))
+                shutil.copy2(str(source), str(target))
                 moved.append(target)
         except OSError:
-            # ``shutil.move`` may leave the source in place when the
-            # target already exists; ``rmtree`` scrubs whatever made it
-            # into the run dir.
             shutil.rmtree(run_dir, ignore_errors=True)
             return []
         return moved
