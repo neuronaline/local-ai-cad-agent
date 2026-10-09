@@ -18,7 +18,7 @@
           <div class="brand">
             <a href="/" class="back-link" title="Back to projects">← Projects</a>
             <h1>{{ project_name }}</h1>
-            <span id="connection-status" class="connection-status" title="Connecting…"></span>
+            <span id="connection-status" class="connection-status" role="status" aria-label="Connecting" title="Connecting…"></span>
           </div>
         </header>
         <div id="chat-feed" class="chat-feed" aria-live="polite"></div>
@@ -80,21 +80,29 @@
           </div>
         </form>
       </section>
-      <div id="panel-resizer" class="panel-resizer" role="separator" aria-orientation="vertical" aria-label="Resize panels"></div>
+      <div id="panel-resizer" class="panel-resizer" role="separator" aria-orientation="vertical" aria-label="Resize panels" tabindex="0"></div>
       <section class="viewer-panel">
         <header class="viewer-toolbar">
-          <div class="viewer-title"><h2>Preview</h2><span id="dimensions">No preview yet</span><span id="grid-warning" class="grid-warning" hidden title="Model exceeds the configured grid surface"></span></div>
+          <div class="viewer-title">
+            <h2>Preview</h2>
+            <span id="dimensions">No preview yet</span>
+            <span id="grid-warning" class="grid-warning" hidden title="Model exceeds the configured grid surface"></span>
+          </div>
           <div class="viewer-actions" aria-label="Preview controls">
-            <div class="view-presets" role="group" aria-label="Standard views">
-              <button type="button" class="quiet icon-only active" data-view="iso" title="Isometric view" aria-label="Isometric view">◈</button>
-              <button type="button" class="quiet icon-only" data-view="front" title="Front view" aria-label="Front view">F</button>
-              <button type="button" class="quiet icon-only" data-view="top" title="Top view" aria-label="Top view">T</button>
-              <button type="button" class="quiet icon-only" data-view="right" title="Right view" aria-label="Right view">R</button>
-            </div>
-            <button id="toggle-wireframe" class="quiet" aria-pressed="false">Wireframe</button>
-            <button id="toggle-grid" class="quiet" aria-pressed="true">Grid</button>
-            <button id="reset-view" class="quiet">Fit</button>
-            <div class="export-group" role="group" aria-label="Export model">
+            <button id="toggle-wireframe" type="button" class="quiet toolbar-pill" aria-pressed="false" title="Toggle wireframe" aria-label="Toggle wireframe">
+              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <path d="m21 16-9 5-9-5V8l9-5 9 5v8z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+                <path d="M12 3v18M3 8l18 8M3 16l18-8" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" opacity="0.6"/>
+              </svg>
+              <span>Wireframe</span>
+            </button>
+            <button id="toggle-grid" type="button" class="quiet toolbar-pill" aria-pressed="true" title="Toggle grid" aria-label="Toggle grid">
+              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <path d="M3 3h18v18H3zM3 9h18M3 15h18M9 3v18M15 3v18" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+              </svg>
+              <span>Grid</span>
+            </button>
+            <div class="export-combo" role="group" aria-label="Export model">
               <select id="export-format" class="export-select" title="Export format" aria-label="Export format">
                 <option value="stl" selected>STL (.stl)</option>
                 <option value="scad">SCAD (.scad)</option>
@@ -104,16 +112,25 @@
                 <option value="off">OFF (.off)</option>
                 <option value="csg">CSG (.csg)</option>
               </select>
-              <button id="download-model" type="button" class="quiet download-btn" title="Download model in selected format" aria-label="Download model" disabled>
+              <button id="download-model" type="button" class="download-btn" title="Download model in selected format" aria-label="Download model" disabled>
                 <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
                   <path d="M12 3v12m0 0 4-4m-4 4-4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
                 </svg>
-                <span>Download</span>
+                <span>Export</span>
               </button>
             </div>
           </div>
         </header>
-        <div id="viewer" class="viewer"><div id="viewer-empty" class="viewer-empty"><span class="preview-icon">◇</span><strong>No preview yet</strong><span>Inspect the model here once it is ready.</span></div></div>
+        <div id="viewer" class="viewer">
+          <div class="viewer-floating-presets" role="group" aria-label="Standard views">
+            <button type="button" class="view-pill active" data-view="iso" title="Isometric view" aria-label="Isometric view" aria-pressed="true">Iso</button>
+            <button type="button" class="view-pill" data-view="front" title="Front view" aria-label="Front view" aria-pressed="false">Front</button>
+            <button type="button" class="view-pill" data-view="top" title="Top view" aria-label="Top view" aria-pressed="false">Top</button>
+            <button type="button" class="view-pill" data-view="right" title="Right view" aria-label="Right view" aria-pressed="false">Right</button>
+            <button id="reset-view" type="button" class="view-pill view-pill-fit" title="Fit view" aria-label="Fit view">Fit</button>
+          </div>
+          <div id="viewer-empty" class="viewer-empty"><span class="preview-icon">◇</span><strong>No preview yet</strong><span>Inspect the model here once it is ready.</span></div>
+        </div>
         <div id="model-actions" class="model-actions" hidden>
           <span>Model ready for review</span>
           <button id="approve-design" type="button">Finalize design</button>

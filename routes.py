@@ -413,7 +413,7 @@ revisions_bp = Blueprint("revisions", __name__)
 
 @projects_bp.get("/")
 def index() -> str:
-    return render_template("projects.html")
+    return render_template("projects.html", cache_bust=int(time.time()))
 
 
 @projects_bp.get("/api/preflight")

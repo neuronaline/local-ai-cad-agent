@@ -32,11 +32,23 @@ const showInfoMessages = appConfig.showInfoMessages ?? true;
 const currentProject = appConfig.projectName || '';
 const viewer = new CadViewer(document.querySelector('#viewer'), document.querySelector('#dimensions'), appConfig);
 
+function updateChatWidth(width) {
+  const minWidth = 360;
+  const maxWidth = Math.max(minWidth, window.innerWidth - 400);
+  const clamped = Math.min(Math.max(width, minWidth), maxWidth);
+  document.documentElement.style.setProperty('--chat-width', `${clamped}px`);
+  const resizerEl = document.querySelector('#panel-resizer');
+  if (resizerEl) {
+    resizerEl.setAttribute('aria-valuenow', String(clamped));
+    resizerEl.setAttribute('aria-valuemin', String(minWidth));
+    resizerEl.setAttribute('aria-valuemax', String(maxWidth));
+  }
+  return clamped;
+}
+
 try {
   const savedWidth = parseInt(localStorage.getItem('cad_chat_width'), 10);
-  if (Number.isFinite(savedWidth) && savedWidth >= 360 && savedWidth <= window.innerWidth - 400) {
-    document.documentElement.style.setProperty('--chat-width', `${savedWidth}px`);
-  }
+  updateChatWidth(Number.isFinite(savedWidth) ? savedWidth : 400);
 } catch {}
 
 function generateUUID() {
@@ -655,7 +667,7 @@ async function loadReviewGallery() {
     const status = result && typeof result.status === 'string' ? result.status : 'pending';
     const summary = result && typeof result.summary === 'string' ? result.summary : '';
     const findings = result && Array.isArray(result.findings) ? result.findings : [];
-    reviewStatus.textContent = summary || statusLabel(status);
+    reviewStatus.textContent = summary || reviewStatusLabel(status);
     reviewStatus.dataset.state = status;
     reviewSummary.replaceChildren();
     if (findings.length) {
@@ -691,7 +703,7 @@ async function loadReviewGallery() {
   }
 }
 
-function statusLabel(status) {
+function reviewStatusLabel(status) {
   if (status === 'pass') return 'Pass';
   if (status === 'fail') return 'Fail';
   if (status === 'inconclusive') return 'Inconclusive';
@@ -1094,7 +1106,14 @@ document.querySelector('#toggle-wireframe')?.addEventListener('click', event => 
 document.querySelector('#toggle-grid')?.addEventListener('click', event => {
   event.currentTarget.setAttribute('aria-pressed', String(viewer.toggleGrid()));
 });
-document.querySelector('#reset-view')?.addEventListener('click', () => viewer.fit());
+document.querySelector('#reset-view')?.addEventListener('click', () => {
+  viewer.fit();
+  document.querySelectorAll('[data-view]').forEach(item => {
+    const isIso = item.dataset.view === 'iso';
+    item.classList.toggle('active', isIso);
+    item.setAttribute('aria-pressed', String(isIso));
+  });
+});
 downloadModelBtn?.addEventListener('click', async () => {
   if (!currentProject || downloadModelBtn.disabled) return;
   const format = exportFormatSelect?.value || 'stl';
@@ -1125,7 +1144,19 @@ downloadModelBtn?.addEventListener('click', async () => {
 document.querySelectorAll('[data-view]').forEach(button => {
   button.addEventListener('click', () => {
     viewer.setView(button.dataset.view);
-    document.querySelectorAll('[data-view]').forEach(item => item.classList.toggle('active', item === button));
+    document.querySelectorAll('[data-view]').forEach(item => {
+      const isActive = item === button;
+      item.classList.toggle('active', isActive);
+      item.setAttribute('aria-pressed', String(isActive));
+    });
+  });
+});
+
+// Clear active view preset highlights when the user orbits or pans freely
+viewer.controls.addEventListener('start', () => {
+  document.querySelectorAll('[data-view]').forEach(item => {
+    item.classList.remove('active');
+    item.setAttribute('aria-pressed', 'false');
   });
 });
 
@@ -1151,9 +1182,7 @@ resizer?.addEventListener('pointerdown', event => {
   document.body.classList.add('is-resizing');
   let currentWidth = null;
   const onMove = moveEvent => {
-    const width = Math.min(Math.max(moveEvent.clientX, 360), window.innerWidth - 400);
-    currentWidth = width;
-    document.documentElement.style.setProperty('--chat-width', `${width}px`);
+    currentWidth = updateChatWidth(moveEvent.clientX);
   };
   const onEnd = () => {
     document.body.classList.remove('is-resizing');
@@ -1167,6 +1196,25 @@ resizer?.addEventListener('pointerdown', event => {
   resizer.addEventListener('pointermove', onMove);
   resizer.addEventListener('pointerup', onEnd);
   resizer.addEventListener('pointercancel', onEnd);
+});
+
+resizer?.addEventListener('keydown', event => {
+  const currentChatWidth = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--chat-width'), 10) || 400;
+  let newWidth = currentChatWidth;
+  if (event.key === 'ArrowRight') {
+    newWidth += 20;
+  } else if (event.key === 'ArrowLeft') {
+    newWidth -= 20;
+  } else if (event.key === 'Home') {
+    newWidth = 360;
+  } else if (event.key === 'End') {
+    newWidth = window.innerWidth - 400;
+  } else {
+    return;
+  }
+  event.preventDefault();
+  const applied = updateChatWidth(newWidth);
+  try { localStorage.setItem('cad_chat_width', `${applied}px`); } catch {}
 });
 
 // History drawer
@@ -1692,11 +1740,17 @@ function connectStream() {
   const status = document.querySelector('#connection-status');
   eventSource = new EventSource('/api/stream');
   eventSource.addEventListener('error', () => {
-    if (status) status.classList.remove('connected');
+    if (status) {
+      status.classList.remove('connected');
+      status.setAttribute('aria-label', 'Disconnected');
+    }
     setTimeout(connectStream, 2000);
   });
   eventSource.addEventListener('open', () => {
-    if (status) status.classList.add('connected');
+    if (status) {
+      status.classList.add('connected');
+      status.setAttribute('aria-label', 'Connected');
+    }
   });
   const handlers = {
     agent_status: data => {
@@ -1874,22 +1928,26 @@ function connectStream() {
       }
     });
   }
+  function handleAgentTerminalState(runId, state, labelText) {
+    const card = getActiveCard(runId);
+    if (card) {
+      if (!card.dataset.raw && !card.dataset.reasoning) {
+        card.remove();
+      } else {
+        setCardState(card, state, labelText);
+      }
+      if (runId) runCards.delete(runId);
+      if (optimisticCard === card) optimisticCard = null;
+    }
+    finalizeAllActiveCards();
+  }
+
   eventSource.addEventListener('agent_error', event => {
     try {
       const data = JSON.parse(event.data);
       if (data.project !== currentProject) return;
       const runId = data.run_id || data.message_id;
-      const card = getActiveCard(runId);
-      if (card) {
-        if (!card.dataset.raw && !card.dataset.reasoning) {
-          card.remove();
-        } else {
-          setCardState(card, 'error', 'Failed');
-        }
-        if (runId) runCards.delete(runId);
-        if (optimisticCard === card) optimisticCard = null;
-      }
-      finalizeAllActiveCards();
+      handleAgentTerminalState(runId, 'error', 'Failed');
       addMessage(data.message || 'Agent error.', 'error');
       // Errors are terminal; ensure the thinking indicator clears.
       setThinking(false);
@@ -1906,17 +1964,7 @@ function connectStream() {
       const data = JSON.parse(event.data);
       if (data.project !== currentProject) return;
       const runId = data.run_id || data.message_id;
-      const card = getActiveCard(runId);
-      if (card) {
-        if (!card.dataset.raw && !card.dataset.reasoning) {
-          card.remove();
-        } else {
-          setCardState(card, 'stopped', 'Stopped');
-        }
-        if (runId) runCards.delete(runId);
-        if (optimisticCard === card) optimisticCard = null;
-      }
-      finalizeAllActiveCards();
+      handleAgentTerminalState(runId, 'stopped', 'Stopped');
       setThinking(false);
       addToolMessage({
         call_id: 'agent-run',

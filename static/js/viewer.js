@@ -51,10 +51,18 @@ export class CadViewer {
     this.wireframe = false;
     this.loadSequence = 0;
     this._needsRender = true;
-    this.controls.addEventListener('change', () => { this._needsRender = true; });
-    new ResizeObserver(() => this.resize()).observe(container);
+    this._animating = false;
+    this.controls.addEventListener('start', () => this.startAnimation());
+    this.controls.addEventListener('change', () => this.requestRender());
+    new ResizeObserver(() => {
+      this.resize();
+      this.startAnimation();
+    }).observe(container);
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) this.startAnimation();
+    });
     this.resize();
-    this.animate();
+    this.startAnimation();
   }
 
   _buildGridHelper() {
@@ -85,9 +93,9 @@ export class CadViewer {
     }
     const dims = this.cadDimensions;
     const exceedsX = dims.x > this.grid.size;
-    const exceedsZ = dims.z > this.grid.size;
-    const exceedsHeight = dims.y > this.grid.size * 2;
-    if (!exceedsX && !exceedsZ && !exceedsHeight) {
+    const exceedsY = dims.y > this.grid.size;
+    const exceedsHeight = dims.z > this.grid.size * 2;
+    if (!exceedsX && !exceedsY && !exceedsHeight) {
       this.gridWarning.hidden = true;
       this.gridWarning.textContent = '';
       delete this.gridWarning.dataset.state;
@@ -95,9 +103,9 @@ export class CadViewer {
     }
     const offenders = [];
     if (exceedsX) offenders.push(`X ${dims.x.toFixed(1)} mm > ${this.grid.size} mm`);
-    if (exceedsZ) offenders.push(`Z ${dims.z.toFixed(1)} mm > ${this.grid.size} mm`);
+    if (exceedsY) offenders.push(`Y ${dims.y.toFixed(1)} mm > ${this.grid.size} mm`);
     if (exceedsHeight) {
-      offenders.push(`Y ${dims.y.toFixed(1)} mm > tolerance`);
+      offenders.push(`Z ${dims.z.toFixed(1)} mm > tolerance`);
     }
     this.gridWarning.hidden = false;
     this.gridWarning.dataset.state = 'exceeds';
@@ -109,16 +117,36 @@ export class CadViewer {
     this.camera.aspect = width / Math.max(height, 1);
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(width, height, false);
+    this.requestRender();
+  }
+
+  requestRender() {
     this._needsRender = true;
+    this.startAnimation();
+  }
+
+  startAnimation() {
+    if (this._animating) return;
+    if (document.hidden || this.container.clientWidth === 0 || this.container.clientHeight === 0) return;
+    this._animating = true;
+    this.animate();
   }
 
   animate() {
-    requestAnimationFrame(() => this.animate());
-    if (this.container.clientWidth === 0 || this.container.clientHeight === 0) return;
+    if (document.hidden || this.container.clientWidth === 0 || this.container.clientHeight === 0) {
+      this._animating = false;
+      return;
+    }
     const isDamping = this.controls.update();
     if (isDamping || this._needsRender) {
       this.renderer.render(this.scene, this.camera);
       this._needsRender = false;
+    }
+    if (isDamping || this._needsRender) {
+      this._animating = true;
+      requestAnimationFrame(() => this.animate());
+    } else {
+      this._animating = false;
     }
   }
 
@@ -140,7 +168,7 @@ export class CadViewer {
     this.emptyState.querySelector('strong').textContent = message;
     this.emptyState.hidden = false;
     this._refreshGridWarning();
-    this._needsRender = true;
+    this.requestRender();
   }
 
   hasModel() {
@@ -219,7 +247,7 @@ export class CadViewer {
     this.controls.update();
     const dimensions = this.cadDimensions || size;
     this.dimensions.textContent = `${dimensions.x.toFixed(1)} × ${dimensions.y.toFixed(1)} × ${dimensions.z.toFixed(1)} mm`;
-    this._needsRender = true;
+    this.requestRender();
   }
 
   setView(view) {
@@ -238,19 +266,19 @@ export class CadViewer {
     this.camera.position.copy(center).addScaledVector(direction.normalize(), distance);
     this.controls.target.copy(center);
     this.controls.update();
-    this._needsRender = true;
+    this.requestRender();
   }
 
   toggleWireframe() {
     this.wireframe = !this.wireframe;
     if (this.model) this.model.material.wireframe = this.wireframe;
-    this._needsRender = true;
+    this.requestRender();
     return this.wireframe;
   }
 
   toggleGrid() {
     this.gridHelper.visible = !this.gridHelper.visible;
-    this._needsRender = true;
+    this.requestRender();
     return this.gridHelper.visible;
   }
 
