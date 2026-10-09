@@ -21,6 +21,7 @@
             <span id="connection-status" class="connection-status" role="status" aria-label="Connecting" title="Connecting…"></span>
           </div>
         </header>
+        <div id="busy-project-banner" class="busy-project-banner" hidden></div>
         <div id="chat-feed" class="chat-feed" aria-live="polite"></div>
         <template id="chat-empty">
           <div class="empty-state">
@@ -44,6 +45,10 @@
           <div id="activity-list" class="activity-list"></div>
         </details>
         <form id="chat-form" class="composer">
+          <div id="slash-popup" class="slash-popup hidden" role="listbox" aria-label="Commands">
+            <div class="slash-popup-header">Commands</div>
+            <div id="slash-popup-list" class="slash-popup-list"></div>
+          </div>
           <textarea id="message" placeholder="Describe the part, dimensions, fit, and required features…" rows="2" required aria-label="Part description"></textarea>
           <div id="attachment-preview" class="attachment-preview" aria-live="polite"></div>
           <div class="action-bar">
@@ -54,15 +59,10 @@
               <input id="attachments" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden>
             </label>
             <span id="attachment-label" class="sr-only">Attach reference images</span>
-            <span class="composer-hint">Enter sends · Shift+Enter adds a line</span>
+            <span class="composer-hint">Enter sends · Shift+Enter adds a line · / for commands</span>
             <button id="history-btn" type="button" class="quiet icon-only" title="History" aria-label="History">
               <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
                 <path d="M3 12a9 9 0 1 0 3.6-7.2M3 4v5h5M12 8v5l3 2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
-              </svg>
-            </button>
-            <button id="reset-context" type="button" class="quiet icon-only" title="Reset context" aria-label="Reset context">
-              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                <path d="M4 12a8 8 0 0 1 13.7-5.6M20 4v4h-4M20 12a8 8 0 0 1-13.7 5.6M4 20v-4h4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
               </svg>
             </button>
             <button id="send-toggle" type="button" class="send-toggle" title="Send" aria-label="Send">
@@ -84,11 +84,20 @@
       <section class="viewer-panel">
         <header class="viewer-toolbar">
           <div class="viewer-title">
-            <h2>Preview</h2>
+            <div class="viewer-tabs" role="tablist" aria-label="Viewer modes">
+              <button id="view-tab-3d" type="button" class="viewer-tab active" role="tab" aria-selected="true">3D View</button>
+              <button id="view-tab-code" type="button" class="viewer-tab" role="tab" aria-selected="false">Code</button>
+            </div>
             <span id="dimensions">No preview yet</span>
             <span id="grid-warning" class="grid-warning" hidden title="Model exceeds the configured grid surface"></span>
           </div>
           <div class="viewer-actions" aria-label="Preview controls">
+            <button id="build-btn" type="button" class="quiet toolbar-pill" title="Rebuild model from model.scad" aria-label="Rebuild model">
+              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.9 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              <span>Build</span>
+            </button>
             <button id="toggle-wireframe" type="button" class="quiet toolbar-pill" aria-pressed="false" title="Toggle wireframe" aria-label="Toggle wireframe">
               <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
                 <path d="m21 16-9 5-9-5V8l9-5 9 5v8z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
@@ -131,28 +140,32 @@
           </div>
           <div id="viewer-empty" class="viewer-empty"><span class="preview-icon">◇</span><strong>No preview yet</strong><span>Inspect the model here once it is ready.</span></div>
         </div>
-        <div id="model-actions" class="model-actions" hidden>
-          <span>Model ready for review</span>
-          <button id="approve-design" type="button">Finalize design</button>
-          <button id="continue-editing" type="button" class="quiet">Continue editing</button>
-        </div>
-        <section class="render-section" id="render-section" hidden>
-          <header class="render-header">
-            <h3>Render</h3>
-            <button id="render-toggle" type="button" class="quiet" aria-expanded="false">Show</button>
-          </header>
-          <div id="render-body" class="render-body" hidden>
-            <img id="render-image" alt="Latest render of the current model" loading="lazy">
+        <div id="code-view" class="code-view" hidden>
+          <div class="code-toolbar">
+            <div class="code-meta">
+              <span class="code-filename">model.scad</span>
+              <span id="code-stats" class="code-stats">0 lines</span>
+            </div>
+            <div class="code-actions">
+              <button id="save-code-btn" type="button" class="quiet toolbar-pill code-action-btn" title="Save code (Ctrl+S)" aria-label="Save code">
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                  <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+                  <polyline points="17 21 17 13 7 13 7 21" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+                  <polyline points="7 3 7 8 15 8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                <span>Save</span>
+              </button>
+              <button id="copy-code-btn" type="button" class="quiet toolbar-pill code-action-btn" title="Copy code" aria-label="Copy code">
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                  <rect x="9" y="9" width="13" height="13" rx="2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                <span>Copy</span>
+              </button>
+            </div>
           </div>
-        </section>
-        <section class="review-section" id="review-section" hidden>
-          <header class="render-header">
-            <h3>Multi-view review</h3>
-            <span id="review-status" class="review-status">Idle</span>
-          </header>
-          <div id="review-summary" class="review-summary" hidden></div>
-          <div class="review-gallery" id="review-gallery"></div>
-        </section>
+          <textarea id="code-editor" class="code-editor" spellcheck="false" placeholder="// No model.scad found"></textarea>
+        </div>
       </section>
     </main>
     <aside id="history-drawer" class="history-drawer" hidden>

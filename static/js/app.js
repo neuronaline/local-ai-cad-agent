@@ -9,22 +9,14 @@ const attachmentLabel = document.querySelector('#attachment-label');
 const sendToggle = document.querySelector('#send-toggle');
 const sendIcon = sendToggle?.querySelector('[data-mode="send"]');
 const stopIcon = sendToggle?.querySelector('[data-mode="stop"]');
-const resetButton = document.querySelector('#reset-context');
+const slashPopup = document.querySelector('#slash-popup');
+const slashPopupList = document.querySelector('#slash-popup-list');
 const questionArea = document.querySelector('#question-area');
-const renderSection = document.querySelector('#render-section');
-const renderBody = document.querySelector('#render-body');
-const renderImage = document.querySelector('#render-image');
-const renderToggle = document.querySelector('#render-toggle');
-const reviewSection = document.querySelector('#review-section');
-const reviewStatus = document.querySelector('#review-status');
-const reviewSummary = document.querySelector('#review-summary');
-const reviewGallery = document.querySelector('#review-gallery');
 const activityPanel = document.querySelector('#activity-panel');
 const activityTitle = document.querySelector('#activity-title');
 const activityList = document.querySelector('#activity-list');
 const usagePill = document.querySelector('#usage-pill');
 const attachmentPreview = document.querySelector('#attachment-preview');
-const modelActions = document.querySelector('#model-actions');
 const downloadModelBtn = document.querySelector('#download-model');
 const exportFormatSelect = document.querySelector('#export-format');
 const appConfig = JSON.parse(document.querySelector('#app-config')?.textContent || '{}');
@@ -61,9 +53,6 @@ let selectedFiles = [];
 let previewProject = '';
 let loadedPreviewRevision = '';
 let previewLoadPromise = null;
-let renderImageUrl = '';
-let renderLoadSequence = 0;
-let reviewLoadSequence = 0;
 const activityItems = new Map();
 const ALLOWED_TAGS = new Set([
   'p', 'br', 'b', 'strong', 'i', 'em', 'u', 's', 'del',
@@ -595,10 +584,7 @@ async function loadCurrentPreview(previewId) {
       // The agent turn has already completed by the time we render; failures
       // here are surfaced as a chat-side error and never block the canonical
       // ``agent_message`` from being persisted.
-      await refreshRender();
-      modelActions.hidden = false;
       if (downloadModelBtn) downloadModelBtn.disabled = false;
-      loadReviewGallery();
     } catch (error) {
       if (error.message?.includes('superseded')) return;
       if (downloadModelBtn) downloadModelBtn.disabled = true;
@@ -613,103 +599,12 @@ async function loadCurrentPreview(previewId) {
 function hideUnapprovedPreview(reviewStatus = 'pending') {
   previewProject = '';
   loadedPreviewRevision = '';
-  modelActions.hidden = true;
   if (downloadModelBtn) downloadModelBtn.disabled = true;
   viewer.clear(
     reviewStatus === 'fail'
       ? 'Preview was rejected by review'
       : 'Preview is awaiting review',
   );
-}
-
-async function refreshRender() {
-  if (!currentProject) return;
-  const sequence = ++renderLoadSequence;
-  try {
-    const res = await fetch(`/api/projects/${encodeURIComponent(currentProject)}/render?ts=${Date.now()}`);
-    if (sequence !== renderLoadSequence) return;
-    if (!res.ok) {
-      clearRenderImage();
-      renderSection.hidden = true;
-      return;
-    }
-    const blob = await res.blob();
-    if (sequence !== renderLoadSequence) return;
-    const url = URL.createObjectURL(blob);
-    const previousUrl = renderImageUrl;
-    renderImageUrl = url;
-    renderImage.src = url;
-    if (previousUrl) URL.revokeObjectURL(previousUrl);
-    renderSection.hidden = false;
-  } catch {
-    if (sequence !== renderLoadSequence) return;
-    clearRenderImage();
-    renderSection.hidden = true;
-  }
-}
-
-function clearRenderImage() {
-  if (renderImageUrl) URL.revokeObjectURL(renderImageUrl);
-  renderImageUrl = '';
-  renderImage.removeAttribute('src');
-}
-
-async function loadReviewGallery() {
-  if (!currentProject) return;
-  const sequence = ++reviewLoadSequence;
-  try {
-    const manifest = await api(`/api/projects/${encodeURIComponent(currentProject)}/review/manifest?ts=${Date.now()}`);
-    if (sequence !== reviewLoadSequence) return;
-    if (!manifest || !Array.isArray(manifest.views)) {
-      reviewSection.hidden = true;
-      return;
-    }
-    reviewSection.hidden = false;
-    const result = manifest.result && typeof manifest.result === 'object' ? manifest.result : null;
-    const status = result && typeof result.status === 'string' ? result.status : 'pending';
-    const summary = result && typeof result.summary === 'string' ? result.summary : '';
-    const findings = result && Array.isArray(result.findings) ? result.findings : [];
-    reviewStatus.textContent = summary || reviewStatusLabel(status);
-    reviewStatus.dataset.state = status;
-    reviewSummary.replaceChildren();
-    if (findings.length) {
-      reviewSummary.hidden = false;
-      for (const finding of findings) {
-        const line = document.createElement('div');
-        line.className = 'finding';
-        const severity = finding && typeof finding.severity === 'string' ? finding.severity : 'minor';
-        const message = finding && typeof finding.message === 'string' ? finding.message : '';
-        line.dataset.severity = severity;
-        line.textContent = message;
-        reviewSummary.appendChild(line);
-      }
-    } else {
-      reviewSummary.hidden = true;
-    }
-    reviewGallery.replaceChildren();
-    for (const view of manifest.views) {
-      if (!view || typeof view.view_id !== 'string') continue;
-      const figure = document.createElement('figure');
-      const img = document.createElement('img');
-      img.src = `/api/projects/${encodeURIComponent(currentProject)}/review/view/${encodeURIComponent(view.view_id)}?ts=${Date.now()}`;
-      img.alt = view.label || view.view_id;
-      img.loading = 'lazy';
-      const caption = document.createElement('figcaption');
-      caption.textContent = view.label || view.view_id;
-      figure.append(img, caption);
-      reviewGallery.appendChild(figure);
-    }
-  } catch {
-    if (sequence !== reviewLoadSequence) return;
-    reviewSection.hidden = true;
-  }
-}
-
-function reviewStatusLabel(status) {
-  if (status === 'pass') return 'Pass';
-  if (status === 'fail') return 'Fail';
-  if (status === 'inconclusive') return 'Inconclusive';
-  return 'Pending';
 }
 
 async function syncCurrentPreview() {
@@ -722,16 +617,69 @@ async function syncCurrentPreview() {
     ) {
       if (meta.displayable) await loadCurrentPreview();
       else hideUnapprovedPreview(meta.review_status);
-      loadReviewGallery();
     }
   } catch {
     // SSE is the primary path; polling is only a reconnect fallback.
   }
 }
 
+let busyWithOtherProject = null;
+
+function setBusyWithOther(activeProject) {
+  busyWithOtherProject = activeProject || null;
+  const banner = document.querySelector('#busy-project-banner');
+  if (!banner) return;
+  if (activeProject) {
+    const safeProj = escapeHTML(activeProject);
+    banner.innerHTML = `
+      <div class="busy-banner-content">
+        <span class="busy-banner-icon" aria-hidden="true">⚡</span>
+        <span class="busy-banner-text">Agent task is currently running in <strong>${safeProj}</strong>.</span>
+      </div>
+      <div class="busy-banner-actions">
+        <a href="/project/${encodeURIComponent(activeProject)}" class="btn-banner-link">Go to ${safeProj}</a>
+        <button type="button" id="busy-banner-stop-btn" class="btn-banner-stop">Stop Task</button>
+      </div>
+    `;
+    banner.hidden = false;
+    const stopBtn = banner.querySelector('#busy-banner-stop-btn');
+    stopBtn?.addEventListener('click', async () => {
+      stopBtn.disabled = true;
+      stopBtn.textContent = 'Stopping…';
+      try {
+        await api('/api/stop', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({project: activeProject}),
+        });
+        setBusyWithOther(null);
+        addMessage(`Agent task in "${activeProject}" was stopped.`, 'info');
+      } catch (err) {
+        addMessage(`Failed to stop agent: ${err.message}`, 'error');
+        stopBtn.disabled = false;
+        stopBtn.textContent = 'Stop Task';
+      }
+    });
+    if (message) {
+      message.placeholder = `Agent is running in project "${activeProject}"…`;
+    }
+  } else {
+    banner.hidden = true;
+    banner.innerHTML = '';
+    if (message && message.placeholder.startsWith('Agent is running in project')) {
+      message.placeholder = 'Describe the part, dimensions, fit, and required features…';
+    }
+  }
+}
+
 async function loadCurrentState() {
   if (!currentProject) return;
   const data = await api(`/api/projects/${encodeURIComponent(currentProject)}/state`);
+  if (data.busy_with_other && data.active_project) {
+    setBusyWithOther(data.active_project);
+  } else {
+    setBusyWithOther(null);
+  }
   if (data.status === 'waiting_for_user') {
     setThinking(false);
     const q = data.question || {};
@@ -907,18 +855,167 @@ function addInfoMessage(type, data = {}) {
   }
 }
 
+const COMMANDS = [
+  {
+    name: '/audit',
+    args: '[notes]',
+    desc: 'Audit model for geometric, manifold & manufacturing defects',
+    iconSvg: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m9 11 3 3L22 4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    action: () => {
+      message.value = '/audit ';
+      message.focus();
+      closeSlashPopup();
+    },
+  },
+  {
+    name: '/reset',
+    alias: '/clear',
+    args: '',
+    desc: 'Reset conversation memory for this project',
+    iconSvg: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 12a8 8 0 0 1 13.7-5.6M20 4v4h-4M20 12a8 8 0 0 1-13.7 5.6M4 20v-4h4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    action: async () => {
+      closeSlashPopup();
+      message.value = '';
+      await executeResetContext();
+    },
+  },
+];
+
+let visibleCommands = [];
+let slashSelectedIndex = 0;
+
+function renderSlashPopup(items) {
+  if (!slashPopupList) return;
+  slashPopupList.replaceChildren();
+  items.forEach((cmd, idx) => {
+    const item = document.createElement('div');
+    item.className = `slash-item${idx === slashSelectedIndex ? ' selected' : ''}`;
+    item.setAttribute('role', 'option');
+    item.setAttribute('aria-selected', String(idx === slashSelectedIndex));
+    item.innerHTML = `
+      <div class="slash-item-icon">${cmd.iconSvg}</div>
+      <div class="slash-item-details">
+        <span class="slash-item-name">${cmd.name}${cmd.args ? `<span class="slash-item-args">${cmd.args}</span>` : ''}</span>
+        <span class="slash-item-desc">${cmd.desc}</span>
+      </div>
+    `;
+    item.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      cmd.action();
+    });
+    slashPopupList.appendChild(item);
+  });
+}
+
+function openSlashPopup(items) {
+  if (!slashPopup || !items.length) {
+    closeSlashPopup();
+    return;
+  }
+  visibleCommands = items;
+  slashSelectedIndex = 0;
+  renderSlashPopup(items);
+  slashPopup.classList.remove('hidden');
+}
+
+function closeSlashPopup() {
+  if (!slashPopup) return;
+  slashPopup.classList.add('hidden');
+  visibleCommands = [];
+  slashSelectedIndex = 0;
+}
+
+function updateSlashSelection(newIndex) {
+  if (!visibleCommands.length || !slashPopupList) return;
+  slashSelectedIndex = (newIndex + visibleCommands.length) % visibleCommands.length;
+  Array.from(slashPopupList.children).forEach((child, idx) => {
+    const isSelected = idx === slashSelectedIndex;
+    child.classList.toggle('selected', isSelected);
+    child.setAttribute('aria-selected', String(isSelected));
+  });
+  const selectedEl = slashPopupList.children[slashSelectedIndex];
+  selectedEl?.scrollIntoView({ block: 'nearest' });
+}
+
+async function executeResetContext() {
+  if (!currentProject) return addMessage('Create or select a project first.', 'error');
+  const proceed = window.confirm(
+    'Reset the AI\u2019s conversation memory for this project?\n\nThe model, preview, and revisions are kept. The next message starts a fresh context.'
+  );
+  if (!proceed) return;
+  try {
+    await api(`/api/projects/${encodeURIComponent(currentProject)}/reset`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+    });
+  } catch (error) {
+    addMessage(error.message, 'error');
+  }
+}
+
+message.addEventListener('input', () => {
+  const val = message.value;
+  if (val.startsWith('/') && !val.includes(' ') && !val.includes('\n')) {
+    const query = val.toLowerCase();
+    const matches = COMMANDS.filter(cmd =>
+      cmd.name.startsWith(query) || (cmd.alias && cmd.alias.startsWith(query))
+    );
+    if (matches.length > 0) {
+      openSlashPopup(matches);
+      return;
+    }
+  }
+  closeSlashPopup();
+});
+
 message.addEventListener('keydown', (e) => {
+  if (slashPopup && !slashPopup.classList.contains('hidden') && visibleCommands.length > 0) {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      updateSlashSelection(slashSelectedIndex + 1);
+      return;
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      updateSlashSelection(slashSelectedIndex - 1);
+      return;
+    }
+    if (e.key === 'Enter' || e.key === 'Tab') {
+      if (e.isComposing) return;
+      e.preventDefault();
+      const selectedCmd = visibleCommands[slashSelectedIndex];
+      if (selectedCmd) selectedCmd.action();
+      return;
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      closeSlashPopup();
+      return;
+    }
+  }
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
     e.preventDefault();
     chatForm.dispatchEvent(new Event('submit'));
   }
 });
 
+document.addEventListener('click', (event) => {
+  if (!event.target.closest('#chat-form')) {
+    closeSlashPopup();
+  }
+});
+
 chatForm.addEventListener('submit', async event => {
   event.preventDefault();
+  closeSlashPopup();
   if (!currentProject) return addMessage('Create a project first.', 'error');
   const text = message.value.trim();
   if (!text) return;
+  if (text.toLowerCase() === '/reset' || text.toLowerCase() === '/clear') {
+    message.value = '';
+    await executeResetContext();
+    return;
+  }
   if (sendToggle) sendToggle.disabled = true;
   message.disabled = true;
   // Snapshot attached files and their preview URLs so we can render the
@@ -935,10 +1032,22 @@ chatForm.addEventListener('submit', async event => {
     setThinking(true);
     scrollFeedToBottom(true);
     message.value = '';
+    let promptText = text;
+    if (text.toLowerCase() === '/audit' || text.toLowerCase().startsWith('/audit ')) {
+      const extraInstructions = text.length > 6 ? text.slice(6).trim() : '';
+      promptText =
+        'Please inspect the current model.scad for any physical, geometric, or manufacturing issues ' +
+        '(such as non-manifold edges, self-intersections, inverted normals, zero-thickness walls, or fragile parts). ' +
+        'If you find any issues, please fix them directly in model.scad, run cad_build to verify, ' +
+        'and briefly let me know what was wrong and how you resolved it.';
+      if (extraInstructions) {
+        promptText += `\n\nAlso, please pay special attention to: ${extraInstructions}`;
+      }
+    }
     const idempotencyKey = generateUUID();
     const body = new FormData();
     body.append('project', currentProject);
-    body.append('message', text);
+    body.append('message', promptText);
     body.append('idempotency_key', idempotencyKey);
     selectedFiles.forEach(file => body.append('attachments', file));
     const response = await api('/api/chat', {method: 'POST', body});
@@ -966,6 +1075,7 @@ chatForm.addEventListener('submit', async event => {
     }
     addMessage(error.message, 'error');
     setThinking(false);
+    loadCurrentState().catch(() => {});
   } finally {
     if (!isQuestionPending) {
       if (sendToggle) sendToggle.disabled = false;
@@ -1006,25 +1116,6 @@ sendToggle?.addEventListener('click', async () => {
     return;
   }
   chatForm.dispatchEvent(new Event('submit'));
-});
-
-resetButton.addEventListener('click', async () => {
-  if (!currentProject) return;
-  const proceed = window.confirm(
-    'Reset the AI\u2019s conversation memory for this project?\n\nThe model, preview, and revisions are kept. The next message starts a fresh context.'
-  );
-  if (!proceed) return;
-  resetButton.disabled = true;
-  try {
-    await api(`/api/projects/${encodeURIComponent(currentProject)}/reset`, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-    });
-  } catch (error) {
-    addMessage(error.message, 'error');
-  } finally {
-    resetButton.disabled = false;
-  }
 });
 
 const ALLOWED_IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/webp']);
@@ -1178,13 +1269,6 @@ document.addEventListener('click', (event) => {
   }
 });
 
-renderToggle.addEventListener('click', () => {
-  const expanded = renderToggle.getAttribute('aria-expanded') === 'true';
-  renderToggle.setAttribute('aria-expanded', String(!expanded));
-  renderToggle.textContent = expanded ? 'Show' : 'Hide';
-  renderBody.hidden = expanded;
-});
-
 // Viewer toolbar
 document.querySelector('#toggle-wireframe')?.addEventListener('click', event => {
   event.currentTarget.setAttribute('aria-pressed', String(viewer.toggleWireframe()));
@@ -1224,7 +1308,7 @@ downloadModelBtn?.addEventListener('click', async () => {
   } catch (error) {
     addMessage(`Export failed: ${error.message}`, 'error');
   } finally {
-    downloadModelBtn.disabled = Boolean(modelActions?.hidden);
+    downloadModelBtn.disabled = !previewProject;
   }
 });
 document.querySelectorAll('[data-view]').forEach(button => {
@@ -1246,11 +1330,184 @@ viewer.controls.addEventListener('start', () => {
   });
 });
 
-document.querySelector('#approve-design')?.addEventListener('click', () => {
-  message.value = 'Finalize the design. Run the final verification and prepare the outputs.';
-  chatForm.dispatchEvent(new Event('submit'));
+// Viewer tabs & Code editor
+const viewTab3d = document.querySelector('#view-tab-3d');
+const viewTabCode = document.querySelector('#view-tab-code');
+const codeView = document.querySelector('#code-view');
+const viewerContainer = document.querySelector('#viewer');
+const codeEditor = document.querySelector('#code-editor');
+const codeStats = document.querySelector('#code-stats');
+const saveCodeBtn = document.querySelector('#save-code-btn');
+const copyCodeBtn = document.querySelector('#copy-code-btn');
+let codeDirty = false;
+
+function updateCodeStats() {
+  if (!codeStats || !codeEditor) return;
+  const lines = codeEditor.value ? codeEditor.value.split('\n').length : 0;
+  const chars = codeEditor.value.length;
+  codeStats.textContent = `${lines} lines · ${chars} chars${codeDirty ? ' (unsaved)' : ''}`;
+}
+
+async function loadModelCode() {
+  if (!currentProject || !codeEditor) return;
+  try {
+    const data = await api(`/api/projects/${encodeURIComponent(currentProject)}/code`);
+    if (data.ok) {
+      codeEditor.value = data.code || '';
+      codeDirty = false;
+      updateCodeStats();
+    }
+  } catch (error) {
+    // Non-blocking
+  }
+}
+
+async function saveModelCode() {
+  if (!currentProject || !codeEditor || !codeDirty) return true;
+  try {
+    const res = await api(`/api/projects/${encodeURIComponent(currentProject)}/code`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code: codeEditor.value }),
+    });
+    if (res.ok) {
+      codeDirty = false;
+      updateCodeStats();
+      return true;
+    }
+    return false;
+  } catch (error) {
+    addMessage(`Failed to save code: ${error.message}`, 'error');
+    return false;
+  }
+}
+
+function setViewerMode(mode) {
+  const isCode = mode === 'code';
+  if (viewTab3d) {
+    viewTab3d.classList.toggle('active', !isCode);
+    viewTab3d.setAttribute('aria-selected', String(!isCode));
+  }
+  if (viewTabCode) {
+    viewTabCode.classList.toggle('active', isCode);
+    viewTabCode.setAttribute('aria-selected', String(isCode));
+  }
+  if (viewerContainer) viewerContainer.hidden = isCode;
+  if (codeView) codeView.hidden = !isCode;
+  if (isCode) {
+    if (!codeDirty) loadModelCode();
+    codeEditor?.focus();
+  } else {
+    viewer?.resize();
+  }
+}
+
+viewTab3d?.addEventListener('click', () => setViewerMode('3d'));
+viewTabCode?.addEventListener('click', () => setViewerMode('code'));
+
+codeEditor?.addEventListener('input', () => {
+  codeDirty = true;
+  updateCodeStats();
 });
-document.querySelector('#continue-editing')?.addEventListener('click', () => message.focus());
+
+codeEditor?.addEventListener('keydown', async event => {
+  if (event.key === 'Tab') {
+    event.preventDefault();
+    const start = codeEditor.selectionStart;
+    const end = codeEditor.selectionEnd;
+    codeEditor.value = codeEditor.value.substring(0, start) + '  ' + codeEditor.value.substring(end);
+    codeEditor.selectionStart = codeEditor.selectionEnd = start + 2;
+    codeDirty = true;
+    updateCodeStats();
+  } else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
+    event.preventDefault();
+    await handleSaveCodeAction();
+  }
+});
+
+async function handleSaveCodeAction() {
+  if (!currentProject || !codeEditor) return;
+  const label = saveCodeBtn?.querySelector('span');
+  const originalText = 'Save';
+  try {
+    const saved = await saveModelCode();
+    if (saved && label) {
+      saveCodeBtn?.classList.add('success');
+      label.textContent = 'Saved!';
+      setTimeout(() => {
+        saveCodeBtn?.classList.remove('success');
+        if (label) label.textContent = originalText;
+      }, 1500);
+    } else if (!saved && label) {
+      label.textContent = 'Error';
+      setTimeout(() => { if (label) label.textContent = originalText; }, 1500);
+    }
+  } catch {
+    if (label) {
+      label.textContent = 'Error';
+      setTimeout(() => { if (label) label.textContent = originalText; }, 1500);
+    }
+  }
+}
+
+saveCodeBtn?.addEventListener('click', handleSaveCodeAction);
+
+copyCodeBtn?.addEventListener('click', async () => {
+  if (!codeEditor?.value) return;
+  const showFeedback = () => {
+    const span = copyCodeBtn.querySelector('span');
+    if (span) {
+      copyCodeBtn?.classList.add('success');
+      span.textContent = 'Copied!';
+      setTimeout(() => {
+        copyCodeBtn?.classList.remove('success');
+        span.textContent = 'Copy';
+      }, 1500);
+    }
+  };
+  try {
+    await navigator.clipboard.writeText(codeEditor.value);
+    showFeedback();
+  } catch {
+    codeEditor.select();
+    document.execCommand('copy');
+    showFeedback();
+  }
+});
+
+const buildBtn = document.querySelector('#build-btn');
+buildBtn?.addEventListener('click', async () => {
+  if (!currentProject) return addMessage('Create or select a project first.', 'error');
+  if (buildBtn.disabled) return;
+  buildBtn.disabled = true;
+  const label = buildBtn.querySelector('span');
+  const originalText = 'Build';
+  if (label) label.textContent = 'Building…';
+  try {
+    if (codeDirty) {
+      const saved = await saveModelCode();
+      if (!saved) return;
+    }
+    const res = await api(`/api/projects/${encodeURIComponent(currentProject)}/build`, {
+      method: 'POST',
+    });
+    if (res.ok) {
+      if (res.preview_id) await loadCurrentPreview(res.preview_id);
+      await loadModelCode();
+      if (label) {
+        label.textContent = 'Built!';
+        setTimeout(() => { if (label) label.textContent = originalText; }, 1200);
+      }
+    }
+  } catch (error) {
+    addMessage(`CAD build failed: ${error.message}`, 'error');
+  } finally {
+    buildBtn.disabled = false;
+    if (label && label.textContent === 'Building…') label.textContent = originalText;
+  }
+});
+
+
 
 document.querySelectorAll('[data-mobile-view]').forEach(button => {
   button.addEventListener('click', () => {
@@ -1367,6 +1624,8 @@ async function loadModelPane() {
           }
           historyDrawer.hidden = true;
           loadModelPane();
+          codeDirty = false;
+          await loadModelCode();
         } catch (error) {
           addMessage(error.message, 'error');
         } finally {
@@ -1840,6 +2099,11 @@ function connectStream() {
   });
   const handlers = {
     agent_status: data => {
+      if (busyWithOtherProject && data.project === busyWithOtherProject) {
+        if (['stopped', 'failed', 'completed'].includes(data.status)) {
+          setBusyWithOther(null);
+        }
+      }
       if (data.project !== currentProject) return;
       if (!(data.status === 'completed' && activityItems.size > 0 && !activityItems.has('agent-run'))) {
         addToolMessage({
@@ -1967,10 +2231,12 @@ function connectStream() {
       if (data.project !== currentProject) return;
       if (data.preview_id) loadCurrentPreview(data.preview_id);
       else hideUnapprovedPreview('pending');
+      if (!codeDirty) loadModelCode();
     },
     revision_updated: data => {
       if (data.project !== currentProject) return;
       syncCurrentPreview();
+      if (!codeDirty) loadModelCode();
     },
     // Phase-complete events from the split cad_screenshot / cad_review tools.
     // The intermediate ``tool_status`` events already drive the running rows;
@@ -2048,6 +2314,9 @@ function connectStream() {
   eventSource.addEventListener('agent_stopped', event => {
     try {
       const data = JSON.parse(event.data);
+      if (busyWithOtherProject && (data.project === busyWithOtherProject || (data.affected_projects && data.affected_projects.includes(busyWithOtherProject)))) {
+        setBusyWithOther(null);
+      }
       if (data.project !== currentProject) return;
       const runId = data.run_id || data.message_id;
       handleAgentTerminalState(runId, 'stopped', 'Stopped');
@@ -2123,5 +2392,6 @@ document.addEventListener('click', event => {
   await loadHistory(currentProject);
   await loadCurrentState();
   await syncCurrentPreview();
+  await loadModelCode();
   connectStream();
 })();

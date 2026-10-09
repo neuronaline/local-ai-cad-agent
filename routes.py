@@ -46,6 +46,7 @@ from agent.review_paths import review_dir
 from agent.revisions import (
     MODEL_FILENAME,
     RevisionIntegrityError,
+    RevisionOrigin,
     RevisionStore,
     cached_model_sha256,
 )
@@ -246,13 +247,6 @@ def _write_project_metadata(project_dir: Path, metadata: dict[str, Any]) -> None
         raise
 
 
-def _model_status(project_dir: Path) -> str:
-    preview = project_dir / "preview.stl"
-    if preview.is_file() and preview.stat().st_size > 0:
-        return "has_model"
-    return "none"
-
-
 def _active_api_key_env(settings: Settings) -> str:
     from agent.llm_base import api_key_env
     return api_key_env(settings.llm_provider)
@@ -437,6 +431,8 @@ def project_view(name: str) -> str:
 @projects_bp.get("/api/projects")
 def list_projects():
     settings: Settings = current_app.config["SETTINGS"]
+    runner: AgentRunner = current_app.config["AGENT_RUNNER"]
+    active = runner.active_project() if runner.is_running() else None
     projects: list[dict[str, Any]] = []
     for item in sorted(settings.workspace_root.iterdir()):
         if not item.is_dir() or not PROJECT_NAME_RE.fullmatch(item.name):
@@ -446,9 +442,9 @@ def list_projects():
             "name": item.name,
             "created_at": metadata.get("created_at"),
             "modified_at": _project_modified_at(item),
-            "model_status": _model_status(item),
+            "is_running": (item.name == active),
         })
-    return jsonify({"projects": projects})
+    return jsonify({"projects": projects, "active_project": active})
 
 
 @projects_bp.post("/api/projects/new")
@@ -606,7 +602,13 @@ def chat():
             ), 202
         _idempotency_forget(idempotency_key)
     if runner.is_running():
-        return jsonify({"error": "An agent task is already running."}), 409
+        active = runner.active_project()
+        msg = (
+            f"An agent task is already running in project '{active}'."
+            if active
+            else "An agent task is already running."
+        )
+        return jsonify({"error": msg, "active_project": active}), 409
     with _project_lock(project_name):
         project_dir = _resolve_project_or_404(
             current_app.config["SETTINGS"], project_name
@@ -672,7 +674,7 @@ def stop():
             return jsonify({"error": str(error)}), 404
     runner: AgentRunner = current_app.config["AGENT_RUNNER"]
     active_proj = runner.active_project()
-    active_run = runner.active_run_id() if (active_proj == project_name or project_name is None) else None
+    active_run = runner.active_run_id()
     affected = runner.stop(project_name)
     event_project = project_name or active_proj
     if event_project is None and affected:
@@ -687,7 +689,18 @@ def stop():
         "agent_stopped",
         stop_event_payload,
     )
-    return jsonify({"stopped": True, "affected_projects": affected})
+    if active_proj and active_proj != event_project:
+        active_payload = dict(stop_event_payload)
+        active_payload["project"] = active_proj
+        current_app.config["EVENT_BUS"].publish(
+            "agent_stopped",
+            active_payload,
+        )
+    return jsonify({
+        "stopped": True,
+        "affected_projects": affected,
+        "stopped_project": active_proj,
+    })
 
 
 @agent_bp.get("/api/projects/<project_name>/state")
@@ -700,9 +713,17 @@ def project_state(project_name: str):
     question = runner.waiting_question(project_name)
     if question:
         return jsonify({"status": "waiting_for_user", "question": question})
-    if runner.is_running() and runner.active_project() == project_name:
-        return jsonify({"status": "running", "run_id": runner.active_run_id()})
-    return jsonify({"status": "idle"})
+    if runner.is_running():
+        active = runner.active_project()
+        if active == project_name:
+            return jsonify({"status": "running", "run_id": runner.active_run_id()})
+        return jsonify({
+            "status": "idle",
+            "busy_with_other": True,
+            "active_project": active,
+            "run_id": runner.active_run_id(),
+        })
+    return jsonify({"status": "idle", "busy_with_other": False})
 
 
 @agent_bp.get("/api/projects/<project_name>/history")
@@ -1095,6 +1116,54 @@ def restore_revision(project_name: str, revision_id: str):
 
         bus = current_app.config["EVENT_BUS"]
         bus.publish("revision_updated", {"project": project_name})
+
+        # Fast path: Check for pre-built artifacts in cache (<15ms)
+        cache_dir = project_dir / ".cad-agent" / "cache" / revision.model_sha256
+        cached_preview = cache_dir / "preview.stl"
+        cached_render = cache_dir / "render.png"
+        cached_metrics = cache_dir / ".cad_metrics.json"
+
+        if cached_preview.is_file() and cached_preview.stat().st_size > 0:
+            shutil.copy2(cached_preview, project_dir / "preview.stl")
+            if cached_render.is_file() and cached_render.stat().st_size > 0:
+                shutil.copy2(cached_render, project_dir / "render.png")
+            else:
+                (project_dir / "render.png").unlink(missing_ok=True)
+            metrics = {}
+            if cached_metrics.is_file() and cached_metrics.stat().st_size > 0:
+                shutil.copy2(cached_metrics, project_dir / ".cad_metrics.json")
+                try:
+                    loaded = json.loads(cached_metrics.read_text(encoding="utf-8"))
+                    metrics = loaded.get("metrics") or {}
+                except (OSError, json.JSONDecodeError):
+                    metrics = {}
+
+            store.record_build_success(
+                revision.id,
+                metrics,
+                project_dir / "preview.stl",
+            )
+            preview_id = runner._register_preview(project_name, project_dir)
+            bus.publish("preview_updated", {
+                "project": project_name,
+                "preview_id": preview_id,
+            })
+            bus.publish("agent_status", {
+                "project": project_name,
+                "status": "idle",
+                "message": "Restored model is ready.",
+            })
+            return jsonify({
+                "ok": True,
+                "restored": True,
+                "revision_id": revision.id,
+                "build_status": "succeeded",
+                "metrics": metrics,
+                "preview_id": preview_id,
+                "cached": True,
+            })
+
+        # Cache miss: compile via CadTool and cache the result
         bus.publish("agent_status", {
             "project": project_name,
             "status": "restoring",
@@ -1104,19 +1173,19 @@ def restore_revision(project_name: str, revision_id: str):
         from agent.tools.cad_tool import CadTool, RenderMode
         cad = CadTool(project_dir, bus.publish, store)
         try:
-            build = cad.build_and_verify(mode=RenderMode.FULL_REVIEW)
+            build = cad.build_and_verify(mode=RenderMode.NONE)
             metrics = build.get("metrics") or {}
+            (project_dir / "render.png").unlink(missing_ok=True)
         except (RuntimeError, ValueError, TypeError) as error:
             bus.publish("agent_error", {
                 "project": project_name,
                 "message": f"Restore succeeded but CAD rebuild failed: {error}",
             })
-            # 207 Multi-Status signals a partial-success: ``model.scad`` was
-            # restored, but the rebuild that re-derives ``preview.stl`` /
-            # ``render.png`` failed. The explicit ``ok: false`` plus a
-            # top-level ``error`` field lets clients detect the failure
-            # without inspecting ``build_status``; the 207 keeps the
-            # surrounding 2xx semantic that the restore half succeeded.
+            bus.publish("agent_status", {
+                "project": project_name,
+                "status": "idle",
+                "message": "Rebuild failed after restore.",
+            })
             return jsonify({
                 "ok": False,
                 "restored": True,
@@ -1132,8 +1201,8 @@ def restore_revision(project_name: str, revision_id: str):
         })
         bus.publish("agent_status", {
             "project": project_name,
-            "status": "rendering",
-            "message": "Restored model is being displayed…",
+            "status": "idle",
+            "message": "Restored model is ready.",
         })
         return jsonify({
             "ok": True,
@@ -1142,4 +1211,125 @@ def restore_revision(project_name: str, revision_id: str):
             "build_status": "succeeded",
             "metrics": metrics,
             "preview_id": preview_id,
+        })
+
+
+@projects_bp.post("/api/projects/<project_name>/build")
+def build_project(project_name: str):
+    """Rebuild preview.stl and metrics directly from the current model.scad."""
+    settings: Settings = current_app.config["SETTINGS"]
+    with _project_lock(project_name):
+        project_dir = _resolve_project_or_404(settings, project_name)
+        if not isinstance(project_dir, Path):
+            return project_dir
+        runner: AgentRunner = current_app.config["AGENT_RUNNER"]
+        if runner.has_active_state_for(project_name):
+            return jsonify({"error": "Agent is currently running on this project"}), 409
+
+        model_path = project_dir / MODEL_FILENAME
+        if not model_path.is_file():
+            return jsonify({"error": "No model.scad found to build"}), 400
+        try:
+            content = model_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as error:
+            return jsonify({"error": f"Failed to read model.scad: {error}"}), 400
+        if not content.strip():
+            return jsonify({"error": "model.scad is empty"}), 400
+
+        store = RevisionStore(
+            project_dir,
+            retention_count=settings.revision_retention_count,
+        )
+        try:
+            store.reconcile()
+        except RevisionIntegrityError as error:
+            return jsonify({"error": f"Revision integrity error: {error}"}), 409
+
+        bus = current_app.config["EVENT_BUS"]
+        from agent.tools.cad_tool import CadTool, RenderMode
+        cad = CadTool(project_dir, None, store)
+        try:
+            build = cad.build_and_verify(mode=RenderMode.NONE)
+            metrics = build.get("metrics") or {}
+            (project_dir / "render.png").unlink(missing_ok=True)
+        except (RuntimeError, ValueError, TypeError) as error:
+            return jsonify({
+                "ok": False,
+                "build_status": "failed",
+                "error": str(error),
+            }), 422
+
+        preview_id = runner._register_preview(project_name, project_dir)
+        bus.publish("preview_updated", {
+            "project": project_name,
+            "preview_id": preview_id,
+        })
+        return jsonify({
+            "ok": True,
+            "build_status": "succeeded",
+            "metrics": metrics,
+            "preview_id": preview_id,
+        })
+
+
+@projects_bp.get("/api/projects/<project_name>/code")
+def get_project_code(project_name: str):
+    """Retrieve raw model.scad source for the project."""
+    settings: Settings = current_app.config["SETTINGS"]
+    with _project_lock(project_name):
+        project_dir = _resolve_project_or_404(settings, project_name)
+        if not isinstance(project_dir, Path):
+            return project_dir
+        model_path = project_dir / MODEL_FILENAME
+        code = ""
+        if model_path.is_file():
+            try:
+                code = model_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                code = ""
+        return jsonify({
+            "ok": True,
+            "code": code,
+        })
+
+
+@projects_bp.put("/api/projects/<project_name>/code")
+def update_project_code(project_name: str):
+    """Update model.scad source and commit a user revision."""
+    settings: Settings = current_app.config["SETTINGS"]
+    with _project_lock(project_name):
+        project_dir = _resolve_project_or_404(settings, project_name)
+        if not isinstance(project_dir, Path):
+            return project_dir
+        runner: AgentRunner = current_app.config["AGENT_RUNNER"]
+        if runner.has_active_state_for(project_name):
+            return jsonify({"error": "Cannot edit code while the agent is active."}), 409
+
+        payload = request.get_json(silent=True) or {}
+        code = payload.get("code")
+        if code is None or not isinstance(code, str):
+            return jsonify({"error": "Missing or invalid 'code' field."}), 400
+
+        store = RevisionStore(
+            project_dir,
+            retention_count=settings.revision_retention_count,
+        )
+        try:
+            revision = store.commit(
+                code,
+                RevisionOrigin(kind="user_edit", operation="code_editor"),
+            )
+        except (ValueError, RevisionIntegrityError) as error:
+            return jsonify({"error": str(error)}), 400
+
+        bus = current_app.config["EVENT_BUS"]
+        bus.publish("revision_updated", {
+            "project": project_name,
+            "revision_id": revision.id,
+        })
+
+        return jsonify({
+            "ok": True,
+            "bytes": len(code.encode("utf-8")),
+            "revision_id": revision.id,
         })

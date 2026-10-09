@@ -906,6 +906,10 @@ def parse_chat_stream(
             raise RequestCancelled(f"{provider_label} request cancelled.")
         raise
 
+    if stop_event and stop_event.is_set():
+        _force_close_response(response)
+        raise RequestCancelled(f"{provider_label} request cancelled.")
+
     if not saw_done:
         # The connection closed before the provider emitted ``[DONE]``.
         # Treat the error as retryable when no partial content was streamed

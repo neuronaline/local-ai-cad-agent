@@ -145,7 +145,7 @@ def _synchronized(method: Callable[_P, _R]) -> Callable[_P, _R]:
 
 @dataclass(frozen=True)
 class RevisionOrigin:
-    kind: str  # agent_edit, restore, import, recovery
+    kind: str  # agent_edit, restore, import, recovery, user_edit
     operation: str | None = None  # write_file, edit_file
     tool_call_id: str | None = None
 
@@ -450,7 +450,7 @@ class RevisionStore:
             raise RevisionIntegrityError("Revision manifest has an invalid parent ID.")
         if revision.restored_from is not None and not _REVISION_ID_RE.fullmatch(revision.restored_from):
             raise RevisionIntegrityError("Revision manifest has an invalid restore source ID.")
-        if revision.origin.kind not in {"agent_edit", "restore", "import", "recovery"}:
+        if revision.origin.kind not in {"agent_edit", "restore", "import", "recovery", "user_edit"}:
             raise RevisionIntegrityError("Revision manifest has an invalid origin kind.")
         return revision
 

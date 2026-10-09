@@ -425,14 +425,16 @@ class AgentRunner:
         """Stop agent work and clear pending state for one or all projects."""
         affected: list[str] = []
         with self._lock:
-            target_project = project or self._active_project
-            stop_active_task = (
-                target_project is None or target_project == self._active_project
-            )
+            stop_active_task = self._thread is not None and not self._run_complete.is_set()
+            if self._active_project and self._active_project not in affected:
+                affected.append(self._active_project)
+            if project is not None and project not in affected:
+                affected.append(project)
+
             if project is None:
-                affected = list(dict.fromkeys(list(self._waiting_questions)))
-                if self._active_project and self._active_project not in affected:
-                    affected.append(self._active_project)
+                for q_proj in self._waiting_questions:
+                    if q_proj not in affected:
+                        affected.append(q_proj)
                 if self.settings.workspace_root.is_dir():
                     for item in self.settings.workspace_root.iterdir():
                         if (
@@ -444,7 +446,7 @@ class AgentRunner:
                 self._waiting_questions.clear()
             else:
                 self._waiting_questions.pop(project, None)
-                affected = [project]
+
             if stop_active_task:
                 self._stop_event.set()
                 if self._active_tools:
@@ -457,17 +459,16 @@ class AgentRunner:
             thread_to_join = self._thread if stop_active_task else None
 
         if thread_to_join is not None and thread_to_join.is_alive():
-            thread_to_join.join(timeout=5.0)
+            thread_to_join.join(timeout=2.0)
 
         with self._lock:
-            if stop_active_task:
+            if stop_active_task and (self._thread is None or not self._thread.is_alive()):
+                self._thread = None
+                self._run_complete.set()
                 self._active_project = None
                 self._active_run_id = None
-                if self._thread is None or not self._thread.is_alive():
-                    self._thread = None
-                    self._run_complete.set()
-                    self._active_tools = None
-                    self._active_client = None
+                self._active_tools = None
+                self._active_client = None
 
         for cleared in affected:
             (
@@ -660,6 +661,8 @@ class AgentRunner:
                 transient=True,
             )
         response = state.client.chat(state.messages, TOOL_SCHEMAS)
+        if self._stop_event.is_set():
+            raise RequestCancelled("Task stopped by the user.")
         if (
             awaiting_tool_render
             and getattr(state.client, "last_image_fallback_used", False)

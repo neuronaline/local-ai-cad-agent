@@ -215,8 +215,9 @@ def dispatch(
     """
     if is_cad_build(name):
         cad = tools.cad.with_call_id(call_id)
-        raw_build = cad.build(mode=RenderMode.FULL_REVIEW)
         views = args.get("views") if isinstance(args, dict) else None
+        mode = RenderMode.FULL_REVIEW if views else RenderMode.NONE
+        raw_build = cad.build(mode=mode)
         if views:
             try:
                 raw_views = tools.image.with_call_id(call_id).get_view_images({"views": views})
@@ -270,7 +271,15 @@ def dispatch(
         return _dispatch_edit_file(tools.file, args, call_id)
     if name == "get_view_images":
         image = tools.image.with_call_id(call_id) if call_id else tools.image
-        return image.get_view_images(args), False
+        try:
+            return image.get_view_images(args), False
+        except ValueError as error:
+            err_msg = str(error)
+            if "No review artifacts exist" in err_msg or "missing manifest.json" in err_msg:
+                cad = tools.cad.with_call_id(call_id) if call_id else tools.cad
+                cad.build(mode=RenderMode.FULL_REVIEW)
+                return image.get_view_images(args), False
+            raise
     if name == "question":
         return _dispatch_question(tools.question, tools.project_dir, project, args)
     raise ValueError(f"Unknown or unsupported tool: {name!r}")

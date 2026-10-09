@@ -20,15 +20,6 @@ function formatDate(iso) {
   return date.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
 }
 
-function statusLabel(status) {
-  const labels = { none: 'Empty', has_model: 'Has Model', finalized: 'Finalized', stale: 'Stale' };
-  return labels[status] || status;
-}
-
-function statusClass(status) {
-  return `status-${status}`;
-}
-
 const searchInput = document.querySelector('#project-search');
 const projectsCount = document.querySelector('#projects-count');
 let allProjects = [];
@@ -36,12 +27,14 @@ let allProjects = [];
 function cardTemplate(project) {
   const name = escapeHTML(project.name);
   const encodedName = encodeURIComponent(project.name);
-  const status = project.model_status || 'none';
+  const runningBadge = project.is_running
+    ? '<span class="running-badge" title="Agent task running"><span class="running-dot"></span> Running</span>'
+    : '';
   return `
     <div class="project-card" data-name="${name}">
       <div class="card-header">
         <span class="card-glyph" aria-hidden="true">◈</span>
-        <span class="model-badge ${statusClass(status)}">${statusLabel(status)}</span>
+        ${runningBadge}
       </div>
       <a href="/project/${encodedName}" class="card-body">
         <h3 class="card-name" title="${name}">${name}</h3>

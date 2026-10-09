@@ -443,6 +443,10 @@ def parse_interactions_stream(
             raise RequestCancelled(f"{provider_label} request cancelled.")
         raise
 
+    if stop_event and stop_event.is_set():
+        _force_close_response(response)
+        raise RequestCancelled(f"{provider_label} request cancelled.")
+
     if finish_reason in ("length", "MAX_TOKENS"):
         raise RuntimeError(
             f"{provider_label} completion was truncated (finish_reason={finish_reason!r}); "

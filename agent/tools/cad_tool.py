@@ -233,6 +233,15 @@ class CadTool:
                 self._atomic_copy(render_path, self.project_dir / "render.png")
             self._atomic_copy(metrics_path, self.project_dir / ".cad_metrics.json")
             self._record_build_success(metrics)
+
+            model_sha = cached.get("model_sha256") or hashlib.sha256(model_code.encode("utf-8")).hexdigest()
+            if model_sha:
+                cache_dir = self.project_dir / ".cad-agent" / "cache" / model_sha
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                self._atomic_copy(preview_path, cache_dir / "preview.stl")
+                self._atomic_copy(metrics_path, cache_dir / ".cad_metrics.json")
+                if mode.produces_render:
+                    self._atomic_copy(workspace / "render.png", cache_dir / "render.png")
             # Stage multi-view review artifacts outside the temp workspace
             # so ``promote_review`` can verify them after bubblewrap tears
             # the workspace down. ``FULL_REVIEW`` only; cheaper modes skip
