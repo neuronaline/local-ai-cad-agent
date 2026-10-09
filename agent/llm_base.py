@@ -568,6 +568,71 @@ def _force_close_response(response: Any | None) -> None:
         pass
 
 
+def iter_lines_with_cancel(
+    response: Any,
+    stop_event: threading.Event | None = None,
+    poll_interval: float = 0.1,
+):
+    """Iterate over response.iter_lines() with responsive stop_event checks.
+
+    Blocking on socket reads inside iter_lines() can delay cancellation across
+    threads. Reading chunks in a daemon thread allows checking stop_event every
+    poll_interval (100ms) and immediately aborting if requested.
+    """
+    if stop_event is None:
+        yield from response.iter_lines()
+        return
+
+    line_queue: queue.Queue[Any] = queue.Queue(maxsize=100)
+    _EOF = object()
+    closed_event = threading.Event()
+
+    def reader() -> None:
+        try:
+            for raw_line in response.iter_lines():
+                if stop_event.is_set() or closed_event.is_set():
+                    break
+                while not (stop_event.is_set() or closed_event.is_set()):
+                    try:
+                        line_queue.put(raw_line, timeout=poll_interval)
+                        break
+                    except queue.Full:
+                        continue
+                if stop_event.is_set() or closed_event.is_set():
+                    break
+        except BaseException as err:
+            try:
+                line_queue.put(err, timeout=0.5)
+            except queue.Full:
+                pass
+        finally:
+            try:
+                line_queue.put(_EOF, timeout=0.5)
+            except queue.Full:
+                pass
+
+    worker = threading.Thread(target=reader, daemon=True)
+    worker.start()
+
+    try:
+        while True:
+            if stop_event.is_set():
+                _force_close_response(response)
+                raise RequestCancelled("LLM request cancelled.")
+            try:
+                item = line_queue.get(timeout=poll_interval)
+            except queue.Empty:
+                continue
+            if item is _EOF:
+                break
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+    finally:
+        closed_event.set()
+        _force_close_response(response)
+
+
 def strip_encrypted_reasoning(text: str | None) -> str:
     """Strip leaked base64 encrypted reasoning / signature blobs from human-readable text."""
     if not text:
@@ -648,7 +713,7 @@ def parse_chat_stream(
     tool_tag_buffer = ""
 
     try:
-        for raw_line in response.iter_lines():
+        for raw_line in iter_lines_with_cancel(response, stop_event=stop_event):
             if stop_event and stop_event.is_set():
                 _force_close_response(response)
                 raise RequestCancelled(f"{provider_label} request cancelled.")

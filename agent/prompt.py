@@ -49,6 +49,12 @@ _OPERATIONAL_RULES = """\
   Also support isolating any single component (e.g. ``PART_TYPE = "50";``). Mention in your final
   reply that all components are displayed together and can be isolated via ``PART_TYPE``.
   CadVerifier recognizes multi-part layouts and verifies them cleanly.
+- Fine detail and engraving verification: When inspecting fine features (e.g. ID numerals,
+  small text, debossed markings, thin slots) in multi-part models or wide layouts where the full
+  scene scale makes them hard to read: pass ``crop=[ymin, xmin, ymax, xmax]`` in ``cad_build``
+  or ``get_view_images`` to zoom in on the sub-region, pass ``resolution=1024`` in ``cad_build``
+  for higher fidelity, or temporarily isolate the component via ``PART_TYPE = "1"`` for visual
+  inspection before finalizing ``PART_TYPE = "ALL"``.
 - Cooperative assistance: Never refuse a user's layout, orientation, or arrangement request
   with rigid refusals (e.g. "I won't combine them"). Provide the requested arrangement using
   clean OpenSCAD translations (e.g. ``PART_TYPE = "ALL"``) while documenting individual and
@@ -349,20 +355,25 @@ TOOL_DESCRIPTIONS = {
             "Compile model.scad into 3D preview (STL), render images, and verify geometry in the sandbox. "
             "Produces physical dimensions, volume, and deterministic quality validation (manifoldness, "
             "watertightness, $fn, EPS rules, risk score). Pass optional 'views' (e.g. ['isometric'], ['all']) "
-            "to inspect renders in the same turn."
+            "to inspect renders in the same turn. Supports 'resolution' (512 or 1024) and 'crop' [ymin, xmin, ymax, xmax] "
+            "to zoom into fine details."
         ),
         "views": (
             "Optional view list to return immediately (e.g. ['isometric'], ['all']). "
             "If omitted, returns only geometric metrics."
         ),
+        "resolution": "Optional render resolution: 512 (default) or 1024 for high detail.",
+        "crop": "Optional normalized crop box [ymin, xmin, ymax, xmax] (0.0 to 1.0) to zoom into a sub-region.",
     },
     "get_view_images": {
         "description": (
             "Retrieve visual render image(s) of the model. Options: 'all' (composite "
             "contact sheet showing all 8 views, default), 'isometric', 'top', 'bottom', "
-            "'front', 'back', 'left', 'right'. Requires a successful cad_build."
+            "'front', 'back', 'left', 'right'. Pass optional 'crop' [ymin, xmin, ymax, xmax] to zoom in. "
+            "Requires a successful cad_build."
         ),
         "views": "List of views to inspect. Defaults to ['all'].",
+        "crop": "Optional normalized crop box [ymin, xmin, ymax, xmax] (0.0 to 1.0) to zoom into a sub-region.",
     },
     "question": {
         "description": (

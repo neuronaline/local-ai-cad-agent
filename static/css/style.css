@@ -68,6 +68,7 @@ button[aria-pressed="true"] { border-color: #5d7ed7; background: #233966; color:
 .drawer-content { scrollbar-width: thin; scrollbar-color: #33435f transparent; }
 .chat-feed::-webkit-scrollbar, .drawer-content::-webkit-scrollbar { width: 7px; }
 .chat-feed::-webkit-scrollbar-thumb, .drawer-content::-webkit-scrollbar-thumb { border-radius: 99px; background: #33435f; }
+.chat-feed::-webkit-scrollbar-thumb:hover, .drawer-content::-webkit-scrollbar-thumb:hover { background: #475d84; }
 .message { max-width: 100%; border: 1px solid var(--line); border-radius: var(--radius); padding: .5rem .6rem; font-size: .85rem; line-height: 1.45; }
 .message.user { align-self: flex-end; max-width: 88%; min-width: 110px; border-color: #5474cf; background: #1b3263; word-break: break-word; }
 .message.agent { background: var(--surface-raised); border-left: 2px solid var(--accent); }
@@ -95,6 +96,16 @@ button[aria-pressed="true"] { border-color: #5d7ed7; background: #233966; color:
 .message-copy-btn:focus-visible,
 .message-copy-btn.copied {
   opacity: 1;
+}
+.message.streaming .message-copy-btn,
+.message.thinking .message-copy-btn,
+.message.writing .message-copy-btn,
+.message.working .message-copy-btn,
+.message.streaming .thought-copy-btn,
+.message.thinking .thought-copy-btn,
+.message.writing .thought-copy-btn,
+.message.working .thought-copy-btn {
+  display: none !important;
 }
 .message-copy-btn:hover {
   background: rgba(255, 255, 255, 0.08);
@@ -274,7 +285,7 @@ button[aria-pressed="true"] { border-color: #5d7ed7; background: #233966; color:
   letter-spacing: 0.02em;
 }
 .thought-copy-btn {
-  display: inline-flex;
+  display: none;
   align-items: center;
   gap: 0.25rem;
   padding: 0.1rem 0.35rem;
@@ -286,6 +297,9 @@ button[aria-pressed="true"] { border-color: #5d7ed7; background: #233966; color:
   cursor: pointer;
   opacity: 0.7;
   transition: all 0.15s ease;
+}
+.thought-disclosure[open] .thought-copy-btn {
+  display: inline-flex;
 }
 .thought-copy-btn:hover {
   background: rgba(192, 132, 252, 0.15);
@@ -319,6 +333,18 @@ button[aria-pressed="true"] { border-color: #5d7ed7; background: #233966; color:
   word-break: break-word;
   max-height: 280px;
   overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(192, 132, 252, 0.3) transparent;
+}
+.thought-content::-webkit-scrollbar {
+  width: 6px;
+}
+.thought-content::-webkit-scrollbar-thumb {
+  border-radius: 99px;
+  background: rgba(192, 132, 252, 0.3);
+}
+.thought-content::-webkit-scrollbar-thumb:hover {
+  background: rgba(192, 132, 252, 0.5);
 }
 .thought-content > :first-child { margin-top: 0; }
 .thought-content > :last-child { margin-bottom: 0; }
@@ -474,7 +500,33 @@ button[aria-pressed="true"] { border-color: #5d7ed7; background: #233966; color:
 .slash-item-name { font-weight: 700; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .74rem; color: #8ca8ff; }
 .slash-item-name .slash-item-args { color: var(--muted); font-weight: 500; font-size: .7rem; margin-left: 4px; }
 .slash-item-desc { font-size: .66rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.composer textarea { width: 100%; min-height: 46px; max-height: 140px; resize: none; border: 0; padding: .35rem .4rem; outline: 0; background: transparent; color: var(--text); }
+.composer textarea {
+  width: 100%;
+  min-height: 46px;
+  max-height: 140px;
+  resize: none;
+  border: 0;
+  padding: .35rem .4rem;
+  outline: 0;
+  background: transparent;
+  color: var(--text);
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: #33435f transparent;
+}
+.composer textarea::-webkit-scrollbar {
+  width: 7px;
+}
+.composer textarea::-webkit-scrollbar-track {
+  background: transparent;
+}
+.composer textarea::-webkit-scrollbar-thumb {
+  border-radius: 99px;
+  background: #33435f;
+}
+.composer textarea::-webkit-scrollbar-thumb:hover {
+  background: #475d84;
+}
 .action-bar { gap: .35rem; margin-top: .25rem; }
 .attach-button { display: inline-flex; align-items: center; justify-content: center; margin-right: auto; border: 1px solid var(--line); border-radius: 6px; padding: 0; color: #c1cee2; cursor: pointer; }
 .attach-button:hover, .attach-button.is-dragging { border-color: var(--accent); color: var(--text); }

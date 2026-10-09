@@ -160,6 +160,7 @@ class CadTool:
         self,
         mode: RenderMode,
         requested_views: list[str] | None = None,
+        resolution: int = 512,
     ) -> dict[str, Any]:
         """JSON-kwarg payload forwarded to ``runner.main`` as ``argv[1]``.
 
@@ -174,6 +175,7 @@ class CadTool:
             "render_workers": self._review_render_workers,
             "required_views": self._review_required_views,
             "requested_views": requested_views,
+            "resolution": int(resolution or 512),
             "enable_manifold": _supports_manifold(),
         }
 
@@ -182,6 +184,7 @@ class CadTool:
         mode: RenderMode = RenderMode.NONE,
         call_id: str = "",
         requested_views: list[str] | None = None,
+        resolution: int = 512,
     ) -> dict[str, Any]:
         model_path = self.project_dir / MODEL_FILENAME
         if not model_path.exists():
@@ -217,6 +220,11 @@ class CadTool:
                 cached_views = {
                     v.get("view_id") for v in manifest.get("views", []) if isinstance(v, dict)
                 }
+                view_widths = {
+                    v.get("view_id"): int(v.get("width", 512) or 512)
+                    for v in manifest.get("views", [])
+                    if isinstance(v, dict) and "view_id" in v
+                }
                 views_to_check = requested_views if requested_views is not None else ["all"]
                 all_views_present = True
                 for rv in views_to_check:
@@ -225,9 +233,16 @@ class CadTool:
                         if len(cached_views) < self._review_required_views:
                             all_views_present = False
                             break
-                    elif canonical not in cached_views:
-                        all_views_present = False
-                        break
+                        if resolution > 512 and any(w < resolution for w in view_widths.values()):
+                            all_views_present = False
+                            break
+                    else:
+                        if canonical not in cached_views:
+                            all_views_present = False
+                            break
+                        if resolution > 512 and view_widths.get(canonical, 512) < resolution:
+                            all_views_present = False
+                            break
                 if all_views_present:
                     cached_review_manifest = manifest
                 else:
@@ -262,13 +277,19 @@ class CadTool:
                         "review_sheet_path": None,
                         "cached": True,
                     }
-            except Exception:
+            except (OSError, json.JSONDecodeError, ValueError):
                 pass  # Fall back to normal sandbox execution on cache read issue
 
         # Copy ``renderer.py`` / ``runner.py`` as siblings into the
         # workspace and pass render settings as JSON on ``argv[1]`` so
         # the sandbox stays at arm's length from the host.
-        settings_payload = json.dumps(self._runner_settings(mode, requested_views=requested_views))
+        settings_payload = json.dumps(
+            self._runner_settings(
+                mode,
+                requested_views=requested_views,
+                resolution=resolution,
+            )
+        )
 
         with tempfile.TemporaryDirectory(prefix="cad-agent-") as temporary:
             workspace = Path(temporary)
@@ -741,18 +762,21 @@ class CadTool:
         self,
         mode: RenderMode = RenderMode.FULL_REVIEW,
         requested_views: list[str] | None = None,
+        resolution: int = 512,
     ) -> dict[str, Any]:
         """Compile model.scad, generate render artifacts, and verify geometry deterministically.
 
         :param mode: RenderMode (NONE for fast preview STL + metrics, FULL_REVIEW for rendered views).
         :param requested_views: Optional list of view names or aliases (e.g. ['isometric_positive', 'front'])
             to selectively render instead of generating all canonical views.
+        :param resolution: Render resolution in pixels (defaults to 512, supports 1024 for high detail).
         """
         if not isinstance(mode, RenderMode):
             raise TypeError("build mode must be a RenderMode.")
         execute_args: dict[str, Any] = {
             "mode": mode,
             "requested_views": requested_views,
+            "resolution": int(resolution or 512),
         }
         if self._call_id:
             execute_args["call_id"] = self._call_id
@@ -817,9 +841,10 @@ class CadTool:
         self,
         mode: RenderMode = RenderMode.FULL_REVIEW,
         requested_views: list[str] | None = None,
+        resolution: int = 512,
     ) -> dict[str, Any]:
         """Legacy alias for :meth:`build`."""
-        return self.build(mode=mode, requested_views=requested_views)
+        return self.build(mode=mode, requested_views=requested_views, resolution=resolution)
 
     def stop(self) -> None:
         with self._lock:

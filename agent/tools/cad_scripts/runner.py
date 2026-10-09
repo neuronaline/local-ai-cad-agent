@@ -201,6 +201,7 @@ def _run_model(
     should_write_iso = bool(settings.get("write_isometric", False))
     render_workers = int(settings.get("render_workers", 4) or 4)
     required_views = int(settings.get("required_views", 8) or 8)
+    resolution = int(settings.get("resolution", 512) or 512)
     enable_manifold = bool(settings.get("enable_manifold", False))
 
     # 1. Compile model.scad to binary STL (headless CGAL/CSG evaluation)
@@ -286,6 +287,7 @@ def _run_model(
             vertices=vertices,
             triangles=triangles,
             requested_views=requested_views,
+            resolution=resolution,
         )
         review_sheet_path = Path(".review-sheet.png")
         sheet_info = build_contact_sheet(review_dir, review_sheet_path)
@@ -297,11 +299,11 @@ def _run_model(
             if iso_view_path.is_file() and iso_view_path.stat().st_size > 0:
                 shutil.copyfile(iso_view_path, render_path)
             else:
-                _write_isometric_artifact(vertices, triangles)
+                _write_isometric_artifact(vertices, triangles, resolution=resolution)
             single_render_payload = {
                 "path": "render.png",
-                "width": _WIDTH,
-                "height": _HEIGHT,
+                "width": resolution,
+                "height": resolution,
                 "image_sha256": hashlib.sha256(render_path.read_bytes()).hexdigest(),
                 "image_bytes": render_path.stat().st_size,
             }
@@ -320,11 +322,11 @@ def _run_model(
         }
     elif should_write_iso:
         render_path = Path("render.png")
-        _write_isometric_artifact(vertices, triangles)
+        _write_isometric_artifact(vertices, triangles, resolution=resolution)
         single_render_payload = {
             "path": "render.png",
-            "width": _WIDTH,
-            "height": _HEIGHT,
+            "width": resolution,
+            "height": resolution,
             "image_sha256": hashlib.sha256(render_path.read_bytes()).hexdigest(),
             "image_bytes": render_path.stat().st_size,
         }

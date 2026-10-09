@@ -99,7 +99,7 @@ def as_chat_image(path: Path) -> dict[str, object]:
     """Encode an image as an OpenAI-compatible ``image_url`` chat content part.
 
     Both OpenRouter and OpenAI Chat Completions accept the same
-    ``{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}``
+    ``{"type": "image_url", "image_url": {"url": "data:image/png;base64,...", "detail": "high"}}``
     shape, so a single helper serves both providers. The MIME type in the
     data URL is derived from the on-disk file extension so JPEG /
     WebP inputs round-trip without a wasteful PNG re-encode.
@@ -114,5 +114,8 @@ def as_chat_image(path: Path) -> dict[str, object]:
     encoded = base64.b64encode(path.read_bytes()).decode("ascii")
     return {
         "type": "image_url",
-        "image_url": {"url": f"data:{mime_type};base64,{encoded}"},
+        "image_url": {
+            "url": f"data:{mime_type};base64,{encoded}",
+            "detail": "high",
+        },
     }

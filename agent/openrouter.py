@@ -84,9 +84,11 @@ class OpenRouterClient(ChatCompletionsClient):
                 payload["cache_control"] = {"type": "ephemeral"}
             else:
                 # Bedrock and Vertex reject the top-level automatic control.
-                # An explicit stable-system breakpoint works across all
+                # Mark both the system prompt and the last eligible conversation turn
+                # so multi-turn tool loops maintain cache continuity across all
                 # Anthropic-compatible endpoints.
                 self._mark_first_system_message(payload)
+                self._mark_last_eligible_message(payload)
         if self.settings.openrouter_reasoning_effort:
             payload["reasoning"] = {
                 "effort": self.settings.openrouter_reasoning_effort,
@@ -158,6 +160,26 @@ class OpenRouterClient(ChatCompletionsClient):
             if isinstance(content, list):
                 for part in reversed(content):
                     if isinstance(part, dict) and part.get("type") == "text":
+                        part["cache_control"] = marker
+                        return
+
+    @staticmethod
+    def _mark_last_eligible_message(payload: dict[str, Any]) -> None:
+        """Mark an explicit cache breakpoint on the last eligible user message."""
+        messages = payload.get("messages", [])
+        for message in reversed(messages):
+            if message.get("role") != "user":
+                continue
+            content = message.get("content")
+            marker = {"type": "ephemeral"}
+            if isinstance(content, str):
+                message["content"] = [
+                    {"type": "text", "text": content, "cache_control": marker}
+                ]
+                return
+            if isinstance(content, list):
+                for part in reversed(content):
+                    if isinstance(part, dict) and part.get("type") in ("text", "image_url"):
                         part["cache_control"] = marker
                         return
 

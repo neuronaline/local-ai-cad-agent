@@ -293,7 +293,7 @@ function addMessage(text, type = 'agent', options = {}) {
     const meta = document.createElement('div');
     meta.className = 'message-meta user-meta';
     meta.innerHTML = `
-      <span class="user-mark">You</span>
+      <span class="user-mark">U</span>
       <span class="message-author">You</span>
       <button type="button" class="message-copy-btn" title="Copy message" aria-label="Copy message">
         ${COPY_ICON_SVG}
@@ -935,6 +935,7 @@ const COMMANDS = [
     iconSvg: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m9 11 3 3L22 4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>',
     action: () => {
       message.value = '/audit ';
+      autoResizeMessage();
       message.focus();
       closeSlashPopup();
     },
@@ -948,6 +949,7 @@ const COMMANDS = [
     action: async () => {
       closeSlashPopup();
       message.value = '';
+      autoResizeMessage();
       await executeResetContext();
     },
   },
@@ -1025,7 +1027,14 @@ async function executeResetContext() {
   }
 }
 
+function autoResizeMessage() {
+  if (!message) return;
+  message.style.height = 'auto';
+  message.style.height = `${Math.min(Math.max(message.scrollHeight, 46), 140)}px`;
+}
+
 message.addEventListener('input', () => {
+  autoResizeMessage();
   const val = message.value;
   if (val.startsWith('/') && !val.includes(' ') && !val.includes('\n')) {
     const query = val.toLowerCase();
@@ -1085,6 +1094,7 @@ chatForm.addEventListener('submit', async event => {
   if (!text) return;
   if (text.toLowerCase() === '/reset' || text.toLowerCase() === '/clear') {
     message.value = '';
+    autoResizeMessage();
     await executeResetContext();
     return;
   }
@@ -1104,6 +1114,7 @@ chatForm.addEventListener('submit', async event => {
     setThinking(true);
     scrollFeedToBottom(true);
     message.value = '';
+    autoResizeMessage();
     let promptText = text;
     if (text.toLowerCase() === '/audit' || text.toLowerCase().startsWith('/audit ')) {
       const extraInstructions = text.length > 6 ? text.slice(6).trim() : '';
@@ -2473,6 +2484,7 @@ document.addEventListener('click', event => {
   const target = event.target.closest('.example-prompt');
   if (!target) return;
   message.value = target.dataset.prompt || message.value;
+  autoResizeMessage();
   message.focus();
 });
 
@@ -2507,6 +2519,7 @@ document.addEventListener('click', async event => {
 });
 
 (async function init() {
+  autoResizeMessage();
   if (!currentProject) return;
   // Load the persisted conversation into the main feed so reopening a
   // project immediately shows its history. The empty-state element is

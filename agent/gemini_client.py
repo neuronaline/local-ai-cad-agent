@@ -29,6 +29,7 @@ from agent.llm_base import (
     _stream_error_detail,
     extract_text_tool_calls,
     extract_think_tags,
+    iter_lines_with_cancel,
     post_with_cancel,
     strip_encrypted_reasoning,
 )
@@ -281,7 +282,7 @@ def parse_interactions_stream(
     finish_reason: str | None = None
 
     try:
-        for raw_line in response.iter_lines():
+        for raw_line in iter_lines_with_cancel(response, stop_event=stop_event):
             if stop_event and stop_event.is_set():
                 _force_close_response(response)
                 raise RequestCancelled(f"{provider_label} request cancelled.")
@@ -333,10 +334,19 @@ def parse_interactions_stream(
                     or usage_meta.get("thoughts_token_count")
                     or 0
                 )
+                cached_tokens = (
+                    usage_meta.get("cached_content_token_count")
+                    or usage_meta.get("cached_tokens")
+                    or (usage_meta.get("prompt_tokens_details") or {}).get("cached_tokens")
+                    or 0
+                )
                 last_usage = {
                     "prompt_tokens": int(p_tokens),
                     "completion_tokens": int(c_tokens),
                     "reasoning_tokens": int(r_tokens),
+                    "prompt_tokens_details": {
+                        "cached_tokens": int(cached_tokens),
+                    },
                 }
 
             event_type = event.get("event_type") or event.get("type")
@@ -545,10 +555,19 @@ def parse_interactions_response(body: dict[str, Any]) -> dict[str, Any]:
             or usage_meta.get("thoughts_token_count")
             or 0
         )
+        cached_tokens = (
+            usage_meta.get("cached_content_token_count")
+            or usage_meta.get("cached_tokens")
+            or (usage_meta.get("prompt_tokens_details") or {}).get("cached_tokens")
+            or 0
+        )
         usage = {
             "prompt_tokens": int(p_tokens),
             "completion_tokens": int(c_tokens),
             "reasoning_tokens": int(r_tokens),
+            "prompt_tokens_details": {
+                "cached_tokens": int(cached_tokens),
+            },
         }
 
     content, extracted_reasoning = extract_think_tags(content, reasoning_text)

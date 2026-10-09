@@ -135,16 +135,21 @@ def _project(
     return projected[:, :2], projected[:, 2]
 
 
-def _frame(projected_xy: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
+def _frame(
+    projected_xy: np.ndarray,
+    resolution: int = _WIDTH,
+) -> tuple[float, np.ndarray, np.ndarray]:
     span = np.ptp(projected_xy, axis=0)
+    # Proportional margin scaling matching default 36px on 512px view
+    margin = round(resolution * (_MARGIN / _WIDTH))
     scale = min(
-        (_WIDTH - 2 * _MARGIN) / max(span[0], 1e-9),
-        (_HEIGHT - 2 * _MARGIN) / max(span[1], 1e-9),
+        (resolution - 2 * margin) / max(span[0], 1e-9),
+        (resolution - 2 * margin) / max(span[1], 1e-9),
     )
     offset = np.array(
         [
-            (_WIDTH - span[0] * scale) / 2 - projected_xy[:, 0].min() * scale,
-            (_HEIGHT - span[1] * scale) / 2 - projected_xy[:, 1].min() * scale,
+            (resolution - span[0] * scale) / 2 - projected_xy[:, 0].min() * scale,
+            (resolution - span[1] * scale) / 2 - projected_xy[:, 1].min() * scale,
         ]
     )
     return scale, offset, span
@@ -156,30 +161,66 @@ def _shade_pixels(
     screen_vertices: np.ndarray,
     depths: np.ndarray,
     light: np.ndarray,
+    resolution: int = _WIDTH,
+    camera_axis: np.ndarray | None = None,
 ) -> np.ndarray:
-    pixels = np.empty((_HEIGHT, _WIDTH, 3), dtype=np.uint8)
+    width = resolution
+    height = resolution
+    pixels = np.empty((height, width, 3), dtype=np.uint8)
     pixels[:] = _BACKGROUND
-    depth_buffer = np.full((_HEIGHT, _WIDTH), -np.inf)
-    for triangle in triangles:
+    depth_buffer = np.full((height, width), -np.inf, dtype=np.float64)
+    normal_buffer = np.zeros((height, width, 3), dtype=np.float32)
+
+    if len(triangles) == 0:
+        return pixels
+
+    # 1. Vectorized face normal calculation
+    v0 = vertices[triangles[:, 0]]
+    v1 = vertices[triangles[:, 1]]
+    v2 = vertices[triangles[:, 2]]
+    face_normals = np.cross(v1 - v0, v2 - v0)
+    norm_lens = np.linalg.norm(face_normals, axis=1, keepdims=True)
+    valid_mask = (norm_lens[:, 0] > 1e-12)
+    unit_normals = np.zeros_like(face_normals)
+    unit_normals[valid_mask] = face_normals[valid_mask] / norm_lens[valid_mask]
+
+    # 2. Backface culling in orthographic screen space
+    if camera_axis is not None:
+        cam_norm = camera_axis / max(np.linalg.norm(camera_axis), 1e-12)
+        dot_cam = np.sum(unit_normals * cam_norm, axis=1)
+        cand_indices = np.where(dot_cam > 1e-5)[0]
+    else:
+        cand_indices = np.arange(len(triangles))
+
+    # 3. Vectorized diffuse color calculation
+    diffuse = np.maximum(0.0, np.dot(unit_normals, light))
+    colors = np.clip(_BASE_COLOR * (0.48 + 0.52 * diffuse[:, None]), 0, 255).astype(np.uint8)
+
+    # 4. Rasterize candidate front-facing triangles
+    for idx in cand_indices:
+        triangle = triangles[idx]
         points = screen_vertices[triangle]
-        minimum = np.maximum(np.floor(points.min(axis=0)).astype(int), 0)
-        maximum = np.minimum(
-            np.ceil(points.max(axis=0)).astype(int),
-            [_WIDTH - 1, _HEIGHT - 1],
-        )
-        if np.any(maximum < minimum):
+        min_xy = points.min(axis=0)
+        max_xy = points.max(axis=0)
+        if min_xy[0] >= width or min_xy[1] >= height or max_xy[0] < 0 or max_xy[1] < 0:
             continue
-        x0, y0 = minimum
-        x1, y1 = maximum
-        grid_y, grid_x = np.mgrid[y0 : y1 + 1, x0 : x1 + 1]
-        sample_x = grid_x + 0.5
-        sample_y = grid_y + 0.5
+        x0 = max(int(np.floor(min_xy[0])), 0)
+        y0 = max(int(np.floor(min_xy[1])), 0)
+        x1 = min(int(np.ceil(max_xy[0])), width - 1)
+        y1 = min(int(np.ceil(max_xy[1])), height - 1)
+        if x1 < x0 or y1 < y0:
+            continue
+
         p0, p1, p2 = points
         denominator = (p1[1] - p2[1]) * (p0[0] - p2[0]) + (p2[0] - p1[0]) * (
             p0[1] - p2[1]
         )
         if abs(denominator) < 1e-12:
             continue
+
+        grid_y, grid_x = np.mgrid[y0 : y1 + 1, x0 : x1 + 1]
+        sample_x = grid_x + 0.5
+        sample_y = grid_y + 0.5
         weight0 = (
             (p1[1] - p2[1]) * (sample_x - p2[0])
             + (p2[0] - p1[0]) * (sample_y - p2[1])
@@ -190,6 +231,7 @@ def _shade_pixels(
         ) / denominator
         weight2 = 1.0 - weight0 - weight1
         inside = (weight0 >= -1e-7) & (weight1 >= -1e-7) & (weight2 >= -1e-7)
+
         triangle_depths = depths[triangle]
         depth = (
             weight0 * triangle_depths[0]
@@ -200,26 +242,37 @@ def _shade_pixels(
         visible = inside & (depth > target_depth)
         if not np.any(visible):
             continue
-        world_points = vertices[triangle]
-        normal = np.cross(
-            world_points[1] - world_points[0], world_points[2] - world_points[0]
-        )
-        normal_length = np.linalg.norm(normal)
-        diffuse = max(
-            0.0,
-            float(
-                np.dot(
-                    normal / max(normal_length, 1e-12),
-                    light,
-                )
-            ),
-        )
-        color = np.clip(_BASE_COLOR * (0.48 + 0.52 * diffuse), 0, 255).astype(
-            np.uint8
-        )
-        target_pixels = pixels[y0 : y1 + 1, x0 : x1 + 1]
+
         target_depth[visible] = depth[visible]
-        target_pixels[visible] = color
+        pixels[y0 : y1 + 1, x0 : x1 + 1][visible] = colors[idx]
+        normal_buffer[y0 : y1 + 1, x0 : x1 + 1][visible] = unit_normals[idx]
+
+    # 5. Image-space feature crease and depth step enhancement
+    fg_mask = depth_buffer > -1e20
+    if np.any(fg_mask):
+        depth_span = max(float(np.ptp(depth_buffer[fg_mask])), 1e-5)
+        d_thresh = max(depth_span * 0.015, 0.05)
+        d_clean = np.where(fg_mask, depth_buffer, 0.0)
+
+        edge_mask = np.zeros_like(fg_mask)
+
+        # Horizontal adjacent foreground pairs (depth steps & normal angle creases >44 deg)
+        fg_x = fg_mask[:, :-1] & fg_mask[:, 1:]
+        diff_d_x = np.abs(d_clean[:, 1:] - d_clean[:, :-1])
+        dot_n_x = np.sum(normal_buffer[:, :-1] * normal_buffer[:, 1:], axis=-1)
+        edge_x = fg_x & ((diff_d_x > d_thresh) | (dot_n_x < 0.72))
+        edge_mask[:, :-1] |= edge_x
+
+        # Vertical adjacent foreground pairs (depth steps & normal angle creases >44 deg)
+        fg_y = fg_mask[:-1, :] & fg_mask[1:, :]
+        diff_d_y = np.abs(d_clean[1:, :] - d_clean[:-1, :])
+        dot_n_y = np.sum(normal_buffer[:-1, :] * normal_buffer[1:, :], axis=-1)
+        edge_y = fg_y & ((diff_d_y > d_thresh) | (dot_n_y < 0.72))
+        edge_mask[:-1, :] |= edge_y
+
+        # Apply crisp dark CAD line color to internal feature edges
+        pixels[edge_mask] = np.array([28, 30, 36], dtype=np.uint8)
+
     return pixels
 
 
@@ -230,7 +283,9 @@ def rasterize_view(
     camera_axis: Sequence[float],
     screen_x_axis: Sequence[float],
     light: Sequence[float] | None = None,
+    resolution: int = _WIDTH,
 ) -> np.ndarray:
+    """Rasterize a 3D mesh into an RGB image buffer from a specified camera view."""
     camera = np.array(camera_axis, dtype=np.float64)
     screen_x = np.array(screen_x_axis, dtype=np.float64)
     if light is not None:
@@ -242,9 +297,17 @@ def rasterize_view(
         light_vec = cam_dir + 0.35 * sx_dir + 0.45 * sy_dir
     light_vec /= np.linalg.norm(light_vec)
     projected_xy, depths = _project(vertices, camera, screen_x)
-    scale, offset, _span = _frame(projected_xy)
+    scale, offset, _span = _frame(projected_xy, resolution=resolution)
     screen_vertices = projected_xy * scale + offset
-    return _shade_pixels(vertices, triangles, screen_vertices, depths, light_vec)
+    return _shade_pixels(
+        vertices,
+        triangles,
+        screen_vertices,
+        depths,
+        light_vec,
+        resolution=resolution,
+        camera_axis=camera,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +383,7 @@ def _worker_render(args: tuple[str, dict[str, object]]) -> dict[str, object]:
     step small and atomic.
     """
     view_id, view_dict = args
+    resolution = int(view_dict.get("resolution", _WIDTH) or _WIDTH)
     camera_axis = np.array(view_dict["camera_axis"], dtype=np.float64)
     screen_x_axis = np.array(view_dict["screen_x_axis"], dtype=np.float64)
     light = np.array(view_dict.get("light", (0.35, -0.25, 0.9)), dtype=np.float64)
@@ -329,9 +393,17 @@ def _worker_render(args: tuple[str, dict[str, object]]) -> dict[str, object]:
     vertices = np.frombuffer(vertices_blob, dtype=np.float64).reshape(-1, 3).copy()
     triangles = np.frombuffer(triangles_blob, dtype=np.int32).reshape(-1, 3).copy()
     projected_xy, depths = _project(vertices, camera_axis, screen_x_axis)
-    scale, offset, _span = _frame(projected_xy)
+    scale, offset, _span = _frame(projected_xy, resolution=resolution)
     screen_vertices = projected_xy * scale + offset
-    pixels = _shade_pixels(vertices, triangles, screen_vertices, depths, light)
+    pixels = _shade_pixels(
+        vertices,
+        triangles,
+        screen_vertices,
+        depths,
+        light,
+        resolution=resolution,
+        camera_axis=camera_axis,
+    )
     image = Image.fromarray(pixels, "RGB")
     with tempfile.NamedTemporaryFile(
         prefix=f"view-{view_id}-", suffix=".png", delete=False
@@ -347,6 +419,8 @@ def _worker_render(args: tuple[str, dict[str, object]]) -> dict[str, object]:
         "bytes": data,
         "sha256": hashlib.sha256(data).hexdigest(),
         "size": len(data),
+        "width": resolution,
+        "height": resolution,
     }
 
 
@@ -406,6 +480,7 @@ def render_views(
     vertices: np.ndarray | None = None,
     triangles: np.ndarray | None = None,
     requested_views: Sequence[str] | None = None,
+    resolution: int = _WIDTH,
 ) -> dict[str, object]:
     """Render required canonical views and persist them under ``output_dir``.
 
@@ -455,6 +530,7 @@ def render_views(
                 "light": (0.35, -0.25, 0.9),
                 "vertices": vertices.tobytes(),
                 "triangles": triangles.tobytes(),
+                "resolution": resolution,
             },
         )
         for spec in selected
@@ -521,8 +597,8 @@ def render_views(
                 "path": f"views/{spec.view_id}.png",
                 "image_sha256": result["sha256"],
                 "image_bytes": int(result["size"]),
-                "width": _WIDTH,
-                "height": _HEIGHT,
+                "width": resolution,
+                "height": resolution,
                 "render_status": "rendered",
             }
         )
@@ -536,7 +612,12 @@ def render_views(
     }
 
 
-def render_iso(vertices: np.ndarray, triangles: np.ndarray, output_path: Path) -> None:
+def render_iso(
+    vertices: np.ndarray,
+    triangles: np.ndarray,
+    output_path: Path,
+    resolution: int = _WIDTH,
+) -> None:
     """Write a single isometric PNG (kept for the legacy ``render.png``)."""
     spec = VIEWS[6]  # isometric_positive
     pixels = rasterize_view(
@@ -544,6 +625,7 @@ def render_iso(vertices: np.ndarray, triangles: np.ndarray, output_path: Path) -
         triangles,
         camera_axis=spec.camera_axis,
         screen_x_axis=spec.screen_x_axis,
+        resolution=resolution,
     )
     Image.fromarray(pixels, "RGB").save(output_path, "PNG", compress_level=1)
 
@@ -564,21 +646,26 @@ def build_contact_sheet(view_dir: Path, output_path: Path) -> dict[str, object]:
     ]
     if not ordered_views:
         raise RuntimeError("No rendered views available for the contact sheet.")
+
+    first_path = ordered_views[0][1]
+    with Image.open(first_path) as first_img:
+        tile_w, tile_h = first_img.size
+
     columns = 4
     rows = max(1, math.ceil(len(ordered_views) / columns))
     sheet = Image.new(
         "RGB",
-        (_WIDTH * columns, (_HEIGHT + _SHEET_LABEL_HEIGHT) * rows),
+        (tile_w * columns, (tile_h + _SHEET_LABEL_HEIGHT) * rows),
         tuple(_BACKGROUND.tolist()),
     )
     draw = ImageDraw.Draw(sheet)
     for index, (spec, path) in enumerate(ordered_views):
-        x = (index % columns) * _WIDTH
-        y = (index // columns) * (_HEIGHT + _SHEET_LABEL_HEIGHT)
+        x = (index % columns) * tile_w
+        y = (index // columns) * (tile_h + _SHEET_LABEL_HEIGHT)
         with Image.open(path) as source:
             sheet.paste(source, (x, y))
         draw.text(
-            (x + 8, y + _HEIGHT + 6),
+            (x + 8, y + tile_h + 6),
             f"{spec.label} ({spec.view_id})",
             fill=(210, 220, 240),
         )
@@ -587,8 +674,8 @@ def build_contact_sheet(view_dir: Path, output_path: Path) -> dict[str, object]:
         "path": "review-sheet.png",
         "width": sheet.size[0],
         "height": sheet.size[1],
-        "tile_width": _WIDTH,
-        "tile_height": _HEIGHT,
+        "tile_width": tile_w,
+        "tile_height": tile_h,
         "view_order": [spec.view_id for spec, _path in ordered_views],
         "image_sha256": hashlib.sha256(output_path.read_bytes()).hexdigest(),
         "image_bytes": output_path.stat().st_size,
@@ -600,9 +687,13 @@ def build_contact_sheet(view_dir: Path, output_path: Path) -> dict[str, object]:
 # ---------------------------------------------------------------------------
 
 
-def _write_isometric_artifact(vertices: np.ndarray, triangles: np.ndarray) -> None:
+def _write_isometric_artifact(
+    vertices: np.ndarray,
+    triangles: np.ndarray,
+    resolution: int = _WIDTH,
+) -> None:
     """Render the backward-compatible single isometric PNG."""
     target = Path("render.png")
-    render_iso(vertices, triangles, target)
+    render_iso(vertices, triangles, target, resolution=resolution)
     if not target.is_file() or target.stat().st_size == 0:
         raise RuntimeError("CAD execution did not produce a render.")

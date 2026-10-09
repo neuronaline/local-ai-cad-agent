@@ -216,21 +216,38 @@ def dispatch(
     if is_cad_build(name):
         cad = tools.cad.with_call_id(call_id)
         raw_views = args.get("views") if isinstance(args, dict) else None
+        raw_res = args.get("resolution") if isinstance(args, dict) else None
+        try:
+            resolution = int(raw_res) if raw_res is not None else 512
+            if resolution not in (512, 1024):
+                resolution = 1024 if resolution > 512 else 512
+        except (ValueError, TypeError):
+            resolution = 512
+        crop = args.get("crop") if isinstance(args, dict) else None
+        if crop is not None:
+            from agent.tools.image_tool import _validate_crop
+            crop = _validate_crop(crop)
+
+        views: list[str] | None = None
         if isinstance(raw_views, str):
-            views: list[str] | None = [raw_views]
+            cleaned = raw_views.strip()
+            views = [cleaned] if cleaned else None
         elif isinstance(raw_views, (list, tuple)):
-            views = [str(v) for v in raw_views if v]
-        else:
-            views = None
-        views = views or None
+            views = [str(v).strip() for v in raw_views if str(v).strip()] or None
+
+        if not views and crop:
+            views = ["all"]
         mode = RenderMode.FULL_REVIEW if views else RenderMode.NONE
-        raw_build = cad.build(mode=mode, requested_views=views)
+        raw_build = cad.build(mode=mode, requested_views=views, resolution=resolution)
         if views:
             try:
-                raw_views = tools.image.with_call_id(call_id).get_view_images({"views": views})
-                if isinstance(raw_views, dict):
-                    raw_build["images"] = raw_views.get("images", [])
-                    raw_build["review_sha256"] = raw_views.get("review_sha256")
+                view_req: dict[str, object] = {"views": views}
+                if crop:
+                    view_req["crop"] = crop
+                img_payload = tools.image.with_call_id(call_id).get_view_images(view_req)
+                if isinstance(img_payload, dict):
+                    raw_build["images"] = img_payload.get("images", [])
+                    raw_build["review_sha256"] = img_payload.get("review_sha256")
             except Exception as error:  # noqa: BLE001 - Non-blocking view resolution fallback.
                 _LOG.warning("Failed to resolve views for cad_build: %s", error)
         return raw_build, False

@@ -15,9 +15,13 @@ ever rewriting the cached prompt prefix.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
+import math
 from collections.abc import Callable
 from pathlib import Path
+
+from PIL import Image
 
 from agent.prompt import TOOL_HINTS
 from agent.review_paths import review_dir
@@ -182,6 +186,49 @@ class ImageTool:
             return None
         return candidate
 
+    def _crop_view(
+        self,
+        source_path: Path,
+        view_id: str,
+        crop: list[float],
+        review_root: Path,
+        rel_dir: str = "",
+    ) -> dict[str, object] | None:
+        try:
+            with Image.open(source_path) as img:
+                img_w, img_h = img.size
+                ymin, xmin, ymax, xmax = crop
+                box = (
+                    max(0, round(xmin * img_w)),
+                    max(0, round(ymin * img_h)),
+                    min(img_w, round(xmax * img_w)),
+                    min(img_h, round(ymax * img_h)),
+                )
+                if box[2] <= box[0] or box[3] <= box[1]:
+                    return None
+                cropped = img.crop(box)
+                buffer = io.BytesIO()
+                cropped.save(buffer, format="PNG", compress_level=1)
+                crop_bytes = buffer.getvalue()
+                crop_sha = hashlib.sha256(crop_bytes).hexdigest()
+                crop_filename = f"{view_id}_crop_{crop_sha[:12]}.png"
+                rel_path = f"{rel_dir}/{crop_filename}" if rel_dir else crop_filename
+                target_path = review_root / rel_path
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                if not target_path.is_file() or target_path.stat().st_size == 0:
+                    target_path.write_bytes(crop_bytes)
+                return {
+                    "view": f"{view_id}_crop",
+                    "cropped": True,
+                    "crop": crop,
+                    "path": rel_path,
+                    "sha256": crop_sha,
+                    "width": cropped.width,
+                    "height": cropped.height,
+                }
+        except (OSError, ValueError):
+            return None
+
     def _resolve_one(
         self,
         review_root: Path,
@@ -195,6 +242,8 @@ class ImageTool:
                 f"Unknown view: {item.get('view')!r}. "
                 "Valid views: 'all', 'isometric', 'top', 'bottom', 'front', 'back', 'left', 'right', 'isometric_negative'."
             )
+
+        crop = _validate_crop(item.get("crop"))
 
         if canonical == "all":
             contact_entry = manifest.get("contact_sheet") if isinstance(manifest, dict) else None
@@ -220,6 +269,16 @@ class ImageTool:
                 if isinstance(contact_entry, dict) and "height" in contact_entry
                 else 1024
             )
+
+            if crop:
+                return self._crop_view(
+                    source_path=sheet_path,
+                    view_id="all",
+                    crop=crop,
+                    review_root=review_root,
+                    rel_dir="",
+                )
+
             return {
                 "view": "all",
                 "cropped": False,
@@ -240,19 +299,59 @@ class ImageTool:
         if not _is_png(view_path, expected_sha):
             return None
 
+        if crop:
+            return self._crop_view(
+                source_path=view_path,
+                view_id=view_id,
+                crop=crop,
+                review_root=review_root,
+                rel_dir=_VIEWS_DIRNAME,
+            )
+
+        actual_w = VIEW_PIXEL_WIDTH
+        actual_h = VIEW_PIXEL_HEIGHT
+        if isinstance(manifest, dict):
+            for v in manifest.get("views", []):
+                if isinstance(v, dict) and v.get("view_id") == view_id:
+                    actual_w = int(v.get("width", VIEW_PIXEL_WIDTH) or VIEW_PIXEL_WIDTH)
+                    actual_h = int(v.get("height", VIEW_PIXEL_HEIGHT) or VIEW_PIXEL_HEIGHT)
+                    break
+
         return {
             "view": view_id,
             "cropped": False,
             "path": f"{_VIEWS_DIRNAME}/{view_id}.png",
             "sha256": expected_sha,
-            "width": VIEW_PIXEL_WIDTH,
-            "height": VIEW_PIXEL_HEIGHT,
+            "width": actual_w,
+            "height": actual_h,
         }
 
 
 # ---------------------------------------------------------------------------
 # Module-level helpers (pure, no I/O dependencies on the tool instance)
 # ---------------------------------------------------------------------------
+
+
+def _validate_crop(crop_val: object) -> list[float] | None:
+    if crop_val is None:
+        return None
+    if not isinstance(crop_val, (list, tuple)) or len(crop_val) != 4:
+        raise ValueError("crop must be a list of 4 numbers [ymin, xmin, ymax, xmax].")
+    try:
+        ymin, xmin, ymax, xmax = [float(v) for v in crop_val]
+    except (ValueError, TypeError):
+        raise ValueError("crop coordinates must be numeric [ymin, xmin, ymax, xmax].")
+    if math.isnan(ymin) or math.isnan(xmin) or math.isnan(ymax) or math.isnan(xmax):
+        raise ValueError("crop coordinates must not contain NaN.")
+    if not (0.0 <= ymin < ymax <= 1.0) or not (0.0 <= xmin < xmax <= 1.0):
+        raise ValueError(
+            f"Invalid crop bounds {[ymin, xmin, ymax, xmax]}; coordinates must satisfy 0.0 <= ymin < ymax <= 1.0 and 0.0 <= xmin < xmax <= 1.0."
+        )
+    if (ymax - ymin < 0.002) or (xmax - xmin < 0.002):
+        raise ValueError(
+            f"Crop box {[ymin, xmin, ymax, xmax]} is too small to contain visible pixels."
+        )
+    return [round(ymin, 4), round(xmin, 4), round(ymax, 4), round(xmax, 4)]
 
 
 def _coerce_list(raw_list: list, label: str) -> list[dict[str, object]]:
@@ -263,7 +362,10 @@ def _coerce_list(raw_list: list, label: str) -> list[dict[str, object]]:
             if cleaned:
                 items.append({"view": cleaned})
         elif isinstance(item, dict) and "view" in item:
-            items.append(dict(item))
+            entry = dict(item)
+            if "crop" in entry:
+                entry["crop"] = _validate_crop(entry["crop"])
+            items.append(entry)
         else:
             raise ValueError(
                 f"{label}[{index}] must be a view name string or object with 'view'."
@@ -287,37 +389,50 @@ def _coerce_requests(requests: object) -> list[dict[str, object]]:
         if not requests:
             return [{"view": "all"}]
 
+        global_crop = _validate_crop(requests.get("crop"))
+
+        items: list[dict[str, object]] = []
         # 1. Handle "views" list/string
         if "views" in requests:
             raw_views = requests["views"]
             if raw_views is None or raw_views == [] or raw_views == "":
-                return [{"view": "all"}]
-            if isinstance(raw_views, str):
+                items = [{"view": "all"}]
+            elif isinstance(raw_views, str):
                 cleaned = raw_views.strip()
-                return [{"view": cleaned}] if cleaned else [{"view": "all"}]
-            if isinstance(raw_views, list):
-                return _coerce_list(raw_views, "views")
-            raise ValueError("'views' must be a list of view names or a single view name.")
-
+                items = [{"view": cleaned}] if cleaned else [{"view": "all"}]
+            elif isinstance(raw_views, list):
+                items = _coerce_list(raw_views, "views")
+            else:
+                raise ValueError("'views' must be a list of view names or a single view name.")
         # 2. Handle "images" list (legacy schema compatibility)
-        if "images" in requests:
+        elif "images" in requests:
             raw_images = requests["images"]
             if raw_images is None or raw_images == [] or raw_images == "":
-                return [{"view": "all"}]
-            if not isinstance(raw_images, list):
+                items = [{"view": "all"}]
+            elif not isinstance(raw_images, list):
                 raise ValueError("'images' must be a list of view requests.")
-            return _coerce_list(raw_images, "images")
-
+            else:
+                items = _coerce_list(raw_images, "images")
         # 3. Handle single "view" key
-        if "view" in requests:
+        elif "view" in requests:
             raw_view = requests["view"]
             if not isinstance(raw_view, str) or not raw_view.strip():
                 raise ValueError("'view' must be a non-empty string.")
-            return [{"view": raw_view.strip()}]
+            items = [{"view": raw_view.strip()}]
+        # 4. Handle crop-only request (defaults to contact sheet "all")
+        elif global_crop:
+            items = [{"view": "all"}]
+        else:
+            raise ValueError(
+                "Invalid arguments for get_view_images. Pass 'views' array or leave empty for contact sheet."
+            )
 
-        raise ValueError(
-            "Invalid arguments for get_view_images. Pass 'views' array or leave empty for contact sheet."
-        )
+        if global_crop:
+            for item in items:
+                if "crop" not in item:
+                    item["crop"] = global_crop
+
+        return items
 
     raise ValueError("Invalid request format for get_view_images.")
 
@@ -336,7 +451,11 @@ def _deduplicate(items: list[dict[str, object]]) -> list[dict[str, object]]:
 
 def _item_key(item: dict[str, object]) -> str:
     raw_view = str(item.get("view") or "").strip().lower()
-    return VIEW_ALIASES.get(raw_view, raw_view)
+    canonical = VIEW_ALIASES.get(raw_view, raw_view)
+    crop = item.get("crop")
+    if crop and isinstance(crop, (list, tuple)) and len(crop) == 4:
+        return f"{canonical}:{tuple(crop)}"
+    return canonical
 
 
 def _read_manifest(review_root: Path) -> dict | None:

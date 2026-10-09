@@ -193,6 +193,8 @@ class _RunState:
     total_completion_tokens: int = 0
     total_reasoning_tokens: int = 0
     run_reasonings: list[str] = field(default_factory=list)
+    current_content: str = ""
+    current_reasoning: str = ""
     start_perf_time: float = 0.0
 
 
@@ -510,6 +512,8 @@ class AgentRunner:
                     self._handle_stop_pre_turn(state)
                     return
                 state.current_message_id = uuid.uuid4().hex
+                state.current_content = ""
+                state.current_reasoning = ""
                 outcome = self._run_turn(state)
                 if outcome is _TurnOutcome.CONTINUE:
                     continue
@@ -620,8 +624,13 @@ class AgentRunner:
         def publish_stream(event: dict[str, Any]) -> None:
             event_type = event.pop("type")
             msg_id = state.current_message_id
-            if event_type in ("content", "reasoning"):
-                sse_name = f"agent_{event_type}_delta"
+            delta = event.get("delta") or ""
+            if event_type == "content":
+                state.current_content += delta
+                sse_name = "agent_content_delta"
+            elif event_type == "reasoning":
+                state.current_reasoning += delta
+                sse_name = "agent_reasoning_delta"
             elif event_type == "tool_call":
                 sse_name = "agent_tool_delta"
             else:
@@ -978,11 +987,15 @@ class AgentRunner:
                 "message": "Task stopped.",
             },
         )
-        _close_dangling_tool_tail(
+        if not _close_dangling_tool_tail(
             state.project_dir,
             state.messages,
             "Task stopped by the user before the next turn started.",
-        )
+        ):
+            if state.messages and state.messages[-1].get("role") == "user":
+                item = {"role": "assistant", "content": "Task stopped."}
+                state.messages.append(item)
+                ConversationStore.append(state.project_dir, item)
 
     def _handle_tool_limit_reached(self, state: _RunState) -> None:
         """The ``agent.tool_call_limit`` budget was exhausted."""
@@ -1015,10 +1028,8 @@ class AgentRunner:
 
         Stopping is not a provider error, so the user sees the same
         ``agent_status: stopped`` event as a stop between iterations.
-        ``chat()`` was interrupted before the new assistant turn could
-        be appended, so the prior iteration's tool results are still
-        the tail of ``state.messages``; close them so the transcript
-        is well-formed for the next user request.
+        When interrupted, any content or reasoning streamed so far is preserved
+        into the conversation history as an assistant turn so the output is not lost.
         """
         if state is None:
             return
@@ -1031,11 +1042,61 @@ class AgentRunner:
                 "message": "Task stopped.",
             },
         )
-        _close_dangling_tool_tail(
-            state.project_dir,
-            state.messages,
-            "Task stopped by the user while the model was responding.",
-        )
+        partial_content = (getattr(state, "current_content", "") or "").strip()
+        partial_reasoning = (getattr(state, "current_reasoning", "") or "").strip()
+
+        if partial_content or partial_reasoning:
+            assistant_message: dict[str, Any] = {
+                "role": "assistant",
+                "content": partial_content or "Task stopped.",
+            }
+            if partial_reasoning:
+                assistant_message["reasoning"] = partial_reasoning
+            ConversationStore.append(state.project_dir, assistant_message)
+            state.messages.append(assistant_message)
+            self.publish(
+                "agent_stream_end",
+                {
+                    "project": state.project,
+                    "run_id": state.run_id,
+                    "message_id": state.current_message_id,
+                    "message": assistant_message["content"],
+                    "reasoning": partial_reasoning,
+                    "has_tools": False,
+                },
+            )
+        else:
+            if _close_dangling_tool_tail(
+                state.project_dir,
+                state.messages,
+                "Task stopped by the user while the model was responding.",
+            ):
+                self.publish(
+                    "agent_stream_end",
+                    {
+                        "project": state.project,
+                        "run_id": state.run_id,
+                        "message_id": state.current_message_id,
+                        "message": "Task stopped.",
+                        "reasoning": "",
+                        "has_tools": False,
+                    },
+                )
+            elif state.messages and state.messages[-1].get("role") == "user":
+                item = {"role": "assistant", "content": "Task stopped."}
+                state.messages.append(item)
+                ConversationStore.append(state.project_dir, item)
+                self.publish(
+                    "agent_stream_end",
+                    {
+                        "project": state.project,
+                        "run_id": state.run_id,
+                        "message_id": state.current_message_id,
+                        "message": item["content"],
+                        "reasoning": "",
+                        "has_tools": False,
+                    },
+                )
 
     def _handle_unexpected_error(
         self,
@@ -1130,8 +1191,9 @@ class AgentRunner:
             # Mark the run finished and drop the thread reference so a
             # subsequent ``start()`` / ``answer()`` never observes a
             # stale ``_thread``.
-            self._thread = None
-            self._run_complete.set()
+            if self._thread is None or self._thread is threading.current_thread():
+                self._thread = None
+                self._run_complete.set()
         self._active_activity_logger = None
         if activity_logger is not None:
             try:
@@ -1252,6 +1314,13 @@ class AgentRunner:
                         model_file = project_dir / MODEL_FILENAME
                         if model_file.is_file() and model_file.stat().st_size <= 100_000:
                             content = model_file.read_text("utf-8", errors="replace")
+                            try:
+                                state_file.write_text(
+                                    json.dumps({"existed": existed, "content": content}),
+                                    encoding="utf-8",
+                                )
+                            except OSError:
+                                pass
                     return existed, content
             except (OSError, json.JSONDecodeError, UnicodeDecodeError):
                 pass

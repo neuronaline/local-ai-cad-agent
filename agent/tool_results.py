@@ -62,7 +62,7 @@ def compact_for_context(tool: str, result: str) -> str:
     if tool == "get_view_images":
         raw_images = data.get("images")
         compact_images = [
-            {"view": img.get("view")}
+            {"view": img.get("view"), **({"crop": img["crop"]} if img.get("crop") else {})}
             for img in raw_images
             if isinstance(img, dict) and "view" in img
         ] if isinstance(raw_images, list) else []
@@ -101,7 +101,7 @@ def compact_for_context(tool: str, result: str) -> str:
     raw_images = data.get("images")
     if isinstance(raw_images, list) and raw_images:
         compact_data["images"] = [
-            {"view": img.get("view")}
+            {"view": img.get("view"), **({"crop": img["crop"]} if img.get("crop") else {})}
             for img in raw_images
             if isinstance(img, dict) and "view" in img
         ]
