@@ -99,6 +99,26 @@ module countersunk_hole(h, d_shaft, d_head, h_head) {
             cylinder(h = h_head + EPS, d1 = d_shaft, d2 = d_head);
     }
 }
+
+// Multi-variant & Plate Layout Pattern (OpenSCAD Customizer Standard)
+/* [Variant Selection] */
+PART_TYPE = "ALL"; // [ALL:All Parts, A:Variant A, B:Variant B]
+
+// Collision-free plate spacing (minimum 10 mm gap between outer bounding surfaces)
+PART_GAP = 10.0; // mm clearance between parts
+
+module plate_layout() {
+    if (PART_TYPE == "ALL") {
+        // Center-to-center offset: (width_A + width_B)/2 + PART_GAP
+        translate([-(PART_A_WIDTH/2 + PART_GAP/2), 0, 0]) part_a();
+        translate([+(PART_B_WIDTH/2 + PART_GAP/2), 0, 0]) part_b();
+    } else if (PART_TYPE == "A") {
+        part_a();
+    } else if (PART_TYPE == "B") {
+        part_b();
+    }
+}
+plate_layout();
 ```
 
 ---

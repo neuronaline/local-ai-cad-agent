@@ -38,13 +38,21 @@ _GOLDEN_RULES = """\
 
 _OPERATIONAL_RULES = """\
 - Edit only the active project's model.scad. Everything else is read-only.
-- This app previews a single STL at a time. For multi-variant requests (Front /
-  Rear, Left / Right, cap / body, etc.) build and ship each variant in its own
-  iteration: declare a top-level ``PART_TYPE = "FRONT";`` (or similar) at the
-  top of model.scad as a self-documenting marker, run ``cad_build``
-  on that variant, then start a fresh build for the next one. Do not stack
-  variants into one scene — the bounding box and contact sheet all assume a
-  single part.
+- Multi-variant & multi-part models: This app previews a single compiled STL at a time.
+  When the user requests multiple components, different sizes/variants (e.g. 3 scoops), or
+  an assembly (e.g. box & lid): declare a top-level parameter using standard OpenSCAD Customizer
+  combo-box syntax on the same line:
+  ``PART_TYPE = "ALL"; // [ALL, 50, 15, 5]`` or ``PART_TYPE = "ALL"; // [ALL:All Parts, 50:50ml, 15:15ml, 5:5ml]``.
+  By default, set ``PART_TYPE = "ALL";`` and arrange all requested components side-by-side
+  with collision-free clearance (minimum 10 mm gap between outer bounding surfaces:
+  ``dx >= (width_1 + width_2)/2 + 10``) so the complete set previews cleanly without overlapping.
+  Also support isolating any single component (e.g. ``PART_TYPE = "50";``). Mention in your final
+  reply that all components are displayed together and can be isolated via ``PART_TYPE``.
+  CadVerifier recognizes multi-part layouts and verifies them cleanly.
+- Cooperative assistance: Never refuse a user's layout, orientation, or arrangement request
+  with rigid refusals (e.g. "I won't combine them"). Provide the requested arrangement using
+  clean OpenSCAD translations (e.g. ``PART_TYPE = "ALL"``) while documenting individual and
+  overall bounding dimensions.
 - Resolve blocking ambiguity first (ask one batched ``question`` if needed),
   then iterate: edit model.scad → ``cad_build(views=['isometric'])`` (or
   ``views=['all']``) to inspect metrics and renders in a single turn → fix or finish.
@@ -117,7 +125,7 @@ _PROMPT_SECTIONS: list[tuple[str, str]] = [
     ("operational_rules", _OPERATIONAL_RULES),
 ]
 
-_STATIC_BUNDLE_TAG = "<!-- StaticBundle:v4.9 -->"
+_STATIC_BUNDLE_TAG = "<!-- StaticBundle:v5.3 -->"
 
 # Template-driven render keeps section markers, the bundle tag, and the optional
 # playbook suffix in one consistent style — no f-string brace escaping is needed

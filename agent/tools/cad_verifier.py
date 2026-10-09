@@ -51,6 +51,48 @@ def _clean_code_preserve_lines(code: str) -> str:
     return cleaned
 
 
+def _detect_multi_part_intent(code: str) -> bool:
+    """Detect whether model.scad intentionally defines a multi-part assembly or plate layout."""
+    param_matches = re.finditer(
+        r"^[ \t]*([A-Z][A-Z0-9_]*)[ \t]*=[ \t]*[\"\']?([A-Za-z0-9_]+)[\"\']?[ \t]*;",
+        code,
+        re.MULTILINE,
+    )
+    selector_found = False
+    for m in param_matches:
+        param_name, param_val = m.group(1).upper(), m.group(2).upper()
+        if param_name in ("PART_TYPE", "LAYOUT", "MODE", "VIEW", "ARRANGEMENT"):
+            selector_found = True
+            if param_val in (
+                "ALL",
+                "PLATE",
+                "BOTH",
+                "ASSEMBLY",
+                "SET",
+                "COMBINED",
+                "PRINT_BED",
+            ):
+                return True
+        if param_name in ("ASSEMBLY", "MULTI_PART", "PRINT_BED", "PLATE_LAYOUT") and param_val in (
+            "TRUE",
+            "1",
+        ):
+            return True
+
+    # If an explicit selector was found (e.g. PART_TYPE = "50"), the user specifically
+    # selected a single variant. Do not fall back to generic comment matching.
+    if selector_found:
+        return False
+
+    return bool(
+        re.search(
+            r"//.*?\b(?:multi[- ]part|assembly|plate layout|print bed|side[- ]by[- ]side)\b",
+            code,
+            re.IGNORECASE,
+        )
+    )
+
+
 class CadVerifier:
     """Deterministic verifier for CAD models, producing categorized findings and a risk score."""
 
@@ -118,7 +160,10 @@ class CadVerifier:
             mesh_findings: list[Finding] = []
             mesh_meta: dict[str, Any] = {"exists": True, "stale": True}
         else:
-            mesh_findings, mesh_meta = self._verify_mesh(preview_path)
+            mesh_findings, mesh_meta = self._verify_mesh(
+                preview_path,
+                multi_part_intent=bool(code_meta.get("multi_part_intent")),
+            )
 
         all_findings = code_findings + build_findings + mesh_findings
         return self._build_envelope(all_findings, code_meta, mesh_meta)
@@ -293,10 +338,13 @@ class CadVerifier:
             "parameters_defined": param_names,
             "fn_value": fn_val,
             "eps_defined": has_eps,
+            "multi_part_intent": _detect_multi_part_intent(code),
         }
         return findings, code_meta
 
-    def _verify_mesh(self, stl_path: Path) -> tuple[list[Finding], dict[str, Any]]:
+    def _verify_mesh(
+        self, stl_path: Path, multi_part_intent: bool = False
+    ) -> tuple[list[Finding], dict[str, Any]]:
         findings: list[Finding] = []
 
         if not stl_path.is_file() or stl_path.stat().st_size == 0:
@@ -455,14 +503,28 @@ class CadVerifier:
 
         # 4. Disconnected Solid Components
         if solid_count > 1:
-            findings.append(
-                Finding(
-                    category="WARNING",
-                    code="DISCONNECTED_SOLIDS",
-                    message=f"Model contains {solid_count} disconnected solid bodies.",
-                    impact="Parts may be floating in air unattached unless explicitly intended as a multi-part assembly.",
+            if multi_part_intent:
+                findings.append(
+                    Finding(
+                        category="INFO",
+                        code="MULTI_PART_ASSEMBLY",
+                        message=f"Model contains {solid_count} intentional components (multi-part assembly or plate arrangement detected).",
+                        impact="Multiple separate components arranged in one file.",
+                    )
                 )
-            )
+            else:
+                findings.append(
+                    Finding(
+                        category="WARNING",
+                        code="DISCONNECTED_SOLIDS",
+                        message=(
+                            f"Model contains {solid_count} disconnected solid bodies. "
+                            "If intended as a multi-part assembly or plate layout, set PART_TYPE = \"ALL\" "
+                            "or add a '// multi-part' comment."
+                        ),
+                        impact="Parts may be floating in air unattached unless explicitly intended as a multi-part assembly.",
+                    )
+                )
 
         mesh_meta = {
             "exists": True,
