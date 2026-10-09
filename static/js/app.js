@@ -2033,19 +2033,10 @@ function finalizeRunCard(runId, finalText, reasoning) {
   flushStreamingRender();
   let card = getActiveCard(runId);
 
-  const rawText = stripToolCallTags(card?.dataset.raw || '').trim();
-  const cleanFinal = stripToolCallTags(finalText || '').trim();
-  let text = cleanFinal || rawText;
-  if (rawText && cleanFinal && rawText !== cleanFinal && rawText.endsWith(cleanFinal)) {
-    text = rawText;
-  }
-
+  const text = stripToolCallTags(finalText || card?.dataset.raw || '').trim();
   const cardReasoning = stripEncryptedReasoning(card?.dataset.reasoning || '').trim();
   const incomingReasoning = stripEncryptedReasoning(reasoning || '').trim();
-  let finalReasoning = incomingReasoning || cardReasoning;
-  if (cardReasoning && incomingReasoning && cardReasoning !== incomingReasoning && cardReasoning.endsWith(incomingReasoning)) {
-    finalReasoning = cardReasoning;
-  }
+  const finalReasoning = cardReasoning || incomingReasoning;
   const cleanReasoning = (text && text === finalReasoning) ? '' : finalReasoning;
 
   if (card) {
@@ -2193,21 +2184,13 @@ function connectStream() {
           card.dataset.reasoning = combined;
           ensureThoughtDisclosure(card, combined, false, false);
         }
-        const rawText = stripToolCallTags(card.dataset.raw || '').trim();
-        const msgText = stripToolCallTags(data.message || '').trim();
-        let text = msgText || rawText;
-        if (rawText && msgText && rawText !== msgText && rawText.endsWith(msgText)) {
-          text = rawText;
-        }
+        const text = stripToolCallTags(data.message || card.dataset.raw || '').trim();
         if (text) {
           card.dataset.raw = text;
           renderAgentContent(card, text);
         }
         if (data.has_tools) {
           if (text) {
-            // Intermediate turn with user-facing message: finalize this turn's card
-            // so it stays permanently in the feed, and create a fresh card for the
-            // tool execution and subsequent turns.
             setCardState(card, 'done');
             if (runId) runCards.delete(runId);
             if (optimisticCard === card) optimisticCard = null;

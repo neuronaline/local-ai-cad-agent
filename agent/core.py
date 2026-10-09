@@ -760,6 +760,8 @@ class AgentRunner:
                 },
             )
             self._append_message(state.project_dir, assistant_message)
+            if assistant_message.get("content") and assistant_message.get("tool_calls"):
+                state.run_reasonings.clear()
         state.messages.append(assistant_message)
         if state.activity_logger is not None:
             state.activity_logger.log(
