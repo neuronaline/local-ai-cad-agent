@@ -90,6 +90,12 @@ if [ "$LLM_PROVIDER" = "ollama" ]; then
 else
     if [ "$LLM_PROVIDER" = "openai" ]; then
         API_KEY_NAME="OPENAI_API_KEY"
+    elif [ "$LLM_PROVIDER" = "gemini" ] || [ "$LLM_PROVIDER" = "google" ]; then
+        if [ -f "$PROJECT_DIR/.env" ] && grep -qE "^[[:space:]]*GOOGLE_API_KEY[[:space:]]*=[[:space:]]*[^[:space:]]" "$PROJECT_DIR/.env" 2>/dev/null; then
+            API_KEY_NAME="GOOGLE_API_KEY"
+        else
+            API_KEY_NAME="GEMINI_API_KEY"
+        fi
     else
         API_KEY_NAME="OPENROUTER_API_KEY"
     fi

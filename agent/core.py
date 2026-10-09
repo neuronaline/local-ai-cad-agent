@@ -1450,11 +1450,12 @@ class AgentRunner:
         """Map technical error messages to user-friendly messages."""
         lower = detail.lower()
         provider_name = provider_label(provider)
-        key_url = (
-            "https://platform.openai.com/api-keys"
-            if provider == "openai"
-            else "https://openrouter.ai/keys"
-        )
+        if provider == "openai":
+            key_url = "https://platform.openai.com/api-keys"
+        elif provider in ("gemini", "google"):
+            key_url = "https://aistudio.google.com/apikey"
+        else:
+            key_url = "https://openrouter.ai/keys"
 
         # Cancellation takes priority: \"cancelled" / "stop" substrings
         # are common in unrelated error messages, so check ``err_type``
@@ -1502,7 +1503,9 @@ class AgentRunner:
             "openrouter" in lower
             or "openai" in lower
             or "ollama" in lower
-            or provider in ("openrouter", "openai", "ollama")
+            or "gemini" in lower
+            or "google" in lower
+            or provider in ("openrouter", "openai", "ollama", "gemini", "google")
         ) and (
             "timeout" in lower or "timed out" in lower or "connection" in lower
         ):

@@ -9,9 +9,9 @@ agent:
   log_mode: off  # off | debug (rolling activity.jsonl) | dataset (untrimmed trajectories/<run_id>.jsonl)
 
 # LLM provider selection. Set ``provider`` to ``openrouter``, ``openai``,
-# or ``ollama``; the matching namespace below supplies its model + endpoint.
-# All namespaces are kept in sync so you can switch providers without
-# losing either configuration.
+# ``ollama``, or ``gemini`` (Google AI Studio Interactions API); the matching
+# namespace below supplies its model + endpoint. All namespaces are kept in sync
+# so you can switch providers without losing configuration.
 llm:
   provider: openrouter
   max_completion_tokens: 65536
@@ -58,6 +58,15 @@ ollama:
   model: qwen2.5-coder:14b-16k
   timeout_seconds: 120
   reasoning_effort: ""
+
+# Google AI Studio Interactions API adapter (POST /v1beta/interactions).
+# Requires GEMINI_API_KEY (or GOOGLE_API_KEY) in .env.
+gemini:
+  base_url: https://generativelanguage.googleapis.com
+  model: gemini-2.5-flash
+  timeout_seconds: 90
+  reasoning_effort: ""
+  store: true
 
 server:
   host: 127.0.0.1

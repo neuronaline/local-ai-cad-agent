@@ -13,7 +13,7 @@ _LOG = logging.getLogger(__name__)
 _WARNED_KEYS: set[str] = set()
 
 REASONING_EFFORTS = {"minimal", "low", "medium", "high"}
-LLM_PROVIDERS = {"openrouter", "openai", "ollama"}
+LLM_PROVIDERS = {"openrouter", "openai", "ollama", "gemini", "google"}
 
 
 @dataclass(frozen=True)
@@ -56,6 +56,12 @@ class Settings:
     ollama_model: str = "qwen2.5-coder:14b-16k"
     ollama_timeout_seconds: int = 120
     ollama_reasoning_effort: str | None = None
+    # Gemini / Google AI Studio Interactions API adapter.
+    gemini_base_url: str = "https://generativelanguage.googleapis.com"
+    gemini_model: str = "gemini-2.5-flash"
+    gemini_timeout_seconds: int = 90
+    gemini_reasoning_effort: str | None = None
+    gemini_store: bool = True
     # ── end provider selection ──
     show_info_messages: bool = True
     agent_tool_call_limit: int = 12
@@ -89,6 +95,8 @@ class Settings:
             return self.openai_model
         if self.llm_provider == "ollama":
             return self.ollama_model
+        if self.llm_provider in ("gemini", "google"):
+            return self.gemini_model
         return self.openrouter_model
 
 
@@ -220,6 +228,7 @@ def load_settings(project_root: Path | None = None) -> Settings:
     openrouter = config.get("openrouter") or {}
     openai = config.get("openai") or {}
     ollama = config.get("ollama") or {}
+    gemini = config.get("gemini") or config.get("google") or {}
     server = config.get("server") or {}
     ui = config.get("ui") or {}
     agent = config.get("agent") or {}
@@ -230,6 +239,11 @@ def load_settings(project_root: Path | None = None) -> Settings:
         ollama,
         {"base_url", "model", "timeout_seconds", "reasoning_effort", "think"},
         "ollama",
+    )
+    _reject_unknown(
+        gemini,
+        {"base_url", "model", "timeout_seconds", "reasoning_effort", "store"},
+        "gemini",
     )
     _reject_unknown(
         agent,
@@ -349,6 +363,11 @@ def load_settings(project_root: Path | None = None) -> Settings:
         ollama_model=str(ollama.get("model") or "qwen2.5-coder:14b-16k"),
         ollama_timeout_seconds=_validate_timeout_seconds(ollama.get("timeout_seconds") or 120, "ollama.timeout_seconds"),
         ollama_reasoning_effort=ollama_reasoning_effort,
+        gemini_base_url=str(gemini.get("base_url") or "https://generativelanguage.googleapis.com").rstrip("/"),
+        gemini_model=str(gemini.get("model") or "gemini-2.5-flash"),
+        gemini_timeout_seconds=_validate_timeout_seconds(gemini.get("timeout_seconds") or 90, "gemini.timeout_seconds"),
+        gemini_reasoning_effort=_optional_effort(gemini.get("reasoning_effort")),
+        gemini_store=_strict_bool(gemini.get("store", True), "gemini.store"),
         show_info_messages=_strict_bool(ui.get("show_info_messages", True), "ui.show_info_messages"),
         agent_tool_call_limit=_positive_int(agent.get("tool_call_limit", 12), "agent.tool_call_limit"),
         revision_retention_count=_non_negative_int(agent.get("revision_retention_count", 0), "agent.revision_retention_count"),

@@ -64,12 +64,16 @@ _REDACTED_KEYS: frozenset[str] = frozenset(
     {
         "authorization",
         "x-api-key",
+        "x-goog-api-key",
         "api_key",
         "apikey",
         "openrouter_api_key",
         "openai_api_key",
+        "gemini_api_key",
+        "google_api_key",
         "openrouter-key",
         "openai-key",
+        "gemini-key",
         "openrouter_api_key_redacted",
         "password",
         "token",
@@ -384,6 +388,8 @@ def _redact_value(value: Any) -> Any:
                 result[key] = _REDACTED_PLACEHOLDER
             elif _looks_like_image_url_part(key, item):
                 result[key] = _redact_image_url_part(key, item)
+            elif _looks_like_inline_data_part(key, item):
+                result[key] = _redact_inline_data_part(key, item)
             else:
                 result[key] = _redact_value(item)
         return result
@@ -402,6 +408,15 @@ def _looks_like_image_url_part(key: Any, value: Any) -> bool:
     if isinstance(url, str):
         return url.startswith("data:")
     return bool(value.get("image_path") or value.get("path") or value.get("name"))
+
+
+def _looks_like_inline_data_part(key: Any, value: Any) -> bool:
+    """Heuristic: dict-like Gemini inline_data payload with base64 data."""
+    if not isinstance(value, dict):
+        return False
+    if key == "inline_data" or "inline_data" in value:
+        return True
+    return "mime_type" in value and "data" in value and isinstance(value.get("data"), str)
 
 
 def _redact_image_url_part(key: Any, value: Any) -> Any:
@@ -423,6 +438,22 @@ def _redact_image_url_part(key: Any, value: Any) -> Any:
             cloned["url"] = "[IMAGE_DATA_URL redacted]"
     elif image_path:
         cloned["url"] = f"[LOCAL_IMAGE path={image_path}]"
+    return cloned
+
+
+def _redact_inline_data_part(key: Any, value: Any) -> Any:
+    """Replace a base64 inline_data payload with a size placeholder."""
+    if not isinstance(value, dict):
+        return value
+    cloned = deepcopy(value)
+    if "inline_data" in cloned and isinstance(cloned["inline_data"], dict):
+        inner = deepcopy(cloned["inline_data"])
+        data = inner.get("data")
+        if isinstance(data, str):
+            inner["data"] = f"[BASE64_DATA redacted, {len(data)} chars]"
+        cloned["inline_data"] = inner
+    elif "data" in cloned and isinstance(cloned.get("data"), str):
+        cloned["data"] = f"[BASE64_DATA redacted, {len(cloned['data'])} chars]"
     return cloned
 
 
@@ -481,12 +512,24 @@ def summarize_llm_messages(
                 {"role": None, "content_bytes": 0, "image_count": 0}
             )
             continue
-        role = message.get("role")
+        role = message.get("role") or message.get("type")
         content = message.get("content")
         image_count = 0
         text_chars = 0
         text_preview_source: str | None = None
-        if isinstance(content, str):
+        if role == "function_call":
+            fn_name = message.get("name") or ""
+            raw_args = message.get("arguments") or message.get("args") or {}
+            arg_str = json.dumps(raw_args) if isinstance(raw_args, dict) else str(raw_args)
+            text_chars = len(arg_str.encode("utf-8"))
+            text_preview_source = f"{fn_name}({arg_str[:60]}...)" if len(arg_str) > 60 else f"{fn_name}({arg_str})"
+        elif role == "function_result":
+            fn_name = message.get("name") or ""
+            res = message.get("result")
+            res_str = json.dumps(res) if isinstance(res, dict) else str(res)
+            text_chars = len(res_str.encode("utf-8"))
+            text_preview_source = f"{fn_name} -> {res_str[:60]}..." if len(res_str) > 60 else f"{fn_name} -> {res_str}"
+        elif isinstance(content, str):
             text_chars = len(content.encode("utf-8"))
             text_preview_source = content
         elif isinstance(content, list):
@@ -500,7 +543,7 @@ def summarize_llm_messages(
                         text_chars += len(text_value.encode("utf-8"))
                         if text_preview_source is None:
                             text_preview_source = text_value
-                elif part_type == "image_url":
+                elif part_type in ("image", "image_url"):
                     image_count += 1
         elif content is None:
             text_chars = 0

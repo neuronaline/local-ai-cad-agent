@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import os
 import queue
 import re
 import threading
@@ -22,7 +23,13 @@ from agent.activity_log import summarize_llm_messages
 from agent.prompt import TOOL_IMAGE_PROMPT
 from agent.settings import Settings
 
-PROVIDER_LABELS = {"openrouter": "OpenRouter", "openai": "OpenAI", "ollama": "Ollama"}
+PROVIDER_LABELS = {
+    "openrouter": "OpenRouter",
+    "openai": "OpenAI",
+    "ollama": "Ollama",
+    "gemini": "Google AI Studio",
+    "google": "Google AI Studio",
+}
 
 # Module-level HTTP/2 client for streaming Chat Completions without HTTP/1.1
 # chunk-size reassembly buffering. HTTP/2 binary DATA frames multiplex over
@@ -984,17 +991,261 @@ def provider_label(provider: str) -> str:
 
 def api_key_env(provider: str) -> str:
     """Return the env var name that supplies the API key for ``provider``."""
-    if provider == "openai":
+    key = provider.strip().lower()
+    if key in ("openai",):
         return "OPENAI_API_KEY"
-    if provider == "openrouter":
+    if key in ("openrouter",):
         return "OPENROUTER_API_KEY"
-    if provider == "ollama":
+    if key in ("ollama",):
         return "OLLAMA_API_KEY"
+    if key in ("gemini", "google", "google ai studio"):
+        if os.getenv("GEMINI_API_KEY", "").strip():
+            return "GEMINI_API_KEY"
+        if os.getenv("GOOGLE_API_KEY", "").strip():
+            return "GOOGLE_API_KEY"
+        return "GEMINI_API_KEY"
     raise ValueError(f"Unknown LLM provider: {provider!r}")
 
 
-def create_llm_client(settings: Settings):
-    """Return the chat-completions client selected by ``settings.llm_provider``.
+class BaseLLMClient:
+    """Shared interface and execution engine for all LLM provider adapters."""
+
+    preserve_reasoning: bool = False
+    requires_api_key: bool = True
+    _DEFAULT_RETRY_ATTEMPTS: int = 3
+
+    def __init__(self, settings: Settings, provider_label: str) -> None:
+        self.settings = settings
+        self.stop_event: threading.Event | None = None
+        self.session_id: str | None = None
+        self.agent_role: str | None = None
+        self.last_usage: dict[str, Any] | None = None
+        self.last_image_fallback_used: bool = False
+        self.stream_callback: Any | None = None
+        self.require_images: bool = False
+        self._provider_label: str = provider_label
+        self.activity_logger: Any | None = None
+        self.run_id: str | None = None
+        self._active_response: Any | None = None
+        self._response_lock = threading.Lock()
+
+    def sanitize_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return sanitize_messages(messages, preserve_reasoning=self.preserve_reasoning)
+
+    def abort(self) -> None:
+        if self.stop_event is not None:
+            self.stop_event.set()
+        with self._response_lock:
+            resp = self._active_response
+        if resp is not None:
+            _force_close_response(resp)
+
+    def _api_key(self) -> str:
+        raise NotImplementedError
+
+    def _endpoint(self) -> str:
+        raise NotImplementedError
+
+    def _build_headers(self, api_key: str) -> dict[str, str]:
+        raise NotImplementedError
+
+    def _build_payload(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def _post(self, payload: dict[str, Any], headers: dict[str, str]) -> Any:
+        raise NotImplementedError
+
+    def _stream_response(self, response: Any) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def _parse_non_stream_response(self, response: Any) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def _try_image_fallback(self, payload: dict[str, Any], response: Any) -> bool:
+        raise NotImplementedError
+
+    def _summarize_payload_for_logging(
+        self, payload: dict[str, Any], is_dataset_mode: bool
+    ) -> dict[str, Any] | None:
+        return None
+
+    def _log_llm_response(
+        self,
+        attempt: int,
+        model: Any,
+        call_start: float,
+        body: dict[str, Any] | None,
+    ) -> None:
+        if self.activity_logger is None or not isinstance(body, dict):
+            return
+        total_duration_ms = round((time.perf_counter() - call_start) * 1000, 2)
+        choices = body.get("choices") if isinstance(body.get("choices"), list) else None
+        first_choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+        choice_msg = (
+            first_choice.get("message", {})
+            if isinstance(first_choice.get("message"), dict)
+            else {}
+        )
+        self.activity_logger.log(
+            "llm_response",
+            {
+                "attempt": attempt,
+                "model": model,
+                "duration_ms": total_duration_ms,
+                "usage": self.last_usage,
+                "has_reasoning": bool(
+                    choice_msg.get("reasoning")
+                    or choice_msg.get("reasoning_details")
+                ),
+                "tool_call_count": len(choice_msg.get("tool_calls") or []),
+            },
+            run_id=self.run_id,
+        )
+
+    def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        *,
+        max_attempts: int | None = None,
+    ) -> dict[str, Any]:
+        attempts = (
+            max_attempts
+            if max_attempts is not None
+            else self._DEFAULT_RETRY_ATTEMPTS
+        )
+        self.last_usage = None
+        self.last_image_fallback_used = False
+        api_key = self._api_key()
+        if self.requires_api_key and not api_key:
+            raise RuntimeError(f"{api_key_env(self._provider_label)} is not configured.")
+        payload = self._build_payload(messages, tools)
+        headers = self._build_headers(api_key)
+        log_payload = self.activity_logger is not None
+
+        image_fallback_used = False
+        for attempt in range(attempts):
+            is_last_attempt = attempt == attempts - 1
+            response: Any | None = None
+            attempt_payload = None
+            if log_payload:
+                is_dataset_mode = getattr(self.activity_logger, "log_mode", "") == "dataset"
+                attempt_payload = self._summarize_payload_for_logging(payload, is_dataset_mode)
+            call_start = time.perf_counter()
+            try:
+                response = self._post(payload, headers)
+            except RequestCancelled:
+                if log_payload:
+                    self.activity_logger.log(
+                        "llm_cancelled",
+                        {"attempt": attempt, "model": payload.get("model")},
+                        run_id=self.run_id,
+                    )
+                raise
+            except Exception:
+                if is_last_attempt:
+                    raise
+            else:
+                image_rejection = _is_image_rejection(response)
+                if image_rejection and not image_fallback_used:
+                    if self.require_images:
+                        response.close()
+                        raise RuntimeError(
+                            "Review model rejected image inputs; cannot "
+                            "complete review without visual evidence."
+                        )
+                    if self._try_image_fallback(payload, response):
+                        image_fallback_used = True
+                        self.last_image_fallback_used = True
+                        if log_payload:
+                            self.activity_logger.log(
+                                "llm_visual_fallback",
+                                {"attempt": attempt, "model": payload.get("model")},
+                                run_id=self.run_id,
+                            )
+                        continue
+                    body_preview = _response_text(response)[:500]
+                    if body_preview:
+                        raise RuntimeError(f"{self._provider_label} {response.status_code}: {body_preview}")
+                if response.status_code not in {408, 429} and response.status_code < 500:
+                    if 400 <= response.status_code < 500:
+                        body_preview = _response_text(response)[:500]
+                        if body_preview:
+                            raise RuntimeError(
+                                f"{self._provider_label} {response.status_code}: {body_preview}"
+                            )
+                    response.raise_for_status()
+                    duration_ms = round((time.perf_counter() - call_start) * 1000, 2)
+                    if log_payload:
+                        self.activity_logger.log(
+                            "llm_request",
+                            {
+                                "attempt": attempt,
+                                "url": self._endpoint(),
+                                "model": payload.get("model"),
+                                "headers": dict(headers),
+                                "payload": attempt_payload,
+                                "status": response.status_code,
+                                "duration_ms": duration_ms,
+                            },
+                            run_id=self.run_id,
+                        )
+                    if hasattr(response, "iter_lines"):
+                        try:
+                            stream_res = self._stream_response(response)
+                            if log_payload:
+                                self._log_llm_response(
+                                    attempt, payload.get("model"), call_start, stream_res
+                                )
+                            return stream_res
+                        except StreamResponseError as error:
+                            if not error.retryable or is_last_attempt:
+                                raise
+                            if log_payload:
+                                self.activity_logger.log(
+                                    "llm_stream_retry",
+                                    {
+                                        "attempt": attempt,
+                                        "model": payload.get("model"),
+                                        "error": str(error),
+                                    },
+                                    run_id=self.run_id,
+                                )
+                    else:
+                        parsed_body = self._parse_non_stream_response(response)
+                        if log_payload:
+                            self._log_llm_response(
+                                attempt, payload.get("model"), call_start, parsed_body
+                            )
+                        return parsed_body
+                if log_payload:
+                    self.activity_logger.log(
+                        "llm_retry",
+                        {
+                            "attempt": attempt,
+                            "status": response.status_code,
+                            "model": payload.get("model"),
+                        },
+                        run_id=self.run_id,
+                    )
+                if is_last_attempt:
+                    response.raise_for_status()
+            finally:
+                close = getattr(response, "close", None)
+                if callable(close):
+                    close()
+            if not is_last_attempt:
+                delay = retry_delay(response, attempt)
+                sleep_with_cancel(delay, self.stop_event)
+        raise RuntimeError(f"{self._provider_label} retry loop ended unexpectedly.")
+
+
+def create_llm_client(settings: Settings) -> BaseLLMClient:
+    """Return the chat client selected by ``settings.llm_provider``.
 
     When ``settings.llm_fallback_provider`` is set, the primary client is
     wrapped in :class:`FallbackChatClient` so a transient primary failure
@@ -1013,7 +1264,7 @@ def create_llm_client(settings: Settings):
     return FallbackChatClient(primary, fallback, fallback_label)
 
 
-def _build_provider_client(provider: str, settings: Settings):
+def _build_provider_client(provider: str, settings: Settings) -> BaseLLMClient:
     """Construct the adapter for a single provider label.
 
     Extracted from :func:`create_llm_client` so the fallback wrapper can
@@ -1031,13 +1282,17 @@ def _build_provider_client(provider: str, settings: Settings):
         from agent.ollama_client import OllamaClient
 
         return OllamaClient(settings)
+    if provider in ("gemini", "google"):
+        from agent.gemini_client import GoogleInteractionsClient
+
+        return GoogleInteractionsClient(settings)
     raise ValueError(f"Unknown LLM provider: {provider!r}")
 
 
-class FallbackChatClient:
-    """Try a primary ``ChatCompletionsClient`` and fall back once on failure.
+class FallbackChatClient(BaseLLMClient):
+    """Try a primary ``BaseLLMClient`` and fall back once on failure.
 
-    The wrapper mirrors the public surface of :class:`ChatCompletionsClient`
+    The wrapper mirrors the public surface of :class:`BaseLLMClient`
     so :class:`agent.core.AgentRunner` can treat it as a drop-in replacement.
     Any exception from the primary (after its own retry loop is exhausted)
     triggers a single attempt against the fallback — except user
@@ -1068,10 +1323,11 @@ class FallbackChatClient:
 
     def __init__(
         self,
-        primary: ChatCompletionsClient,
-        fallback: ChatCompletionsClient,
+        primary: BaseLLMClient,
+        fallback: BaseLLMClient,
         fallback_label: str,
     ) -> None:
+        super().__init__(primary.settings, provider_label=primary._provider_label)
         self._primary = primary
         self._fallback = fallback
         self._fallback_label = fallback_label
@@ -1109,7 +1365,7 @@ class FallbackChatClient:
             except Exception:
                 pass
 
-    def _capture_result(self, client: ChatCompletionsClient) -> None:
+    def _capture_result(self, client: BaseLLMClient) -> None:
         """Copy per-call metrics from the successful inner client.
 
         ``preserve_reasoning`` differs between providers — copying it
@@ -1199,7 +1455,7 @@ class FallbackChatClient:
 # ---------------------------------------------------------------------------
 
 
-class ChatCompletionsClient:
+class ChatCompletionsClient(BaseLLMClient):
     """Shared base for OpenAI-compatible Chat Completions clients.
 
     Provider-specific logic (endpoint, headers, payload extras) is pushed into
@@ -1208,65 +1464,10 @@ class ChatCompletionsClient:
     are fully shared here.
     """
 
-    # Whether this provider needs the latest assistant turn's reasoning
-    # payloads (``reasoning`` / ``reasoning_details``) on the wire so it can
-    # continue an interrupted tool-call response. OpenRouter-compatible
-    # providers (Anthropic extended thinking, xai reasoning, Gemini thinking)
-    # require this; OpenAI rejects unknown reasoning fields and never sets
-    # the flag. Both the wire-payload sanitizer and the agent runner's
-    # per-message sanitizer read this attribute, so there is a single source
-    # of truth for "should we keep reasoning?" rather than two parallel
-    # implementations that can drift.
     preserve_reasoning: bool = False
     requires_api_key: bool = True
 
-    def __init__(self, settings: Settings, provider_label: str) -> None:
-        self.settings = settings
-        self.stop_event = None
-        self.session_id: str | None = None
-        # Subordinate evaluator hook. The structured ``cad_review`` tool (the
-        # historical setter of ``"reviewer"``) was removed from the tool
-        # surface; the field is preserved here so a future sub-agent can
-        # tag its ``trace.span_name`` on the OpenRouter adapter without
-        # changing the cache prefix on the base client. Today nothing
-        # outside this module sets the attribute, so the value is always
-        # ``None`` in production. The OpenAI adapter does not consume it.
-        self.agent_role: str | None = None
-        self.last_usage: dict[str, Any] | None = None
-        self.last_image_fallback_used = False
-        self.stream_callback = None
-        self.require_images = False
-        self._provider_label = provider_label
-        # Optional activity-log hook. The agent runner wires this when
-        # ``agent.log_tool_activity`` is enabled; ``None`` keeps the wire
-        # path inert for tests and review sub-sessions that do not log.
-        # Public on purpose: :class:`agent.core.AgentRunner` writes these
-        # from outside the client, so they are part of the documented
-        # surface and consumed by ``chat()`` directly.
-        self.activity_logger = None
-        self.run_id: str | None = None
-        self._active_response: Any | None = None
-        self._response_lock = threading.Lock()
-
-    def _endpoint(self) -> str:  # pragma: no cover — overridden by subclass
-        raise NotImplementedError
-
-    def _build_headers(self, api_key: str) -> dict[str, str]:  # pragma: no cover
-        raise NotImplementedError
-
-    def _build_payload(self, messages, tools):  # pragma: no cover
-        raise NotImplementedError
-
-    def _post(self, payload, headers):  # pragma: no cover
-        raise NotImplementedError
-
-    def _api_key(self) -> str:  # pragma: no cover
-        raise NotImplementedError
-
-    def sanitize_messages(self, messages):
-        return sanitize_messages(messages, preserve_reasoning=self.preserve_reasoning)
-
-    def _stream_response(self, response):
+    def _stream_response(self, response: Any) -> dict[str, Any]:
         with self._response_lock:
             self._active_response = response
         try:
@@ -1290,229 +1491,52 @@ class ChatCompletionsClient:
                 except Exception:
                     pass
 
-    def abort(self) -> None:
-        if self.stop_event is not None:
-            self.stop_event.set()
-        with self._response_lock:
-            resp = self._active_response
-        if resp is not None:
-            _force_close_response(resp)
-
-    def _try_image_fallback(self, payload, response):
+    def _try_image_fallback(self, payload: dict[str, Any], response: Any) -> bool:
         messages_without_images, removed = without_images(payload["messages"])
         if removed:
             response.close()
             payload["messages"] = messages_without_images
         return removed
 
-    def _log_llm_response(
-        self,
-        attempt: int,
-        model: Any,
-        call_start: float,
-        body: dict[str, Any] | None,
-    ) -> None:
-        if self.activity_logger is None or not isinstance(body, dict):
-            return
-        total_duration_ms = round((time.perf_counter() - call_start) * 1000, 2)
-        choices = body.get("choices") if isinstance(body.get("choices"), list) else None
-        first_choice = choices[0] if choices and isinstance(choices[0], dict) else {}
-        choice_msg = (
-            first_choice.get("message", {})
-            if isinstance(first_choice.get("message"), dict)
-            else {}
-        )
-        self.activity_logger.log(
-            "llm_response",
-            {
-                "attempt": attempt,
-                "model": model,
-                "duration_ms": total_duration_ms,
-                "usage": self.last_usage,
-                "has_reasoning": bool(
-                    choice_msg.get("reasoning")
-                    or choice_msg.get("reasoning_details")
-                ),
-                "tool_call_count": len(choice_msg.get("tool_calls") or []),
-            },
-            run_id=self.run_id,
-        )
+    def _summarize_payload_for_logging(
+        self, payload: dict[str, Any], is_dataset_mode: bool
+    ) -> dict[str, Any] | None:
+        attempt_payload = deepcopy(payload)
+        if (
+            isinstance(attempt_payload, dict)
+            and isinstance(attempt_payload.get("messages"), list)
+        ):
+            attempt_payload["messages"] = summarize_llm_messages(
+                attempt_payload["messages"],
+                lossless=is_dataset_mode,
+            )
+        return attempt_payload
 
-    # How many attempts the inner retry loop makes when ``chat()`` is
-    # called directly. ``FallbackChatClient`` passes a per-call override
-    # so a primary failure does not burn the wrapper's documented
-    # "one shot" budget on the fallback hop.
-    _DEFAULT_RETRY_ATTEMPTS = 3
-
-    def chat(self, messages, tools=None, *, max_attempts: int | None = None):
-        attempts = (
-            max_attempts
-            if max_attempts is not None
-            else self._DEFAULT_RETRY_ATTEMPTS
-        )
-        self.last_usage = None
-        self.last_image_fallback_used = False
-        api_key = self._api_key()
-        if self.requires_api_key and not api_key:
-            raise RuntimeError(f"{api_key_env(self._provider_label.lower())} is not configured.")
-        payload = self._build_payload(messages, tools)
-        headers = self._build_headers(api_key)
-        log_payload = self.activity_logger is not None
-
-        image_fallback_used = False
-        for attempt in range(attempts):
-            is_last_attempt = attempt == attempts - 1
-            response: Any | None = None
-            # When activity logging is enabled, replace the raw
-            # ``messages`` array with a structural summary so a single
-            # multi-image upload cannot exhaust the 5 MiB rolling cap
-            # and the activity log never echoes prompt content in
-            # plaintext. ``redact()`` already scrubs ``authorization`` /
-            # provider-key headers.
-            attempt_payload = deepcopy(payload) if log_payload else None
-            if (
-                log_payload
-                and isinstance(attempt_payload, dict)
-                and isinstance(attempt_payload.get("messages"), list)
-            ):
-                is_dataset_mode = getattr(self.activity_logger, "log_mode", "") == "dataset"
-                attempt_payload["messages"] = summarize_llm_messages(
-                    attempt_payload["messages"],
-                    lossless=is_dataset_mode,
-                )
-            call_start = time.perf_counter()
+    def _parse_non_stream_response(self, response: Any) -> dict[str, Any]:
+        if hasattr(response, "read") and callable(response.read):
             try:
-                response = self._post(payload, headers)
-            except RequestCancelled:
-                if log_payload:
-                    self.activity_logger.log(
-                        "llm_cancelled",
-                        {"attempt": attempt, "model": payload.get("model")},
-                        run_id=self.run_id,
-                    )
-                raise
+                response.read()
             except Exception:
-                if is_last_attempt:
-                    raise
-            else:
-                image_rejection = _is_image_rejection(response)
-                if image_rejection and not image_fallback_used:
-                    # Review calls require images: a refusal that traces back
-                    # to ``image_url`` parts is treated as an inconclusive
-                    # review and surfaces to the caller instead of retrying
-                    # the request without its visual evidence.
-                    if self.require_images:
-                        response.close()
-                        raise RuntimeError(
-                            "Review model rejected image inputs; cannot "
-                            "complete review without visual evidence."
-                        )
-                    if self._try_image_fallback(payload, response):
-                        image_fallback_used = True
-                        self.last_image_fallback_used = True
-                        if log_payload:
-                            self.activity_logger.log(
-                                "llm_visual_fallback",
-                                {"attempt": attempt, "model": payload.get("model")},
-                                run_id=self.run_id,
-                            )
-                        continue
-                    body_preview = _response_text(response)[:500]
-                    if body_preview:
-                        raise RuntimeError(f"{self._provider_label} {response.status_code}: {body_preview}")
-                if response.status_code not in {408, 429} and response.status_code < 500:
-                    if 400 <= response.status_code < 500:
-                        body_preview = _response_text(response)[:500]
-                        if body_preview:
-                            raise RuntimeError(
-                                f"{self._provider_label} {response.status_code}: {body_preview}"
-                            )
-                    response.raise_for_status()
-                    duration_ms = round((time.perf_counter() - call_start) * 1000, 2)
-                    if log_payload:
-                        self.activity_logger.log(
-                            "llm_request",
-                            {
-                                "attempt": attempt,
-                                "url": self._endpoint(),
-                                "model": payload.get("model"),
-                                "headers": dict(headers),
-                                "payload": attempt_payload,
-                                "status": response.status_code,
-                                "duration_ms": duration_ms,
-                            },
-                            run_id=self.run_id,
-                        )
-                    if hasattr(response, "iter_lines"):
-                        try:
-                            stream_res = self._stream_response(response)
-                            if log_payload:
-                                self._log_llm_response(
-                                    attempt, payload.get("model"), call_start, stream_res
-                                )
-                            return stream_res
-                        except StreamResponseError as error:
-                            if not error.retryable or is_last_attempt:
-                                raise
-                            if log_payload:
-                                self.activity_logger.log(
-                                    "llm_stream_retry",
-                                    {
-                                        "attempt": attempt,
-                                        "model": payload.get("model"),
-                                        "error": str(error),
-                                    },
-                                    run_id=self.run_id,
-                                )
-                    else:
-                        if hasattr(response, "read") and callable(response.read):
-                            try:
-                                response.read()
-                            except Exception:
-                                pass
-                        body = response.json()
-                        self.last_usage = body.get("usage") if isinstance(body.get("usage"), dict) else None
-                        choices = body.get("choices") if isinstance(body, dict) else None
-                        if choices and choices[0].get("finish_reason") == "length":
-                            raise RuntimeError(
-                                f"{self._provider_label} completion was truncated "
-                                "(finish_reason='length'); no tool calls were executed. "
-                                "Consider increasing 'llm.max_completion_tokens' "
-                                "in config.yaml or reducing 'reasoning_effort'."
-                            )
-                        if choices and isinstance(choices[0].get("message"), dict):
-                            msg = choices[0]["message"]
-                            r_content = msg.get("reasoning_content") or msg.get("thinking")
-                            if r_content and not msg.get("reasoning"):
-                                msg["reasoning"] = r_content
-                            clean_text, extracted_r = extract_think_tags(
-                                msg.get("content"), msg.get("reasoning")
-                            )
-                            if extracted_r and not msg.get("reasoning"):
-                                msg["reasoning"] = extracted_r
-                            msg["content"] = clean_text or None
-                        if log_payload:
-                            self._log_llm_response(
-                                attempt, payload.get("model"), call_start, body
-                            )
-                        return body
-                if log_payload:
-                    self.activity_logger.log(
-                        "llm_retry",
-                        {
-                            "attempt": attempt,
-                            "status": response.status_code,
-                            "model": payload.get("model"),
-                        },
-                        run_id=self.run_id,
-                    )
-                if is_last_attempt:
-                    response.raise_for_status()
-            finally:
-                close = getattr(response, "close", None)
-                if callable(close):
-                    close()
-            if not is_last_attempt:
-                delay = retry_delay(response, attempt)
-                sleep_with_cancel(delay, self.stop_event)
-        raise RuntimeError(f"{self._provider_label} retry loop ended unexpectedly.")
+                pass
+        body = response.json()
+        self.last_usage = body.get("usage") if isinstance(body.get("usage"), dict) else None
+        choices = body.get("choices") if isinstance(body, dict) else None
+        if choices and choices[0].get("finish_reason") == "length":
+            raise RuntimeError(
+                f"{self._provider_label} completion was truncated "
+                "(finish_reason='length'); no tool calls were executed. "
+                "Consider increasing 'llm.max_completion_tokens' "
+                "in config.yaml or reducing 'reasoning_effort'."
+            )
+        if choices and isinstance(choices[0].get("message"), dict):
+            msg = choices[0]["message"]
+            r_content = msg.get("reasoning_content") or msg.get("thinking")
+            if r_content and not msg.get("reasoning"):
+                msg["reasoning"] = r_content
+            clean_text, extracted_r = extract_think_tags(
+                msg.get("content"), msg.get("reasoning")
+            )
+            if extracted_r and not msg.get("reasoning"):
+                msg["reasoning"] = extracted_r
+            msg["content"] = clean_text or None
+        return body
