@@ -90,10 +90,7 @@ def cached_model_sha256(project_dir: Path) -> str | None:
                 _MODEL_DIGEST_CACHE.popitem(last=False)
         cached_value = project_cache.get(key)
         if cached_value is None and key not in project_cache:
-            try:
-                cached_value = hashlib.sha256(model_path.read_bytes()).hexdigest()
-            except OSError:
-                cached_value = None
+            cached_value = compute_model_sha256(project_dir)
             project_cache[key] = cached_value
             while len(project_cache) > _MAX_DIGEST_ENTRIES_PER_PROJECT:
                 project_cache.popitem(last=False)
@@ -240,18 +237,25 @@ class BuildRecord:
 def compute_model_sha256(project_dir: Path) -> str | None:
     """Return the SHA-256 of ``<project_dir>/model.scad`` or ``None`` when absent.
 
-    Centralised so the orchestrators (``CadScreenshotTool``, ``AgentRunner``)
+    Centralised so the orchestrators (``ImageTool``, ``CadTool``, ``AgentRunner``)
     and :meth:`RevisionStore.active_model_digest` agree on the exact same
     digest semantics instead of each re-rolling an ``is_file`` + ``read_bytes``
-    + ``OSError`` dance.
+    + ``OSError`` dance. Normalises text line endings to standard Unix LF (``\n``)
+    so CRLF vs LF differences (e.g. from Windows checkouts or edits) compute
+    identical digests matching CadTool and the runner.
     """
     model_path = project_dir / MODEL_FILENAME
     try:
         if not model_path.is_file():
             return None
-        return hashlib.sha256(model_path.read_bytes()).hexdigest()
-    except OSError:
-        return None
+        text = model_path.read_text(encoding="utf-8")
+        norm = text.replace("\r\n", "\n").replace("\r", "\n")
+        return hashlib.sha256(norm.encode("utf-8")).hexdigest()
+    except (OSError, UnicodeDecodeError):
+        try:
+            return hashlib.sha256(model_path.read_bytes()).hexdigest()
+        except OSError:
+            return None
 
 
 def model_is_built(project_dir: Path) -> bool:
@@ -311,7 +315,7 @@ class RevisionStore:
         """
         model_path = self.project_dir / MODEL_FILENAME
         model_digest = (
-            hashlib.sha256(model_path.read_bytes()).hexdigest() if model_path.is_file() else None
+            compute_model_sha256(self.project_dir) if model_path.is_file() else None
         )
 
         head_data = self._read_json_safe(self._head_path)
@@ -502,6 +506,7 @@ class RevisionStore:
         When retention > 0, prunes excess revisions after commit, keeping at
         most `retention` revisions plus the last-known-good revision.
         """
+        source = source.replace("\r\n", "\n").replace("\r", "\n")
         source_bytes = source.encode("utf-8")
         if len(source_bytes) > _MAX_SOURCE_BYTES:
             raise ValueError("Source exceeds the maximum allowed size.")

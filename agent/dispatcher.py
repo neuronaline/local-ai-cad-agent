@@ -192,6 +192,37 @@ def is_cad_build(name: str) -> bool:
     return name in {"cad_build", "cad_build_and_verify"}
 
 
+def _extract_requested_views(args: object) -> list[str] | None:
+    """Extract view names from get_view_images arguments for on-demand build."""
+    try:
+        from agent.tools.image_tool import VIEW_ALIASES, _coerce_requests
+
+        items = _coerce_requests(args)
+    except Exception:
+        return None
+    views: list[str] = []
+    for item in items:
+        raw = str(item.get("view") or "").strip().lower()
+        alias = VIEW_ALIASES.get(raw, raw)
+        if alias == "all":
+            return None
+        if alias and alias not in views:
+            views.append(alias)
+    return views or None
+
+
+def _extract_resolution(args: object) -> int:
+    """Extract render resolution from get_view_images arguments if specified."""
+    if isinstance(args, dict):
+        try:
+            res = int(args.get("resolution", 512) or 512)
+            if res > 0:
+                return res
+        except (ValueError, TypeError):
+            pass
+    return 512
+
+
 def dispatch(
     tools,
     project: str,
@@ -299,9 +330,15 @@ def dispatch(
             return image.get_view_images(args), False
         except ValueError as error:
             err_msg = str(error)
-            if "No review artifacts exist" in err_msg or "missing manifest.json" in err_msg:
+            if "cad_build" in err_msg:
                 cad = tools.cad.with_call_id(call_id) if call_id else tools.cad
-                cad.build(mode=RenderMode.FULL_REVIEW)
+                req_views = _extract_requested_views(args)
+                resolution = _extract_resolution(args)
+                cad.build(
+                    mode=RenderMode.FULL_REVIEW,
+                    requested_views=req_views,
+                    resolution=resolution,
+                )
                 return image.get_view_images(args), False
             raise
     if name == "question":

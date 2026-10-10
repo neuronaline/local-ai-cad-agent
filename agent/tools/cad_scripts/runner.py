@@ -194,6 +194,7 @@ def _run_model(
 ) -> dict[str, Any]:
     """Compile model.scad with OpenSCAD, validate geometry, and render evidence."""
     settings = settings or {}
+    model_code = model_code.replace("\r\n", "\n").replace("\r", "\n")
     model_path = Path(str(settings.get("model_path", "model.scad")))
     model_path.write_text(model_code, encoding="utf-8")
 
@@ -206,37 +207,39 @@ def _run_model(
 
     # 1. Compile model.scad to binary STL (headless CGAL/CSG evaluation)
     preview_stl = Path("preview.stl")
-    compile_cmd = [
-        "openscad",
-        "-o",
-        str(preview_stl),
-        "--export-format",
-        "binstl",
-    ]
-    if enable_manifold:
-        compile_cmd.append("--enable=manifold")
-    compile_cmd.append(str(model_path))
-    try:
-        proc = subprocess.run(
-            compile_cmd,
-            capture_output=True,
-            text=True,
-            timeout=_OPENSCAD_TIMEOUT_SECONDS,
-            check=False,
-        )
-        ret, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
-    except (subprocess.SubprocessError, OSError) as exc:
-        ret, stdout, stderr = 1, "", str(exc)
-
-    if ret != 0 or not preview_stl.is_file() or preview_stl.stat().st_size == 0:
-        err_detail = (stderr or stdout).strip()
-        lines = [
-            line
-            for line in err_detail.splitlines()
-            if any(k in line.lower() for k in ("error", "warning", "syntax", "can't", "cgal", "expr:"))
+    needs_compile = not preview_stl.is_file() or preview_stl.stat().st_size == 0
+    if needs_compile:
+        compile_cmd = [
+            "openscad",
+            "-o",
+            str(preview_stl),
+            "--export-format",
+            "binstl",
         ]
-        summary = "\n".join(lines) if lines else err_detail[-1000:]
-        raise RuntimeError(f"OpenSCAD execution failed:\n{summary or 'OpenSCAD produced no output or an empty STL.'}")
+        if enable_manifold:
+            compile_cmd.append("--enable=manifold")
+        compile_cmd.append(str(model_path))
+        try:
+            proc = subprocess.run(
+                compile_cmd,
+                capture_output=True,
+                text=True,
+                timeout=_OPENSCAD_TIMEOUT_SECONDS,
+                check=False,
+            )
+            ret, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
+        except (subprocess.SubprocessError, OSError) as exc:
+            ret, stdout, stderr = 1, "", str(exc)
+
+        if ret != 0 or not preview_stl.is_file() or preview_stl.stat().st_size == 0:
+            err_detail = (stderr or stdout).strip()
+            lines = [
+                line
+                for line in err_detail.splitlines()
+                if any(k in line.lower() for k in ("error", "warning", "syntax", "can't", "cgal", "expr:"))
+            ]
+            summary = "\n".join(lines) if lines else err_detail[-1000:]
+            raise RuntimeError(f"OpenSCAD execution failed:\n{summary or 'OpenSCAD produced no output or an empty STL.'}")
 
     preview_bytes = preview_stl.read_bytes()
     preview_sha256 = hashlib.sha256(preview_bytes).hexdigest()

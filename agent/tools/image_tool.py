@@ -111,8 +111,9 @@ class ImageTool:
     # restating the same plumbing here.
     # ------------------------------------------------------------------
     def with_call_id(self, call_id: str) -> ImageTool:
-        self._call_id = call_id or ""
-        return self
+        tool = ImageTool(self.project_dir, self._publish)
+        tool._call_id = call_id or ""
+        return tool
 
     # ------------------------------------------------------------------
     # Public tool entry point
@@ -156,9 +157,9 @@ class ImageTool:
             if entry is not None:
                 out_images.append(entry)
 
-        if not out_images:
+        if len(out_images) < len(deduped):
             raise ValueError(
-                "None of the requested views could be produced. "
+                "Requested views could not all be produced. "
                 f"{TOOL_HINTS['IMAGE_REFRESH_REVIEW']}"
             )
 
@@ -256,6 +257,8 @@ class ImageTool:
                 expected_sha = None
             sheet_path = review_root / "review-sheet.png"
             if not _is_png(sheet_path, expected_sha):
+                return None
+            if isinstance(manifest, dict) and len(manifest.get("views", [])) < len(CANONICAL_VIEW_IDS):
                 return None
             if not expected_sha:
                 expected_sha = _hash_file(sheet_path)

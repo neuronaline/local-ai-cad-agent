@@ -190,6 +190,7 @@ class CadTool:
         if not model_path.exists():
             raise ValueError(f"{MODEL_FILENAME} does not exist yet.")
         model_code = model_path.read_text(encoding="utf-8")
+        model_code = model_code.replace("\r\n", "\n").replace("\r", "\n")
         FileTool.validate_model(model_code)
 
         model_sha = hashlib.sha256(model_code.encode("utf-8")).hexdigest()
@@ -302,6 +303,11 @@ class CadTool:
                 (_SCRIPTS_DIR / _RENDERER_FILENAME).read_text(encoding="utf-8"),
                 encoding="utf-8",
             )
+            if cached_stl.is_file() and cached_stl.stat().st_size > 0:
+                try:
+                    shutil.copyfile(cached_stl, workspace / "preview.stl")
+                except OSError:
+                    pass
             command, seccomp_fd = sandbox_command(
                 workspace,
                 [_RUNNER_FILENAME, settings_payload],
