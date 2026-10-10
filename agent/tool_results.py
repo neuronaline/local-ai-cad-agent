@@ -241,6 +241,13 @@ def _classify(tool: str, error: Exception, message: str) -> tuple[str, str, bool
             TOOL_HINTS["MODEL_MISSING"].format(filename="model.scad"),
         )
     if tool in {"cad_build", "cad_build_and_verify"}:
+        if "cgal" in lower or "assertion violation" in lower:
+            return (
+                "CAD_BUILD_FAILED",
+                "build",
+                True,
+                TOOL_HINTS["CAD_CGAL_ERROR"].format(filename="model.scad"),
+            )
         return (
             "CAD_BUILD_FAILED",
             "build",

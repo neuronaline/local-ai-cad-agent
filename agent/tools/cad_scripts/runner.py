@@ -233,7 +233,7 @@ def _run_model(
         lines = [
             line
             for line in err_detail.splitlines()
-            if any(k in line.lower() for k in ("error", "warning", "syntax", "can't"))
+            if any(k in line.lower() for k in ("error", "warning", "syntax", "can't", "cgal", "expr:"))
         ]
         summary = "\n".join(lines) if lines else err_detail[-1000:]
         raise RuntimeError(f"OpenSCAD execution failed:\n{summary or 'OpenSCAD produced no output or an empty STL.'}")

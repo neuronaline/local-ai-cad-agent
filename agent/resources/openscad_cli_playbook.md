@@ -44,6 +44,7 @@ EPS = 0.01;   // Manifold clearance for cutters/overlaps
 * **2D-Only Children:** `linear_extrude()` and `rotate_extrude()` accept **strictly 2D children** (`circle`, `square`, `polygon`, `offset()`). Passing 3D objects causes a fatal error.
 * **Revolve Rule ($X \ge 0$):** In `rotate_extrude()`, the entire 2D profile must sit at $X \ge 0$. Crossing $X = 0$ crashes the compiler.
 * **Minkowski Ban & Hull Scaling:** **Never use 3D `minkowski()`** (causes compiler lockup). Use `hull()` or 2D `offset()` before extrusion. Avoid chaining hundreds of `hull()` calls in loops for continuous geometries (e.g. threads); use `linear_extrude(twist=...)` or `polyhedron()` to prevent CGAL compiler freezing.
+* **Non-Self-Intersecting Profiles:** In 2D profiles (`polygon()`) revolved with `rotate_extrude()` or extruded with `linear_extrude()`, the profile boundary must never self-intersect (e.g. outer wall radius stepping inside inner bore radius at any Z station). Self-intersecting 2D contours create invalid 3D Nef polyhedra that crash CGAL during booleans (`applyUnion3D assertion violation`).
 * **Transforms:** Evaluate right-to-left (innermost executes first):
   ```scad
   translate([x, y, z]) rotate([ax, ay, az]) shape(); // Rotate locally, then translate
@@ -131,5 +132,6 @@ plate_layout();
 | `Current top level object is not a 2D object` | 3D shape passed to extrusion | Use only 2D shapes (`square`, `circle`, `offset`) inside extrusions. |
 | `all points for rotate_extrude() must have the same X coordinate sign` | Profile crosses Y-axis | Shift profile entirely to $X \ge 0$: `translate([r, 0]) shape();`. |
 | `CGAL error in CGAL_Nef_polyhedron3` | Coincident surfaces / zero-thickness walls | Add `EPS` overshoot to cutters; overlap `union()` solids by `EPS`. |
+| `CGAL error in applyUnion3D / assertion violation` | Self-intersecting 2D polygon in `rotate_extrude` (outer radius < inner radius at same Z) or broken polyhedron | Verify 2D polygon outer profile is strictly outside inner profile; fix crossed coordinates. |
 | Process lockup / timeout | 3D `minkowski()` or `$fn > 100` | Replace `minkowski` with `hull()`; set `$fn = 60;`. |
 | `UI-WARNING: No top level geometry` | Empty model or cutter consumed base | Check cutter dimensions/offsets vs. base dimensions. |
