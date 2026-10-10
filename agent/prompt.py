@@ -316,6 +316,13 @@ TOOL_HINTS = {
     "TIMEOUT": "Simplify the operation before retrying.",
     "MODEL_MISSING": "Create {filename} first.",
     "CAD_BUILD_FAILED": "Fix {filename} using the reported location and cause, then rebuild.",
+    "CAD_CGAL_ERROR": (
+        "CGAL boolean assertion violation in {filename}. "
+        "Common causes: (1) Self-intersecting 2D profile in rotate_extrude() or linear_extrude() "
+        "(outer radius stepping inside inner radius at some station), "
+        "(2) Non-manifold or inverted faces in custom polyhedron(), "
+        "(3) Coplanar face collisions. Isolate components with '!' to find the culprit."
+    ),
     "VALIDATION_ERROR": "Correct the arguments or source named in the message.",
     "FILE_NOT_FOUND": "Create the required project file first.",
     "TOOL_EXECUTION_FAILED": "Use the message to correct the request before retrying.",
