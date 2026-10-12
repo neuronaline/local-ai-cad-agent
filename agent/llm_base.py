@@ -616,11 +616,10 @@ def iter_lines_with_cancel(
 
     Blocking on socket reads inside iter_lines() can delay cancellation across
     threads. Reading chunks in a daemon thread allows checking stop_event every
-    poll_interval (100ms) and immediately aborting if requested.
+    poll_interval (100ms) and immediately aborting if requested. Yields None on
+    queue timeouts so consumer loops can evaluate idle deadlines without blocking.
     """
-    if stop_event is None:
-        yield from response.iter_lines()
-        return
+    effective_stop = stop_event or threading.Event()
 
     line_queue: queue.Queue[Any] = queue.Queue(maxsize=100)
     _EOF = object()
@@ -629,15 +628,15 @@ def iter_lines_with_cancel(
     def reader() -> None:
         try:
             for raw_line in response.iter_lines():
-                if stop_event.is_set() or closed_event.is_set():
+                if effective_stop.is_set() or closed_event.is_set():
                     break
-                while not (stop_event.is_set() or closed_event.is_set()):
+                while not (effective_stop.is_set() or closed_event.is_set()):
                     try:
                         line_queue.put(raw_line, timeout=poll_interval)
                         break
                     except queue.Full:
                         continue
-                if stop_event.is_set() or closed_event.is_set():
+                if effective_stop.is_set() or closed_event.is_set():
                     break
         except BaseException as err:
             try:
@@ -655,12 +654,13 @@ def iter_lines_with_cancel(
 
     try:
         while True:
-            if stop_event.is_set():
+            if effective_stop.is_set():
                 _force_close_response(response)
                 raise RequestCancelled("LLM request cancelled.")
             try:
                 item = line_queue.get(timeout=poll_interval)
             except queue.Empty:
+                yield None
                 continue
             if item is _EOF:
                 break
@@ -741,6 +741,7 @@ def parse_chat_stream(
     tool_calls: dict[int, dict[str, Any]] = {}
     saw_done = False
     finish_reason: str | None = None
+    finish_time: float | None = None
     last_usage: dict[str, Any] | None = None
     reasoning_text = ""
     reasoning_details: list[dict[str, Any]] = []
@@ -756,6 +757,12 @@ def parse_chat_stream(
             if stop_event and stop_event.is_set():
                 _force_close_response(response)
                 raise RequestCancelled(f"{provider_label} request cancelled.")
+            if raw_line is None:
+                if finish_reason is not None and finish_time is not None:
+                    if time.monotonic() - finish_time >= 1.5:
+                        saw_done = True
+                        break
+                continue
             line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
             if not line:
                 continue
@@ -784,7 +791,10 @@ def parse_chat_stream(
             if not choices:
                 continue
             choice = choices[0]
-            finish_reason = choice.get("finish_reason") or finish_reason
+            if choice.get("finish_reason"):
+                if finish_reason is None:
+                    finish_time = time.monotonic()
+                finish_reason = choice.get("finish_reason")
             if finish_reason == "error":
                 delta = choice.get("delta") or {}
                 stream_error = choice.get("error") or delta.get("error")
@@ -989,6 +999,9 @@ def parse_chat_stream(
                             "arguments_delta": arguments_delta,
                         }
                     )
+            if finish_reason is not None and last_usage is not None:
+                saw_done = True
+                break
         if tag_buffer:
             if in_think_tag:
                 reasoning_text += tag_buffer
@@ -1016,6 +1029,9 @@ def parse_chat_stream(
     if stop_event and stop_event.is_set():
         _force_close_response(response)
         raise RequestCancelled(f"{provider_label} request cancelled.")
+
+    if not saw_done and finish_reason is not None:
+        saw_done = True
 
     if not saw_done:
         # The connection closed before the provider emitted ``[DONE]``.

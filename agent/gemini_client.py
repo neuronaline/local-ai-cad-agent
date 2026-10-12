@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import threading
+import time
 import uuid
 from copy import deepcopy
 from typing import Any
@@ -326,12 +327,18 @@ def parse_interactions_stream(
     last_usage: dict[str, Any] | None = None
     interaction_id: str | None = None
     finish_reason: str | None = None
+    finish_time: float | None = None
 
     try:
         for raw_line in iter_lines_with_cancel(response, stop_event=stop_event):
             if stop_event and stop_event.is_set():
                 _force_close_response(response)
                 raise RequestCancelled(f"{provider_label} request cancelled.")
+            if raw_line is None:
+                if finish_reason is not None and finish_time is not None:
+                    if time.monotonic() - finish_time >= 1.5:
+                        break
+                continue
             line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
             if not line:
                 continue
@@ -359,9 +366,14 @@ def parse_interactions_stream(
                 interaction_id = event["id"]
 
             if event.get("finish_reason"):
+                if finish_reason is None:
+                    finish_time = time.monotonic()
                 finish_reason = str(event["finish_reason"])
             elif event.get("status"):
-                finish_reason = str(event["status"])
+                status_val = str(event["status"])
+                if finish_reason is None and status_val == "completed":
+                    finish_time = time.monotonic()
+                finish_reason = status_val
 
             usage_meta = event.get("usage") or event.get("usage_metadata")
             if isinstance(usage_meta, dict):
@@ -505,6 +517,8 @@ def parse_interactions_stream(
                         if sig:
                             tc_entry["thought_signature"] = sig
                         tool_calls[cid] = tc_entry
+            if finish_reason is not None and last_usage is not None:
+                break
 
     except Exception as err:
         _force_close_response(response)

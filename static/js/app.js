@@ -2320,6 +2320,8 @@ function connectStream() {
           } else {
             setCardState(card, 'working', 'Running tools');
           }
+        } else if (text) {
+          setCardState(card, 'done');
         }
       }
     },
