@@ -64,6 +64,8 @@ class VertexClient(ChatCompletionsClient):
 
     def _normalize_model_name(self, model: str) -> str:
         name = model.strip() if model else DEFAULT_MODEL
+        if name.startswith("models/"):
+            name = name[7:]
         # Vertex AI OpenAPI endpoint expects <publisher>/<model>, e.g. 'google/gemini-2.5-flash'
         if "/" not in name:
             return f"google/{name}"
@@ -92,7 +94,9 @@ class VertexClient(ChatCompletionsClient):
 
         max_tokens = self.settings.llm_max_completion_tokens
         if max_tokens:
-            payload["max_tokens"] = max_tokens
+            # Vertex AI OpenAPI enforces maxOutputTokens < 65536 (exclusive upper bound).
+            # Clamp to 65535 to prevent 400 INVALID_ARGUMENT when 65536 is configured.
+            payload["max_tokens"] = min(max_tokens, 65535)
 
         effort = (
             self.settings.gemini_reasoning_effort
@@ -128,6 +132,10 @@ class VertexClient(ChatCompletionsClient):
 
         # Check for expired/invalid token response (401 Unauthorized)
         if getattr(response, "status_code", None) == 401:
+            try:
+                response.close()
+            except Exception:
+                pass
             gcloud_auth.invalidate_token()
             if not (self.stop_event and self.stop_event.is_set()):
                 try:

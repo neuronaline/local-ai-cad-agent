@@ -816,6 +816,49 @@ def extract_think_tags(
     return cleaned_content, (extracted or existing_reasoning or None)
 
 
+def normalize_usage(usage: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Standardize provider usage dictionaries into canonical OpenAI token accounting.
+
+    Extracts reasoning tokens and cached prompt tokens across diverse provider schemas
+    (OpenAI, Anthropic, Google Vertex AI, Google AI Studio, OpenRouter) so downstream
+    cost tracking, activity logging, and the frontend receive consistent metrics.
+    """
+    if not isinstance(usage, dict):
+        return None
+    normalized = dict(usage)
+    # 1. Normalize prompt cached tokens
+    ptd = normalized.get("prompt_tokens_details")
+    ptd_copy = dict(ptd) if isinstance(ptd, dict) else {}
+    cached = (
+        ptd_copy.get("cached_tokens")
+        or normalized.get("cached_tokens")
+        or normalized.get("cached_content_token_count")
+        or (normalized.get("extra_properties") or {}).get("google", {}).get("cached_content_token_count")
+        or (normalized.get("extra_properties") or {}).get("google", {}).get("cached_tokens")
+        or 0
+    )
+    if cached:
+        ptd_copy["cached_tokens"] = int(cached)
+        normalized["prompt_tokens_details"] = ptd_copy
+
+    # 2. Normalize completion reasoning tokens
+    ctd = normalized.get("completion_tokens_details")
+    ctd_copy = dict(ctd) if isinstance(ctd, dict) else {}
+    reasoning = (
+        ctd_copy.get("reasoning_tokens")
+        or normalized.get("reasoning_tokens")
+        or (normalized.get("extra_properties") or {}).get("google", {}).get("thoughts_token_count")
+        or (normalized.get("extra_properties") or {}).get("google", {}).get("reasoning_tokens")
+        or normalized.get("thoughts_token_count")
+        or 0
+    )
+    if reasoning:
+        ctd_copy["reasoning_tokens"] = int(reasoning)
+        normalized["completion_tokens_details"] = ctd_copy
+
+    return normalized
+
+
 def parse_chat_stream(
     response: Any,
     *,
@@ -883,7 +926,7 @@ def parse_chat_stream(
                     retryable=not (content or tool_calls or reasoning_text or reasoning_details),
                 )
             if isinstance(chunk.get("usage"), dict):
-                last_usage = chunk["usage"]
+                last_usage = normalize_usage(chunk["usage"])
             choices = chunk.get("choices") or []
             if not choices:
                 if finish_reason is not None and last_usage is not None:
@@ -1085,7 +1128,11 @@ def parse_chat_stream(
                 arguments_delta = function.get("arguments") or ""
                 call["function"]["name"] += name_delta
                 call["function"]["arguments"] += arguments_delta
-                sig = call_delta.get("thought_signature") or function.get("thought_signature")
+                sig = (
+                    call_delta.get("thought_signature")
+                    or (call_delta.get("extra_content") or {}).get("google", {}).get("thought_signature")
+                    or function.get("thought_signature")
+                )
                 if sig and "thought_signature" not in call:
                     call["thought_signature"] = sig
                 if stream_callback:
@@ -1763,7 +1810,7 @@ class ChatCompletionsClient(BaseLLMClient):
             except Exception:
                 pass
         body = response.json()
-        self.last_usage = body.get("usage") if isinstance(body.get("usage"), dict) else None
+        self.last_usage = normalize_usage(body.get("usage")) if isinstance(body.get("usage"), dict) else None
         choices = body.get("choices") if isinstance(body, dict) else None
         if choices and choices[0].get("finish_reason") == "length":
             raise RuntimeError(

@@ -779,7 +779,8 @@ class GoogleInteractionsClient(BaseLLMClient):
 
         gen_config: dict[str, Any] = {}
         if self.settings.llm_max_completion_tokens:
-            gen_config["max_output_tokens"] = self.settings.llm_max_completion_tokens
+            # Google GenAI API enforces maxOutputTokens < 65536.
+            gen_config["max_output_tokens"] = min(self.settings.llm_max_completion_tokens, 65535)
 
         model_name = (self.settings.gemini_model or "").lower()
         is_gemini_3 = "3." in model_name or "gemini-3" in model_name
