@@ -639,8 +639,45 @@ button[aria-pressed="true"] { border-color: #5d7ed7; background: #233966; color:
   background: #475d84;
 }
 .action-bar { gap: .35rem; margin-top: .25rem; }
-.attach-button { display: inline-flex; align-items: center; justify-content: center; margin-right: auto; border: 1px solid var(--line); border-radius: 6px; padding: 0; color: #c1cee2; cursor: pointer; }
+.attach-button { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border: 1px solid var(--line); border-radius: 6px; padding: 0; color: #c1cee2; cursor: pointer; flex-shrink: 0; }
 .attach-button:hover, .attach-button.is-dragging { border-color: var(--accent); color: var(--text); }
+.effort-picker {
+  display: inline-flex;
+  align-items: center;
+  gap: .3rem;
+  margin-right: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0 .38rem 0 .32rem;
+  height: 28px;
+  background: #0d1727;
+  color: #8da2c0;
+  transition: border-color .15s ease, color .15s ease;
+}
+.effort-picker:hover, .effort-picker:focus-within {
+  border-color: var(--accent);
+  color: var(--text);
+}
+.effort-picker .effort-icon {
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+  opacity: .85;
+}
+.effort-select {
+  border: 0;
+  background: transparent;
+  color: #cbd7ee;
+  font-size: .68rem;
+  font-weight: 500;
+  padding: 0;
+  cursor: pointer;
+  outline: none;
+}
+.effort-select option {
+  background-color: #101a2c;
+  color: #e6edf8;
+}
 .composer-hint { color: #71819b; font-size: .65rem; white-space: nowrap; }
 .send-toggle { display: grid; place-items: center; width: 32px; height: 32px; padding: 0; border: 0; border-radius: 7px; background: var(--accent); color: var(--accent-ink); }
 .send-toggle:hover { filter: brightness(1.08); }

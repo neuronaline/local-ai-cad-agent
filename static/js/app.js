@@ -23,6 +23,39 @@ const appConfig = JSON.parse(document.querySelector('#app-config')?.textContent 
 const showInfoMessages = appConfig.showInfoMessages ?? true;
 const currentProject = appConfig.projectName || '';
 const viewer = new CadViewer(document.querySelector('#viewer'), document.querySelector('#dimensions'), appConfig);
+const reasoningEffortSelect = document.querySelector('#reasoning-effort');
+const VALID_EFFORTS = new Set(['minimal', 'low', 'medium', 'high']);
+
+function getActiveReasoningEffort() {
+  const val = reasoningEffortSelect?.value;
+  return val && VALID_EFFORTS.has(val) ? val : 'medium';
+}
+
+function setActiveReasoningEffort(effort, syncBackend = true) {
+  if (!effort || !VALID_EFFORTS.has(effort) || !reasoningEffortSelect) return;
+  reasoningEffortSelect.value = effort;
+  try {
+    localStorage.setItem('cad_reasoning_effort', effort);
+  } catch {}
+  if (syncBackend) {
+    api('/api/settings/reasoning-effort', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({effort}),
+    }).catch(() => {});
+  }
+}
+
+try {
+  const savedEffort = localStorage.getItem('cad_reasoning_effort');
+  if (savedEffort && VALID_EFFORTS.has(savedEffort)) {
+    setActiveReasoningEffort(savedEffort, false);
+  }
+} catch {}
+
+reasoningEffortSelect?.addEventListener('change', () => {
+  setActiveReasoningEffort(reasoningEffortSelect.value, true);
+});
 
 function updateChatWidth(width) {
   const minWidth = 360;
@@ -714,6 +747,7 @@ async function handleRetry(errorElement = null, context = null) {
       body.append('project', currentProject);
       body.append('message', sub.text);
       body.append('idempotency_key', idempotencyKey);
+      body.append('reasoning_effort', getActiveReasoningEffort());
       if (Array.isArray(sub.files)) {
         sub.files.forEach(file => body.append('attachments', file));
       }
@@ -748,7 +782,10 @@ async function handleRetry(errorElement = null, context = null) {
     const response = await api('/api/chat/retry', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({project: currentProject}),
+      body: JSON.stringify({
+        project: currentProject,
+        reasoning_effort: getActiveReasoningEffort(),
+      }),
     });
     if (!response.accepted) {
       throw new Error(response.error || 'Retry request not accepted.');
@@ -1266,6 +1303,7 @@ chatForm.addEventListener('submit', async event => {
     body.append('project', currentProject);
     body.append('message', promptText);
     body.append('idempotency_key', idempotencyKey);
+    body.append('reasoning_effort', getActiveReasoningEffort());
     selectedFiles.forEach(file => body.append('attachments', file));
     const submissionSnapshot = {
       project: currentProject,

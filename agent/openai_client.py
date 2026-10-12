@@ -61,7 +61,10 @@ class OpenAIClient(ChatCompletionsClient):
         if self.settings.llm_max_completion_tokens:
             payload["max_completion_tokens"] = self.settings.llm_max_completion_tokens
         if self.settings.openai_reasoning_effort:
-            payload["reasoning_effort"] = self.settings.openai_reasoning_effort
+            effort = self.settings.openai_reasoning_effort
+            if effort == "minimal":
+                effort = "low"
+            payload["reasoning_effort"] = effort
         return payload
 
     @staticmethod

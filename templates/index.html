@@ -59,6 +59,17 @@
               <input id="attachments" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden>
             </label>
             <span id="attachment-label" class="sr-only">Attach reference images</span>
+            <div class="effort-picker" title="Model reasoning effort">
+              <svg class="icon effort-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <path d="M12 2a7 7 0 0 0-7 7c0 2.38 1.19 4.47 3 5.74V17a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1v-2.26c1.81-1.27 3-3.36 3-5.74a7 7 0 0 0-7-7M9 21a1 1 0 0 0 1 1h4a1 1 0 0 0 1-1v-1H9z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              <select id="reasoning-effort" class="effort-select" aria-label="Model reasoning effort" title="Model reasoning effort">
+                <option value="minimal"{% if reasoning_effort == 'minimal' %} selected{% endif %}>Minimal</option>
+                <option value="low"{% if reasoning_effort == 'low' %} selected{% endif %}>Low</option>
+                <option value="medium"{% if reasoning_effort == 'medium' %} selected{% endif %}>Medium</option>
+                <option value="high"{% if reasoning_effort == 'high' %} selected{% endif %}>High</option>
+              </select>
+            </div>
             <span class="composer-hint">Enter sends · Shift+Enter adds a line · / for commands</span>
             <button id="send-toggle" type="button" class="send-toggle" title="Send" aria-label="Send">
               <span class="send-toggle-icon" data-mode="send">
@@ -191,6 +202,7 @@
       {{ {
         'projectName': project_name,
         'showInfoMessages': show_info_messages,
+        'reasoningEffort': reasoning_effort,
         'viewerGrid': {
           'size': viewer_grid_size,
           'divisions': viewer_grid_divisions,

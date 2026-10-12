@@ -56,7 +56,7 @@ from agent.revisions import (
     RevisionStore,
     model_is_built,
 )
-from agent.settings import Settings
+from agent.settings import Settings, with_reasoning_effort
 from agent.tool_schemas import TOOL_SCHEMAS
 from agent.tools.cad_tool import CadTool
 from agent.tools.file_tool import FileTool
@@ -296,6 +296,11 @@ class AgentRunner:
             self._waiting_questions[project] = question
         return question.copy()
 
+    def set_reasoning_effort(self, effort: str | None) -> None:
+        """Update reasoning effort dynamically for future runs."""
+        with self._lock:
+            self.settings = with_reasoning_effort(self.settings, effort)
+
     # ------------------------------------------------------------------ lifecycle
 
     def start(
@@ -303,6 +308,8 @@ class AgentRunner:
         project: str,
         message: str,
         image_paths: list[Path] | None = None,
+        *,
+        reasoning_effort: str | None = None,
     ) -> bool:
         """Validate inputs, take ownership, then spawn the worker thread.
 
@@ -319,9 +326,17 @@ class AgentRunner:
             prepared_paths = self._take_run_inputs(
                 project, image_paths or [], run_id
             )
-            return self._start_locked(project, message, prepared_paths, run_id)
+            return self._start_locked(
+                project, message, prepared_paths, run_id, reasoning_effort=reasoning_effort
+            )
 
-    def start_retry(self, project: str, message: str = "") -> bool:
+    def start_retry(
+        self,
+        project: str,
+        message: str = "",
+        *,
+        reasoning_effort: str | None = None,
+    ) -> bool:
         """Retry the last turn for a project without re-appending the user prompt."""
         if self.waiting_question(project):
             return False
@@ -330,7 +345,7 @@ class AgentRunner:
                 return False
             run_id = uuid.uuid4().hex
             return self._start_locked(
-                project, message, [], run_id, is_retry=True
+                project, message, [], run_id, is_retry=True, reasoning_effort=reasoning_effort
             )
 
     def _start_locked(
@@ -341,6 +356,7 @@ class AgentRunner:
         run_id: str,
         *,
         is_retry: bool = False,
+        reasoning_effort: str | None = None,
     ) -> bool:
         if self._thread is not None and not self._run_complete.is_set():
             return False
@@ -350,7 +366,7 @@ class AgentRunner:
         self._active_run_id = run_id
         self._thread = threading.Thread(
             target=self._run,
-            args=(project, message, image_paths, run_id, is_retry),
+            args=(project, message, image_paths, run_id, is_retry, reasoning_effort),
             daemon=True,
         )
         self._thread.start()
@@ -503,6 +519,7 @@ class AgentRunner:
         image_paths: list[Path] | None = None,
         run_id: str = "",
         is_retry: bool = False,
+        reasoning_effort: str | None = None,
     ) -> None:
         """Lifecycle wrapper: init, dispatch turns, terminal cleanup.
 
@@ -518,7 +535,13 @@ class AgentRunner:
         activity_logger: ActivityLogger | None = None
         try:
             state = self._init_run(
-                project, message, image_paths or [], project_dir, run_id, is_retry=is_retry
+                project,
+                message,
+                image_paths or [],
+                project_dir,
+                run_id,
+                is_retry=is_retry,
+                reasoning_effort=reasoning_effort,
             )
             activity_logger = state.activity_logger
             # Bound once: the publisher reads ``current_message_id`` lazily
@@ -557,6 +580,7 @@ class AgentRunner:
         run_id: str,
         *,
         is_retry: bool = False,
+        reasoning_effort: str | None = None,
     ) -> _RunState:
         """Build tools/client, log ``run_start``, return the run state.
 
@@ -564,6 +588,11 @@ class AgentRunner:
         dispatch. If this raises, ``_run``'s exception handlers take
         over and ``state`` is ``None`` for the ``finally`` block.
         """
+        effective_settings = (
+            with_reasoning_effort(self.settings, reasoning_effort)
+            if reasoning_effort
+            else self.settings
+        )
         self.publish(
             "agent_status",
             {
@@ -571,17 +600,18 @@ class AgentRunner:
                 "run_id": run_id,
                 "status": "started",
                 "message": "Planning CAD task...",
+                "reasoning_effort": effective_settings.reasoning_effort,
             },
         )
         tools = ProjectTools(
-            project_dir, self.publish, self.settings, self._stop_event
+            project_dir, self.publish, effective_settings, self._stop_event
         )
-        client = create_llm_client(self.settings)
+        client = create_llm_client(effective_settings)
         client.stop_event = self._stop_event
         session_prefix = (
-            self.settings.openrouter_session_prefix
-            if self.settings.llm_provider == "openrouter"
-            else self.settings.llm_provider
+            effective_settings.openrouter_session_prefix
+            if effective_settings.llm_provider == "openrouter"
+            else effective_settings.llm_provider
         )
         client.session_id = f"{session_prefix}:{project}"
         with self._lock:
@@ -589,10 +619,10 @@ class AgentRunner:
             self._active_client = client
         messages = self._context(project_dir, message, image_paths, is_retry=is_retry)
         activity_logger: ActivityLogger | None = None
-        if activity_logging_enabled(self.settings):
+        if activity_logging_enabled(effective_settings):
             activity_logger = get_logger(
                 project_dir,
-                log_mode=getattr(self.settings, "agent_log_mode", "debug"),
+                log_mode=getattr(effective_settings, "agent_log_mode", "debug"),
             )
             client.activity_logger = activity_logger
             client.run_id = run_id
@@ -605,8 +635,9 @@ class AgentRunner:
                 "run_start",
                 {
                     "project": project,
-                    "model": self.settings.llm_model,
-                    "provider": self.settings.llm_provider,
+                    "model": effective_settings.llm_model,
+                    "provider": effective_settings.llm_provider,
+                    "reasoning_effort": effective_settings.reasoning_effort,
                 },
                 run_id=run_id,
             )

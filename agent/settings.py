@@ -111,6 +111,43 @@ class Settings:
             return self.vertex_model
         return self.openrouter_model
 
+    @property
+    def reasoning_effort(self) -> str | None:
+        """Return the reasoning effort of the active provider."""
+        if self.llm_provider == "openai":
+            return self.openai_reasoning_effort
+        if self.llm_provider == "ollama":
+            return self.ollama_reasoning_effort
+        if self.llm_provider in ("gemini", "google"):
+            return self.gemini_reasoning_effort
+        if self.llm_provider in ("vertex", "gcloud"):
+            return self.vertex_reasoning_effort
+        return self.openrouter_reasoning_effort
+
+
+def with_reasoning_effort(settings: Settings, effort: str | None) -> Settings:
+    """Return a copy of ``settings`` with reasoning effort updated for the active provider."""
+    from dataclasses import replace
+
+    cleaned = _optional_effort(effort)
+    updates: dict[str, Any] = {}
+    for provider in {settings.llm_provider, settings.llm_fallback_provider}:
+        if not provider:
+            continue
+        if provider == "openai":
+            updates["openai_reasoning_effort"] = cleaned
+        elif provider == "ollama":
+            updates["ollama_reasoning_effort"] = cleaned
+        elif provider in ("gemini", "google"):
+            updates["gemini_reasoning_effort"] = cleaned
+        elif provider in ("vertex", "gcloud"):
+            updates["vertex_reasoning_effort"] = cleaned
+        elif provider == "openrouter":
+            updates["openrouter_reasoning_effort"] = cleaned
+    if not updates:
+        updates["openrouter_reasoning_effort"] = cleaned
+    return replace(settings, **updates)
+
 
 def _read_yaml(path: Path) -> dict[str, Any]:
     if not path.exists():

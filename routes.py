@@ -51,7 +51,7 @@ from agent.revisions import (
     RevisionStore,
     cached_model_sha256,
 )
-from agent.settings import Settings
+from agent.settings import REASONING_EFFORTS, Settings, with_reasoning_effort
 
 PROJECT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 INFO_EVENT_TYPES = frozenset({"agent_status", "tool_status", "agent_usage", "agent_stopped"})
@@ -238,6 +238,24 @@ def _active_api_key_env(settings: Settings) -> str:
     return api_key_env(settings.llm_provider)
 
 
+def _sync_reasoning_effort(effort_raw: Any) -> str | None:
+    """Validate and sync reasoning effort with app config and agent runner."""
+    if not effort_raw:
+        return None
+    effort = str(effort_raw).strip().lower()
+    if not effort:
+        return None
+    if effort not in REASONING_EFFORTS:
+        raise ValueError(
+            f"Invalid reasoning_effort: {effort!r}. Must be one of: {', '.join(sorted(REASONING_EFFORTS))}"
+        )
+    settings = current_app.config["SETTINGS"]
+    current_app.config["SETTINGS"] = with_reasoning_effort(settings, effort)
+    runner: AgentRunner = current_app.config["AGENT_RUNNER"]
+    runner.set_reasoning_effort(effort)
+    return effort
+
+
 def _run_preflight(settings: Settings) -> dict[str, Any]:
     from agent.sandbox import _BWRAP, seccomp_filter_fd
 
@@ -411,6 +429,7 @@ def project_view(name: str) -> str:
         show_info_messages=current_app.config["SETTINGS"].show_info_messages,
         viewer_grid_size=current_app.config["SETTINGS"].viewer_grid_size,
         viewer_grid_divisions=current_app.config["SETTINGS"].viewer_grid_divisions,
+        reasoning_effort=current_app.config["SETTINGS"].reasoning_effort or "medium",
         cache_bust=int(time.time()),
         example_prompts=UI_EXAMPLE_PROMPTS,
     )
@@ -574,6 +593,10 @@ def chat():
     idempotency_key = str(payload.get("idempotency_key", "")).strip()
     if not message:
         return jsonify({"error": "Message is required."}), 400
+    try:
+        effort = _sync_reasoning_effort(payload.get("reasoning_effort"))
+    except ValueError as err:
+        return jsonify({"error": str(err)}), 400
     runner: AgentRunner = current_app.config["AGENT_RUNNER"]
     if runner.waiting_question(project_name):
         return jsonify({"error": "Answer the pending question before sending another message."}), 409
@@ -611,7 +634,7 @@ def chat():
         # so the HTTP handler must no longer speculatively unlink here —
         # the runner is the sole owner of the artifacts from the moment
         # ``start`` returns.
-        started = runner.start(project_name, message, image_paths)
+        started = runner.start(project_name, message, image_paths, reasoning_effort=effort)
     if not started:
         return jsonify({"error": "Unable to start the agent task."}), 409
     if idempotency_key:
@@ -628,6 +651,10 @@ def chat_retry():
     project_name = str(payload.get("project", "")).strip()
     if not project_name:
         return jsonify({"error": "Project is required."}), 400
+    try:
+        effort = _sync_reasoning_effort(payload.get("reasoning_effort"))
+    except ValueError as err:
+        return jsonify({"error": str(err)}), 400
     runner: AgentRunner = current_app.config["AGENT_RUNNER"]
     if runner.waiting_question(project_name):
         return jsonify({"error": "Answer the pending question before retrying."}), 409
@@ -656,10 +683,37 @@ def chat_retry():
                 if isinstance(part, dict) and part.get("type") == "text":
                     parts.append(str(part.get("text", "")))
             prompt_text = "\n".join(parts)
-        started = runner.start_retry(project_name, message=prompt_text)
+        started = runner.start_retry(project_name, message=prompt_text, reasoning_effort=effort)
     if not started:
         return jsonify({"error": "Unable to start retry task."}), 409
     return jsonify({"accepted": True}), 202
+
+
+@agent_bp.get("/api/settings/reasoning-effort")
+def get_reasoning_effort():
+    settings: Settings = current_app.config["SETTINGS"]
+    effort = settings.reasoning_effort or "medium"
+    return jsonify({
+        "reasoning_effort": effort,
+        "available_efforts": sorted(REASONING_EFFORTS),
+        "provider": settings.llm_provider,
+    })
+
+
+@agent_bp.post("/api/settings/reasoning-effort")
+def update_reasoning_effort():
+    payload = request.get_json(silent=True) if request.is_json else request.form
+    payload = payload or {}
+    try:
+        effort = _sync_reasoning_effort(payload.get("effort"))
+        if not effort:
+            return jsonify({"error": "Effort is required."}), 400
+    except ValueError as err:
+        return jsonify({"error": str(err)}), 400
+    return jsonify({
+        "reasoning_effort": effort,
+        "provider": current_app.config["SETTINGS"].llm_provider,
+    })
 
 
 @agent_bp.post("/api/questions/answer")
