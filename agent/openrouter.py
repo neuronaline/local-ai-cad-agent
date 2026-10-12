@@ -90,8 +90,15 @@ class OpenRouterClient(ChatCompletionsClient):
                 self._mark_first_system_message(payload)
                 self._mark_last_eligible_message(payload)
         if self.settings.openrouter_reasoning_effort:
-            payload["reasoning"] = {
+            reasoning_dict: dict[str, Any] = {
                 "effort": self.settings.openrouter_reasoning_effort,
+            }
+            if self.settings.openrouter_reasoning_max_tokens:
+                reasoning_dict["max_tokens"] = self.settings.openrouter_reasoning_max_tokens
+            payload["reasoning"] = reasoning_dict
+        elif self.settings.openrouter_reasoning_max_tokens:
+            payload["reasoning"] = {
+                "max_tokens": self.settings.openrouter_reasoning_max_tokens,
             }
         if provider_order:
             if self.settings.openrouter_force_provider:

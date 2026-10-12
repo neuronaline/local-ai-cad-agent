@@ -6,7 +6,7 @@
 
 A local-first, self-hosted web application that lets you **create and refine parametric 3D CAD models through natural language conversations with an AI agent**.
 
-Built with [OpenSCAD](https://openscad.org/) for solid geometry, [Three.js](https://threejs.org/) for in-browser 3D inspection, and [Bubblewrap](https://github.com/containers/bubblewrap) for isolated code execution. Run completely offline with local models via **Ollama** (once model weights are pulled, all generation runs with zero telemetry or network calls), or connect to cloud models through **OpenRouter**, **OpenAI**, or **Google Gemini** (Google AI Studio Interactions API).
+Built with [OpenSCAD](https://openscad.org/) for solid geometry, [Three.js](https://threejs.org/) for in-browser 3D inspection, and [Bubblewrap](https://github.com/containers/bubblewrap) for isolated code execution. Run completely offline with local models via **Ollama** (once model weights are pulled, all generation runs with zero telemetry or network calls), or connect to cloud models through **OpenRouter**, **OpenAI**, **Google Gemini**, or **Google Cloud Vertex AI** (via local `gcloud` CLI authentication).
 
 > **⚠️ Project Status:** This project is under **active development** and is currently a **hobby project**. It excels at **functional mechanical parts, enclosures, brackets, adapters, and simple-to-intermediate 3D-printable models**. Highly intricate, organic, or sculptural geometry is outside its current scope.
 
@@ -48,7 +48,7 @@ Built with [OpenSCAD](https://openscad.org/) for solid geometry, [Three.js](http
 
 - 💬 **Chat-Driven Parametric CAD** — Describe components, dimensions, tolerances, and design intent in plain English. The agent authors and edits clean, parametric OpenSCAD scripts (`model.scad`).
 - 🧠 **Live Streaming & Reasoning** — Watch the model's chain-of-thought and tool invocations stream in real time via Server-Sent Events (SSE).
-- 🦙 **Local & Cloud LLMs** — Full support for **Ollama** (offline, private, no API keys), alongside **OpenRouter**, **OpenAI**, and **Google Gemini**, with optional automatic secondary fallback.
+- 🦙 **Local & Cloud LLMs** — Full support for **Ollama** (offline, private, no API keys), alongside **OpenRouter**, **OpenAI**, **Google Gemini**, and **Vertex AI** (via `gcloud` terminal login, no API key required), with optional automatic secondary fallback.
 - 🛡️ **Sandboxed Code Execution** — OpenSCAD runs inside an isolated [Bubblewrap](https://github.com/containers/bubblewrap) container with detached networking and read-only host mounts.
 - 🔍 **Deterministic Build & Mesh Verification** — Automatically validates code syntax, manifold mesh topology, non-zero volume, bounds, and parametric conventions with categorized risk scoring on every build.
 - 📸 **Multi-View Visual Inspection** — Parallel rendering of 8 canonical camera views plus an assembled contact sheet, allowing the agent to visually inspect geometry and correct defects (`get_view_images`).
@@ -83,8 +83,8 @@ Built with [OpenSCAD](https://openscad.org/) for solid geometry, [Three.js](http
   - `xvfb` (`xvfb-run` for headless multi-view rendering)
   - `libgl1-mesa-dri` (software OpenGL rasterizer / `llvmpipe` for zero-GPU headless rendering)
 - **LLM Provider (choose at least one):**
-  - **Local:** [Ollama](https://ollama.com) (e.g. `qwen2.5-coder:14b-16k`)
-  - **Cloud:** [OpenRouter](https://openrouter.ai/keys), [OpenAI](https://platform.openai.com/api-keys), or [Google AI Studio (Gemini)](https://aistudio.google.com/)
+  - **Local:** [Ollama](https://ollama.com) (offline, private, no API keys)
+  - **Cloud:** [OpenRouter](https://openrouter.ai/keys), [OpenAI](https://platform.openai.com/api-keys), [Google AI Studio (Gemini)](https://aistudio.google.com/), or Google Cloud Vertex AI (via `gcloud` CLI)
 
 ### 🖥️ Hardware Recommendations (for Local LLMs)
 
@@ -132,10 +132,10 @@ Choose your preferred provider below:
 2. Run our setup helper to pull and configure a model with a 16k context window (initial pull requires an internet connection; once downloaded, inference runs 100% offline):
 
    ```bash
-   ./setup_ollama.sh qwen2.5-coder:14b
+   ./setup_ollama.sh <model-name>
    ```
 
-   *(This helper automatically builds a custom model variant named `qwen2.5-coder:14b-16k` with a 16k context window and optimal temperature.)*
+   *(This helper automatically builds a custom model variant named `<model-name>-16k` with a 16k context window and optimal temperature.)*
 
 3. In `config.yaml`, set:
 
@@ -145,7 +145,7 @@ Choose your preferred provider below:
 
    ollama:
      base_url: http://localhost:11434/v1
-     model: qwen2.5-coder:14b-16k
+     model: <model-name>-16k
      timeout_seconds: 120
    ```
 
@@ -214,6 +214,29 @@ Choose your preferred provider below:
 
 > [!IMPORTANT]
 > **Replace placeholder before starting:** `<model-name>` is a placeholder. You must replace it with an active model slug from the [Google AI Studio Gemini Models Documentation](https://ai.google.dev/gemini-api/docs/models/gemini) before starting the server.
+
+#### Option E: Cloud with Google Cloud Vertex AI via `gcloud` (No API Key Needed)
+
+1. Authenticate with Google Cloud in your terminal:
+
+   ```bash
+   gcloud auth application-default login
+   # or: gcloud auth login
+   ```
+
+2. In `config.yaml`, set:
+
+   ```yaml
+   llm:
+     provider: vertex
+
+   vertex:
+     project_id: ""  # Leave blank to auto-detect from active gcloud config
+     location: "us-central1"
+     model: <model-slug>
+   ```
+
+   *(No `.env` API keys needed when authenticating via `gcloud`!)*
 
 ---
 
@@ -323,12 +346,12 @@ While frontier LLMs can generate raw OpenSCAD syntax, programmatic CAD behaves f
 2. **Headless Display & Automated Rasterization:** In headless environments without an active X11/Wayland display server or dedicated GPU, agents attempting visual self-correction encounter missing display errors. In our internal development runs, unassisted terminal loops attempting to configure virtual framebuffers or parse raw vertex buffers regularly burned ~40,000–60,000 tokens per session (captured in telemetry logs under `.cad-agent/trajectories/`).  
    While headless rendering requires `xvfb-run` and software OpenGL rasterization (`osmesa` or `llvmpipe`), `local-ai-cad-agent` handles this entirely behind the scenes: `./install.sh` checks and installs these dependencies automatically, and the backend runtime manages the virtual framebuffer without requiring the LLM to write shell commands or troubleshoot display sockets in context.
 3. **Turnkey Isolation:** `local-ai-cad-agent` isolates compilation inside Linux Bubblewrap (`bwrap`) containers with unprivileged user namespaces, detached networking, and syscall filtering out of the box, without requiring custom host environment setup.
-4. **Enabling Local Offline Models:** By offloading geometric verification, canonical multi-view rendering, and file diffing to the deterministic Python backend, the cognitive burden on the LLM is reduced. This allows compact local models (such as Qwen 2.5 Coder 14B via Ollama) to produce functional 3D printable models offline.
+4. **Enabling Local Offline Models:** By offloading geometric verification, canonical multi-view rendering, and file diffing to the deterministic Python backend, the cognitive burden on the LLM is reduced. This allows compact local models (such as ~14B code-focused models via Ollama) to produce functional 3D printable models offline.
 
-> **Scope with Local Models (e.g. Qwen 2.5 Coder 14B via Ollama):**
+> **Scope with Local Models:**
 > - **Well suited for:** Prismatic functional parts, mounting brackets, electronics enclosures, adapters, standoffs, and baseplates with 5–10 parametric dimensions.
 > - **Challenging:** Highly intricate assemblies, complex organic curves, tight-tolerance interlocking snap fits, or deeply nested boolean subtractions (where frontier cloud models remain recommended).
-> - **Testing & Version Note:** Tested with `qwen2.5-coder:14b` (Q4_K_M quant, tested on Ollama 0.5.x, October 2026). Larger models like `qwen2.5-coder:32b` offer improved spatial reasoning on hardware with ≥24 GB VRAM; smaller 7B variants can handle basic prismatic boxes and plates but frequently struggle with complex boolean cutouts.
+> - **Sizing & Capability Note:** Intermediate models (~14B parameters, Q4_K_M quantization) handle typical functional parts well. Larger models (~32B+) offer improved spatial reasoning on hardware with ≥24 GB VRAM, while smaller ~7B variants can handle basic prismatic boxes and plates but frequently struggle with complex boolean cutouts.
 
 ### Architectural Comparison
 
@@ -480,7 +503,7 @@ Settings are loaded from `config.yaml` (git-ignored) at startup. Copy `config.ex
 
 | Key | Default | Description |
 |---|---|---|
-| `llm.provider` | `openrouter` | Active provider: `openrouter`, `openai`, `ollama`, or `gemini` |
+| `llm.provider` | `openrouter` | Active provider: `openrouter`, `openai`, `ollama`, `gemini`, or `vertex` |
 | `llm.max_completion_tokens` | `65536` | Token limit for LLM completions |
 | `llm.fallback_provider` | `""` | Optional secondary provider to failover to on unexpected API errors |
 
@@ -492,6 +515,7 @@ Settings are loaded from `config.yaml` (git-ignored) at startup. Copy `config.ex
 | `openrouter.model` | *(empty)* | Model slug (e.g. `<provider>/<model-slug>`, see [OpenRouter Models](https://openrouter.ai/models)) |
 | `openrouter.timeout_seconds` | `90` | HTTP request timeout in seconds |
 | `openrouter.reasoning_effort` | `medium` | Reasoning level: `minimal`, `low`, `medium`, or `high` |
+| `openrouter.reasoning_max_tokens` | `0` | Optional maximum tokens reserved for thinking (0 lets model decide) |
 | `openrouter.provider_order` | `["google-ai-studio", "google-vertex/global"]` | Priority-ordered upstream routing slugs |
 | `openrouter.provider` | `""` | Legacy single-provider slug |
 | `openrouter.force_provider` | `false` | Force pinned upstream with no fallback fanout |
@@ -512,7 +536,7 @@ Settings are loaded from `config.yaml` (git-ignored) at startup. Copy `config.ex
 | Key | Default | Description |
 |---|---|---|
 | `ollama.base_url` | `http://localhost:11434/v1` | Ollama OpenAI-compatible endpoint |
-| `ollama.model` | `qwen2.5-coder:14b-16k` | Name of your locally hosted model |
+| `ollama.model` | *(empty)* | Name of your locally hosted model |
 | `ollama.timeout_seconds` | `120` | Request timeout in seconds (allows for local inference latency) |
 | `ollama.reasoning_effort` | `""` | Reasoning effort for thinking models (`low`, `medium`, `high`, or empty) |
 
@@ -521,10 +545,21 @@ Settings are loaded from `config.yaml` (git-ignored) at startup. Copy `config.ex
 | Key | Default | Description |
 |---|---|---|
 | `gemini.base_url` | `https://generativelanguage.googleapis.com` | Google AI Studio endpoint |
-| `gemini.model` | `""` | Gemini model slug (refer to Google AI Studio documentation) |
+| `gemini.model` | *(empty)* | Gemini model slug (refer to Google AI Studio documentation) |
 | `gemini.timeout_seconds` | `90` | HTTP request timeout in seconds |
 | `gemini.reasoning_effort` | `""` | Reasoning effort for thinking models (`low`, `medium`, `high`, or empty) |
 | `gemini.store` | `true` | Enable interaction storage on Google backend |
+| `gemini.auth_mode` | `api_key` | Authentication mode: `api_key` or `gcloud` |
+
+### Vertex AI Settings (Google Cloud via `gcloud`)
+
+| Key | Default | Description |
+|---|---|---|
+| `vertex.project_id` | `""` | GCP Project ID (auto-detected from active `gcloud` config if empty) |
+| `vertex.location` | `us-central1` | Vertex AI regional location |
+| `vertex.model` | *(empty)* | Gemini model on Vertex AI |
+| `vertex.timeout_seconds` | `90` | HTTP request timeout in seconds |
+| `vertex.reasoning_effort` | `""` | Reasoning effort for thinking models (`low`, `medium`, `high`, or empty) |
 
 ### Server & UI Settings
 

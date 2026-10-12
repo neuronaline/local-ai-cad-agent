@@ -13,23 +13,24 @@ _LOG = logging.getLogger(__name__)
 _WARNED_KEYS: set[str] = set()
 
 REASONING_EFFORTS = {"minimal", "low", "medium", "high"}
-LLM_PROVIDERS = {"openrouter", "openai", "ollama", "gemini", "google"}
+LLM_PROVIDERS = {"openrouter", "openai", "ollama", "gemini", "google", "vertex", "gcloud"}
 
 
 @dataclass(frozen=True)
 class Settings:
-    workspace_root: Path
-    openrouter_base_url: str
-    openrouter_model: str
-    openrouter_timeout_seconds: int
-    host: str
-    port: int
+    workspace_root: Path = Path("/tmp/cad_workspace")
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    openrouter_model: str = ""
+    openrouter_timeout_seconds: int = 90
+    host: str = "127.0.0.1"
+    port: int = 8000
     openrouter_app_title: str = "Local AI CAD Agent"
     openrouter_app_url: str = ""
     openrouter_session_prefix: str = "local-ai-cad-agent"
     openrouter_enable_anthropic_cache: bool = True
     openrouter_enable_gemini_cache: bool = True
     openrouter_reasoning_effort: str | None = None
+    openrouter_reasoning_max_tokens: int | None = None
     openrouter_provider: str | None = None
     openrouter_force_provider: bool = False
     # Ordered list of OpenRouter provider routing slugs (highest priority
@@ -62,6 +63,15 @@ class Settings:
     gemini_timeout_seconds: int = 90
     gemini_reasoning_effort: str | None = None
     gemini_store: bool = True
+    gemini_auth_mode: str = "api_key"  # "api_key" | "gcloud"
+    gemini_project_id: str = ""
+    gemini_location: str = "us-central1"
+    # Vertex AI / gcloud terminal authentication adapter.
+    vertex_project_id: str = ""
+    vertex_location: str = "us-central1"
+    vertex_model: str = "gemini-2.5-flash"
+    vertex_timeout_seconds: int = 90
+    vertex_reasoning_effort: str | None = None
     # ── end provider selection ──
     show_info_messages: bool = True
     agent_tool_call_limit: int = 15
@@ -97,6 +107,8 @@ class Settings:
             return self.ollama_model
         if self.llm_provider in ("gemini", "google"):
             return self.gemini_model
+        if self.llm_provider in ("vertex", "gcloud"):
+            return self.vertex_model
         return self.openrouter_model
 
 
@@ -221,6 +233,13 @@ def _parse_grid_extent(value: Any) -> tuple[float, int]:
     return size, divisions
 
 
+def _validate_auth_mode(val: Any, field_name: str) -> str:
+    s = str(val or "api_key").strip().lower()
+    if s not in ("api_key", "gcloud"):
+        raise ValueError(f"{field_name} must be 'api_key' or 'gcloud', got {s!r}.")
+    return s
+
+
 def load_settings(project_root: Path | None = None) -> Settings:
     project_root = project_root or Path(__file__).resolve().parents[1]
     config = _read_yaml(project_root / "config.yaml")
@@ -229,6 +248,7 @@ def load_settings(project_root: Path | None = None) -> Settings:
     openai = config.get("openai") or {}
     ollama = config.get("ollama") or {}
     gemini = config.get("gemini") or config.get("google") or {}
+    vertex = config.get("vertex") or config.get("gcloud") or {}
     server = config.get("server") or {}
     ui = config.get("ui") or {}
     agent = config.get("agent") or {}
@@ -242,8 +262,22 @@ def load_settings(project_root: Path | None = None) -> Settings:
     )
     _reject_unknown(
         gemini,
-        {"base_url", "model", "timeout_seconds", "reasoning_effort", "store"},
+        {
+            "base_url",
+            "model",
+            "timeout_seconds",
+            "reasoning_effort",
+            "store",
+            "auth_mode",
+            "project_id",
+            "location",
+        },
         "gemini",
+    )
+    _reject_unknown(
+        vertex,
+        {"project_id", "location", "model", "timeout_seconds", "reasoning_effort"},
+        "vertex",
     )
     _reject_unknown(
         agent,
@@ -350,6 +384,15 @@ def load_settings(project_root: Path | None = None) -> Settings:
         openrouter_enable_anthropic_cache=_strict_bool(openrouter.get("enable_anthropic_cache", True), "openrouter.enable_anthropic_cache"),
         openrouter_enable_gemini_cache=_strict_bool(openrouter.get("enable_gemini_cache", True), "openrouter.enable_gemini_cache"),
         openrouter_reasoning_effort=_optional_effort(openrouter.get("reasoning_effort")),
+        openrouter_reasoning_max_tokens=_optional_positive_int(
+            openrouter.get("reasoning_max_tokens")
+            or (
+                openrouter.get("reasoning", {}).get("max_tokens")
+                if isinstance(openrouter.get("reasoning"), dict)
+                else None
+            ),
+            "openrouter.reasoning_max_tokens",
+        ),
         openrouter_provider=_optional_string(openrouter.get("provider")),
         openrouter_force_provider=_strict_bool(openrouter.get("force_provider", False), "openrouter.force_provider"),
         openrouter_provider_order=openrouter_provider_order,
@@ -368,6 +411,14 @@ def load_settings(project_root: Path | None = None) -> Settings:
         gemini_timeout_seconds=_validate_timeout_seconds(gemini.get("timeout_seconds") or 90, "gemini.timeout_seconds"),
         gemini_reasoning_effort=_optional_effort(gemini.get("reasoning_effort")),
         gemini_store=_strict_bool(gemini.get("store", True), "gemini.store"),
+        gemini_auth_mode=_validate_auth_mode(gemini.get("auth_mode"), "gemini.auth_mode"),
+        gemini_project_id=str(gemini.get("project_id") or "").strip(),
+        gemini_location=str(gemini.get("location") or "us-central1").strip(),
+        vertex_project_id=str(vertex.get("project_id") or "").strip(),
+        vertex_location=str(vertex.get("location") or "us-central1").strip(),
+        vertex_model=str(vertex.get("model") or "gemini-2.5-flash").strip(),
+        vertex_timeout_seconds=_validate_timeout_seconds(vertex.get("timeout_seconds") or 90, "vertex.timeout_seconds"),
+        vertex_reasoning_effort=_optional_effort(vertex.get("reasoning_effort")),
         show_info_messages=_strict_bool(ui.get("show_info_messages", True), "ui.show_info_messages"),
         agent_tool_call_limit=_positive_int(agent.get("tool_call_limit", 15), "agent.tool_call_limit"),
         revision_retention_count=_non_negative_int(agent.get("revision_retention_count", 0), "agent.revision_retention_count"),
@@ -467,7 +518,19 @@ def _non_negative_int(value: Any, name: str) -> int:
 def _optional_positive_int(value: Any, name: str) -> int | None:
     if value is None:
         return None
-    return _positive_int(value, name)
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be a positive integer.") from error
+    if number == 0:
+        return None
+    if number < 0:
+        raise ValueError(f"{name} must be a positive integer.")
+    return number
 
 
 def _validate_log_activity(

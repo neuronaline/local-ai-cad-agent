@@ -38,6 +38,7 @@ from agent.converter import (
     SUPPORTED_EXPORT_FORMATS,
     export_project_model,
 )
+from agent.conversation import ConversationStore
 from agent.core import AgentRunner
 from agent.images import store_images
 from agent.io import utc_now_iso
@@ -237,19 +238,21 @@ def _active_api_key_env(settings: Settings) -> str:
     return api_key_env(settings.llm_provider)
 
 
-def _api_key_configured(settings: Settings) -> bool:
-    if settings.llm_provider == "ollama":
-        return bool(settings.llm_model.strip())
-    key = os.getenv(_active_api_key_env(settings), "")
-    return bool(key.strip()) and bool(settings.llm_model.strip())
-
-
 def _run_preflight(settings: Settings) -> dict[str, Any]:
     from agent.sandbox import _BWRAP, seccomp_filter_fd
 
     checks: dict[str, bool | str] = {}
     if settings.llm_provider == "ollama":
         checks["api_key"] = True
+    elif settings.llm_provider in ("vertex", "gcloud") or (
+        settings.llm_provider in ("gemini", "google") and getattr(settings, "gemini_auth_mode", "api_key") == "gcloud"
+    ):
+        from agent.gcloud_auth import check_gcloud_status
+        ok, detail = check_gcloud_status()
+        checks["api_key"] = ok
+        checks["gcloud_auth"] = ok
+        if not ok:
+            checks["gcloud_error"] = detail
     else:
         api_key = os.getenv(_active_api_key_env(settings), "").strip()
         checks["api_key"] = bool(api_key)
@@ -616,6 +619,47 @@ def chat():
     return jsonify({"accepted": True, "attachments": [
         path.relative_to(project_dir).as_posix() for path in image_paths
     ]}), 202
+
+
+@agent_bp.post("/api/chat/retry")
+def chat_retry():
+    payload = request.get_json(silent=True) if request.is_json else request.form
+    payload = payload or {}
+    project_name = str(payload.get("project", "")).strip()
+    if not project_name:
+        return jsonify({"error": "Project is required."}), 400
+    runner: AgentRunner = current_app.config["AGENT_RUNNER"]
+    if runner.waiting_question(project_name):
+        return jsonify({"error": "Answer the pending question before retrying."}), 409
+    if runner.is_running():
+        active = runner.active_project()
+        msg = (
+            f"An agent task is already running in project '{active}'."
+            if active
+            else "An agent task is already running."
+        )
+        return jsonify({"error": msg, "active_project": active}), 409
+    with _project_lock(project_name):
+        project_dir = _resolve_project_or_404(project_name)
+        if not isinstance(project_dir, Path):
+            return project_dir
+        last_user_turn = ConversationStore.rewind_to_last_user_message(project_dir)
+        if not last_user_turn:
+            return jsonify({"error": "No previous user message found to retry."}), 400
+        prompt_text = ""
+        user_content = last_user_turn.get("content")
+        if isinstance(user_content, str):
+            prompt_text = user_content
+        elif isinstance(user_content, list):
+            parts = []
+            for part in user_content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    parts.append(str(part.get("text", "")))
+            prompt_text = "\n".join(parts)
+        started = runner.start_retry(project_name, message=prompt_text)
+    if not started:
+        return jsonify({"error": "Unable to start retry task."}), 409
+    return jsonify({"accepted": True}), 202
 
 
 @agent_bp.post("/api/questions/answer")

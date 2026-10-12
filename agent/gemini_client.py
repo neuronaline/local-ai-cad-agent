@@ -24,6 +24,7 @@ from typing import Any
 from agent.activity_log import summarize_llm_messages
 from agent.llm_base import (
     BaseLLMClient,
+    CompletionTruncatedError,
     RequestCancelled,
     StreamResponseError,
     _force_close_response,
@@ -329,15 +330,20 @@ def parse_interactions_stream(
     finish_reason: str | None = None
     finish_time: float | None = None
 
+    last_activity_time = time.monotonic()
+
     try:
         for raw_line in iter_lines_with_cancel(response, stop_event=stop_event):
             if stop_event and stop_event.is_set():
                 _force_close_response(response)
                 raise RequestCancelled(f"{provider_label} request cancelled.")
+            now = time.monotonic()
             if raw_line is None:
                 if finish_reason is not None and finish_time is not None:
-                    if time.monotonic() - finish_time >= 1.5:
+                    if now - finish_time >= 1.0:
                         break
+                if (content or tool_calls or reasoning_text) and (now - last_activity_time >= 15.0):
+                    break
                 continue
             line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
             if not line:
@@ -352,6 +358,7 @@ def parse_interactions_stream(
                 event = json.loads(payload)
             except json.JSONDecodeError as error:
                 raise RuntimeError(f"{provider_label} returned malformed streaming JSON.") from error
+            last_activity_time = now
 
             if not isinstance(event, dict):
                 continue
@@ -536,13 +543,6 @@ def parse_interactions_stream(
         _force_close_response(response)
         raise RequestCancelled(f"{provider_label} request cancelled.")
 
-    if finish_reason in ("length", "MAX_TOKENS"):
-        raise RuntimeError(
-            f"{provider_label} completion was truncated (finish_reason={finish_reason!r}); "
-            "no tool calls were executed. Consider increasing 'llm.max_completion_tokens' "
-            "in config.yaml or reducing 'reasoning_effort'."
-        )
-
     # Fallback tag cleanup
     content, extracted_reasoning = extract_think_tags(content, reasoning_text)
     if extracted_reasoning:
@@ -555,6 +555,17 @@ def parse_interactions_stream(
             cid = call.get("id") or f"call_{uuid.uuid4().hex[:8]}"
             call["id"] = cid
             tool_calls[cid] = call
+
+    if finish_reason in ("length", "MAX_TOKENS"):
+        raise CompletionTruncatedError(
+            f"{provider_label} completion was truncated (finish_reason={finish_reason!r}); "
+            "token limit was reached before completion. Consider increasing 'llm.max_completion_tokens' "
+            "in config.yaml or reducing 'reasoning_effort'.",
+            partial_content=content,
+            reasoning_text=reasoning_text,
+            partial_tool_calls=list(tool_calls.values()) if tool_calls else [],
+            provider_label=provider_label,
+        )
 
     if not content and not tool_calls:
         if reasoning_text.strip() and finish_reason in (None, "stop", "completed"):
@@ -672,10 +683,14 @@ def parse_interactions_response(body: dict[str, Any]) -> dict[str, Any]:
 
     finish_reason = body.get("finish_reason") or body.get("status")
     if finish_reason in ("length", "MAX_TOKENS"):
-        raise RuntimeError(
+        raise CompletionTruncatedError(
             f"Google AI Studio completion was truncated (finish_reason={finish_reason!r}); "
-            "no tool calls were executed. Consider increasing 'llm.max_completion_tokens' "
-            "in config.yaml or reducing 'reasoning_effort'."
+            "token limit was reached before completion. Consider increasing 'llm.max_completion_tokens' "
+            "in config.yaml or reducing 'reasoning_effort'.",
+            partial_content=content,
+            reasoning_text=reasoning_text,
+            partial_tool_calls=tool_calls,
+            provider_label="Google AI Studio",
         )
 
     if not content and not tool_calls:

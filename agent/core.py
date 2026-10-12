@@ -37,6 +37,7 @@ from agent.dispatcher import (
 )
 from agent.images import as_chat_image
 from agent.llm_base import (
+    CompletionTruncatedError,
     RequestCancelled,
     create_llm_client,
     extract_text_tool_calls,
@@ -196,6 +197,7 @@ class _RunState:
     current_content: str = ""
     current_reasoning: str = ""
     start_perf_time: float = 0.0
+    truncation_continuations: int = 0
 
 
 def _extract_reasoning(message: dict[str, Any]) -> str:
@@ -319,12 +321,26 @@ class AgentRunner:
             )
             return self._start_locked(project, message, prepared_paths, run_id)
 
+    def start_retry(self, project: str, message: str = "") -> bool:
+        """Retry the last turn for a project without re-appending the user prompt."""
+        if self.waiting_question(project):
+            return False
+        with self._lock:
+            if self._thread is not None and not self._run_complete.is_set():
+                return False
+            run_id = uuid.uuid4().hex
+            return self._start_locked(
+                project, message, [], run_id, is_retry=True
+            )
+
     def _start_locked(
         self,
         project: str,
         message: str,
         image_paths: list[Path],
         run_id: str,
+        *,
+        is_retry: bool = False,
     ) -> bool:
         if self._thread is not None and not self._run_complete.is_set():
             return False
@@ -334,7 +350,7 @@ class AgentRunner:
         self._active_run_id = run_id
         self._thread = threading.Thread(
             target=self._run,
-            args=(project, message, image_paths, run_id),
+            args=(project, message, image_paths, run_id, is_retry),
             daemon=True,
         )
         self._thread.start()
@@ -486,6 +502,7 @@ class AgentRunner:
         message: str,
         image_paths: list[Path] | None = None,
         run_id: str = "",
+        is_retry: bool = False,
     ) -> None:
         """Lifecycle wrapper: init, dispatch turns, terminal cleanup.
 
@@ -501,7 +518,7 @@ class AgentRunner:
         activity_logger: ActivityLogger | None = None
         try:
             state = self._init_run(
-                project, message, image_paths or [], project_dir, run_id
+                project, message, image_paths or [], project_dir, run_id, is_retry=is_retry
             )
             activity_logger = state.activity_logger
             # Bound once: the publisher reads ``current_message_id`` lazily
@@ -538,6 +555,8 @@ class AgentRunner:
         image_paths: list[Path],
         project_dir: Path,
         run_id: str,
+        *,
+        is_retry: bool = False,
     ) -> _RunState:
         """Build tools/client, log ``run_start``, return the run state.
 
@@ -568,7 +587,7 @@ class AgentRunner:
         with self._lock:
             self._active_tools = tools
             self._active_client = client
-        messages = self._context(project_dir, message, image_paths)
+        messages = self._context(project_dir, message, image_paths, is_retry=is_retry)
         activity_logger: ActivityLogger | None = None
         if activity_logging_enabled(self.settings):
             activity_logger = get_logger(
@@ -667,9 +686,60 @@ class AgentRunner:
                     "status": "started",
                     "message": "Thinking...",
                 },
-                transient=True,
             )
-        response = state.client.chat(state.messages, TOOL_SCHEMAS)
+        try:
+            response = state.client.chat(state.messages, TOOL_SCHEMAS)
+        except CompletionTruncatedError as trunc_err:
+            if (
+                state.truncation_continuations < 2
+                and (trunc_err.reasoning_text or trunc_err.partial_content)
+                and not self._stop_event.is_set()
+            ):
+                state.total_turns += 1
+                state.truncation_continuations += 1
+                usage = getattr(state.client, "last_usage", None)
+                if isinstance(usage, dict):
+                    state.total_prompt_tokens += int(usage.get("prompt_tokens") or 0)
+                    state.total_completion_tokens += int(usage.get("completion_tokens") or 0)
+                    details = usage.get("completion_tokens_details") or {}
+                    state.total_reasoning_tokens += int(details.get("reasoning_tokens") or 0)
+                content = trunc_err.partial_content.strip() if trunc_err.partial_content else ""
+                partial_msg: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": content,
+                }
+                if trunc_err.reasoning_text:
+                    partial_msg["reasoning"] = trunc_err.reasoning_text
+                state.messages.append(partial_msg)
+                ConversationStore.append(state.project_dir, partial_msg)
+                continuation_nudge = _synthetic_user(
+                    "Your previous response reached the token limit. "
+                    "Please output your tool call (e.g. write_file, cad_build) or final answer directly now without repeating your reasoning."
+                )
+                state.messages.append(continuation_nudge)
+                ConversationStore.append(state.project_dir, continuation_nudge)
+                self.publish(
+                    "agent_status",
+                    {
+                        "project": state.project,
+                        "run_id": state.run_id,
+                        "status": "started",
+                        "message": "Continuing generation after token limit...",
+                    },
+                )
+                if state.activity_logger is not None:
+                    state.activity_logger.log(
+                        "assistant_turn",
+                        {
+                            "project": state.project,
+                            "turn": state.total_turns,
+                            "message": partial_msg,
+                            "truncated": True,
+                        },
+                        run_id=state.run_id,
+                    )
+                return _TurnOutcome.CONTINUE
+            raise
         if self._stop_event.is_set():
             raise RequestCancelled("Task stopped by the user.")
         if (
@@ -1258,19 +1328,25 @@ class AgentRunner:
     # ------------------------------------------------------------------ context
 
     def _context(
-        self, project_dir: Path, message: str, image_paths: list[Path]
+        self,
+        project_dir: Path,
+        message: str,
+        image_paths: list[Path],
+        *,
+        is_retry: bool = False,
     ) -> list[dict]:
         history = self._load_history(project_dir)
-        user_message: dict[str, object] = {"role": "user", "content": message}
-        if image_paths:
-            user_message = {
-                "role": "user",
-                "content": [{"type": "text", "text": message}]
-                + [as_chat_image(path) for path in image_paths],
-            }
-        if not history or history[-1] != user_message:
-            history.append(user_message)
-            self._append_message(project_dir, user_message)
+        if not is_retry:
+            user_message: dict[str, object] = {"role": "user", "content": message}
+            if image_paths:
+                user_message = {
+                    "role": "user",
+                    "content": [{"type": "text", "text": message}]
+                    + [as_chat_image(path) for path in image_paths],
+                }
+            if not history or history[-1] != user_message:
+                history.append(user_message)
+                self._append_message(project_dir, user_message)
         return [
             {"role": "system", "content": get_system_prompt()},
             self._project_state_message(project_dir, history),
@@ -1547,10 +1623,28 @@ class AgentRunner:
         # that did not pass the type.
         if err_type == "RequestCancelled" or "task was cancelled" in lower:
             return "Task was cancelled."
+        if (
+            err_type == "CompletionTruncatedError"
+            or "completion was truncated" in lower
+            or "finish_reason='length'" in lower
+            or "finish_reason='max_tokens'" in lower
+        ):
+            return (
+                f"{provider_name} model output was truncated by token limits before completing tools. "
+                "Consider reducing 'reasoning_effort' (e.g. to 'medium' or 'low') or setting "
+                "'reasoning_max_tokens' in config.yaml."
+            )
         if "401" in detail or "unauthorized" in lower or "invalid api key" in lower:
             if provider == "ollama":
                 return "Authentication failed for Ollama. Check your OLLAMA_API_KEY environment variable."
+            if provider in ("vertex", "gcloud"):
+                return "Google Cloud authentication failed. Run 'gcloud auth login' in your terminal."
             return f"Invalid {provider_name} API key. Check your key at {key_url}."
+        if provider in ("vertex", "gcloud") and "project" in lower and ("not configured" in lower or "not found" in lower):
+            return (
+                f"Google Cloud project error: {detail}. "
+                "Set 'vertex.project_id' in config.yaml or run 'gcloud config set project <PROJECT_ID>'."
+            )
         if "429" in detail or "rate limit" in lower:
             return f"{provider_name} rate limit reached. Wait a moment and try again."
         if provider == "ollama":
@@ -1589,7 +1683,9 @@ class AgentRunner:
             or "ollama" in lower
             or "gemini" in lower
             or "google" in lower
-            or provider in ("openrouter", "openai", "ollama", "gemini", "google")
+            or "vertex" in lower
+            or "gcloud" in lower
+            or provider in ("openrouter", "openai", "ollama", "gemini", "google", "vertex", "gcloud")
         ) and (
             "timeout" in lower or "timed out" in lower or "connection" in lower
         ):

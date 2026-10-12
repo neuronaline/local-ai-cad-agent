@@ -50,6 +50,7 @@ function generateUUID() {
 }
 
 let selectedFiles = [];
+let lastUserSubmission = null;
 let previewProject = '';
 let loadedPreviewRevision = '';
 let previewLoadPromise = null;
@@ -163,6 +164,12 @@ const COPY_ICON_SVG = `
   <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
     <rect x="9" y="9" width="13" height="13" rx="2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
     <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>
+`;
+
+const RETRY_ICON_SVG = `
+  <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+    <path d="M21 12a9 9 0 1 1-2.636-6.364M21 3v6h-6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
   </svg>
 `;
 
@@ -289,16 +296,25 @@ function addMessage(text, type = 'agent', options = {}) {
     return item;
   }
   if (type === 'user') {
+    if (target === feed) {
+      feed.querySelectorAll('.message.user .message-retry-btn').forEach(btn => btn.remove());
+    }
     item.classList.add('user-message');
     const meta = document.createElement('div');
     meta.className = 'message-meta user-meta';
     meta.innerHTML = `
       <span class="user-mark">U</span>
       <span class="message-author">You</span>
-      <button type="button" class="message-copy-btn" title="Copy message" aria-label="Copy message">
-        ${COPY_ICON_SVG}
-        <span class="copy-label">Copy</span>
-      </button>
+      <div class="user-actions">
+        <button type="button" class="message-retry-btn" title="Retry prompt" aria-label="Retry prompt">
+          ${RETRY_ICON_SVG}
+          <span class="retry-label">Retry</span>
+        </button>
+        <button type="button" class="message-copy-btn" title="Copy message" aria-label="Copy message">
+          ${COPY_ICON_SVG}
+          <span class="copy-label">Copy</span>
+        </button>
+      </div>
     `;
     item.appendChild(meta);
 
@@ -327,7 +343,41 @@ function addMessage(text, type = 'agent', options = {}) {
     target.appendChild(item);
     return item;
   }
-  // ``error`` and other bare-message types keep the simple text rendering path.
+  if (type === 'error') {
+    const errorBody = document.createElement('div');
+    errorBody.className = 'error-body';
+
+    const textNode = document.createElement('div');
+    textNode.className = 'error-text';
+    textNode.textContent = text || '';
+    errorBody.appendChild(textNode);
+
+    if (options.retryable !== false) {
+      const actions = document.createElement('div');
+      actions.className = 'error-actions';
+      const retryBtn = document.createElement('button');
+      retryBtn.type = 'button';
+      retryBtn.className = 'error-retry-btn';
+      retryBtn.title = 'Retry this request';
+      retryBtn.setAttribute('aria-label', 'Retry this request');
+      retryBtn.innerHTML = `
+        ${RETRY_ICON_SVG}
+        <span>Retry</span>
+      `;
+      retryBtn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        handleRetry(item, options.retryContext);
+      });
+      actions.appendChild(retryBtn);
+      errorBody.appendChild(actions);
+    }
+
+    item.appendChild(errorBody);
+    target.appendChild(item);
+    return item;
+  }
+  // Other bare-message types keep the simple text rendering path.
   item.textContent = text || '';
   target.appendChild(item);
   return item;
@@ -610,6 +660,16 @@ function refreshLatestToolRow(tool, updates = {}) {
   return null;
 }
 
+function isAgentActive() {
+  return sendToggle?.dataset.mode === 'stop' || Boolean(document.querySelector('.thinking-indicator'));
+}
+
+function updateRetryButtonsState(active) {
+  document.querySelectorAll('.error-retry-btn, .message-retry-btn').forEach(btn => {
+    btn.disabled = active;
+  });
+}
+
 function setThinking(active) {
   if (sendToggle) {
     sendToggle.dataset.mode = active ? 'stop' : 'send';
@@ -619,12 +679,92 @@ function setThinking(active) {
     if (sendIcon) sendIcon.hidden = active;
     if (stopIcon) stopIcon.hidden = !active;
   }
+  updateRetryButtonsState(active);
   if (active) {
     if (feed && !getActiveCard()) {
       getOrCreateRunCard(null, { optimistic: true });
     }
   } else {
     document.querySelectorAll('.thinking-indicator').forEach(el => el.remove());
+  }
+}
+
+async function handleRetry(errorElement = null, context = null) {
+  if (!currentProject || isAgentActive()) return;
+  const retryBtn = errorElement?.querySelector('.error-retry-btn') || document.querySelector('.message-retry-btn');
+  if (retryBtn) {
+    retryBtn.disabled = true;
+    retryBtn.classList.add('retrying');
+  }
+  try {
+    // If we have a cached client-side submission from a failed initial fetch
+    if (context && context.clientSubmission) {
+      const sub = context.clientSubmission;
+      if (sub.project && sub.project !== currentProject) {
+        throw new Error('Cannot retry prompt for a different project.');
+      }
+      if (errorElement) errorElement.remove();
+      feed?.querySelectorAll('.message.error').forEach(el => el.remove());
+      clearActivity();
+      finalizeAllActiveCards();
+      setThinking(true);
+      scrollFeedToBottom(true);
+      const idempotencyKey = generateUUID();
+      const body = new FormData();
+      body.append('project', currentProject);
+      body.append('message', sub.text);
+      body.append('idempotency_key', idempotencyKey);
+      if (Array.isArray(sub.files)) {
+        sub.files.forEach(file => body.append('attachments', file));
+      }
+      const response = await api('/api/chat', {method: 'POST', body});
+      if (response.duplicate) {
+        if (optimisticCard) {
+          optimisticCard.remove();
+          optimisticCard = null;
+        }
+        setThinking(false);
+        return;
+      }
+      if (response.attachments?.length) {
+        addToolMessage({
+          call_id: `attachments-${generateUUID()}`,
+          tool: 'Images',
+          status: 'completed',
+          result: `${response.attachments.length} reference image(s) uploaded.`,
+        });
+      }
+      return;
+    }
+
+    // Server-side retry via /api/chat/retry (restores context from conversation.jsonl)
+    if (errorElement) errorElement.remove();
+    feed?.querySelectorAll('.message.error').forEach(el => el.remove());
+    clearActivity();
+    finalizeAllActiveCards();
+    setThinking(true);
+    scrollFeedToBottom(true);
+
+    const response = await api('/api/chat/retry', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({project: currentProject}),
+    });
+    if (!response.accepted) {
+      throw new Error(response.error || 'Retry request not accepted.');
+    }
+  } catch (error) {
+    if (optimisticCard) {
+      optimisticCard.remove();
+      optimisticCard = null;
+    }
+    setThinking(false);
+    addMessage(`Retry failed: ${error.message}`, 'error', {retryable: true, retryContext: context});
+  } finally {
+    if (retryBtn) {
+      retryBtn.disabled = false;
+      retryBtn.classList.remove('retrying');
+    }
   }
 }
 
@@ -1127,6 +1267,14 @@ chatForm.addEventListener('submit', async event => {
     body.append('message', promptText);
     body.append('idempotency_key', idempotencyKey);
     selectedFiles.forEach(file => body.append('attachments', file));
+    const submissionSnapshot = {
+      project: currentProject,
+      text: promptText,
+      originalText: text,
+      files: [...selectedFiles],
+      images: imagePayload,
+    };
+    lastUserSubmission = submissionSnapshot;
     const response = await api('/api/chat', {method: 'POST', body});
     if (response.duplicate) {
       if (optimisticCard) {
@@ -1150,7 +1298,10 @@ chatForm.addEventListener('submit', async event => {
       optimisticCard.remove();
       optimisticCard = null;
     }
-    addMessage(error.message, 'error');
+    addMessage(error.message, 'error', {
+      retryable: true,
+      retryContext: { clientSubmission: lastUserSubmission },
+    });
     setThinking(false);
     loadCurrentState().catch(() => {});
   } finally {
@@ -2151,7 +2302,7 @@ function handleStreamingToolDelta(runId, data) {
 
 function finalizeRunCard(runId, finalText, reasoning) {
   flushStreamingRender();
-  let card = getActiveCard(runId);
+  let card = (runId && runCards.get(runId)) || getActiveCard(runId);
 
   const text = stripToolCallTags(finalText || card?.dataset.raw || '').trim();
   const cardReasoning = stripEncryptedReasoning(card?.dataset.reasoning || '').trim();
@@ -2192,8 +2343,8 @@ function finalizeRunCard(runId, finalText, reasoning) {
     return card;
   }
 
-  if (cleanFinal || cleanReasoning) {
-    const item = addMessage(cleanFinal || '', 'agent', { reasoning: cleanReasoning });
+  if (text || cleanReasoning) {
+    const item = addMessage(text || '', 'agent', { reasoning: cleanReasoning });
     scrollFeedToBottom();
     return item;
   }
@@ -2268,6 +2419,9 @@ function connectStream() {
         } else if (data.status === 'failed' && card) {
           setCardState(card, 'error', 'Failed');
         }
+        if (data.status === 'completed') {
+          markActivityRecovered();
+        }
         finalizeAllActiveCards();
       }
     },
@@ -2320,7 +2474,7 @@ function connectStream() {
           } else {
             setCardState(card, 'working', 'Running tools');
           }
-        } else if (text) {
+        } else {
           setCardState(card, 'done');
         }
       }
@@ -2438,7 +2592,7 @@ function connectStream() {
       if (data.project !== currentProject) return;
       const runId = data.run_id || data.message_id;
       handleAgentTerminalState(runId, 'error', 'Failed');
-      addMessage(data.message || 'Agent error.', 'error');
+      addMessage(data.message || 'Agent error.', 'error', {retryable: true});
       // Errors are terminal; ensure the thinking indicator clears.
       setThinking(false);
       addToolMessage({
@@ -2547,6 +2701,27 @@ document.addEventListener('click', async event => {
     }
     if (!rawText.trim()) return;
     await copyTextToClipboard(rawText, messageCopyBtn);
+    return;
+  }
+
+  const messageRetryBtn = event.target.closest('.message-retry-btn');
+  if (messageRetryBtn) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (isAgentActive()) return;
+    const messageEl = messageRetryBtn.closest('.message');
+    if (!messageEl) return;
+    messageRetryBtn.disabled = true;
+    messageRetryBtn.classList.add('retrying');
+
+    // Remove any trailing elements after messageEl so the DOM matches the rewound history
+    let sibling = messageEl.nextElementSibling;
+    while (sibling) {
+      const next = sibling.nextElementSibling;
+      sibling.remove();
+      sibling = next;
+    }
+    await handleRetry(null);
     return;
   }
 });

@@ -30,6 +30,8 @@ PROVIDER_LABELS = {
     "ollama": "Ollama",
     "gemini": "Google AI Studio",
     "google": "Google AI Studio",
+    "vertex": "Google Cloud Vertex AI (gcloud)",
+    "gcloud": "Google Cloud Vertex AI (gcloud)",
 }
 
 # Module-level HTTP/2 client for streaming Chat Completions without HTTP/1.1
@@ -54,6 +56,25 @@ class StreamResponseError(RuntimeError):
     def __init__(self, message: str, *, retryable: bool) -> None:
         super().__init__(message)
         self.retryable = retryable
+
+
+class CompletionTruncatedError(RuntimeError):
+    """Raised when an LLM completion stream terminates prematurely due to token budget exhaustion."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        partial_content: str = "",
+        reasoning_text: str = "",
+        partial_tool_calls: list[dict[str, Any]] | None = None,
+        provider_label: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.partial_content = partial_content
+        self.reasoning_text = reasoning_text
+        self.partial_tool_calls = partial_tool_calls or []
+        self.provider_label = provider_label
 
 
 def _stream_error_detail(error: Any) -> str:
@@ -253,9 +274,14 @@ def sanitize_assistant_message(
     # Strip any leaked tool-call tags from content in assistant messages
     if isinstance(sanitized.get("content"), str):
         cleaned_content, extra_calls = extract_text_tool_calls(sanitized["content"])
-        sanitized["content"] = cleaned_content or None
+        sanitized["content"] = (
+            ensure_closed_code_fences(cleaned_content) if cleaned_content else None
+        )
         if not sanitized.get("tool_calls") and extra_calls:
             sanitized["tool_calls"] = extra_calls
+
+    if not sanitized.get("tool_calls") and not (sanitized.get("content") or "").strip():
+        sanitized["content"] = "..."
 
     tool_calls = sanitized.get("tool_calls")
     if isinstance(tool_calls, list):
@@ -286,6 +312,16 @@ def sanitize_assistant_message(
     return sanitized
 
 
+def ensure_closed_code_fences(text: str) -> str:
+    """Ensure that markdown code blocks (```) in text are closed."""
+    if not text:
+        return text
+    fence_count = text.count("```")
+    if fence_count % 2 != 0:
+        return text.rstrip() + "\n```\n"
+    return text
+
+
 def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return an API-safe copy while preserving a stable system prefix.
 
@@ -294,6 +330,9 @@ def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     state change, defeating provider prompt caches.
     Adjacent non-system messages with the same role (e.g. consecutive 'user'
     or 'assistant' messages) are merged to satisfy strict provider role-alternation contracts.
+    Dangling tool calls (assistant tool calls missing matching role: tool responses)
+    are automatically healed by injecting synthetic failure tool responses so the
+    conversation never bricks with 400 Bad Request errors.
     Trailing assistant messages are closed with a synthetic user prompt to satisfy
     providers that disallow conversations ending on a model turn (e.g. Google Vertex Gemini).
     """
@@ -344,14 +383,63 @@ def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             curr_tcs = msg.get("tool_calls") or []
             if curr_tcs:
                 prev["tool_calls"] = prev_tcs + curr_tcs
+            prev_reasoning = prev.get("reasoning") or ""
+            curr_reasoning = msg.get("reasoning") or ""
+            if prev_reasoning and curr_reasoning:
+                prev["reasoning"] = f"{prev_reasoning}\n\n{curr_reasoning}"
+            elif curr_reasoning:
+                prev["reasoning"] = curr_reasoning
         else:
             merged_non_system.append(msg)
 
-    # Gemini / Vertex AI reject requests ending with a model turn
-    if merged_non_system and merged_non_system[-1].get("role") == "assistant":
-        merged_non_system.append({"role": "user", "content": "Continue."})
+    # Heal dangling tool calls: verify that every tool_calls entry is followed by
+    # matching role: 'tool' messages before the next non-tool turn.
+    healed_non_system: list[dict[str, Any]] = []
+    idx = 0
+    while idx < len(merged_non_system):
+        msg = merged_non_system[idx]
+        healed_non_system.append(msg)
+        idx += 1
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            tool_calls = msg["tool_calls"]
+            expected_ids: dict[str, str] = {}
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                cid = tc.get("id")
+                if not cid:
+                    cid = f"call_{uuid.uuid4().hex[:8]}"
+                    tc["id"] = cid
+                fn_name = (tc.get("function") or {}).get("name", "unknown_tool")
+                expected_ids[cid] = fn_name
+            found_ids: set[str] = set()
+            while idx < len(merged_non_system) and merged_non_system[idx].get("role") == "tool":
+                tool_msg = merged_non_system[idx]
+                healed_non_system.append(tool_msg)
+                call_id = tool_msg.get("tool_call_id")
+                if call_id:
+                    found_ids.add(call_id)
+                idx += 1
+            missing_ids = [cid for cid in expected_ids if cid not in found_ids]
+            for missing_id in missing_ids:
+                fn_name = expected_ids.get(missing_id, "unknown_tool")
+                healed_non_system.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": missing_id,
+                        "name": fn_name,
+                        "content": json.dumps(
+                            {"error": "Tool execution was interrupted or did not complete."},
+                            ensure_ascii=False,
+                        ),
+                    }
+                )
 
-    return system_messages + merged_non_system
+    # Gemini / Vertex AI reject requests ending with a model turn
+    if healed_non_system and healed_non_system[-1].get("role") == "assistant":
+        healed_non_system.append({"role": "user", "content": "Continue."})
+
+    return system_messages + healed_non_system
 
 
 def sanitize_messages(
@@ -752,16 +840,24 @@ def parse_chat_stream(
     tag_buffer = ""
     tool_tag_buffer = ""
 
+    last_activity_time = time.monotonic()
+
     try:
         for raw_line in iter_lines_with_cancel(response, stop_event=stop_event):
             if stop_event and stop_event.is_set():
                 _force_close_response(response)
                 raise RequestCancelled(f"{provider_label} request cancelled.")
+            now = time.monotonic()
             if raw_line is None:
                 if finish_reason is not None and finish_time is not None:
-                    if time.monotonic() - finish_time >= 1.5:
+                    if now - finish_time >= 1.0:
                         saw_done = True
                         break
+                # Inactivity guard: if content/tool/reasoning was already streamed
+                # and no chunk has arrived for 15s, treat stream as completed
+                if (content or tool_calls or reasoning_text) and (now - last_activity_time >= 15.0):
+                    saw_done = True
+                    break
                 continue
             line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
             if not line:
@@ -779,6 +875,7 @@ def parse_chat_stream(
                 raise RuntimeError(
                     f"{provider_label} returned malformed streaming JSON."
                 ) from error
+            last_activity_time = now
             stream_error = chunk.get("error")
             if stream_error:
                 raise StreamResponseError(
@@ -789,6 +886,9 @@ def parse_chat_stream(
                 last_usage = chunk["usage"]
             choices = chunk.get("choices") or []
             if not choices:
+                if finish_reason is not None and last_usage is not None:
+                    saw_done = True
+                    break
                 continue
             choice = choices[0]
             if choice.get("finish_reason"):
@@ -1048,12 +1148,6 @@ def parse_chat_stream(
             + ("; partial response preserved." if had_partial else ".")
         )
         raise StreamResponseError(message, retryable=not had_partial)
-    if finish_reason == "length":
-        raise RuntimeError(
-            f"{provider_label} completion was truncated (finish_reason='length'); "
-            "no tool calls were executed. Consider increasing 'llm.max_completion_tokens' "
-            "in config.yaml or reducing 'reasoning_effort'."
-        )
     # Fallback: extract <think>...</think> from content when reasoning was not in separate delta
     content, extracted_reasoning = extract_think_tags(content, reasoning_text)
     if extracted_reasoning:
@@ -1071,6 +1165,17 @@ def parse_chat_stream(
     if not tool_calls and all_extracted_calls:
         for idx, call in enumerate(all_extracted_calls):
             tool_calls[idx] = call
+
+    if finish_reason in ("length", "MAX_TOKENS"):
+        raise CompletionTruncatedError(
+            f"{provider_label} completion was truncated (finish_reason={finish_reason!r}); "
+            "token limit was reached before completion. Consider increasing 'llm.max_completion_tokens' "
+            "in config.yaml or reducing 'reasoning_effort'.",
+            partial_content=content,
+            reasoning_text=reasoning_text,
+            partial_tool_calls=list(tool_calls.values()) if tool_calls else [],
+            provider_label=provider_label,
+        )
 
     # Some reasoning-first models (Anthropic extended thinking, OpenAI o-series,
     # Gemini thinking) emit reasoning deltas with no text content and finish
@@ -1127,6 +1232,8 @@ def api_key_env(provider: str) -> str:
         return "OPENROUTER_API_KEY"
     if key in ("ollama",):
         return "OLLAMA_API_KEY"
+    if key in ("vertex", "gcloud"):
+        return ""
     if key in ("gemini", "google", "google ai studio"):
         if os.getenv("GEMINI_API_KEY", "").strip():
             return "GEMINI_API_KEY"
@@ -1411,7 +1518,15 @@ def _build_provider_client(provider: str, settings: Settings) -> BaseLLMClient:
         from agent.ollama_client import OllamaClient
 
         return OllamaClient(settings)
+    if provider in ("vertex", "gcloud"):
+        from agent.vertex_client import VertexClient
+
+        return VertexClient(settings)
     if provider in ("gemini", "google"):
+        if getattr(settings, "gemini_auth_mode", "api_key") == "gcloud":
+            from agent.vertex_client import VertexClient
+
+            return VertexClient(settings)
         from agent.gemini_client import GoogleInteractionsClient
 
         return GoogleInteractionsClient(settings)

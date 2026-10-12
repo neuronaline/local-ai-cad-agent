@@ -73,6 +73,10 @@ class ConversationStore:
         stale data between the two steps.
         """
         cls._cache.pop(str(project_dir), None)
+        try:
+            cls._cache.pop(str(project_dir.resolve()), None)
+        except OSError:
+            pass
 
     @classmethod
     def load(cls, project_dir: Path) -> list[dict[str, Any]]:
@@ -179,6 +183,39 @@ class ConversationStore:
         from datetime import datetime, timezone
 
         return datetime.now(timezone.utc).isoformat()
+
+    @classmethod
+    def rewind_to_last_user_message(cls, project_dir: Path) -> dict[str, Any] | None:
+        """Prune conversation.jsonl back to the last user turn, discarding any
+        uncompleted trailing assistant/tool/continuation messages.
+
+        Returns the last user message dict, or None if no user turn is found.
+        """
+        with shared_history_lock():
+            cls.invalidate(project_dir)
+            log_path = project_dir / "conversation.jsonl"
+            if not log_path.exists():
+                return None
+            lines = log_path.read_text(encoding="utf-8").splitlines()
+            last_user_idx = -1
+            last_user_item: dict[str, Any] | None = None
+            for idx, line in enumerate(lines):
+                if not line.strip():
+                    continue
+                try:
+                    item = json.loads(line)
+                    if isinstance(item, dict):
+                        if item.get("role") == "user" and not item.get("synthetic"):
+                            last_user_idx = idx
+                            last_user_item = item
+                except json.JSONDecodeError:
+                    continue
+            if last_user_idx == -1 or last_user_item is None:
+                return None
+            kept_lines = lines[: last_user_idx + 1]
+            log_path.write_text("\n".join(kept_lines) + "\n", encoding="utf-8")
+            cls.invalidate(project_dir)
+            return deepcopy(last_user_item)
 
     @classmethod
     def clear(cls, project_dir: Path) -> bool:

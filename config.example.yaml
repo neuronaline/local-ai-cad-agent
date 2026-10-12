@@ -9,7 +9,8 @@ agent:
   log_mode: off  # off | debug (rolling activity.jsonl) | dataset (untrimmed trajectories/<run_id>.jsonl)
 
 # LLM provider selection. Set ``provider`` to ``openrouter``, ``openai``,
-# ``ollama``, or ``gemini`` (Google AI Studio Interactions API); the matching
+# ``ollama``, ``gemini`` (Google AI Studio Interactions API), or ``vertex``
+# (Google Cloud Vertex AI using local gcloud CLI authentication); the matching
 # namespace below supplies its model + endpoint. All namespaces are kept in sync
 # so you can switch providers without losing configuration.
 llm:
@@ -30,6 +31,9 @@ openrouter:
   # Optional reasoning effort ("low", "medium", "high"). Leave blank ("")
   # for models that do not support reasoning tokens.
   reasoning_effort: ""
+  # Optional maximum tokens to allocate to reasoning/thinking (e.g. 8192).
+  # Leave 0 or blank to let the model decide dynamically.
+  reasoning_max_tokens: 0
   # OpenRouter provider routing order, highest priority first. OpenRouter
   # walks this list and only falls back to its internal pool if every named
   # upstream is unavailable. Use ``"<provider>/<quantization>"`` slugs such
@@ -60,13 +64,25 @@ ollama:
   reasoning_effort: ""
 
 # Google AI Studio Interactions API adapter (POST /v1beta/interactions).
-# Requires GEMINI_API_KEY (or GOOGLE_API_KEY) in .env.
+# Requires GEMINI_API_KEY (or GOOGLE_API_KEY) in .env, OR set auth_mode: gcloud
+# to use your terminal gcloud authentication without needing an API key.
 gemini:
   base_url: https://generativelanguage.googleapis.com
   model: gemini-2.5-flash
   timeout_seconds: 90
   reasoning_effort: ""
   store: true
+  auth_mode: api_key  # api_key | gcloud
+
+# Google Cloud Vertex AI (OpenAI-compatible endpoint).
+# Authenticates directly via your terminal's `gcloud` CLI (no API key required).
+# Requires running `gcloud auth application-default login` or `gcloud auth login`.
+vertex:
+  project_id: ""  # Leave blank to auto-detect from active gcloud config or GCP_PROJECT env
+  location: "us-central1"
+  model: gemini-2.5-flash
+  timeout_seconds: 90
+  reasoning_effort: ""
 
 server:
   host: 127.0.0.1
