@@ -18,7 +18,7 @@ from agent.settings import Settings
 _LOG = logging.getLogger(__name__)
 
 DEFAULT_LOCATION = "us-central1"
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.8-flash"
 
 
 class VertexClient(ChatCompletionsClient):
@@ -66,7 +66,7 @@ class VertexClient(ChatCompletionsClient):
         name = model.strip() if model else DEFAULT_MODEL
         if name.startswith("models/"):
             name = name[7:]
-        # Vertex AI OpenAPI endpoint expects <publisher>/<model>, e.g. 'google/gemini-2.5-flash'
+        # Vertex AI OpenAPI endpoint expects <publisher>/<model>, e.g. 'google/gemini-3.8-flash'
         if "/" not in name:
             return f"google/{name}"
         return name

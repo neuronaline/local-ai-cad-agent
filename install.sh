@@ -149,7 +149,7 @@ echo "  Next steps:"
 LLM_PROVIDER="$("$VENV_PYTHON" -c 'from agent.settings import load_settings; print(load_settings().llm_provider)')"
 if [ "$LLM_PROVIDER" = "ollama" ]; then
     echo "  1. Prepare your Ollama model (16k context recommended):"
-    echo "     ${GREEN}./setup_ollama.sh qwen2.5-coder:14b${NC}"
+    echo "     ${GREEN}./setup_ollama.sh qwen3.8:27b${NC}"
     echo ""
     echo "  2. Start the application:"
     echo "     ${GREEN}./run.sh${NC}"

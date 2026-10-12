@@ -35,7 +35,7 @@ if ! curl -s -f -m 2 http://localhost:11434/api/tags >/dev/null 2>&1; then
 fi
 
 # 3. Model selection
-DEFAULT_MODEL="qwen2.5-coder:14b"
+DEFAULT_MODEL="qwen3.8:27b"
 BASE_MODEL="${1:-$DEFAULT_MODEL}"
 CONTEXT_SIZE="${2:-16384}"
 

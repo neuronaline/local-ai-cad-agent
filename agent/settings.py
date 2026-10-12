@@ -54,12 +54,12 @@ class Settings:
     openai_reasoning_effort: str | None = None
     # Ollama local Chat Completions adapter.
     ollama_base_url: str = "http://localhost:11434/v1"
-    ollama_model: str = "qwen2.5-coder:14b-16k"
+    ollama_model: str = "qwen3.8:27b"
     ollama_timeout_seconds: int = 120
     ollama_reasoning_effort: str | None = None
     # Gemini / Google AI Studio Interactions API adapter.
     gemini_base_url: str = "https://generativelanguage.googleapis.com"
-    gemini_model: str = "gemini-2.5-flash"
+    gemini_model: str = "gemini-3.8-flash"
     gemini_timeout_seconds: int = 90
     gemini_reasoning_effort: str | None = None
     gemini_store: bool = True
@@ -69,7 +69,7 @@ class Settings:
     # Vertex AI / gcloud terminal authentication adapter.
     vertex_project_id: str = ""
     vertex_location: str = "us-central1"
-    vertex_model: str = "gemini-2.5-flash"
+    vertex_model: str = "gemini-3.8-flash"
     vertex_timeout_seconds: int = 90
     vertex_reasoning_effort: str | None = None
     # ── end provider selection ──
@@ -440,11 +440,11 @@ def load_settings(project_root: Path | None = None) -> Settings:
         openai_timeout_seconds=_validate_timeout_seconds(openai.get("timeout_seconds", 60), "openai.timeout_seconds"),
         openai_reasoning_effort=_optional_effort(openai.get("reasoning_effort")),
         ollama_base_url=str(ollama.get("base_url") or "http://localhost:11434/v1").rstrip("/"),
-        ollama_model=str(ollama.get("model") or "qwen2.5-coder:14b-16k"),
+        ollama_model=str(ollama.get("model") or "qwen3.8:27b"),
         ollama_timeout_seconds=_validate_timeout_seconds(ollama.get("timeout_seconds") or 120, "ollama.timeout_seconds"),
         ollama_reasoning_effort=ollama_reasoning_effort,
         gemini_base_url=str(gemini.get("base_url") or "https://generativelanguage.googleapis.com").rstrip("/"),
-        gemini_model=str(gemini.get("model") or "gemini-2.5-flash"),
+        gemini_model=str(gemini.get("model") or "gemini-3.8-flash"),
         gemini_timeout_seconds=_validate_timeout_seconds(gemini.get("timeout_seconds") or 90, "gemini.timeout_seconds"),
         gemini_reasoning_effort=_optional_effort(gemini.get("reasoning_effort")),
         gemini_store=_strict_bool(gemini.get("store", True), "gemini.store"),
@@ -453,7 +453,7 @@ def load_settings(project_root: Path | None = None) -> Settings:
         gemini_location=str(gemini.get("location") or "us-central1").strip(),
         vertex_project_id=str(vertex.get("project_id") or "").strip(),
         vertex_location=str(vertex.get("location") or "us-central1").strip(),
-        vertex_model=str(vertex.get("model") or "gemini-2.5-flash").strip(),
+        vertex_model=str(vertex.get("model") or "gemini-3.8-flash").strip(),
         vertex_timeout_seconds=_validate_timeout_seconds(vertex.get("timeout_seconds") or 90, "vertex.timeout_seconds"),
         vertex_reasoning_effort=_optional_effort(vertex.get("reasoning_effort")),
         show_info_messages=_strict_bool(ui.get("show_info_messages", True), "ui.show_info_messages"),
@@ -576,7 +576,12 @@ def _validate_log_activity(
     if log_mode_raw is None:
         mode = "debug" if log_tool_activity else "off"
         return log_tool_activity, mode
-    mode = str(log_mode_raw).strip().lower()
+    if log_mode_raw is False:
+        mode = "off"
+    elif log_mode_raw is True:
+        mode = "debug"
+    else:
+        mode = str(log_mode_raw).strip().lower()
     if mode not in {"off", "debug", "dataset"}:
         raise ValueError(
             f"agent.log_mode must be 'off', 'debug', or 'dataset', got {log_mode_raw!r}."

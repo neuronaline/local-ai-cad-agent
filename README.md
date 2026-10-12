@@ -132,10 +132,10 @@ Choose your preferred provider below:
 2. Run our setup helper to pull and configure a model with a 16k context window (initial pull requires an internet connection; once downloaded, inference runs 100% offline):
 
    ```bash
-   ./setup_ollama.sh <model-name>
+   ./setup_ollama.sh qwen3.8:27b
    ```
 
-   *(This helper automatically builds a custom model variant named `<model-name>-16k` with a 16k context window and optimal temperature.)*
+   *(This helper automatically builds a custom model variant named `qwen3.8:27b-16k` with a 16k context window and optimal temperature.)*
 
 3. In `config.yaml`, set:
 
@@ -145,7 +145,7 @@ Choose your preferred provider below:
 
    ollama:
      base_url: http://localhost:11434/v1
-     model: <model-name>-16k
+     model: qwen3.8:27b
      timeout_seconds: 120
    ```
 
@@ -166,12 +166,12 @@ Choose your preferred provider below:
      provider: openrouter
 
    openrouter:
-     model: <provider>/<model-slug>
+     model:
      reasoning_effort: medium
    ```
 
 > [!IMPORTANT]
-> **Replace placeholder before starting:** `<provider>/<model-slug>` is a placeholder. You must replace it with an active model ID from the [OpenRouter Models Catalog](https://openrouter.ai/models) before starting the server.
+> **Set your model before starting:** Specify your preferred model ID from the [OpenRouter Models Catalog](https://openrouter.ai/models) in `config.yaml` before starting the server.
 
 #### Option C: Cloud with Direct OpenAI
 
@@ -209,11 +209,8 @@ Choose your preferred provider below:
      provider: gemini
 
    gemini:
-     model: <model-name>
+     model: gemini-3.8-flash
    ```
-
-> [!IMPORTANT]
-> **Replace placeholder before starting:** `<model-name>` is a placeholder. You must replace it with an active model slug from the [Google AI Studio Gemini Models Documentation](https://ai.google.dev/gemini-api/docs/models/gemini) before starting the server.
 
 #### Option E: Cloud with Google Cloud Vertex AI via `gcloud` (No API Key Needed)
 
@@ -233,7 +230,7 @@ Choose your preferred provider below:
    vertex:
      project_id: ""  # Leave blank to auto-detect from active gcloud config
      location: "us-central1"
-     model: <model-slug>
+     model: gemini-3.8-flash
    ```
 
    *(No `.env` API keys needed when authenticating via `gcloud`!)*
@@ -512,11 +509,11 @@ Settings are loaded from `config.yaml` (git-ignored) at startup. Copy `config.ex
 | Key | Default | Description |
 |---|---|---|
 | `openrouter.base_url` | `https://openrouter.ai/api/v1` | OpenRouter endpoint |
-| `openrouter.model` | *(empty)* | Model slug (e.g. `<provider>/<model-slug>`, see [OpenRouter Models](https://openrouter.ai/models)) |
+| `openrouter.model` | *(empty)* | Model slug (see [OpenRouter Models](https://openrouter.ai/models)) |
 | `openrouter.timeout_seconds` | `90` | HTTP request timeout in seconds |
 | `openrouter.reasoning_effort` | `medium` | Reasoning level: `minimal`, `low`, `medium`, or `high` |
 | `openrouter.reasoning_max_tokens` | `0` | Optional maximum tokens reserved for thinking (0 lets model decide) |
-| `openrouter.provider_order` | `["google-ai-studio", "google-vertex/global"]` | Priority-ordered upstream routing slugs |
+| `openrouter.provider_order` | `[]` | Priority-ordered upstream routing slugs |
 | `openrouter.provider` | `""` | Legacy single-provider slug |
 | `openrouter.force_provider` | `false` | Force pinned upstream with no fallback fanout |
 | `openrouter.enable_anthropic_cache` | `true` | Enable prompt caching for Anthropic models |
@@ -536,7 +533,7 @@ Settings are loaded from `config.yaml` (git-ignored) at startup. Copy `config.ex
 | Key | Default | Description |
 |---|---|---|
 | `ollama.base_url` | `http://localhost:11434/v1` | Ollama OpenAI-compatible endpoint |
-| `ollama.model` | *(empty)* | Name of your locally hosted model |
+| `ollama.model` | `qwen3.8:27b` | Name of your locally hosted model |
 | `ollama.timeout_seconds` | `120` | Request timeout in seconds (allows for local inference latency) |
 | `ollama.reasoning_effort` | `""` | Reasoning effort for thinking models (`low`, `medium`, `high`, or empty) |
 
@@ -545,7 +542,7 @@ Settings are loaded from `config.yaml` (git-ignored) at startup. Copy `config.ex
 | Key | Default | Description |
 |---|---|---|
 | `gemini.base_url` | `https://generativelanguage.googleapis.com` | Google AI Studio endpoint |
-| `gemini.model` | *(empty)* | Gemini model slug (refer to Google AI Studio documentation) |
+| `gemini.model` | `gemini-3.8-flash` | Gemini model slug (refer to Google AI Studio documentation) |
 | `gemini.timeout_seconds` | `90` | HTTP request timeout in seconds |
 | `gemini.reasoning_effort` | `""` | Reasoning effort for thinking models (`low`, `medium`, `high`, or empty) |
 | `gemini.store` | `true` | Enable interaction storage on Google backend |
@@ -557,7 +554,7 @@ Settings are loaded from `config.yaml` (git-ignored) at startup. Copy `config.ex
 |---|---|---|
 | `vertex.project_id` | `""` | GCP Project ID (auto-detected from active `gcloud` config if empty) |
 | `vertex.location` | `us-central1` | Vertex AI regional location |
-| `vertex.model` | *(empty)* | Gemini model on Vertex AI |
+| `vertex.model` | `gemini-3.8-flash` | Gemini model on Vertex AI |
 | `vertex.timeout_seconds` | `90` | HTTP request timeout in seconds |
 | `vertex.reasoning_effort` | `""` | Reasoning effort for thinking models (`low`, `medium`, `high`, or empty) |
 
