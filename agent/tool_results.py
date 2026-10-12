@@ -45,6 +45,19 @@ def is_failure(value: str) -> bool:
     return isinstance(payload, dict) and payload.get("ok") is False
 
 
+def _truncate_error_message(msg: str, max_chars: int = 600, max_lines: int = 10) -> str:
+    """Truncate verbose compiler/tool error messages to preserve context budget."""
+    lines = [line.strip() for line in msg.splitlines() if line.strip()]
+    if len(msg) <= max_chars and len(lines) <= max_lines:
+        return msg
+    if len(lines) > max_lines:
+        lines = lines[:max_lines] + ["... [truncated compiler output]"]
+    text = "\n".join(lines)
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip() + "\n... [truncated compiler output]"
+    return text
+
+
 def compact_for_context(tool: str, result: str) -> str:
     """Compact verbose tool envelopes for LLM context while keeping essential metrics."""
     if tool not in {"cad_build", "cad_build_and_verify", "get_view_images"}:
@@ -53,7 +66,22 @@ def compact_for_context(tool: str, result: str) -> str:
         payload = json.loads(result)
     except (TypeError, json.JSONDecodeError):
         return result
-    if not isinstance(payload, dict) or payload.get("ok") is not True:
+    if not isinstance(payload, dict):
+        return result
+    if payload.get("ok") is not True:
+        err = payload.get("error")
+        if isinstance(err, dict):
+            msg = err.get("message")
+            if isinstance(msg, str) and (len(msg) > 600 or msg.count("\n") >= 10):
+                compact_payload = dict(payload)
+                compact_err = dict(err)
+                compact_err["message"] = _truncate_error_message(msg)
+                compact_payload["error"] = compact_err
+                return json.dumps(compact_payload, ensure_ascii=False)
+        elif isinstance(err, str) and (len(err) > 600 or err.count("\n") >= 10):
+            compact_payload = dict(payload)
+            compact_payload["error"] = _truncate_error_message(err)
+            return json.dumps(compact_payload, ensure_ascii=False)
         return result
     data = payload.get("data")
     if not isinstance(data, dict):

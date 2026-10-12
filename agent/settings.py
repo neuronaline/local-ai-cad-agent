@@ -64,7 +64,7 @@ class Settings:
     gemini_store: bool = True
     # ── end provider selection ──
     show_info_messages: bool = True
-    agent_tool_call_limit: int = 12
+    agent_tool_call_limit: int = 15
     revision_retention_count: int = 0  # 0 = unlimited, >0 = keep at most N revisions
     agent_debug_log_tool_errors: bool = False
     # When True, every agent run writes a redacted, append-only JSONL
@@ -86,7 +86,7 @@ class Settings:
     # is the cell count per side. Defaults match the previous hard-coded grid.
     viewer_grid_size: float = 200.0
     viewer_grid_divisions: int = 20
-    llm_max_completion_tokens: int | None = 8192
+    llm_max_completion_tokens: int | None = 65536
 
     @property
     def llm_model(self) -> str:
@@ -341,9 +341,9 @@ def load_settings(project_root: Path | None = None) -> Settings:
         workspace_root=Path(config.get("workspace_root", "~/CAD-Agent-Projects")).expanduser(),
         openrouter_base_url=str(openrouter.get("base_url", "https://openrouter.ai/api/v1")).rstrip("/"),
         openrouter_model=str(openrouter.get("model") or ""),
-        openrouter_timeout_seconds=_validate_timeout_seconds(openrouter.get("timeout_seconds", 60), "openrouter.timeout_seconds"),
+        openrouter_timeout_seconds=_validate_timeout_seconds(openrouter.get("timeout_seconds", 90), "openrouter.timeout_seconds"),
         host=str(server.get("host", "127.0.0.1")),
-        port=_validate_port(server.get("port", 5000), "server.port"),
+        port=_validate_port(server.get("port", 8000), "server.port"),
         openrouter_app_title=str(openrouter.get("app_title", "Local AI CAD Agent")),
         openrouter_app_url=str(openrouter.get("app_url", "")).rstrip("/"),
         openrouter_session_prefix=str(openrouter.get("session_prefix", "local-ai-cad-agent")),
@@ -369,7 +369,7 @@ def load_settings(project_root: Path | None = None) -> Settings:
         gemini_reasoning_effort=_optional_effort(gemini.get("reasoning_effort")),
         gemini_store=_strict_bool(gemini.get("store", True), "gemini.store"),
         show_info_messages=_strict_bool(ui.get("show_info_messages", True), "ui.show_info_messages"),
-        agent_tool_call_limit=_positive_int(agent.get("tool_call_limit", 12), "agent.tool_call_limit"),
+        agent_tool_call_limit=_positive_int(agent.get("tool_call_limit", 15), "agent.tool_call_limit"),
         revision_retention_count=_non_negative_int(agent.get("revision_retention_count", 0), "agent.revision_retention_count"),
         agent_debug_log_tool_errors=_strict_bool(
             agent.get("debug_log_tool_errors", False), "agent.debug_log_tool_errors"
@@ -385,7 +385,7 @@ def load_settings(project_root: Path | None = None) -> Settings:
         viewer_grid_size=grid_size,
         viewer_grid_divisions=grid_divisions,
         llm_max_completion_tokens=_optional_positive_int(
-            llm.get("max_completion_tokens", 8192), "llm.max_completion_tokens"
+            llm.get("max_completion_tokens", 65536), "llm.max_completion_tokens"
         ),
     )
 

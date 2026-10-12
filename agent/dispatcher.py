@@ -347,49 +347,37 @@ def dispatch(
 
 
 def _dispatch_edit_file(file_tool, args: dict, call_id: str) -> tuple[object, bool]:
-    """Resolve ``edit_file`` arguments into a single ``edit_file`` /
-    ``edit_file_atomic`` call.
-
-    ``edit_file`` accepts either ``{old_string, new_string}`` for a
-    single replacement, or ``edits`` (a list of such pairs) for an
-    atomic batch. ``edit_file_atomic`` performs the batch safely so the
-    revision captures the final post-state under the file tool's lock.
-    """
-    tool = (
-        file_tool.with_call_id(call_id) if call_id else file_tool
-    )
+    """Resolve ``edit_file`` arguments into an edit execution."""
+    tool = file_tool.with_call_id(call_id) if call_id else file_tool
     edits = args.get("edits")
     if not edits and "old_string" in args:
-        new_str = args.get("new_string")
         edits = [
             {
                 "old_string": args["old_string"],
-                "new_string": "" if new_str is None else new_str,
+                "new_string": args.get("new_string", ""),
             }
         ]
     elif isinstance(edits, dict):
         edits = [edits]
-    if not edits:
-        raise ValueError(
-            "edit_file requires 'edits' (list of {old_string, new_string}) or 'old_string' and 'new_string'."
-        )
-    if not isinstance(edits, list):
-        raise ValueError("edit_file 'edits' must be a list of objects.")
+    if not isinstance(edits, list) or not edits:
+        raise ValueError("edit_file requires 'old_string' and 'new_string'.")
+
     cleaned_edits = []
-    for index, entry in enumerate(edits):
+    for entry in edits:
         if not isinstance(entry, dict):
             raise ValueError("edit_file 'edits' must be a list of objects.")
-        ns = entry.get("new_string")
+        old_str = entry.get("old_string")
+        if not isinstance(old_str, str):
+            raise ValueError("edit_file requires 'old_string' to be a string.")
+        ns = entry.get("new_string", "")
         cleaned_edits.append({
             **entry,
+            "old_string": old_str,
             "new_string": _clean_code_fences(
                 ns if isinstance(ns, str) else ("" if ns is None else str(ns))
             ),
         })
-    return (
-        tool.edit_file_atomic(MODEL_FILENAME, cleaned_edits),
-        False,
-    )
+    return tool.edit_file_atomic(MODEL_FILENAME, cleaned_edits), False
 
 
 def _dispatch_question(

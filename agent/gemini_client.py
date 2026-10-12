@@ -10,6 +10,7 @@ into the standard agent event stream and chat completion dictionary.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -24,8 +25,6 @@ from agent.llm_base import (
     RequestCancelled,
     StreamResponseError,
     _force_close_response,
-    _is_image_rejection,
-    _response_text,
     _stream_error_detail,
     extract_text_tool_calls,
     extract_think_tags,
@@ -33,6 +32,7 @@ from agent.llm_base import (
     post_with_cancel,
     strip_encrypted_reasoning,
 )
+from agent.prompt import TOOL_IMAGE_PROMPT
 from agent.settings import Settings
 
 _LOG = logging.getLogger(__name__)
@@ -114,12 +114,25 @@ def convert_messages_to_interactions(
     """
     system_instruction: str | None = None
     steps: list[dict[str, Any]] = []
-
-    # Map call_id -> function_name for tool responses that might lack the name field
     call_id_to_name: dict[str, str] = {}
+    pending_tool_images: list[dict[str, Any]] = []
+
+    def _flush_pending_images() -> None:
+        nonlocal pending_tool_images
+        if pending_tool_images:
+            steps.append(
+                {
+                    "type": "user_input",
+                    "content": [{"type": "text", "text": TOOL_IMAGE_PROMPT}] + pending_tool_images,
+                }
+            )
+            pending_tool_images = []
 
     for msg in messages:
         role = msg.get("role")
+        if role != "tool":
+            _flush_pending_images()
+
         if role == "system":
             text = ""
             content = msg.get("content")
@@ -214,7 +227,7 @@ def convert_messages_to_interactions(
                 if isinstance(raw_args, str):
                     try:
                         args = json.loads(raw_args)
-                    except Exception:
+                    except (json.JSONDecodeError, TypeError, ValueError):
                         args = {}
                 elif isinstance(raw_args, dict):
                     args = raw_args
@@ -235,18 +248,38 @@ def convert_messages_to_interactions(
             call_id = msg.get("tool_call_id") or ""
             fn_name = msg.get("name") or call_id_to_name.get(call_id, "unknown_tool")
             content = msg.get("content")
+            image_steps: list[dict[str, Any]] = []
             if isinstance(content, list):
-                text_parts = [
-                    p.get("text", "")
-                    for p in content
-                    if isinstance(p, dict) and p.get("type") == "text"
-                ]
-                content = "\n".join(tp for tp in text_parts if tp)
+                text_parts: list[str] = []
+                for p in content:
+                    if not isinstance(p, dict):
+                        continue
+                    ptype = p.get("type")
+                    if ptype == "text":
+                        t = p.get("text", "")
+                        if t:
+                            text_parts.append(t)
+                    elif ptype == "image_url":
+                        img_dict = p.get("image_url") or {}
+                        url = img_dict.get("url", "")
+                        parsed = _parse_data_uri(url)
+                        if parsed:
+                            mime, b64_data = parsed
+                            image_steps.append({
+                                "type": "image",
+                                "inline_data": {
+                                    "mime_type": mime,
+                                    "data": b64_data,
+                                },
+                            })
+                        elif url:
+                            image_steps.append({"type": "image", "image_url": url})
+                content = "\n".join(text_parts)
 
             if isinstance(content, str):
                 try:
                     res_val = json.loads(content)
-                except Exception:
+                except (json.JSONDecodeError, TypeError, ValueError):
                     res_val = {"output": content}
             elif isinstance(content, dict):
                 res_val = content
@@ -262,7 +295,10 @@ def convert_messages_to_interactions(
                     "result": res_val if isinstance(res_val, dict) else {"output": res_val},
                 }
             )
+            if image_steps:
+                pending_tool_images.extend(image_steps)
 
+    _flush_pending_images()
     return system_instruction, steps
 
 
@@ -447,11 +483,17 @@ def parse_interactions_stream(
                             "index": tool_calls.get(cid, {}).get("index", len(tool_calls)),
                         }
 
-    except Exception:
+    except Exception as err:
+        _force_close_response(response)
+        if isinstance(err, RequestCancelled):
+            raise
         if stop_event and stop_event.is_set():
-            _force_close_response(response)
-            raise RequestCancelled(f"{provider_label} request cancelled.")
-        raise
+            raise RequestCancelled(f"{provider_label} request cancelled.") from err
+        had_partial = bool(content or tool_calls or reasoning_text)
+        raise StreamResponseError(
+            f"{provider_label} streaming error: {err}",
+            retryable=not had_partial,
+        ) from err
 
     if stop_event and stop_event.is_set():
         _force_close_response(response)
@@ -634,7 +676,7 @@ class GoogleInteractionsClient(BaseLLMClient):
 
     def _endpoint(self) -> str:
         base = (self.settings.gemini_base_url or DEFAULT_BASE_URL).rstrip("/")
-        if base.endswith("/v1beta") or base.endswith("/v1"):
+        if base.endswith(("/v1beta", "/v1")):
             return f"{base}/interactions"
         return f"{base}/v1beta/interactions"
 
@@ -716,17 +758,13 @@ class GoogleInteractionsClient(BaseLLMClient):
             if self.stop_event is not None and self.stop_event.is_set():
                 _force_close_response(response)
             elif response is not None:
-                try:
+                with contextlib.suppress(Exception):
                     response.close()
-                except Exception:
-                    pass
 
     def _parse_non_stream_response(self, response: Any) -> dict[str, Any]:
         if hasattr(response, "read") and callable(response.read):
-            try:
+            with contextlib.suppress(Exception):
                 response.read()
-            except Exception:
-                pass
         body = response.json()
         parsed_body = parse_interactions_response(body)
         self.last_usage = parsed_body.get("usage")

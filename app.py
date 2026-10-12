@@ -143,11 +143,12 @@ def _hostname(header_value: str) -> str:
     # Strip path.
     value = value.split("/")[0]
     # Handle IPv6 brackets: [::1]:5000 -> ::1
-    if value.startswith("["):
-        value = value.lstrip("[").split("]")[0]
-    else:
-        value = value.split(":")[0]
-    return value
+    if "[" in value and "]" in value:
+        return value.split("[")[1].split("]")[0]
+    # Multiple colons indicate a bare IPv6 address without brackets
+    if value.count(":") > 1:
+        return value
+    return value.split(":")[0]
 
 
 def _active_api_key_env(settings: Settings) -> str:

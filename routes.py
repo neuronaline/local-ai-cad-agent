@@ -64,22 +64,6 @@ _MAX_DIFF_LINES = 500
 # ---------------------------------------------------------------------------
 
 
-def _hostname(header_value: str) -> str:
-    """Extract the bare hostname from a Host or Origin header."""
-    if not header_value:
-        return ""
-    # Strip scheme for Origin headers.
-    value = header_value.split("://")[-1]
-    # Strip path.
-    value = value.split("/")[0]
-    # Handle IPv6 brackets: [::1]:5000 -> ::1
-    if value.startswith("["):
-        value = value.lstrip("[").split("]")[0]
-    else:
-        value = value.split(":")[0]
-    return value
-
-
 def _project_path(settings: Settings, project_name: str) -> Path:
     if not PROJECT_NAME_RE.fullmatch(project_name):
         raise ValueError(
@@ -92,22 +76,23 @@ def _project_path(settings: Settings, project_name: str) -> Path:
 
 
 def _resolve_project_or_404(
-    settings: Settings, project_name: str
+    project_name: str,
+    settings: Settings | None = None,
 ) -> Path | tuple[Response, int]:
     """Return the project :class:`Path` or a Flask ``(body, 404)`` response.
 
     Callers should run this *inside* the project lock so a project that
     is concurrently deleted cannot leave the handler operating on a
     dangling path. The helper packages the resolve+404 dance into one
-    call so each handler — previously repeating the try/except outside
-    *and* inside the lock — only inspects the result once. The shape is::
+    call so each handler only inspects the result once. The shape is::
 
-        project_dir = _resolve_project_or_404(settings, project_name)
+        project_dir = _resolve_project_or_404(project_name)
         if not isinstance(project_dir, Path):
             return project_dir
     """
+    cfg = settings or current_app.config["SETTINGS"]
     try:
-        return _project_path(settings, project_name)
+        return _project_path(cfg, project_name)
     except (ValueError, FileNotFoundError) as error:
         return jsonify({"error": str(error)}), 404
 
@@ -470,9 +455,8 @@ def new_project():
 
 @projects_bp.delete("/api/projects/<project_name>")
 def delete_project(project_name: str):
-    settings: Settings = current_app.config["SETTINGS"]
     with _project_lock(project_name):
-        project_dir = _resolve_project_or_404(settings, project_name)
+        project_dir = _resolve_project_or_404(project_name)
         if not isinstance(project_dir, Path):
             return project_dir
         runner: AgentRunner = current_app.config["AGENT_RUNNER"]
@@ -501,9 +485,8 @@ def reset_project(project_name: str):
     review artifacts are left intact. Refuses to run while an agent task
     or a pending preview is in-flight so a reset cannot race the worker.
     """
-    settings: Settings = current_app.config["SETTINGS"]
     with _project_lock(project_name):
-        project_dir = _resolve_project_or_404(settings, project_name)
+        project_dir = _resolve_project_or_404(project_name)
         if not isinstance(project_dir, Path):
             return project_dir
         runner: AgentRunner = current_app.config["AGENT_RUNNER"]
@@ -537,7 +520,7 @@ def rename_project(project_name: str):
         return jsonify({"project": project_name})
     target = settings.workspace_root / new_name
     with _project_locks(project_name, new_name):
-        project_dir = _resolve_project_or_404(settings, project_name)
+        project_dir = _resolve_project_or_404(project_name)
         if not isinstance(project_dir, Path):
             return project_dir
         if target.exists():
@@ -610,9 +593,7 @@ def chat():
         )
         return jsonify({"error": msg, "active_project": active}), 409
     with _project_lock(project_name):
-        project_dir = _resolve_project_or_404(
-            current_app.config["SETTINGS"], project_name
-        )
+        project_dir = _resolve_project_or_404(project_name)
         if not isinstance(project_dir, Path):
             return project_dir
         try:
@@ -820,10 +801,10 @@ def project_render(project_name: str):
 
 @render_bp.get("/api/projects/<project_name>/preview")
 def preview(project_name: str):
-    try:
-        preview_path = _project_path(current_app.config["SETTINGS"], project_name) / "preview.stl"
-    except (ValueError, FileNotFoundError) as error:
-        return jsonify({"error": str(error)}), 404
+    project_dir = _resolve_project_or_404(project_name)
+    if not isinstance(project_dir, Path):
+        return project_dir
+    preview_path = project_dir / "preview.stl"
     if not preview_path.is_file():
         return jsonify({"error": "No preview has been generated."}), 404
     if preview_path.stat().st_size == 0:
@@ -833,11 +814,10 @@ def preview(project_name: str):
 
 @render_bp.get("/api/projects/<project_name>/preview/meta")
 def preview_meta(project_name: str):
-    try:
-        project_dir = _project_path(current_app.config["SETTINGS"], project_name)
-        preview_path = project_dir / "preview.stl"
-    except (ValueError, FileNotFoundError) as error:
-        return jsonify({"error": str(error)}), 404
+    project_dir = _resolve_project_or_404(project_name)
+    if not isinstance(project_dir, Path):
+        return project_dir
+    preview_path = project_dir / "preview.stl"
     if not preview_path.is_file() or preview_path.stat().st_size == 0:
         return jsonify({"available": False, "displayable": False})
     stat = preview_path.stat()
@@ -865,10 +845,9 @@ def export_model(project_name: str):
     if fmt not in SUPPORTED_EXPORT_FORMATS:
         supported = ", ".join(sorted(SUPPORTED_EXPORT_FORMATS))
         return jsonify({"error": f"Unsupported format '{fmt}'. Supported: {supported}"}), 400
-    try:
-        project_dir = _project_path(current_app.config["SETTINGS"], project_name)
-    except (ValueError, FileNotFoundError) as error:
-        return jsonify({"error": str(error)}), 404
+    project_dir = _resolve_project_or_404(project_name)
+    if not isinstance(project_dir, Path):
+        return project_dir
 
     try:
         exported_path = export_project_model(project_dir, fmt)
@@ -902,10 +881,9 @@ _REVIEW_SHEET_NAME = "review-sheet.png"
 
 @review_bp.get("/api/projects/<project_name>/review/manifest")
 def review_manifest(project_name: str):
-    try:
-        project_dir = _project_path(current_app.config["SETTINGS"], project_name)
-    except (ValueError, FileNotFoundError) as error:
-        return jsonify({"error": str(error)}), 404
+    project_dir = _resolve_project_or_404(project_name)
+    if not isinstance(project_dir, Path):
+        return project_dir
     model_path = project_dir / MODEL_FILENAME
     if not model_path.is_file():
         return jsonify({"error": f"{MODEL_FILENAME} is missing."}), 404
@@ -927,10 +905,9 @@ def review_manifest(project_name: str):
 
 @review_bp.get("/api/projects/<project_name>/review/sheet")
 def review_sheet(project_name: str):
-    try:
-        project_dir = _project_path(current_app.config["SETTINGS"], project_name)
-    except (ValueError, FileNotFoundError) as error:
-        return jsonify({"error": str(error)}), 404
+    project_dir = _resolve_project_or_404(project_name)
+    if not isinstance(project_dir, Path):
+        return project_dir
     model_path = project_dir / MODEL_FILENAME
     if not model_path.is_file():
         return jsonify({"error": f"{MODEL_FILENAME} is missing."}), 404
@@ -946,10 +923,9 @@ def review_sheet(project_name: str):
 
 @review_bp.get("/api/projects/<project_name>/review/view/<view_id>")
 def review_view(project_name: str, view_id: str):
-    try:
-        project_dir = _project_path(current_app.config["SETTINGS"], project_name)
-    except (ValueError, FileNotFoundError) as error:
-        return jsonify({"error": str(error)}), 404
+    project_dir = _resolve_project_or_404(project_name)
+    if not isinstance(project_dir, Path):
+        return project_dir
     # ``view_id`` is a filesystem identifier; restrict to the documented
     # canonical names to avoid path traversal via the URL.
     if not view_id or "/" in view_id or "\\" in view_id or view_id.startswith("."):
@@ -1094,7 +1070,7 @@ def revision_diff(project_name: str, revision_id: str):
 def restore_revision(project_name: str, revision_id: str):
     settings: Settings = current_app.config["SETTINGS"]
     with _project_lock(project_name):
-        project_dir = _resolve_project_or_404(settings, project_name)
+        project_dir = _resolve_project_or_404(project_name)
         if not isinstance(project_dir, Path):
             return project_dir
         runner: AgentRunner = current_app.config["AGENT_RUNNER"]
@@ -1219,7 +1195,7 @@ def build_project(project_name: str):
     """Rebuild preview.stl and metrics directly from the current model.scad."""
     settings: Settings = current_app.config["SETTINGS"]
     with _project_lock(project_name):
-        project_dir = _resolve_project_or_404(settings, project_name)
+        project_dir = _resolve_project_or_404(project_name)
         if not isinstance(project_dir, Path):
             return project_dir
         runner: AgentRunner = current_app.config["AGENT_RUNNER"]
@@ -1275,9 +1251,8 @@ def build_project(project_name: str):
 @projects_bp.get("/api/projects/<project_name>/code")
 def get_project_code(project_name: str):
     """Retrieve raw model.scad source for the project."""
-    settings: Settings = current_app.config["SETTINGS"]
     with _project_lock(project_name):
-        project_dir = _resolve_project_or_404(settings, project_name)
+        project_dir = _resolve_project_or_404(project_name)
         if not isinstance(project_dir, Path):
             return project_dir
         model_path = project_dir / MODEL_FILENAME
@@ -1298,7 +1273,7 @@ def update_project_code(project_name: str):
     """Update model.scad source and commit a user revision."""
     settings: Settings = current_app.config["SETTINGS"]
     with _project_lock(project_name):
-        project_dir = _resolve_project_or_404(settings, project_name)
+        project_dir = _resolve_project_or_404(project_name)
         if not isinstance(project_dir, Path):
             return project_dir
         runner: AgentRunner = current_app.config["AGENT_RUNNER"]

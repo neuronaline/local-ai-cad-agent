@@ -6,7 +6,7 @@
 
 A local-first, self-hosted web application that lets you **create and refine parametric 3D CAD models through natural language conversations with an AI agent**.
 
-Built with [OpenSCAD](https://openscad.org/) for solid geometry, [Three.js](https://threejs.org/) for in-browser 3D inspection, and [Bubblewrap](https://github.com/containers/bubblewrap) for isolated code execution. Run completely offline with local models via **Ollama** (once model weights are pulled, all generation runs with zero telemetry or network calls), or connect to cloud models through **OpenRouter** or **OpenAI**.
+Built with [OpenSCAD](https://openscad.org/) for solid geometry, [Three.js](https://threejs.org/) for in-browser 3D inspection, and [Bubblewrap](https://github.com/containers/bubblewrap) for isolated code execution. Run completely offline with local models via **Ollama** (once model weights are pulled, all generation runs with zero telemetry or network calls), or connect to cloud models through **OpenRouter**, **OpenAI**, or **Google Gemini** (Google AI Studio Interactions API).
 
 > **⚠️ Project Status:** This project is under **active development** and is currently a **hobby project**. It excels at **functional mechanical parts, enclosures, brackets, adapters, and simple-to-intermediate 3D-printable models**. Highly intricate, organic, or sculptural geometry is outside its current scope.
 
@@ -48,7 +48,7 @@ Built with [OpenSCAD](https://openscad.org/) for solid geometry, [Three.js](http
 
 - 💬 **Chat-Driven Parametric CAD** — Describe components, dimensions, tolerances, and design intent in plain English. The agent authors and edits clean, parametric OpenSCAD scripts (`model.scad`).
 - 🧠 **Live Streaming & Reasoning** — Watch the model's chain-of-thought and tool invocations stream in real time via Server-Sent Events (SSE).
-- 🦙 **Local & Cloud LLMs** — Full support for **Ollama** (offline, private, no API keys), alongside **OpenRouter** and **OpenAI**, with optional automatic secondary fallback.
+- 🦙 **Local & Cloud LLMs** — Full support for **Ollama** (offline, private, no API keys), alongside **OpenRouter**, **OpenAI**, and **Google Gemini**, with optional automatic secondary fallback.
 - 🛡️ **Sandboxed Code Execution** — OpenSCAD runs inside an isolated [Bubblewrap](https://github.com/containers/bubblewrap) container with detached networking and read-only host mounts.
 - 🔍 **Deterministic Build & Mesh Verification** — Automatically validates code syntax, manifold mesh topology, non-zero volume, bounds, and parametric conventions with categorized risk scoring on every build.
 - 📸 **Multi-View Visual Inspection** — Parallel rendering of 8 canonical camera views plus an assembled contact sheet, allowing the agent to visually inspect geometry and correct defects (`get_view_images`).
@@ -84,7 +84,7 @@ Built with [OpenSCAD](https://openscad.org/) for solid geometry, [Three.js](http
   - `libgl1-mesa-dri` (software OpenGL rasterizer / `llvmpipe` for zero-GPU headless rendering)
 - **LLM Provider (choose at least one):**
   - **Local:** [Ollama](https://ollama.com) (e.g. `qwen2.5-coder:14b-16k`)
-  - **Cloud:** [OpenRouter](https://openrouter.ai/keys) or [OpenAI](https://platform.openai.com/api-keys)
+  - **Cloud:** [OpenRouter](https://openrouter.ai/keys), [OpenAI](https://platform.openai.com/api-keys), or [Google AI Studio (Gemini)](https://aistudio.google.com/)
 
 ### 🖥️ Hardware Recommendations (for Local LLMs)
 
@@ -135,7 +135,7 @@ Choose your preferred provider below:
    ./setup_ollama.sh qwen2.5-coder:14b
    ```
 
-   *(This creates a custom model variant named `qwen2.5-coder:14b-16k` via [Modelfile.example](Modelfile.example).)*
+   *(This helper automatically builds a custom model variant named `qwen2.5-coder:14b-16k` with a 16k context window and optimal temperature.)*
 
 3. In `config.yaml`, set:
 
@@ -193,6 +193,24 @@ Choose your preferred provider below:
 
 > [!IMPORTANT]
 > **Replace placeholder before starting:** `<model-name>` is a placeholder. You must replace it with a supported model name from the [OpenAI Models Documentation](https://platform.openai.com/docs/models) before starting the server.
+
+#### Option D: Cloud with Google AI Studio (Gemini)
+
+1. In `.env`, add your Gemini / Google AI Studio API key:
+
+   ```bash
+   GEMINI_API_KEY=AIzaSy...
+   ```
+
+2. In `config.yaml`, set:
+
+   ```yaml
+   llm:
+     provider: gemini
+
+   gemini:
+     model: gemini-2.5-flash
+   ```
 
 ---
 
@@ -348,8 +366,8 @@ flowchart TD
 
 - **`read_file`** — Inspect existing `model.scad` content with optional offset/limit paging.
 - **`write_file`** — Perform initial file creation or deliberate full rewrites.
-- **`edit_file`** — Apply single or atomic batch (up to 16) exact replacements to preserve parametric structure.
-- **`cad_build`** (legacy alias `cad_build_and_verify`) — Compiles `model.scad` in the Bubblewrap sandbox, produces 8 canonical views and the review contact sheet, and runs deterministic code and mesh verification (manifoldness, watertightness, volume, solid count, $fn/EPS rules, risk score).
+- **`edit_file`** — Apply targeted exact string replacements (matching `old_string` to `new_string`) to preserve parametric structure.
+- **`cad_build`** (legacy alias `cad_build_and_verify`) — Compiles `model.scad` in the Bubblewrap sandbox, produces canonical renders (when `views` is requested), and runs deterministic code and mesh verification (manifoldness, watertightness, volume, solid count, $fn/EPS rules, risk score). Supports optional `views` (e.g. `["isometric"]` or `["all"]`), `resolution` (512 or 1024), and `crop` bounding boxes.
 - **`get_view_images`** — Fetches rendered canonical views or the 8-view contact sheet as visual memory to evaluate geometry.
 - **`question`** — Halts execution to present structured input fields to the user for clarification.
 
@@ -459,7 +477,7 @@ Settings are loaded from `config.yaml` (git-ignored) at startup. Copy `config.ex
 
 | Key | Default | Description |
 |---|---|---|
-| `llm.provider` | `openrouter` | Active provider: `openrouter`, `openai`, or `ollama` |
+| `llm.provider` | `openrouter` | Active provider: `openrouter`, `openai`, `ollama`, or `gemini` |
 | `llm.max_completion_tokens` | `65536` | Token limit for LLM completions |
 | `llm.fallback_provider` | `""` | Optional secondary provider to failover to on unexpected API errors |
 
@@ -494,6 +512,16 @@ Settings are loaded from `config.yaml` (git-ignored) at startup. Copy `config.ex
 | `ollama.model` | `qwen2.5-coder:14b-16k` | Name of your locally hosted model |
 | `ollama.timeout_seconds` | `120` | Request timeout in seconds (allows for local inference latency) |
 | `ollama.reasoning_effort` | `""` | Reasoning effort for thinking models (`low`, `medium`, `high`, or empty) |
+
+### Gemini Settings (Google AI Studio)
+
+| Key | Default | Description |
+|---|---|---|
+| `gemini.base_url` | `https://generativelanguage.googleapis.com` | Google AI Studio endpoint |
+| `gemini.model` | `gemini-2.5-flash` | Gemini model slug (e.g. `gemini-2.5-flash`, `gemini-2.5-pro`) |
+| `gemini.timeout_seconds` | `90` | HTTP request timeout in seconds |
+| `gemini.reasoning_effort` | `""` | Reasoning effort for thinking models (`low`, `medium`, `high`, or empty) |
+| `gemini.store` | `true` | Enable interaction storage on Google backend |
 
 ### Server & UI Settings
 

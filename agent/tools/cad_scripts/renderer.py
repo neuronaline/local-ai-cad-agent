@@ -386,8 +386,15 @@ def _worker_render(args: tuple[str, dict[str, object]]) -> dict[str, object]:
     resolution = int(view_dict.get("resolution", _WIDTH) or _WIDTH)
     camera_axis = np.array(view_dict["camera_axis"], dtype=np.float64)
     screen_x_axis = np.array(view_dict["screen_x_axis"], dtype=np.float64)
-    light = np.array(view_dict.get("light", (0.35, -0.25, 0.9)), dtype=np.float64)
-    light /= np.linalg.norm(light)
+    raw_light = view_dict.get("light")
+    if raw_light is not None:
+        light = np.array(raw_light, dtype=np.float64)
+    else:
+        cam_dir = camera_axis / max(np.linalg.norm(camera_axis), 1e-12)
+        sx_dir = screen_x_axis / max(np.linalg.norm(screen_x_axis), 1e-12)
+        sy_dir = np.cross(cam_dir, sx_dir)
+        light = cam_dir + 0.35 * sx_dir + 0.45 * sy_dir
+    light /= max(np.linalg.norm(light), 1e-12)
     vertices_blob = view_dict["vertices"]
     triangles_blob = view_dict["triangles"]
     vertices = np.frombuffer(vertices_blob, dtype=np.float64).reshape(-1, 3).copy()
@@ -527,7 +534,6 @@ def render_views(
             {
                 "camera_axis": spec.camera_axis,
                 "screen_x_axis": spec.screen_x_axis,
-                "light": (0.35, -0.25, 0.9),
                 "vertices": vertices.tobytes(),
                 "triangles": triangles.tobytes(),
                 "resolution": resolution,
