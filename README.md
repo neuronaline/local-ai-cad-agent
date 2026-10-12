@@ -209,8 +209,11 @@ Choose your preferred provider below:
      provider: gemini
 
    gemini:
-     model: gemini-2.5-flash
+     model: <model-name>
    ```
+
+> [!IMPORTANT]
+> **Replace placeholder before starting:** `<model-name>` is a placeholder. You must replace it with an active model slug from the [Google AI Studio Gemini Models Documentation](https://ai.google.dev/gemini-api/docs/models/gemini) before starting the server.
 
 ---
 
@@ -518,7 +521,7 @@ Settings are loaded from `config.yaml` (git-ignored) at startup. Copy `config.ex
 | Key | Default | Description |
 |---|---|---|
 | `gemini.base_url` | `https://generativelanguage.googleapis.com` | Google AI Studio endpoint |
-| `gemini.model` | `gemini-2.5-flash` | Gemini model slug (e.g. `gemini-2.5-flash`, `gemini-2.5-pro`) |
+| `gemini.model` | `""` | Gemini model slug (refer to Google AI Studio documentation) |
 | `gemini.timeout_seconds` | `90` | HTTP request timeout in seconds |
 | `gemini.reasoning_effort` | `""` | Reasoning effort for thinking models (`low`, `medium`, `high`, or empty) |
 | `gemini.store` | `true` | Enable interaction storage on Google backend |
