@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import threading
+import uuid
 from copy import deepcopy
 from typing import Any
 
@@ -222,7 +223,7 @@ def convert_messages_to_interactions(
             for tc in tool_calls:
                 fn = tc.get("function") or {}
                 fn_name = fn.get("name") or ""
-                call_id = tc.get("id") or f"call_{len(call_id_to_name)}"
+                call_id = tc.get("id") or f"call_{uuid.uuid4().hex[:8]}"
                 if fn_name:
                     call_id_to_name[call_id] = fn_name
                 raw_args = fn.get("arguments", "{}")
@@ -235,16 +236,18 @@ def convert_messages_to_interactions(
                     args = raw_args
                 else:
                     args = {}
-                steps.append(
-                    {
-                        "type": "function_call",
-                        "id": call_id,
-                        "call_id": call_id,
-                        "name": fn_name,
-                        "arguments": args,
-                        "args": args,
-                    }
-                )
+                step_item = {
+                    "type": "function_call",
+                    "id": call_id,
+                    "call_id": call_id,
+                    "name": fn_name,
+                    "arguments": args,
+                    "args": args,
+                }
+                sig = tc.get("thought_signature") or "skip_thought_signature_validator"
+                if sig:
+                    step_item["thought_signature"] = sig
+                steps.append(step_item)
 
         elif role == "tool":
             call_id = msg.get("tool_call_id") or ""
@@ -301,6 +304,11 @@ def convert_messages_to_interactions(
                 pending_tool_images.extend(image_steps)
 
     _flush_pending_images()
+    if steps and steps[-1].get("type") in ("model_output", "thought", "function_call"):
+        steps.append({
+            "type": "user_input",
+            "content": [{"type": "text", "text": "Continue."}],
+        })
     return system_instruction, steps
 
 
@@ -419,8 +427,13 @@ def parse_interactions_stream(
                     call_id = (
                         fc_data.get("call_id")
                         or fc_data.get("id")
-                        or f"call_{len(tool_calls)}"
+                        or event.get("step_id")
                     )
+                    if not call_id:
+                        if tool_calls and not fc_data.get("name"):
+                            call_id = list(tool_calls.keys())[-1]
+                        else:
+                            call_id = f"call_{uuid.uuid4().hex[:8]}"
                     fn_name = fc_data.get("name") or ""
                     args_delta = (
                         fc_data.get("arguments_delta")
@@ -443,6 +456,10 @@ def parse_interactions_stream(
                         entry["function"]["name"] = fn_name
                     if args_delta:
                         entry["function"]["arguments"] += args_delta
+
+                    sig = fc_data.get("thought_signature") or delta.get("thought_signature")
+                    if sig and not entry.get("thought_signature"):
+                        entry["thought_signature"] = sig
 
                     if stream_callback:
                         stream_callback(
@@ -474,16 +491,20 @@ def parse_interactions_stream(
                             if isinstance(p, dict) and p.get("type") == "text":
                                 reasoning_text += p.get("text", "")
                     elif stype == "function_call":
-                        cid = s.get("call_id") or s.get("id") or f"call_{len(tool_calls)}"
+                        cid = s.get("call_id") or s.get("id") or s.get("step_id") or f"call_{uuid.uuid4().hex[:8]}"
                         fname = s.get("name") or ""
                         fargs = s.get("args") or s.get("arguments") or {}
                         arg_str = json.dumps(fargs) if isinstance(fargs, dict) else str(fargs)
-                        tool_calls[cid] = {
+                        tc_entry = {
                             "id": cid,
                             "type": "function",
                             "function": {"name": fname, "arguments": arg_str},
                             "index": tool_calls.get(cid, {}).get("index", len(tool_calls)),
                         }
+                        sig = s.get("thought_signature")
+                        if sig:
+                            tc_entry["thought_signature"] = sig
+                        tool_calls[cid] = tc_entry
 
     except Exception as err:
         _force_close_response(response)
@@ -517,7 +538,9 @@ def parse_interactions_stream(
     content = cleaned_content
     if not tool_calls and text_calls:
         for idx, call in enumerate(text_calls):
-            tool_calls[f"call_{idx}"] = call
+            cid = call.get("id") or f"call_{uuid.uuid4().hex[:8]}"
+            call["id"] = cid
+            tool_calls[cid] = call
 
     if not content and not tool_calls:
         if reasoning_text.strip() and finish_reason in (None, "stop", "completed"):
@@ -532,6 +555,9 @@ def parse_interactions_stream(
 
     message: dict[str, Any] = {"role": "assistant", "content": content or None}
     if tool_calls:
+        for tc in tool_calls.values():
+            if not tc.get("thought_signature"):
+                tc["thought_signature"] = "skip_thought_signature_validator"
         message["tool_calls"] = list(tool_calls.values())
     if reasoning_text.strip():
         clean_r = strip_encrypted_reasoning(reasoning_text)
@@ -569,17 +595,19 @@ def parse_interactions_response(body: dict[str, Any]) -> dict[str, Any]:
                 if isinstance(part, dict) and part.get("type") == "text":
                     reasoning_text += part.get("text", "")
         elif step_type == "function_call":
-            call_id = step.get("call_id") or step.get("id") or f"call_{len(tool_calls)}"
+            call_id = step.get("call_id") or step.get("id") or step.get("step_id") or f"call_{uuid.uuid4().hex[:8]}"
             fn_name = step.get("name") or ""
             args = step.get("args") or step.get("arguments") or {}
             arg_str = json.dumps(args) if isinstance(args, dict) else str(args)
-            tool_calls.append(
-                {
-                    "id": call_id,
-                    "type": "function",
-                    "function": {"name": fn_name, "arguments": arg_str},
-                }
-            )
+            tc_dict: dict[str, Any] = {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": fn_name, "arguments": arg_str},
+            }
+            sig = step.get("thought_signature") or "skip_thought_signature_validator"
+            if sig:
+                tc_dict["thought_signature"] = sig
+            tool_calls.append(tc_dict)
 
     usage_meta = body.get("usage") or body.get("usage_metadata")
     usage: dict[str, Any] | None = None
@@ -621,6 +649,11 @@ def parse_interactions_response(body: dict[str, Any]) -> dict[str, Any]:
     cleaned_content, text_calls = extract_text_tool_calls(content)
     content = cleaned_content
     if not tool_calls and text_calls:
+        for tc in text_calls:
+            if not tc.get("id"):
+                tc["id"] = f"call_{uuid.uuid4().hex[:8]}"
+            if not tc.get("thought_signature"):
+                tc["thought_signature"] = "skip_thought_signature_validator"
         tool_calls = text_calls
 
     finish_reason = body.get("finish_reason") or body.get("status")
@@ -644,6 +677,9 @@ def parse_interactions_response(body: dict[str, Any]) -> dict[str, Any]:
 
     message: dict[str, Any] = {"role": "assistant", "content": content or None}
     if tool_calls:
+        for tc in tool_calls:
+            if not tc.get("thought_signature"):
+                tc["thought_signature"] = "skip_thought_signature_validator"
         message["tool_calls"] = tool_calls
     if reasoning_text.strip():
         clean_r = strip_encrypted_reasoning(reasoning_text)
@@ -715,13 +751,35 @@ class GoogleInteractionsClient(BaseLLMClient):
         gen_config: dict[str, Any] = {}
         if self.settings.llm_max_completion_tokens:
             gen_config["max_output_tokens"] = self.settings.llm_max_completion_tokens
-        if self.settings.gemini_reasoning_effort:
-            gen_config["thinking_config"] = {
-                "thinking_level": self.settings.gemini_reasoning_effort,
-                "include_thoughts": True,
-            }
+
+        model_name = (self.settings.gemini_model or "").lower()
+        is_gemini_3 = "3." in model_name or "gemini-3" in model_name
+        effort = (self.settings.gemini_reasoning_effort or "").lower().strip()
+
+        thinking_config: dict[str, Any] = {"include_thoughts": True}
+        if effort:
+            if is_gemini_3:
+                level_map = {
+                    "low": "LOW",
+                    "medium": "MEDIUM",
+                    "high": "HIGH",
+                    "minimal": "MINIMAL",
+                }
+                thinking_config["thinking_level"] = level_map.get(effort, effort.upper())
+            else:
+                budget_map = {
+                    "minimal": 1024,
+                    "low": 2048,
+                    "medium": 4096,
+                    "high": 8192,
+                }
+                thinking_config["thinking_budget"] = budget_map.get(effort, 8192)
+        elif is_gemini_3:
+            thinking_config["thinking_level"] = "HIGH"
         else:
-            gen_config["thinking_config"] = {"include_thoughts": True}
+            thinking_config["thinking_budget"] = 8192
+
+        gen_config["thinking_config"] = thinking_config
         if gen_config:
             payload["generation_config"] = gen_config
 

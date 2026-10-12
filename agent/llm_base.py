@@ -14,6 +14,7 @@ import queue
 import re
 import threading
 import time
+import uuid
 from copy import deepcopy
 from typing import Any
 
@@ -256,6 +257,20 @@ def sanitize_assistant_message(
         if not sanitized.get("tool_calls") and extra_calls:
             sanitized["tool_calls"] = extra_calls
 
+    tool_calls = sanitized.get("tool_calls")
+    if isinstance(tool_calls, list):
+        cleaned_calls = []
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            tc_copy = deepcopy(tc)
+            # Ensure thought_signature is present; fallback to Google's official sentinel
+            # to prevent 400 INVALID_ARGUMENT from Gemini / Vertex AI endpoints.
+            if not tc_copy.get("thought_signature"):
+                tc_copy["thought_signature"] = "skip_thought_signature_validator"
+            cleaned_calls.append(tc_copy)
+        sanitized["tool_calls"] = cleaned_calls
+
     for key in list(sanitized):
         if key.startswith("_"):
             sanitized.pop(key, None)
@@ -278,7 +293,9 @@ def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     prompt with dynamic workspace state changes the cacheable prefix on every
     state change, defeating provider prompt caches.
     Adjacent non-system messages with the same role (e.g. consecutive 'user'
-    messages) are merged to satisfy strict provider role-alternation contracts.
+    or 'assistant' messages) are merged to satisfy strict provider role-alternation contracts.
+    Trailing assistant messages are closed with a synthetic user prompt to satisfy
+    providers that disallow conversations ending on a model turn (e.g. Google Vertex Gemini).
     """
     system_messages: list[dict[str, Any]] = []
     non_system: list[dict[str, Any]] = []
@@ -310,8 +327,29 @@ def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 prev["content"] = [{"type": "text", "text": prev_content}, *curr_content]
             elif isinstance(prev_content, list) and isinstance(curr_content, list):
                 prev["content"] = [*prev_content, *curr_content]
+        elif (
+            merged_non_system
+            and merged_non_system[-1].get("role") == "assistant"
+            and msg.get("role") == "assistant"
+        ):
+            # Combine consecutive assistant messages to preserve strict role alternation
+            prev = merged_non_system[-1]
+            prev_content = prev.get("content") or ""
+            curr_content = msg.get("content") or ""
+            if prev_content and curr_content:
+                prev["content"] = f"{prev_content}\n\n{curr_content}"
+            elif curr_content:
+                prev["content"] = curr_content
+            prev_tcs = prev.get("tool_calls") or []
+            curr_tcs = msg.get("tool_calls") or []
+            if curr_tcs:
+                prev["tool_calls"] = prev_tcs + curr_tcs
         else:
             merged_non_system.append(msg)
+
+    # Gemini / Vertex AI reject requests ending with a model turn
+    if merged_non_system and merged_non_system[-1].get("role") == "assistant":
+        merged_non_system.append({"role": "user", "content": "Continue."})
 
     return system_messages + merged_non_system
 
@@ -931,12 +969,15 @@ def parse_chat_stream(
                 if call_delta.get("id"):
                     call["id"] = call_delta["id"]
                 elif not call["id"]:
-                    call["id"] = f"call_{index}"
+                    call["id"] = f"call_{uuid.uuid4().hex[:8]}"
                 function = call_delta.get("function") or {}
                 name_delta = function.get("name") or ""
                 arguments_delta = function.get("arguments") or ""
                 call["function"]["name"] += name_delta
                 call["function"]["arguments"] += arguments_delta
+                sig = call_delta.get("thought_signature") or function.get("thought_signature")
+                if sig and "thought_signature" not in call:
+                    call["thought_signature"] = sig
                 if stream_callback:
                     stream_callback(
                         {
@@ -1034,7 +1075,9 @@ def parse_chat_stream(
     if tool_calls:
         for idx, call in tool_calls.items():
             if not call.get("id"):
-                call["id"] = f"call_{idx}"
+                call["id"] = f"call_{uuid.uuid4().hex[:8]}"
+            if not call.get("thought_signature"):
+                call["thought_signature"] = "skip_thought_signature_validator"
         message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
     if reasoning_details:
         message["reasoning_details"] = reasoning_details
