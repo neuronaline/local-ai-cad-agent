@@ -119,13 +119,16 @@ def compact_for_context(tool: str, result: str) -> str:
         compact_data["feature_summary"] = features
     verif = data.get("verification")
     if isinstance(verif, dict) and verif:
-        compact_data["verification"] = {
+        verif_dict: dict[str, Any] = {
             "status": verif.get("status"),
             "risk_score": verif.get("risk_score"),
             "risk_level": verif.get("risk_level"),
-            "findings": verif.get("findings", []),
             "watertight": (verif.get("mesh_integrity") or {}).get("watertight"),
         }
+        findings = verif.get("findings")
+        if findings:
+            verif_dict["findings"] = findings
+        compact_data["verification"] = verif_dict
     raw_images = data.get("images")
     if isinstance(raw_images, list) and raw_images:
         compact_data["images"] = [
@@ -282,6 +285,28 @@ def _classify(tool: str, error: Exception, message: str) -> tuple[str, str, bool
             True,
             TOOL_HINTS["CAD_BUILD_FAILED"].format(filename="model.scad"),
         )
+    if tool == "get_view_images":
+        if "again" in lower or "missing manifest" in lower:
+            return (
+                "IMAGE_RUN_CAD_BUILD_AGAIN",
+                "execution",
+                True,
+                TOOL_HINTS["IMAGE_RUN_CAD_BUILD_AGAIN"],
+            )
+        if "refresh" in lower or "could not all be produced" in lower:
+            return (
+                "IMAGE_REFRESH_REVIEW",
+                "execution",
+                True,
+                TOOL_HINTS["IMAGE_REFRESH_REVIEW"],
+            )
+        if "compile and render" in lower or "run cad_build" in lower or "no review artifacts" in lower:
+            return (
+                "IMAGE_RUN_CAD_BUILD_FIRST",
+                "execution",
+                True,
+                TOOL_HINTS["IMAGE_RUN_CAD_BUILD_FIRST"],
+            )
     if isinstance(error, (ValueError, TypeError, KeyError)):
         return (
             "VALIDATION_ERROR",

@@ -897,13 +897,20 @@ class AgentRunner:
                 state.messages,
             )
             processed_call_ids.add(call_id)
-            if is_cad_build(call.get("function", {}).get("name", "")):
+            tool_name = call.get("function", {}).get("name", "")
+            if tool_name in {"write_file", "edit_file"}:
+                state.nudged_cad = False
+                state.nudged_final_verification = False
+            elif is_cad_build(tool_name):
+                state.nudged_cad = False
                 # Circuit-breaker for repeated CAD build failures; reset
                 # on every successful build so a stale history cannot
                 # trip the breaker on a future invocation.
                 if not state.cad_error:
                     state.build_failure_count = 0
                     state.build_failure_signatures.clear()
+                    if not state.cad_fix_required:
+                        state.nudged_final_verification = False
                 else:
                     state.build_failure_count += 1
                     signature = self._failure_signature(state.cad_error)
@@ -987,15 +994,18 @@ class AgentRunner:
                 "message": "Task stopped.",
             },
         )
-        if not _close_dangling_tool_tail(
-            state.project_dir,
-            state.messages,
-            "Task stopped by the user before the next turn started.",
+        if (
+            not _close_dangling_tool_tail(
+                state.project_dir,
+                state.messages,
+                "Task stopped by the user before the next turn started.",
+            )
+            and state.messages
+            and state.messages[-1].get("role") == "user"
         ):
-            if state.messages and state.messages[-1].get("role") == "user":
-                item = {"role": "assistant", "content": "Task stopped."}
-                state.messages.append(item)
-                ConversationStore.append(state.project_dir, item)
+            item = {"role": "assistant", "content": "Task stopped."}
+            state.messages.append(item)
+            ConversationStore.append(state.project_dir, item)
 
     def _handle_tool_limit_reached(self, state: _RunState) -> None:
         """The ``agent.tool_call_limit`` budget was exhausted."""

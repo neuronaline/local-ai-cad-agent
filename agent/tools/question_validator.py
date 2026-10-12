@@ -28,8 +28,9 @@ class QuestionValidator:
             if len(questions) == 1:
                 return QuestionValidator._validate_single(questions[0], answer)
             return False
-        # Legacy single-question format.
-        return QuestionValidator._validate_legacy(question, answer)
+        if "question" in question:
+            return QuestionValidator._validate_single(question, answer)
+        return False
 
     @staticmethod
     def _validate_multi(questions: list[dict[str, object]], answers: dict[str, object]) -> bool:
@@ -137,11 +138,6 @@ class QuestionValidator:
         if input_type == "number":
             return QuestionValidator._is_valid_number_with_unit(answer)
         return bool(answer.strip())
-
-    @staticmethod
-    def _validate_legacy(question: dict[str, object], answer: str) -> bool:
-        """Validate against the deprecated flat question format."""
-        return QuestionValidator._validate_single(question, answer)
 
     _NUMBER_UNIT_RE = re.compile(
         r"^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*([a-zA-Z°]+)?\s*$"

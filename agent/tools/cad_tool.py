@@ -64,7 +64,7 @@ def _supports_manifold() -> bool:
         )
         out = (proc.stdout or "") + (proc.stderr or "")
         _MANIFOLD_SUPPORTED = "--enable=manifold" in out
-    except Exception:
+    except (subprocess.SubprocessError, OSError):
         _MANIFOLD_SUPPORTED = False
     return _MANIFOLD_SUPPORTED
 
@@ -599,7 +599,11 @@ class CadTool:
                 kept_existing_sheet = True
 
             if not kept_existing_sheet:
+                if not sheet_path.is_file() or sheet_path.stat().st_size == 0:
+                    raise RuntimeError("Review contact sheet was not produced by the sandbox.")
                 shutil.copyfile(sheet_path, sheet_target)
+                if not sheet_target.is_file() or sheet_target.stat().st_size == 0:
+                    raise RuntimeError("Review contact sheet could not be staged.")
                 actual_sheet_sha = hashlib.sha256(sheet_target.read_bytes()).hexdigest()
                 expected_sheet_sha = contact_sheet.get("image_sha256")
                 if (

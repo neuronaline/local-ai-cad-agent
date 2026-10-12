@@ -75,8 +75,27 @@ TOOL_SCHEMAS = [
                 "type": "string",
                 "description": TOOL_DESCRIPTIONS["edit_file"]["new_string"],
             },
+            "edits": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "old_string": {
+                            "type": "string",
+                            "description": TOOL_DESCRIPTIONS["edit_file"]["old_string"],
+                        },
+                        "new_string": {
+                            "type": "string",
+                            "description": TOOL_DESCRIPTIONS["edit_file"]["new_string"],
+                        },
+                    },
+                    "required": ["old_string", "new_string"],
+                    "additionalProperties": False,
+                },
+                "description": TOOL_DESCRIPTIONS["edit_file"]["edits"],
+            },
         },
-        ["old_string", "new_string"],
+        [],
     ),
     _tool(
         "cad_build",

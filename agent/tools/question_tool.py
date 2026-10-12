@@ -9,7 +9,7 @@ SINGLE_CHOICE_TYPES = frozenset({"select", "multiselect"})
 
 
 def normalize_questions(args: dict) -> list[dict]:
-    """Normalize the legacy flat question format into the list format."""
+    """Validate and extract the questions list from args, supporting flat and nested formats."""
     questions = args.get("questions")
     if "questions" in args:
         if isinstance(questions, dict):
@@ -49,7 +49,7 @@ class QuestionTool:
         if not isinstance(questions, list) or not questions:
             raise ValueError("At least one question is required.")
         if len(questions) > 3:
-            questions[:] = questions[:3]
+            raise ValueError("At most 3 questions can be asked in a single batch.")
         seen: set[str] = set()
         for i, item in enumerate(questions):
             if not isinstance(item, dict):

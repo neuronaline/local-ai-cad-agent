@@ -50,10 +50,9 @@ def _pick_intended_value(key: str, existing: object, candidate: object) -> objec
     if _is_empty_or_none(existing) and not _is_empty_or_none(candidate):
         return candidate
 
-    # Both values are non-empty. For primary code payloads (content/code in OpenSCAD files),
-    # pick the substantial payload (longest non-empty string) to prevent token leaks
-    # (e.g. "FEMALE" or trailing quotes) from overwriting multi-line OpenSCAD models.
-    if key in ("content", "code") and isinstance(existing, str) and isinstance(candidate, str):
+    # Both values are non-empty. For string payloads, prefer the substantial
+    # payload (longest non-empty string) to prevent token leaks from truncating code.
+    if isinstance(existing, str) and isinstance(candidate, str):
         return candidate if len(candidate) > len(existing) else existing
 
     # For all other keys (or equal values), preserve the first emitted value.
@@ -100,7 +99,7 @@ def _clean_code_fences(code: str) -> str:
         inner = text[3:-3].strip()
         m = re.match(r"^[a-zA-Z0-9_-]+\s+(.*)$", inner)
         return m.group(1) if m else inner
-    match = re.search(r"```(?:[a-zA-Z0-9_-]+)?\s*\r?\n(.*)\r?\n```", text, re.DOTALL)
+    match = re.search(r"```(?:[a-zA-Z0-9_-]+)?\s*\r?\n(.*?)\r?\n```", text, re.DOTALL)
     if match:
         return match.group(1)
     lines = text.splitlines()
@@ -192,35 +191,6 @@ def is_cad_build(name: str) -> bool:
     return name in {"cad_build", "cad_build_and_verify"}
 
 
-def _extract_requested_views(args: object) -> list[str] | None:
-    """Extract view names from get_view_images arguments for on-demand build."""
-    try:
-        from agent.tools.image_tool import VIEW_ALIASES, _coerce_requests
-
-        items = _coerce_requests(args)
-    except Exception:
-        return None
-    views: list[str] = []
-    for item in items:
-        raw = str(item.get("view") or "").strip().lower()
-        alias = VIEW_ALIASES.get(raw, raw)
-        if alias == "all":
-            return None
-        if alias and alias not in views:
-            views.append(alias)
-    return views or None
-
-
-def _extract_resolution(args: object) -> int:
-    """Extract render resolution from get_view_images arguments if specified."""
-    if isinstance(args, dict):
-        try:
-            res = int(args.get("resolution", 512) or 512)
-            if res > 0:
-                return res
-        except (ValueError, TypeError):
-            pass
-    return 512
 
 
 def dispatch(
@@ -326,21 +296,7 @@ def dispatch(
         return _dispatch_edit_file(tools.file, args, call_id)
     if name == "get_view_images":
         image = tools.image.with_call_id(call_id) if call_id else tools.image
-        try:
-            return image.get_view_images(args), False
-        except ValueError as error:
-            err_msg = str(error)
-            if "cad_build" in err_msg:
-                cad = tools.cad.with_call_id(call_id) if call_id else tools.cad
-                req_views = _extract_requested_views(args)
-                resolution = _extract_resolution(args)
-                cad.build(
-                    mode=RenderMode.FULL_REVIEW,
-                    requested_views=req_views,
-                    resolution=resolution,
-                )
-                return image.get_view_images(args), False
-            raise
+        return image.get_view_images(args), False
     if name == "question":
         return _dispatch_question(tools.question, tools.project_dir, project, args)
     raise ValueError(f"Unknown or unsupported tool: {name!r}")
@@ -360,7 +316,7 @@ def _dispatch_edit_file(file_tool, args: dict, call_id: str) -> tuple[object, bo
     elif isinstance(edits, dict):
         edits = [edits]
     if not isinstance(edits, list) or not edits:
-        raise ValueError("edit_file requires 'old_string' and 'new_string'.")
+        raise ValueError("edit_file requires 'old_string' and 'new_string' or 'edits'.")
 
     cleaned_edits = []
     for entry in edits:

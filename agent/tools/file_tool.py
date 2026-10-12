@@ -15,51 +15,47 @@ MAX_FILE_BYTES = 1 * 1024 * 1024
 # the JSON schema's ``maximum`` so the runtime guard and the model-facing
 # limit cannot drift.
 MAX_READ_LINES = 2000
-# Per-project locks for ``model.scad`` writes. OrderedDict-backed so the
-# cache evicts the least-recently-touched project when it grows past
-# ``_MAX_PROJECT_FILE_LOCKS`` (long-running servers that create + delete
-# many projects otherwise accumulate an unbounded set of stale locks).
+class _ProjectLock:
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.active_count = 0
+
+
 _MAX_PROJECT_FILE_LOCKS = 256
-_MODEL_FILE_LOCKS: OrderedDict[str, threading.RLock] = OrderedDict()
+_MODEL_FILE_LOCKS: OrderedDict[str, _ProjectLock] = OrderedDict()
 _MODEL_FILE_LOCKS_GUARD: threading.Lock = threading.Lock()
 
 
 @contextmanager
 def _file_lock(path: Path) -> Iterator[threading.RLock]:
-    """Serialise writes to ``model.scad`` per project.
-
-    Only ``model.scad`` is editable (see ``EDITABLE_FILES``), so keying by
-    ``path.parent`` (= the project directory) is sufficient. Touched
-    projects are moved to the end of the OrderedDict so a steady-state
-    server naturally keeps its active projects warm and lets idle ones
-    age out.
-    """
+    """Serialise writes to ``model.scad`` per project with active reference tracking."""
     key = str(path.parent)
     with _MODEL_FILE_LOCKS_GUARD:
-        lock = _MODEL_FILE_LOCKS.get(key)
-        if lock is None:
-            lock = threading.RLock()
-        # Re-insert unconditionally so the eviction order is updated on
-        # every write — an existing lock for this project is moved to the
-        # end of the OrderedDict, keeping recently-touched projects warm.
-        _MODEL_FILE_LOCKS[key] = lock
+        entry = _MODEL_FILE_LOCKS.get(key)
+        if entry is None:
+            entry = _ProjectLock()
+            _MODEL_FILE_LOCKS[key] = entry
+        entry.active_count += 1
         _MODEL_FILE_LOCKS.move_to_end(key)
-        while len(_MODEL_FILE_LOCKS) > _MAX_PROJECT_FILE_LOCKS:
-            _MODEL_FILE_LOCKS.popitem(last=False)
-    lock.acquire()
+        # Only evict idle locks (active_count == 0) to prevent race conditions
+        if len(_MODEL_FILE_LOCKS) > _MAX_PROJECT_FILE_LOCKS:
+            for k in list(_MODEL_FILE_LOCKS):
+                if len(_MODEL_FILE_LOCKS) <= _MAX_PROJECT_FILE_LOCKS:
+                    break
+                if _MODEL_FILE_LOCKS[k].active_count == 0:
+                    _MODEL_FILE_LOCKS.pop(k, None)
+
+    entry.lock.acquire()
     try:
-        yield lock
+        yield entry.lock
     finally:
-        lock.release()
+        entry.lock.release()
+        with _MODEL_FILE_LOCKS_GUARD:
+            entry.active_count = max(0, entry.active_count - 1)
 
 
 def invalidate_model_file_lock(project_dir: Path) -> None:
-    """Drop the per-project file lock when its directory goes away.
-
-    Called from the project-delete route so a server that cycles through
-    many short-lived projects does not accumulate orphaned
-    ``threading.RLock`` objects. Safe to call when no lock exists.
-    """
+    """Drop the per-project file lock when its directory goes away."""
     key = str(Path(project_dir))
     with _MODEL_FILE_LOCKS_GUARD:
         _MODEL_FILE_LOCKS.pop(key, None)
@@ -72,20 +68,45 @@ class OpenScadPreflight:
         self.warnings: list[str] = []
         self.blocked_errors: list[str] = []
 
+    PYTHON_KEYWORD_PATTERNS = (
+        (re.compile(r"^[ \t]*def\s+[a-zA-Z_][a-zA-Z0-9_]*\s*\("), "def", "OpenSCAD uses 'module name() { ... }'."),
+        (re.compile(r"^[ \t]*class\s+[a-zA-Z_]"), "class", "OpenSCAD does not support classes."),
+        (re.compile(r"^[ \t]*elif\b"), "elif", "OpenSCAD uses 'else if'."),
+        (re.compile(r"^[ \t]*from\s+[a-zA-Z_][a-zA-Z0-9_]*\s+import\b"), "from ... import", "OpenSCAD uses 'use <...>' or 'include <...>'."),
+        (re.compile(r"^[ \t]*import\s+[a-zA-Z_][a-zA-Z0-9_]*(?!\s*\()"), "import", "OpenSCAD uses 'use <...>' or 'include <...>'. Built-in import() requires parentheses."),
+    )
+
+    @classmethod
+    def check_python_syntax(cls, clean_code: str) -> list[tuple[int, str, str]]:
+        """Check for Python keywords in OpenSCAD code. Returns list of (line_num, keyword, impact)."""
+        findings: list[tuple[int, str, str]] = []
+        for line_num, line in enumerate(clean_code.splitlines(), start=1):
+            for pattern, kw, impact in cls.PYTHON_KEYWORD_PATTERNS:
+                if pattern.search(line):
+                    findings.append((line_num, kw, impact))
+        return findings
+
+    @staticmethod
+    def clean_code_preserve_lines(code: str) -> str:
+        """Strip comments and string contents while keeping exact line numbering."""
+        def repl_block(match: re.Match) -> str:
+            return "\n" * match.group(0).count("\n")
+
+        cleaned = re.sub(r"/\*.*?\*/", repl_block, code, flags=re.DOTALL)
+        cleaned = re.sub(r"//.*", "", cleaned)
+        return re.sub(r'"(?:\\.|[^"\\])*"', '""', cleaned)
+
     def validate(self, code: str) -> None:
-        # Strip comments to prevent false positives in comments/documentation
-        clean_code = re.sub(r"/\*.*?\*/", "", code, flags=re.DOTALL)
-        clean_code = re.sub(r"//.*", "", clean_code)
+        clean_code = self.clean_code_preserve_lines(code)
 
         # 1. Check for accidental Python syntax
-        python_keywords = ("def ", "import ", "from ", "class ", "elif ")
-        for kw in python_keywords:
-            if re.search(r"^[ \t]*" + re.escape(kw), clean_code, re.MULTILINE):
-                self.blocked_errors.append(
-                    f"Unsafe or invalid OpenSCAD syntax: Python keyword '{kw.strip()}' found. "
-                    "Write native OpenSCAD code (use 'module', 'use <...>', etc.)."
-                )
-                return
+        python_matches = self.check_python_syntax(clean_code)
+        if python_matches:
+            line_num, kw, impact = python_matches[0]
+            self.blocked_errors.append(
+                f"Unsafe or invalid OpenSCAD syntax: Python keyword '{kw}' found at line {line_num}. {impact}"
+            )
+            return
 
         # 2. Check for unsafe file inclusions / path traversal
         inc_matches = re.findall(r"(?:include|use)\s*<([^>]+)>", code)
@@ -235,7 +256,7 @@ class FileTool:
             tool_call_id,
         )
 
-    def _path(self, filename: str) -> Path:
+    def _path(self, filename: str = MODEL_FILENAME) -> Path:
         if filename not in EDITABLE_FILES:
             raise ValueError(f"Only {MODEL_FILENAME} can be edited.")
         path = (self.project_dir / filename).resolve()
@@ -253,7 +274,7 @@ class FileTool:
 
     def read_file(
         self,
-        filename: str,
+        filename: str = MODEL_FILENAME,
         offset: int = 1,
         limit: int | None = None,
     ) -> dict:
@@ -306,9 +327,15 @@ class FileTool:
 
     def write_file(
         self,
-        filename: str,
-        content: str,
+        filename: str = MODEL_FILENAME,
+        content: str | None = None,
     ) -> str:
+        if content is None:
+            if filename == MODEL_FILENAME:
+                content = ""
+            else:
+                content = filename
+                filename = MODEL_FILENAME
         path = self._path(filename)
         with _file_lock(path):
             return self._write_model(content, "write_file")
@@ -328,39 +355,6 @@ class FileTool:
             f"Wrote model.scad ({len(content.splitlines())} lines, "
             f"{len(content)} chars, revision {revision.id[:8]})."
         )
-
-    @staticmethod
-    def _reindent(
-        file_lines: list[str], old_lines: list[str], new_string: str
-    ) -> str:
-        def get_indent(lines: list[str]) -> int:
-            for line in lines:
-                if line.strip():
-                    return len(line) - len(line.lstrip(" "))
-            return 0
-
-        file_indent = get_indent(file_lines)
-        old_indent = get_indent(old_lines)
-        delta = file_indent - old_indent
-        if delta == 0 or not new_string:
-            return new_string
-
-        new_lines = new_string.splitlines(keepends=True)
-        new_indent = get_indent(new_lines)
-        if new_indent == file_indent:
-            return new_string
-
-        if new_indent == old_indent:
-            adjusted: list[str] = []
-            for line in new_lines:
-                if not line.strip():
-                    adjusted.append(line)
-                else:
-                    curr_indent = len(line) - len(line.lstrip(" "))
-                    target_indent = max(0, curr_indent + delta)
-                    adjusted.append(" " * target_indent + line.lstrip(" "))
-            return "".join(adjusted)
-        return new_string
 
     @classmethod
     def _resolve_match(
@@ -413,7 +407,7 @@ class FileTool:
 
             if old_string.endswith(("\n", "\r")):
                 end_char = start_char + len(matched_text)
-                replacement = cls._reindent(matched_slice, old_lines, new_string)
+                replacement = new_string
                 if replacement and not replacement.endswith(("\n", "\r")):
                     replacement += "\n"
             else:
@@ -423,7 +417,7 @@ class FileTool:
                     else ("\n" if matched_text.endswith("\n") else "")
                 )
                 end_char = start_char + len(matched_text) - len(line_ending)
-                replacement = cls._reindent(matched_slice, old_lines, new_string)
+                replacement = new_string
 
             matched_sub = current[start_char:end_char]
             return ((start_char, end_char), matched_sub, replacement)
@@ -441,11 +435,16 @@ class FileTool:
 
     def edit_file(
         self,
-        filename: str,
-        old_string: str,
+        filename: str = MODEL_FILENAME,
+        old_string: str = "",
         new_string: str = "",
     ) -> str:
         """Replace a unique occurrence of ``old_string`` with ``new_string``."""
+        if filename not in EDITABLE_FILES:
+            # Caller passed 2 positional arguments: edit_file(old_string, new_string)
+            new_string = old_string
+            old_string = filename
+            filename = MODEL_FILENAME
         if not isinstance(old_string, str) or not old_string:
             raise ValueError("old_string must not be empty.")
         if new_string is not None and not isinstance(new_string, str):
@@ -457,8 +456,8 @@ class FileTool:
 
     def edit_file_atomic(
         self,
-        filename: str,
-        edits: list[dict[str, str]],
+        filename: str | list[dict[str, str]] = MODEL_FILENAME,
+        edits: list[dict[str, str]] | None = None,
     ) -> str:
         """Apply several ``{old_string, new_string}`` replacements atomically.
 
@@ -469,6 +468,11 @@ class FileTool:
         text the LLM copied from the pre-edit file. A failed validation aborts
         the whole batch with no write.
         """
+        if edits is None and isinstance(filename, list):
+            edits = filename
+            actual_filename = MODEL_FILENAME
+        else:
+            actual_filename = str(filename) if isinstance(filename, str) else MODEL_FILENAME
         if not edits:
             raise ValueError("edit_file_atomic requires at least one edit.")
         normalised: list[tuple[str, str]] = []
@@ -484,11 +488,11 @@ class FileTool:
             if not isinstance(new_string, str):
                 raise ValueError(f"edits[{index}].new_string must be a string.")
             normalised.append((old_string, new_string))
-        path = self._path(filename)
+        path = self._path(actual_filename)
         with _file_lock(path):
             if not path.exists():
                 raise FileNotFoundError(
-                    f"{filename} does not exist; use write_file to create it."
+                    f"{actual_filename} does not exist; use write_file to create it."
                 )
             current = path.read_text(encoding="utf-8")
             # Validate every match against the original buffer (not the running

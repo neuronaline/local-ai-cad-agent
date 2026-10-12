@@ -5,6 +5,7 @@ exact mathematical mesh topology validation without hallucination or fuzzy guess
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -40,15 +41,7 @@ class Finding:
         return result
 
 
-def _clean_code_preserve_lines(code: str) -> str:
-    """Strip comments and string contents while keeping exact line numbering."""
-    def repl_block(match: re.Match) -> str:
-        return "\n" * match.group(0).count("\n")
-
-    cleaned = re.sub(r"/\*.*?\*/", repl_block, code, flags=re.DOTALL)
-    cleaned = re.sub(r"//.*", "", cleaned)
-    cleaned = re.sub(r'"(?:\\.|[^"\\])*"', '""', cleaned)
-    return cleaned
+_clean_code_preserve_lines = OpenScadPreflight.clean_code_preserve_lines
 
 
 def _detect_multi_part_intent(code: str) -> bool:
@@ -186,65 +179,21 @@ class CadVerifier:
                 )
             )
 
-        # 2. Python syntax & banned ops checks with line-number preservation
+        # 2. Python syntax checks via centralized OpenScadPreflight
         clean_code = _clean_code_preserve_lines(code)
+        for line_num, kw, impact in OpenScadPreflight.check_python_syntax(clean_code):
+            findings.append(
+                Finding(
+                    category="CRITICAL",
+                    code="PYTHON_SYNTAX_DETECTED",
+                    message=f"Python syntax '{kw}' found at line {line_num}.",
+                    line=line_num,
+                    impact=impact,
+                )
+            )
+            syntax_error = True
 
         for line_num, line in enumerate(clean_code.splitlines(), start=1):
-            if re.search(r"^[ \t]*def\s+[a-zA-Z_][a-zA-Z0-9_]*\s*\(", line):
-                findings.append(
-                    Finding(
-                        category="CRITICAL",
-                        code="PYTHON_SYNTAX_DETECTED",
-                        message=f"Python function definition 'def' found at line {line_num}.",
-                        line=line_num,
-                        impact="OpenSCAD is not Python; use 'module name() { ... }'.",
-                    )
-                )
-                syntax_error = True
-            elif re.search(r"^[ \t]*class\s+[a-zA-Z_]", line):
-                findings.append(
-                    Finding(
-                        category="CRITICAL",
-                        code="PYTHON_SYNTAX_DETECTED",
-                        message=f"Python 'class' keyword found at line {line_num}.",
-                        line=line_num,
-                        impact="OpenSCAD does not support classes.",
-                    )
-                )
-                syntax_error = True
-            elif re.search(r"^[ \t]*elif\b", line):
-                findings.append(
-                    Finding(
-                        category="CRITICAL",
-                        code="PYTHON_SYNTAX_DETECTED",
-                        message=f"Python 'elif' keyword found at line {line_num}.",
-                        line=line_num,
-                        impact="OpenSCAD uses 'else if'.",
-                    )
-                )
-                syntax_error = True
-            elif re.search(r"^[ \t]*from\s+[a-zA-Z_][a-zA-Z0-9_]*\s+import\b", line):
-                findings.append(
-                    Finding(
-                        category="CRITICAL",
-                        code="PYTHON_SYNTAX_DETECTED",
-                        message=f"Python 'from ... import' found at line {line_num}.",
-                        line=line_num,
-                        impact="OpenSCAD uses 'use <...>' or 'include <...>'.",
-                    )
-                )
-                syntax_error = True
-            elif re.search(r"^[ \t]*import\s+[a-zA-Z_][a-zA-Z0-9_]*(?!\s*\()", line):
-                findings.append(
-                    Finding(
-                        category="CRITICAL",
-                        code="PYTHON_SYNTAX_DETECTED",
-                        message=f"Python-style import found at line {line_num}.",
-                        line=line_num,
-                        impact="OpenSCAD uses 'use <...>' or 'include <...>'. Built-in import() requires parentheses.",
-                    )
-                )
-                syntax_error = True
 
             # 3. Minkowski ban
             if re.search(r"\bminkowski\s*\(", line):
@@ -369,9 +318,16 @@ class CadVerifier:
             try:
                 cached_data = json.loads(metrics_file.read_text(encoding="utf-8"))
                 if isinstance(cached_data, dict) and isinstance(cached_data.get("metrics"), dict):
-                    m = cached_data["metrics"]
-                    if "dimensions_mm" in m and "volume_mm3" in m and "boundary_edges" in m:
-                        cached_metrics = m
+                    expected_sha = cached_data.get("preview_sha256")
+                    is_valid_cache = True
+                    if expected_sha and isinstance(expected_sha, str):
+                        actual_sha = hashlib.sha256(stl_path.read_bytes()).hexdigest()
+                        if actual_sha != expected_sha:
+                            is_valid_cache = False
+                    if is_valid_cache:
+                        m = cached_data["metrics"]
+                        if "dimensions_mm" in m and "volume_mm3" in m and "boundary_edges" in m:
+                            cached_metrics = m
             except (OSError, json.JSONDecodeError, UnicodeDecodeError):
                 pass
 
@@ -437,15 +393,20 @@ class CadVerifier:
             return findings, {"exists": True, "valid": False}
 
         # 1. Bounding box & non-zero dimensions
-        if not all(math.isfinite(d) for d in (dim_x, dim_y, dim_z)):
+        is_finite_geom = all(math.isfinite(d) for d in (dim_x, dim_y, dim_z)) and math.isfinite(volume)
+        if not is_finite_geom:
             findings.append(
                 Finding(
                     category="CRITICAL",
                     code="NON_FINITE_GEOMETRY",
-                    message="Mesh dimensions contain non-finite values (NaN or Inf).",
+                    message="Mesh dimensions or volume contain non-finite values (NaN or Inf).",
                     impact="Invalid floating-point geometry.",
                 )
             )
+            dim_x = dim_x if math.isfinite(dim_x) else 0.0
+            dim_y = dim_y if math.isfinite(dim_y) else 0.0
+            dim_z = dim_z if math.isfinite(dim_z) else 0.0
+            volume = volume if math.isfinite(volume) else 0.0
         elif any(d <= 0.0001 for d in (dim_x, dim_y, dim_z)):
             findings.append(
                 Finding(
@@ -466,24 +427,25 @@ class CadVerifier:
             )
 
         # 2. Signed Polyhedron Volume
-        if volume <= 0.0001:
-            findings.append(
-                Finding(
-                    category="CRITICAL",
-                    code="INVALID_VOLUME",
-                    message="Calculated mesh volume is zero mm³.",
-                    impact="Zero-volume or self-intersecting collapsed geometry.",
+        if is_finite_geom:
+            if volume <= 0.0001:
+                findings.append(
+                    Finding(
+                        category="CRITICAL",
+                        code="INVALID_VOLUME",
+                        message="Calculated mesh volume is zero mm³.",
+                        impact="Zero-volume or self-intersecting collapsed geometry.",
+                    )
                 )
-            )
-        elif raw_volume < -0.0001:
-            findings.append(
-                Finding(
-                    category="WARNING",
-                    code="INVERTED_NORMALS",
-                    message="Mesh has inverted surface normals (clockwise face winding).",
-                    impact="Face normals point inward; slicers may require auto-repair.",
+            elif raw_volume < -0.0001:
+                findings.append(
+                    Finding(
+                        category="WARNING",
+                        code="INVERTED_NORMALS",
+                        message="Mesh has inverted surface normals (clockwise face winding).",
+                        impact="Face normals point inward; slicers may require auto-repair.",
+                    )
                 )
-            )
 
         # 3. Watertight Manifold Edge-sharing Check
         is_watertight = boundary_edges == 0 and multi_face_edges == 0

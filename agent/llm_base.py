@@ -402,13 +402,14 @@ def relocate_tool_images(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
             if isinstance(part, dict) and part.get("type") == "image_url"
         ]
         tool_copy = deepcopy(message)
-        if len(text_parts) == 1 and isinstance(text_parts[0], dict):
-            text = text_parts[0].get("text")
-            tool_copy["content"] = (
-                text if isinstance(text, str) else text_parts
-            )
+        if text_parts:
+            joined_text = "\n".join(
+                p.get("text", "") if isinstance(p, dict) else str(p)
+                for p in text_parts
+            ).strip()
+            tool_copy["content"] = joined_text or "Visual inspection completed."
         else:
-            tool_copy["content"] = text_parts or "An attached image was unavailable."
+            tool_copy["content"] = "Visual inspection completed."
         relocated.append(tool_copy)
         batch_images.extend(deepcopy(part) for part in image_parts)
     flush_batch_images()

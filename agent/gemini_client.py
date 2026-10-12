@@ -29,6 +29,7 @@ from agent.llm_base import (
     extract_text_tool_calls,
     extract_think_tags,
     iter_lines_with_cancel,
+    normalize_messages,
     post_with_cancel,
     strip_encrypted_reasoning,
 )
@@ -112,6 +113,7 @@ def convert_messages_to_interactions(
     Returns:
         (system_instruction, steps)
     """
+    messages = normalize_messages(messages)
     system_instruction: str | None = None
     steps: list[dict[str, Any]] = []
     call_id_to_name: dict[str, str] = {}
