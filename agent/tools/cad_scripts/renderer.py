@@ -58,6 +58,7 @@ class ViewSpec:
     view_id: str
     camera_axis: tuple[float, float, float]
     screen_x_axis: tuple[float, float, float]
+    screen_y_axis: tuple[float, float, float]
     label: str
 
     def as_dict(self) -> dict[str, object]:
@@ -65,6 +66,7 @@ class ViewSpec:
             "view_id": self.view_id,
             "camera_axis": list(self.camera_axis),
             "screen_x_axis": list(self.screen_x_axis),
+            "screen_y_axis": list(self.screen_y_axis),
             "label": self.label,
         }
 
@@ -82,30 +84,44 @@ def _v(
     camera: Iterable[float],
     screen_x: Iterable[float],
     label: str,
+    screen_y: Iterable[float] | None = None,
 ) -> ViewSpec:
-    return ViewSpec(view_id, _axis(camera), _axis(screen_x), label)
+    cam_ax = _axis(camera)
+    sx_ax = _axis(screen_x)
+    if screen_y is not None:
+        sy_ax = _axis(screen_y)
+    else:
+        # Standard right-handed camera Up: cross(cam_axis, screen_x_axis)
+        sy_ax = _axis(np.cross(np.array(cam_ax), np.array(sx_ax)))
+    return ViewSpec(view_id, cam_ax, sx_ax, sy_ax, label)
 
 
 # Canonical eight views: six face-aligned orthographics plus a positive and
 # negative isometric for occlusion/contact-sheet purposes.
+# In standard CAD convention:
+# - screen_x points horizontally RIGHT on screen.
+# - screen_y points vertically UP on screen (mapped to top of image).
+# - camera_axis points towards viewer (out of screen).
 VIEWS: tuple[ViewSpec, ...] = (
     _v("x_positive", (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), "+X face"),
     _v("x_negative", (-1.0, 0.0, 0.0), (0.0, -1.0, 0.0), "-X face"),
-    _v("y_positive", (0.0, 1.0, 0.0), (1.0, 0.0, 0.0), "+Y face"),
-    _v("y_negative", (0.0, -1.0, 0.0), (-1.0, 0.0, 0.0), "-Y face"),
-    _v("z_positive", (0.0, 0.0, 1.0), (1.0, -1.0, 0.0), "+Z face"),
-    _v("z_negative", (0.0, 0.0, -1.0), (1.0, 1.0, 0.0), "-Z face"),
+    _v("y_positive", (0.0, 1.0, 0.0), (-1.0, 0.0, 0.0), "+Y face"),
+    _v("y_negative", (0.0, -1.0, 0.0), (1.0, 0.0, 0.0), "-Y face"),
+    _v("z_positive", (0.0, 0.0, 1.0), (1.0, 0.0, 0.0), "+Z face"),
+    _v("z_negative", (0.0, 0.0, -1.0), (1.0, 0.0, 0.0), "-Z face"),
     _v(
         "isometric_positive",
         (1.0, 1.0, 1.0),
         (1.0, -1.0, 0.0),
         "iso +",
+        screen_y=(-1.0, -1.0, 2.0),
     ),
     _v(
         "isometric_negative",
         (-1.0, -1.0, -1.0),
         (1.0, -1.0, 0.0),
         "iso -",
+        screen_y=(1.0, 1.0, 2.0),
     ),
 )
 
@@ -119,16 +135,22 @@ def _project(
     vertices: np.ndarray,
     camera_axis: np.ndarray,
     screen_x_axis: np.ndarray,
+    screen_y_axis: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return projected (xy_screen, depth) arrays for the orthographic camera."""
+    """Return projected (xy_screen, depth) arrays for the orthographic camera.
+
+    Inverts the Y coordinate so mathematical Up (positive dot with screen_y_axis)
+    maps to the top of the raster image (smaller pixel row index).
+    """
     camera_axis = camera_axis / np.linalg.norm(camera_axis)
     screen_x_axis = screen_x_axis / np.linalg.norm(screen_x_axis)
-    screen_y_axis = np.cross(camera_axis, screen_x_axis)
-    screen_y_axis /= np.linalg.norm(screen_y_axis)
+    if screen_y_axis is None:
+        screen_y_axis = np.cross(camera_axis, screen_x_axis)
+    screen_y_axis = screen_y_axis / np.linalg.norm(screen_y_axis)
     projected = np.column_stack(
         (
             vertices @ screen_x_axis,
-            vertices @ screen_y_axis,
+            -(vertices @ screen_y_axis),
             vertices @ camera_axis,
         )
     )
@@ -282,21 +304,28 @@ def rasterize_view(
     *,
     camera_axis: Sequence[float],
     screen_x_axis: Sequence[float],
+    screen_y_axis: Sequence[float] | None = None,
     light: Sequence[float] | None = None,
     resolution: int = _WIDTH,
 ) -> np.ndarray:
     """Rasterize a 3D mesh into an RGB image buffer from a specified camera view."""
     camera = np.array(camera_axis, dtype=np.float64)
     screen_x = np.array(screen_x_axis, dtype=np.float64)
+    cam_dir = camera / max(np.linalg.norm(camera), 1e-12)
+    sx_dir = screen_x / max(np.linalg.norm(screen_x), 1e-12)
+    if screen_y_axis is not None:
+        screen_y = np.array(screen_y_axis, dtype=np.float64)
+        sy_dir = screen_y / max(np.linalg.norm(screen_y), 1e-12)
+    else:
+        sy_dir = np.cross(cam_dir, sx_dir)
+        sy_dir /= max(np.linalg.norm(sy_dir), 1e-12)
+        screen_y = sy_dir
     if light is not None:
         light_vec = np.array(light, dtype=np.float64)
     else:
-        cam_dir = camera / max(np.linalg.norm(camera), 1e-12)
-        sx_dir = screen_x / max(np.linalg.norm(screen_x), 1e-12)
-        sy_dir = np.cross(cam_dir, sx_dir)
         light_vec = cam_dir + 0.35 * sx_dir + 0.45 * sy_dir
     light_vec /= np.linalg.norm(light_vec)
-    projected_xy, depths = _project(vertices, camera, screen_x)
+    projected_xy, depths = _project(vertices, camera, screen_x, screen_y)
     scale, offset, _span = _frame(projected_xy, resolution=resolution)
     screen_vertices = projected_xy * scale + offset
     return _shade_pixels(
@@ -386,20 +415,27 @@ def _worker_render(args: tuple[str, dict[str, object]]) -> dict[str, object]:
     resolution = int(view_dict.get("resolution", _WIDTH) or _WIDTH)
     camera_axis = np.array(view_dict["camera_axis"], dtype=np.float64)
     screen_x_axis = np.array(view_dict["screen_x_axis"], dtype=np.float64)
+    raw_sy = view_dict.get("screen_y_axis")
+    cam_dir = camera_axis / max(np.linalg.norm(camera_axis), 1e-12)
+    sx_dir = screen_x_axis / max(np.linalg.norm(screen_x_axis), 1e-12)
+    if raw_sy is not None:
+        screen_y_axis = np.array(raw_sy, dtype=np.float64)
+        sy_dir = screen_y_axis / max(np.linalg.norm(screen_y_axis), 1e-12)
+    else:
+        sy_dir = np.cross(cam_dir, sx_dir)
+        sy_dir /= max(np.linalg.norm(sy_dir), 1e-12)
+        screen_y_axis = sy_dir
     raw_light = view_dict.get("light")
     if raw_light is not None:
         light = np.array(raw_light, dtype=np.float64)
     else:
-        cam_dir = camera_axis / max(np.linalg.norm(camera_axis), 1e-12)
-        sx_dir = screen_x_axis / max(np.linalg.norm(screen_x_axis), 1e-12)
-        sy_dir = np.cross(cam_dir, sx_dir)
         light = cam_dir + 0.35 * sx_dir + 0.45 * sy_dir
     light /= max(np.linalg.norm(light), 1e-12)
     vertices_blob = view_dict["vertices"]
     triangles_blob = view_dict["triangles"]
     vertices = np.frombuffer(vertices_blob, dtype=np.float64).reshape(-1, 3).copy()
     triangles = np.frombuffer(triangles_blob, dtype=np.int32).reshape(-1, 3).copy()
-    projected_xy, depths = _project(vertices, camera_axis, screen_x_axis)
+    projected_xy, depths = _project(vertices, camera_axis, screen_x_axis, screen_y_axis)
     scale, offset, _span = _frame(projected_xy, resolution=resolution)
     screen_vertices = projected_xy * scale + offset
     pixels = _shade_pixels(
@@ -534,6 +570,7 @@ def render_views(
             {
                 "camera_axis": spec.camera_axis,
                 "screen_x_axis": spec.screen_x_axis,
+                "screen_y_axis": spec.screen_y_axis,
                 "vertices": vertices.tobytes(),
                 "triangles": triangles.tobytes(),
                 "resolution": resolution,
@@ -600,6 +637,7 @@ def render_views(
                 "label": spec.label,
                 "camera_axis": list(spec.camera_axis),
                 "screen_x_axis": list(spec.screen_x_axis),
+                "screen_y_axis": list(spec.screen_y_axis),
                 "path": f"views/{spec.view_id}.png",
                 "image_sha256": result["sha256"],
                 "image_bytes": int(result["size"]),
@@ -631,6 +669,7 @@ def render_iso(
         triangles,
         camera_axis=spec.camera_axis,
         screen_x_axis=spec.screen_x_axis,
+        screen_y_axis=spec.screen_y_axis,
         resolution=resolution,
     )
     Image.fromarray(pixels, "RGB").save(output_path, "PNG", compress_level=1)
