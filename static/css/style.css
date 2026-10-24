@@ -641,6 +641,48 @@ button[aria-pressed="true"] { border-color: #5d7ed7; background: #233966; color:
 .action-bar { gap: .35rem; margin-top: .25rem; }
 .attach-button { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border: 1px solid var(--line); border-radius: 6px; padding: 0; color: #c1cee2; cursor: pointer; flex-shrink: 0; }
 .attach-button:hover, .attach-button.is-dragging { border-color: var(--accent); color: var(--text); }
+.model-picker {
+  display: inline-flex;
+  align-items: center;
+  gap: .3rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0 .38rem 0 .32rem;
+  height: 28px;
+  background: #0d1727;
+  color: #8da2c0;
+  max-width: 210px;
+  transition: border-color .15s ease, color .15s ease;
+}
+.model-picker:hover, .model-picker:focus-within {
+  border-color: var(--accent);
+  color: var(--text);
+}
+.model-picker .model-icon {
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+  opacity: .85;
+}
+.model-select {
+  border: 0;
+  background: transparent;
+  color: #cbd7ee;
+  font-size: .68rem;
+  font-weight: 500;
+  padding: 0;
+  cursor: pointer;
+  outline: none;
+  max-width: 180px;
+  text-overflow: ellipsis;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.model-select option,
+.model-select optgroup {
+  background-color: #101a2c;
+  color: #e6edf8;
+}
 .effort-picker {
   display: inline-flex;
   align-items: center;
@@ -1032,6 +1074,204 @@ input, select, textarea { border: 1px solid var(--line); border-radius: 6px; bac
   max-height: 80vh;
   object-fit: contain;
   border-radius: 4px;
+}
+
+/* Print Advisor Modal */
+.print-advisor-modal-content {
+  width: min(580px, 95vw);
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 0;
+  overflow: hidden;
+  box-shadow: 0 24px 60px #020712dd;
+}
+
+.print-advisor-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.85rem 1.15rem;
+  border-bottom: 1px solid var(--line);
+  background: #141f33;
+}
+
+.print-advisor-title-group {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.print-advisor-title-group h3 {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 750;
+  color: var(--text);
+}
+
+.advisor-badge {
+  font-size: 0.68rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0.15rem 0.45rem;
+  border-radius: 4px;
+  background: #2a2c1e;
+  color: #dfdb76;
+  border: 1px solid #555835;
+}
+
+.print-advisor-body {
+  padding: 1.1rem;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.advisor-telemetry-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 0.5rem;
+}
+
+.telemetry-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  padding: 0.55rem 0.65rem;
+  background: #0d1524;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.telemetry-label {
+  font-size: 0.68rem;
+  color: var(--muted);
+}
+
+.telemetry-value {
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.advisor-form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem 1rem;
+}
+
+.advisor-form-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.advisor-form-row label {
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.advisor-select, .advisor-input {
+  width: 100%;
+  padding: 0.42rem 0.6rem;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: #0a0f1d;
+  color: var(--text);
+  font-size: 0.78rem;
+}
+
+.advisor-select:focus, .advisor-input:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.advisor-checkbox-row {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  padding-top: 0.4rem;
+}
+
+.advisor-check-label {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.75rem;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.advisor-check-label input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.advisor-select-inline, .advisor-input-inline {
+  width: auto;
+  min-width: 110px;
+  max-width: 130px;
+}
+
+.advisor-rationale-box {
+  padding: 0.7rem 0.85rem;
+  background: #0d1627;
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+}
+
+.advisor-rationale-title {
+  display: block;
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: var(--accent);
+  margin-bottom: 0.25rem;
+}
+
+.advisor-rationale-text {
+  margin: 0;
+  font-size: 0.76rem;
+  line-height: 1.45;
+  color: #c4d3eb;
+}
+
+.print-advisor-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.75rem 1.15rem;
+  border-top: 1px solid var(--line);
+  background: #111a2a;
+}
+
+.advisor-export-buttons {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.primary-btn {
+  padding: 0.42rem 0.8rem;
+}
+
+@media (max-width: 540px) {
+  .advisor-telemetry-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+  .advisor-form-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 900px) {

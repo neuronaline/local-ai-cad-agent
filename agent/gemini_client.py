@@ -26,11 +26,14 @@ from agent.llm_base import (
     BaseLLMClient,
     CompletionTruncatedError,
     RequestCancelled,
+    THOUGHT_SIGNATURE_SENTINEL,
     StreamResponseError,
     _force_close_response,
+    attach_thought_signature,
     _stream_error_detail,
     extract_text_tool_calls,
     extract_think_tags,
+    get_thought_signature,
     iter_lines_with_cancel,
     normalize_messages,
     post_with_cancel,
@@ -193,6 +196,18 @@ def convert_messages_to_interactions(
                 steps.append({"type": "user_input", "content": parts})
 
         elif role == "assistant":
+            tool_calls = msg.get("tool_calls") or []
+            # The turn's real signature (thought step + unsigned calls); stored
+            # calls without one carry the sentinel, so skip those.
+            turn_sig = get_thought_signature(msg) or next(
+                (
+                    sig
+                    for sig in map(get_thought_signature, tool_calls)
+                    if sig and sig != THOUGHT_SIGNATURE_SENTINEL
+                ),
+                THOUGHT_SIGNATURE_SENTINEL,
+            )
+
             # 1. Intermediate thoughts
             reasoning = (
                 msg.get("reasoning")
@@ -205,6 +220,8 @@ def convert_messages_to_interactions(
                     steps.append(
                         {
                             "type": "thought",
+                            "signature": turn_sig,
+                            "summary": [{"type": "text", "text": clean_r}],
                             "content": [{"type": "text", "text": clean_r}],
                         }
                     )
@@ -221,7 +238,6 @@ def convert_messages_to_interactions(
                 )
 
             # 3. Function calls — directly preceding subsequent function_results
-            tool_calls = msg.get("tool_calls") or []
             for tc in tool_calls:
                 fn = tc.get("function") or {}
                 fn_name = fn.get("name") or ""
@@ -246,9 +262,7 @@ def convert_messages_to_interactions(
                     "arguments": args,
                     "args": args,
                 }
-                sig = tc.get("thought_signature") or "skip_thought_signature_validator"
-                if sig:
-                    step_item["thought_signature"] = sig
+                step_item["thought_signature"] = get_thought_signature(tc) or turn_sig
                 steps.append(step_item)
 
         elif role == "tool":
@@ -325,6 +339,8 @@ def parse_interactions_stream(
     content = ""
     reasoning_text = ""
     tool_calls: dict[str, dict[str, Any]] = {}
+    step_meta: dict[str, dict[str, Any]] = {}
+    last_thought_signature: str | None = None
     last_usage: dict[str, Any] | None = None
     interaction_id: str | None = None
     finish_reason: str | None = None
@@ -369,20 +385,40 @@ def parse_interactions_stream(
                     retryable=not (content or tool_calls or reasoning_text),
                 )
 
-            if "id" in event:
-                interaction_id = event["id"]
+            interaction_obj = (
+                event.get("interaction")
+                if isinstance(event.get("interaction"), dict)
+                else {}
+            )
 
-            if event.get("finish_reason"):
+            ev_id = event.get("id") or interaction_obj.get("id")
+            if ev_id:
+                interaction_id = str(ev_id)
+
+            ev_finish = event.get("finish_reason") or interaction_obj.get("finish_reason")
+            ev_status = event.get("status") or interaction_obj.get("status")
+            event_type = event.get("event_type") or event.get("type")
+
+            if ev_finish:
                 if finish_reason is None:
                     finish_time = time.monotonic()
-                finish_reason = str(event["finish_reason"])
-            elif event.get("status"):
-                status_val = str(event["status"])
-                if finish_reason is None and status_val == "completed":
+                finish_reason = str(ev_finish)
+            elif ev_status:
+                status_val = str(ev_status)
+                if finish_reason is None and status_val.lower() == "completed":
                     finish_time = time.monotonic()
                 finish_reason = status_val
+            elif event_type in ("interaction.completed", "interaction.complete", "response.completed"):
+                if finish_reason is None:
+                    finish_time = time.monotonic()
+                    finish_reason = "completed"
 
-            usage_meta = event.get("usage") or event.get("usage_metadata")
+            usage_meta = (
+                event.get("usage")
+                or event.get("usage_metadata")
+                or interaction_obj.get("usage")
+                or interaction_obj.get("usage_metadata")
+            )
             if isinstance(usage_meta, dict):
                 p_tokens = (
                     usage_meta.get("prompt_tokens")
@@ -409,54 +445,154 @@ def parse_interactions_stream(
                     "prompt_tokens": int(p_tokens),
                     "completion_tokens": int(c_tokens),
                     "reasoning_tokens": int(r_tokens),
+                    "completion_tokens_details": {
+                        "reasoning_tokens": int(r_tokens),
+                    },
                     "prompt_tokens_details": {
                         "cached_tokens": int(cached_tokens),
                     },
                 }
 
-            event_type = event.get("event_type") or event.get("type")
+            # Handle step.start / step.stop events carrying a single 'step' object
+            step_obj = event.get("step") if isinstance(event.get("step"), dict) else None
+            if step_obj:
+                sid = (
+                    step_obj.get("id")
+                    or step_obj.get("step_id")
+                    or step_obj.get("call_id")
+                    or event.get("step_id")
+                )
+                stype = step_obj.get("type") or step_obj.get("step_type")
+                if sid:
+                    step_meta[str(sid)] = {"type": stype, "id": str(sid)}
+                sig = step_obj.get("signature") or step_obj.get("thought_signature")
+                if sig:
+                    last_thought_signature = str(sig)
+                if stype == "function_call":
+                    call_id = (
+                        step_obj.get("call_id")
+                        or step_obj.get("id")
+                        or step_obj.get("step_id")
+                        or f"call_{uuid.uuid4().hex[:8]}"
+                    )
+                    if sid:
+                        step_meta[str(sid)]["call_id"] = str(call_id)
+                    fn_name = step_obj.get("name") or ""
+                    raw_args = step_obj.get("arguments") or step_obj.get("args")
+                    arg_str = ""
+                    if isinstance(raw_args, dict) and raw_args:
+                        arg_str = json.dumps(raw_args)
+                    elif isinstance(raw_args, str) and raw_args:
+                        arg_str = raw_args
+                    entry = tool_calls.setdefault(
+                        call_id,
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": fn_name, "arguments": ""},
+                            "index": len(tool_calls),
+                        },
+                    )
+                    if fn_name and not entry["function"]["name"]:
+                        entry["function"]["name"] = fn_name
+                    if arg_str and not entry["function"]["arguments"]:
+                        entry["function"]["arguments"] = arg_str
+                    if sig and not entry.get("thought_signature"):
+                        entry["thought_signature"] = str(sig)
+                elif stype == "thought" and event_type in ("step.stop", "interaction.step.done"):
+                    if not reasoning_text:
+                        parts = step_obj.get("summary") or step_obj.get("content") or []
+                        if isinstance(parts, list):
+                            for p in parts:
+                                if isinstance(p, dict) and p.get("type") == "text":
+                                    reasoning_text += p.get("text", "")
+                elif stype == "model_output" and event_type in ("step.stop", "interaction.step.done"):
+                    if not content:
+                        parts = step_obj.get("content") or []
+                        if isinstance(parts, list):
+                            for p in parts:
+                                if isinstance(p, dict) and p.get("type") == "text":
+                                    content += p.get("text", "")
+
             delta = event.get("delta")
+            active_step_id = event.get("step_id") or (delta.get("step_id") if isinstance(delta, dict) else None)
+            active_step_type = (
+                step_meta.get(str(active_step_id), {}).get("type")
+                if active_step_id
+                else None
+            )
 
             # Handle step.delta events
-            if (event_type == "step.delta" or delta) and isinstance(delta, dict):
+            if (event_type in ("step.delta", "content.delta") or delta) and isinstance(delta, dict):
                 delta_type = delta.get("type")
-                # 1. Text deltas
-                if delta_type == "text" or "text" in delta:
+                d_sig = delta.get("signature") or delta.get("thought_signature")
+                if d_sig:
+                    last_thought_signature = str(d_sig)
+
+                # 1. Thought deltas (explicit thought delta or text delta inside a thought step)
+                if (
+                    delta_type in ("thought", "thought_summary")
+                    or "thought" in delta
+                    or "summary" in delta
+                    or (active_step_type == "thought" and (delta_type == "text" or "text" in delta))
+                ):
+                    th = delta.get("thought") or delta.get("text") or ""
+                    if not th and isinstance(delta.get("summary"), list):
+                        th = "".join(
+                            p.get("text", "")
+                            for p in delta["summary"]
+                            if isinstance(p, dict)
+                        )
+                    elif not th and isinstance(delta.get("summary"), str):
+                        th = delta["summary"]
+                    if isinstance(th, str) and th:
+                        reasoning_text += th
+                        if stream_callback:
+                            stream_callback({"type": "reasoning", "delta": th})
+
+                # 2. Text deltas
+                elif delta_type == "text" or "text" in delta:
                     t = delta.get("text", "")
                     if isinstance(t, str) and t:
                         content += t
                         if stream_callback:
                             stream_callback({"type": "content", "delta": t})
 
-                # 2. Thought deltas
-                elif delta_type == "thought" or "thought" in delta:
-                    th = delta.get("thought", "")
-                    if isinstance(th, str) and th:
-                        reasoning_text += th
-                        if stream_callback:
-                            stream_callback({"type": "reasoning", "delta": th})
-
-                # 3. Function call deltas
-                elif delta_type == "function_call" or "function_call" in delta:
+                # 3. Function call / arguments_delta events
+                elif (
+                    delta_type in ("function_call", "arguments_delta")
+                    or "function_call" in delta
+                    or "arguments_delta" in delta
+                    or "args_delta" in delta
+                    or (active_step_type == "function_call" and "arguments" in delta)
+                ):
                     fc_data = (
                         delta.get("function_call")
                         if isinstance(delta.get("function_call"), dict)
                         else delta
                     )
+                    mapped_call_id = (
+                        step_meta.get(str(active_step_id), {}).get("call_id")
+                        if active_step_id
+                        else None
+                    )
                     call_id = (
                         fc_data.get("call_id")
                         or fc_data.get("id")
-                        or event.get("step_id")
+                        or mapped_call_id
+                        or active_step_id
                     )
                     if not call_id:
                         if tool_calls and not fc_data.get("name"):
                             call_id = list(tool_calls.keys())[-1]
                         else:
                             call_id = f"call_{uuid.uuid4().hex[:8]}"
+                    call_id = str(call_id)
                     fn_name = fc_data.get("name") or ""
                     args_delta = (
                         fc_data.get("arguments_delta")
                         or fc_data.get("args_delta")
+                        or fc_data.get("arguments")
                         or ""
                     )
                     if isinstance(args_delta, dict):
@@ -476,9 +612,13 @@ def parse_interactions_stream(
                     if args_delta:
                         entry["function"]["arguments"] += args_delta
 
-                    sig = fc_data.get("thought_signature") or delta.get("thought_signature")
+                    sig = (
+                        fc_data.get("thought_signature")
+                        or fc_data.get("signature")
+                        or d_sig
+                    )
                     if sig and not entry.get("thought_signature"):
-                        entry["thought_signature"] = sig
+                        entry["thought_signature"] = str(sig)
 
                     if stream_callback:
                         stream_callback(
@@ -492,25 +632,33 @@ def parse_interactions_stream(
                             }
                         )
 
-            # Handle direct step completions or full step items in the event
-            steps = event.get("steps") or []
+            # Handle direct step completions or full step items in the event / interaction
+            steps = event.get("steps") or interaction_obj.get("steps") or []
             if isinstance(steps, list):
                 for s in steps:
                     if not isinstance(s, dict):
                         continue
-                    stype = s.get("type")
+                    stype = s.get("type") or s.get("step_type")
+                    s_sig = s.get("signature") or s.get("thought_signature")
+                    if s_sig:
+                        last_thought_signature = str(s_sig)
                     if stype == "model_output" and not content:
                         parts = s.get("content") or []
                         for p in parts:
                             if isinstance(p, dict) and p.get("type") == "text":
                                 content += p.get("text", "")
                     elif stype == "thought" and not reasoning_text:
-                        parts = s.get("content") or []
+                        parts = s.get("summary") or s.get("content") or []
                         for p in parts:
                             if isinstance(p, dict) and p.get("type") == "text":
                                 reasoning_text += p.get("text", "")
                     elif stype == "function_call":
-                        cid = s.get("call_id") or s.get("id") or s.get("step_id") or f"call_{uuid.uuid4().hex[:8]}"
+                        cid = str(
+                            s.get("call_id")
+                            or s.get("id")
+                            or s.get("step_id")
+                            or f"call_{uuid.uuid4().hex[:8]}"
+                        )
                         fname = s.get("name") or ""
                         fargs = s.get("args") or s.get("arguments") or {}
                         arg_str = json.dumps(fargs) if isinstance(fargs, dict) else str(fargs)
@@ -520,9 +668,9 @@ def parse_interactions_stream(
                             "function": {"name": fname, "arguments": arg_str},
                             "index": tool_calls.get(cid, {}).get("index", len(tool_calls)),
                         }
-                        sig = s.get("thought_signature")
+                        sig = s_sig or last_thought_signature
                         if sig:
-                            tc_entry["thought_signature"] = sig
+                            tc_entry["thought_signature"] = str(sig)
                         tool_calls[cid] = tc_entry
             if finish_reason is not None and last_usage is not None:
                 break
@@ -581,8 +729,7 @@ def parse_interactions_stream(
     message: dict[str, Any] = {"role": "assistant", "content": content or None}
     if tool_calls:
         for tc in tool_calls.values():
-            if not tc.get("thought_signature"):
-                tc["thought_signature"] = "skip_thought_signature_validator"
+            attach_thought_signature(tc, tc.get("thought_signature") or last_thought_signature)
         message["tool_calls"] = list(tool_calls.values())
     if reasoning_text.strip():
         clean_r = strip_encrypted_reasoning(reasoning_text)
@@ -603,19 +750,23 @@ def parse_interactions_response(body: dict[str, Any]) -> dict[str, Any]:
     content = ""
     reasoning_text = ""
     tool_calls: list[dict[str, Any]] = []
+    last_thought_signature: str | None = None
 
     steps = body.get("steps") or []
     for step in steps:
         if not isinstance(step, dict):
             continue
-        step_type = step.get("type")
+        step_type = step.get("type") or step.get("step_type")
+        step_sig = step.get("signature") or step.get("thought_signature")
+        if step_sig:
+            last_thought_signature = str(step_sig)
         if step_type == "model_output":
             parts = step.get("content") or []
             for part in parts:
                 if isinstance(part, dict) and part.get("type") == "text":
                     content += part.get("text", "")
         elif step_type == "thought":
-            parts = step.get("content") or []
+            parts = step.get("summary") or step.get("content") or []
             for part in parts:
                 if isinstance(part, dict) and part.get("type") == "text":
                     reasoning_text += part.get("text", "")
@@ -629,9 +780,8 @@ def parse_interactions_response(body: dict[str, Any]) -> dict[str, Any]:
                 "type": "function",
                 "function": {"name": fn_name, "arguments": arg_str},
             }
-            sig = step.get("thought_signature") or "skip_thought_signature_validator"
-            if sig:
-                tc_dict["thought_signature"] = sig
+            if step_sig or last_thought_signature:
+                tc_dict["thought_signature"] = step_sig or last_thought_signature
             tool_calls.append(tc_dict)
 
     usage_meta = body.get("usage") or body.get("usage_metadata")
@@ -662,6 +812,9 @@ def parse_interactions_response(body: dict[str, Any]) -> dict[str, Any]:
             "prompt_tokens": int(p_tokens),
             "completion_tokens": int(c_tokens),
             "reasoning_tokens": int(r_tokens),
+            "completion_tokens_details": {
+                "reasoning_tokens": int(r_tokens),
+            },
             "prompt_tokens_details": {
                 "cached_tokens": int(cached_tokens),
             },
@@ -677,8 +830,6 @@ def parse_interactions_response(body: dict[str, Any]) -> dict[str, Any]:
         for tc in text_calls:
             if not tc.get("id"):
                 tc["id"] = f"call_{uuid.uuid4().hex[:8]}"
-            if not tc.get("thought_signature"):
-                tc["thought_signature"] = "skip_thought_signature_validator"
         tool_calls = text_calls
 
     finish_reason = body.get("finish_reason") or body.get("status")
@@ -707,8 +858,7 @@ def parse_interactions_response(body: dict[str, Any]) -> dict[str, Any]:
     message: dict[str, Any] = {"role": "assistant", "content": content or None}
     if tool_calls:
         for tc in tool_calls:
-            if not tc.get("thought_signature"):
-                tc["thought_signature"] = "skip_thought_signature_validator"
+            attach_thought_signature(tc, tc.get("thought_signature") or last_thought_signature)
         message["tool_calls"] = tool_calls
     if reasoning_text.strip():
         clean_r = strip_encrypted_reasoning(reasoning_text)
@@ -763,8 +913,11 @@ class GoogleInteractionsClient(BaseLLMClient):
         system_instruction, steps = convert_messages_to_interactions(wire_messages)
         declarations = convert_tools_to_declarations(tools)
 
+        # The Interactions API expects bare model IDs (no OpenRouter / REST prefixes).
+        raw_model = (self.settings.gemini_model or "").strip().removeprefix("google/").removeprefix("models/")
+
         payload: dict[str, Any] = {
-            "model": self.settings.gemini_model,
+            "model": raw_model,
             "input": steps,
             "stream": True,
         }
@@ -782,13 +935,14 @@ class GoogleInteractionsClient(BaseLLMClient):
             # Google GenAI API enforces maxOutputTokens < 65536.
             gen_config["max_output_tokens"] = min(self.settings.llm_max_completion_tokens, 65535)
 
-        model_name = (self.settings.gemini_model or "").lower()
-        is_gemini_3 = "3." in model_name or "gemini-3" in model_name
+        model_name = raw_model.lower()
+        # Gemini 2.x takes a token ``thinking_budget``; newer models take ``thinking_level``.
+        is_gemini_2 = "2.5" in model_name or "gemini-2" in model_name
         effort = (self.settings.gemini_reasoning_effort or "").lower().strip()
 
         thinking_config: dict[str, Any] = {"include_thoughts": True}
         if effort:
-            if is_gemini_3:
+            if not is_gemini_2:
                 level_map = {
                     "low": "LOW",
                     "medium": "MEDIUM",
@@ -804,7 +958,7 @@ class GoogleInteractionsClient(BaseLLMClient):
                     "high": 8192,
                 }
                 thinking_config["thinking_budget"] = budget_map.get(effort, 8192)
-        elif is_gemini_3:
+        elif not is_gemini_2:
             thinking_config["thinking_level"] = "HIGH"
         else:
             thinking_config["thinking_budget"] = 8192

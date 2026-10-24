@@ -3,73 +3,76 @@
 ## 1. Global Setup & Syntax Traps
 
 ```scad
-$fn = 32;     // Circle resolution (keep 24-32 for drafting/fast iteration, <= 60 for final)
-EPS = 0.01;   // Manifold clearance for cutters/overlaps
+$fn = 32;     // Arc resolution (24-32 for fast drafting, <= 60 for final render)
+EPS = 0.01;   // Manifold clearance for boolean cutters and solid overlaps
 ```
 
-| Feature | OpenSCAD (Required) | Python Pitfall (Invalid) |
+| Feature | OpenSCAD (Valid) | Python Pitfall (Invalid) |
 |---|---|---|
-| **Comments** | `//` or `/* */` | `#` (Reserved for debug modifier!) |
-| **Booleans** | `true`, `false` | `True`, `False` |
-| **Exponent** | `pow(b, e)` or `b ^ e` | `b ** e` |
+| **Comments** | `//` or `/* */` | `#` (Debug modifier, NOT a comment!) |
+| **Booleans / Null** | `true`, `false`, `undef` | `True`, `False`, `None`, `null` |
+| **Exponent** | `b ^ e` or `pow(b, e)` | `b ** e` |
+| **Trigonometry** | `sin(deg)`, `cos(deg)`, `atan2(y, x)` (**degrees**) | Radians (`deg * PI / 180` breaks angles!) |
 | **Branching** | `if (...) {} else if (...) {}` | `elif` |
-| **Null** | `undef` | `None`, `null` |
 | **Print** | `echo("val:", v);` | `print()` |
-| **Terminator**| Must end with `;` | Missing semicolon |
+| **Terminator** | Statements must end with `;` | Missing semicolon |
 
-* **Scope & Variables:** Evaluated at compile-time. Variables are immutable per scope (last assignment wins). No mutation in loops—use list comprehensions or ternaries:
+* **Immutability & Lexical Scope:** Variables are compile-time constants per scope. Reassigning inside `if {}` or `for {}` creates a shadowed inner variable and **never** updates the outer variable. Use ternaries, `let()`, or list comprehensions:
   ```scad
+  w = compact ? 10 : 20;           // Conditional assignment (NEVER assign inside if {})
   vals = [for (i = [0:2]) i * 10]; // [0, 10, 20]
-  w = compact ? 10 : 20;
   ```
-* **Debug Modifiers:** `#` (red debug overlay), `*` (disable), `!` (render only this root), `%` (transparent background).
+* **Modifiers:** `#` (highlight), `%` (transparent background — **omitted from STL**), `*` (disable — **omitted from STL**), `!` (root — **exports ONLY this subtree to STL**). Never leave `%`, `*`, or `!` on active geometry in final code.
 
 ---
 
 ## 2. Primitives & Centering
 
-*Units: Millimeters, Degrees.*
+*Units: Millimeters (`mm`), Degrees (`deg`).*
 
-| Primitive | Centered (`center = true`) | Not Centered (`center = false`) |
+| Primitive | Centered (`center = true`) | Default (`center = false`) |
 |---|---|---|
-| `cube([x,y,z])` | Centered across **X, Y, and Z** | Sits at `(0,0,0)` to `(+x, +y, +z)` |
-| `cylinder(h, r\|d)` | **Z only** (`-h/2` to `+h/2`). X/Y centered at origin. | Base at `Z = 0` (`0` to `+h`). X/Y centered. |
-| `sphere(r\|d)` | Always origin `(0,0,0)` | Always origin `(0,0,0)` |
-| `polyhedron()` | Exterior face vertices must wind **clockwise**. |
+| `cube([x, y, z])` | Centered on **X, Y, Z** (`-x/2..+x/2`, etc.) | `(0, 0, 0)` to `(+x, +y, +z)` |
+| `cylinder(h, r\|d, r1, r2, d1, d2)` | **Z only** (`-h/2` to `+h/2`); X/Y at `(0, 0)` | Base at `Z = 0` (`0` to `+h`); X/Y at `(0, 0)` |
+| `sphere(r\|d)` | Always centered at `(0, 0, 0)` | Always centered at `(0, 0, 0)` |
+| `square([x, y])` (2D) | Centered on **X, Y** (`-x/2..+x/2`, `-y/2..+y/2`) | `(0, 0)` to `(+x, +y)` |
+| `circle(r\|d)` (2D) | Always centered at `(0, 0)` | Always centered at `(0, 0)` |
+| `text(t, size, halign, valign)` | **2D only** — wrap in `linear_extrude(h)` for 3D | `halign = "left"`, `valign = "baseline"` |
+| `polyhedron(points, faces)` | Exterior face vertices must wind **clockwise** when viewed from the **outside** looking inward. |
 
 ---
 
 ## 3. Extrusions & CSG Rules
 
-* **2D-Only Children:** `linear_extrude()` and `rotate_extrude()` accept **strictly 2D children** (`circle`, `square`, `polygon`, `offset()`). Passing 3D objects causes a fatal error.
-* **Revolve Rule ($X \ge 0$):** In `rotate_extrude()`, the entire 2D profile must sit at $X \ge 0$. Crossing $X = 0$ crashes the compiler.
-* **Minkowski Ban & Hull Scaling:** **Never use 3D `minkowski()`** (causes compiler lockup). Use `hull()` or 2D `offset()` before extrusion. Avoid chaining hundreds of `hull()` calls in loops for continuous geometries (e.g. threads); use `linear_extrude(twist=...)` or `polyhedron()` to prevent CGAL compiler freezing.
-* **Non-Self-Intersecting Profiles:** In 2D profiles (`polygon()`) revolved with `rotate_extrude()` or extruded with `linear_extrude()`, the profile boundary must never self-intersect (e.g. outer wall radius stepping inside inner bore radius at any Z station). Self-intersecting 2D contours create invalid 3D Nef polyhedra that crash CGAL during booleans (`applyUnion3D assertion violation`).
-* **Transforms:** Evaluate right-to-left (innermost executes first):
+* **2D-Only Children:** `linear_extrude(height, center, twist, scale)` and `rotate_extrude(angle = 360)` accept **strictly 2D children** (`square`, `circle`, `polygon`, `text`, `offset`). Keep transforms inside extrusions strictly 2D; apply 3D `rotate([ax, ay, az])` and `translate([x, y, z])` **after** extrusion.
+* **Revolve Rule ($X \ge 0$):** In `rotate_extrude()`, all 2D profile points must have the same X sign (keep at $X \ge 0$). Crossing $X = 0$ fails compilation; touching $X = 0$ at a single sharp vertex creates a non-manifold pinch.
+* **2D `offset()` & `hull()` over `minkowski()`:** **Never use 3D `minkowski()`** (causes severe CGAL lockups). Use 2D `offset(r = ...)` (rounded corners) or `offset(delta = ...)` (parallel wall shift) before extrusion, or `hull()` around corner cylinders/spheres. Avoid chaining hundreds of 3D `hull()` calls in loops; use `linear_extrude(twist = ...)` or `polyhedron()`.
+* **Non-Self-Intersecting Profiles:** 2D `polygon()` contours must never self-intersect or cross inner/outer walls (causes CGAL `applyUnion3D` assertion crashes).
+* **Transform Order:** Evaluates right-to-left (innermost executes first):
   ```scad
-  translate([x, y, z]) rotate([ax, ay, az]) shape(); // Rotate locally, then translate
+  translate([x, y, z]) rotate([ax, ay, az]) shape(); // 1. Rotate locally, 2. Translate
   ```
 
 ---
 
 ## 4. Manifold Cutters (The EPS Rule)
 
-OpenSCAD requires 2-manifold (watertight) meshes. Prevent zero-thickness walls and coincident surfaces:
+OpenSCAD requires watertight 2-manifold meshes. Eliminate coplanar faces and zero-thickness walls:
 
-1. **Cutters:** Must overshoot target geometry on both sides:
+1. **Cutters:** Must overshoot cut surfaces by `EPS`:
    ```scad
    difference() {
        cube([W, L, H], center = true);
-       translate([0, 0, -H/2 - EPS]) 
-           cylinder(h = H + 2 * EPS, d = DIA); // Overshoots top and bottom
+       translate([0, 0, -H/2 - EPS])
+           cylinder(h = H + 2 * EPS, d = DIA); // Overshoots top and bottom by EPS
    }
    ```
-2. **Unions:** Adjoining solid bodies must overlap by at least `EPS`.
-3. **Multi-Part Base:** Wrap multi-body bases in `union()` as the first child of `difference()`:
+2. **Unions:** Adjoining solids must penetrate each other by at least `EPS` (no flush kiss contacts).
+3. **Multi-Part Base:** Wrap multiple base solids in an explicit `union()` as the **first** child of `difference()`:
    ```scad
    difference() {
-       union() { base1(); base2(); }
-       cutter();
+       union() { base1(); base2(); } // Kept solid
+       cutter1();                    // Subtracted (2nd+ children)
    }
    ```
 
@@ -78,7 +81,7 @@ OpenSCAD requires 2-manifold (watertight) meshes. Prevent zero-thickness walls a
 ## 5. Standard Helper Modules
 
 ```scad
-// Rounded box on XY plane, seated on Z = 0
+// Rounded box on XY plane, base at Z = 0
 module rounded_box(w, l, h, r) {
     hull() {
         for (x = [-w/2 + r, w/2 - r], y = [-l/2 + r, l/2 - r])
@@ -86,33 +89,28 @@ module rounded_box(w, l, h, r) {
     }
 }
 
-// Subtractive hex nut pocket (AF: M3=5.5, M4=7, M5=8, M6=10)
+// Subtractive hex nut pocket at Z = 0 (AF: M3=5.5, M4=7, M5=8, M6=10)
 module hex_nut_pocket(depth, af) {
     translate([0, 0, -EPS])
-        cylinder(h = depth + EPS, r = af / 1.73205, $fn = 6);
+        cylinder(h = depth + EPS, r = af / sqrt(3), $fn = 6);
 }
 
-// Subtractive countersunk screw hole
+// Subtractive countersunk through-hole (board thickness h, cone at top Z = h)
 module countersunk_hole(h, d_shaft, d_head, h_head) {
-    translate([0, 0, -EPS]) {
+    translate([0, 0, -EPS])
         cylinder(h = h + 2 * EPS, d = d_shaft);
-        translate([0, 0, h - h_head + EPS])
-            cylinder(h = h_head + EPS, d1 = d_shaft, d2 = d_head);
-    }
+    translate([0, 0, h - h_head])
+        cylinder(h = h_head + EPS, d1 = d_shaft, d2 = d_head);
 }
 
-// Multi-variant & Plate Layout Pattern (OpenSCAD Customizer Standard)
-/* [Variant Selection] */
-PART_TYPE = "ALL"; // [ALL:All Parts, A:Variant A, B:Variant B]
-
-// Collision-free plate spacing (minimum 10 mm gap between outer bounding surfaces)
-PART_GAP = 10.0; // mm clearance between parts
+// Multi-variant & Plate Layout Pattern (Customizer)
+PART_TYPE = "ALL"; // [ALL, A, B]
+PART_GAP = 10.0;   // mm, minimum clearance between outer bounds
 
 module plate_layout() {
     if (PART_TYPE == "ALL") {
-        // Center-to-center offset: (width_A + width_B)/2 + PART_GAP
-        translate([-(PART_A_WIDTH/2 + PART_GAP/2), 0, 0]) part_a();
-        translate([+(PART_B_WIDTH/2 + PART_GAP/2), 0, 0]) part_b();
+        translate([-(PART_A_WIDTH + PART_GAP) / 2, 0, 0]) part_a();
+        translate([+(PART_B_WIDTH + PART_GAP) / 2, 0, 0]) part_b();
     } else if (PART_TYPE == "A") {
         part_a();
     } else if (PART_TYPE == "B") {
@@ -128,10 +126,11 @@ plate_layout();
 
 | Compiler Output | Root Cause | Fix |
 |---|---|---|
-| `syntax error` | Missing `;`, unclosed `{`, or Python syntax | Add semicolons; check brackets; strip `def`/`import`. |
-| `Current top level object is not a 2D object` | 3D shape passed to extrusion | Use only 2D shapes (`square`, `circle`, `offset`) inside extrusions. |
-| `all points for rotate_extrude() must have the same X coordinate sign` | Profile crosses Y-axis | Shift profile entirely to $X \ge 0$: `translate([r, 0]) shape();`. |
-| `CGAL error in CGAL_Nef_polyhedron3` | Coincident surfaces / zero-thickness walls | Add `EPS` overshoot to cutters; overlap `union()` solids by `EPS`. |
-| `CGAL error in applyUnion3D / assertion violation` | Self-intersecting 2D polygon in `rotate_extrude` (outer radius < inner radius at same Z) or broken polyhedron | Verify 2D polygon outer profile is strictly outside inner profile; fix crossed coordinates. |
-| Process lockup / timeout | 3D `minkowski()` or `$fn > 100` | Replace `minkowski` with `hull()`; set `$fn = 60;`. |
-| `UI-WARNING: No top level geometry` | Empty model or cutter consumed base | Check cutter dimensions/offsets vs. base dimensions. |
+| `Parser error: syntax error` | Missing `;`, unmatched `{}`, or Python syntax | Add `;`, match braces, replace `elif`/`**`/`True`/`#`. |
+| `Current top level object is not a 2D object` | 3D primitive inside `linear_extrude` or `rotate_extrude` | Pass only 2D shapes (`square`, `circle`, `polygon`, `text`, `offset`). |
+| `WARNING: Scaling a 2D object with 0` | 3D rotation (`rotate([90,0,0])`) applied inside extrusion | Apply 3D rotations **outside** `linear_extrude()` / `rotate_extrude()`. |
+| `all points for rotate_extrude() must have the same X coordinate sign` | 2D profile crosses the Y-axis ($X = 0$) | Shift entire 2D profile to $X \ge 0$ before revolving. |
+| `CGAL error in CGAL_Nef_polyhedron3` | Coplanar boolean faces, zero-thickness walls, or pinch point | Overshoot cutters by `EPS`; overlap `union()` parts by `EPS`. |
+| `CGAL error in applyUnion3D` / `assertion violation` | Self-intersecting 2D `polygon()` or inverted `polyhedron()` faces | Fix crossed 2D contour points; wind `polyhedron` faces clockwise from outside. |
+| `Current top level object is empty` / `No top level geometry` | Cutter consumed entire base, or `%` / `*` hid root geometry | Check cutter dimensions/offsets; remove `%` and `*` modifiers. |
+| Process lockup / timeout | 3D `minkowski()`, looped 3D `hull()`, or `$fn > 100` | Replace `minkowski()` with 2D `offset()` or `hull()`; keep `$fn <= 60`. |

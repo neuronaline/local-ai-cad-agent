@@ -59,6 +59,18 @@
               <input id="attachments" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden>
             </label>
             <span id="attachment-label" class="sr-only">Attach reference images</span>
+            <div class="model-picker" title="Select AI model">
+              <svg class="icon model-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              <select id="model-select" class="model-select" aria-label="Select AI model" title="Select AI model">
+                {% for item in available_models or [] %}
+                <option value="{{ item.key }}"{% if item.key == active_model_key %} selected{% endif %}>
+                  {{ item.provider_label }} · {{ item.label }}
+                </option>
+                {% endfor %}
+              </select>
+            </div>
             <div class="effort-picker" title="Model reasoning effort">
               <svg class="icon effort-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
                 <path d="M12 2a7 7 0 0 0-7 7c0 2.38 1.19 4.47 3 5.74V17a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1v-2.26c1.81-1.27 3-3.36 3-5.74a7 7 0 0 0-7-7M9 21a1 1 0 0 0 1 1h4a1 1 0 0 0 1-1v-1H9z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
@@ -198,11 +210,141 @@
         </div>
       </div>
     </div>
+    <div id="print-advisor-modal" class="modal hidden" aria-hidden="true" role="dialog" aria-label="3MF Print Settings Advisor">
+      <div class="modal-content print-advisor-modal-content">
+        <header class="print-advisor-header">
+          <div class="print-advisor-title-group">
+            <h3>3D Print Advisor & 3MF Export</h3>
+            <span class="advisor-badge">Auto-Tuned</span>
+          </div>
+          <button id="advisor-modal-close" type="button" class="quiet icon-only" title="Close" aria-label="Close">✕</button>
+        </header>
+
+        <div class="print-advisor-body">
+          <div class="advisor-telemetry-grid">
+            <div class="telemetry-card">
+              <span class="telemetry-label">Overhangs (&gt;45°)</span>
+              <span id="telemetry-overhang" class="telemetry-value">--</span>
+            </div>
+            <div class="telemetry-card">
+              <span class="telemetry-label">Bed Contact</span>
+              <span id="telemetry-bed" class="telemetry-value">--</span>
+            </div>
+            <div class="telemetry-card">
+              <span class="telemetry-label">Slenderness</span>
+              <span id="telemetry-slenderness" class="telemetry-value">--</span>
+            </div>
+            <div class="telemetry-card">
+              <span class="telemetry-label">Adhesion / Brim</span>
+              <span id="telemetry-brim" class="telemetry-value">--</span>
+            </div>
+          </div>
+
+          <div class="advisor-form-grid">
+            <div class="advisor-form-row">
+              <label for="advisor-material">Filament Material</label>
+              <select id="advisor-material" class="advisor-select">
+                <option value="auto" selected>Auto (Recommended)</option>
+                <option value="PLA">PLA (Standard)</option>
+                <option value="PETG">PETG (Durable / Heat)</option>
+                <option value="ASA">ASA (Outdoor / UV)</option>
+                <option value="ABS">ABS (Engineering)</option>
+                <option value="TPU">TPU (Flexible)</option>
+              </select>
+            </div>
+
+            <div class="advisor-form-row">
+              <label for="advisor-priority">Optimization Priority</label>
+              <select id="advisor-priority" class="advisor-select">
+                <option value="auto">Auto (Balanced)</option>
+                <option value="strength">Strength (Dense / Thick Walls)</option>
+                <option value="quality">Quality (Fine Layer / Detail)</option>
+                <option value="speed">Speed (Thick Layer / Fast)</option>
+              </select>
+            </div>
+
+            <div class="advisor-form-row">
+              <label for="advisor-layer-height">Layer Height (mm)</label>
+              <select id="advisor-layer-height" class="advisor-select">
+                <option value="0.08">0.08 mm (Ultra Fine)</option>
+                <option value="0.12">0.12 mm (Fine Detail)</option>
+                <option value="0.16">0.16 mm (High Quality)</option>
+                <option value="0.20">0.20 mm (Standard)</option>
+                <option value="0.24">0.24 mm (Speed / Draft)</option>
+                <option value="0.28">0.28 mm (Draft / Fast)</option>
+              </select>
+            </div>
+
+            <div class="advisor-form-row">
+              <label for="advisor-wall-loops">Wall Loops (Perimeters)</label>
+              <input id="advisor-wall-loops" type="number" min="2" max="6" step="1" value="3" class="advisor-input">
+            </div>
+
+            <div class="advisor-form-row">
+              <label for="advisor-infill-density">Infill Density (%)</label>
+              <input id="advisor-infill-density" type="number" min="0" max="100" step="5" value="20" class="advisor-input">
+            </div>
+
+            <div class="advisor-form-row">
+              <label for="advisor-infill-pattern">Infill Pattern</label>
+              <select id="advisor-infill-pattern" class="advisor-select">
+                <option value="gyroid">Gyroid (Isotropic)</option>
+                <option value="cubic">Cubic (Structural 3D)</option>
+                <option value="grid">Grid (Fast)</option>
+                <option value="honeycomb">Honeycomb</option>
+                <option value="adaptivecubic">Adaptive Cubic</option>
+                <option value="lightning">Lightning (Minimal)</option>
+              </select>
+            </div>
+
+            <div class="advisor-form-row advisor-checkbox-row">
+              <label class="advisor-check-label">
+                <input id="advisor-support-enabled" type="checkbox">
+                <span>Enable Supports</span>
+              </label>
+              <select id="advisor-support-type" class="advisor-select advisor-select-inline">
+                <option value="normal">Normal (Grid)</option>
+                <option value="tree">Tree (Organic)</option>
+              </select>
+            </div>
+
+            <div class="advisor-form-row advisor-checkbox-row">
+              <label class="advisor-check-label">
+                <input id="advisor-brim-enabled" type="checkbox">
+                <span>Enable Brim</span>
+              </label>
+              <input id="advisor-brim-width" type="number" min="4" max="15" step="1" value="6" class="advisor-input advisor-input-inline" title="Brim width in mm">
+            </div>
+          </div>
+
+          <div class="advisor-rationale-box">
+            <span class="advisor-rationale-title">Engineering Rationale:</span>
+            <p id="advisor-rationale-text" class="advisor-rationale-text">Analyzing model geometry...</p>
+          </div>
+        </div>
+
+        <footer class="print-advisor-footer">
+          <button id="advisor-recompute-btn" type="button" class="quiet toolbar-pill" title="Re-evaluate with selected priority and material">
+            <span>Refresh Advice</span>
+          </button>
+          <div class="advisor-export-buttons">
+            <button id="advisor-download-geom" type="button" class="quiet" title="Export clean 3MF geometry without embedded slicer configs">
+              Geometry Only
+            </button>
+            <button id="advisor-download-smart" type="button" class="primary-btn" title="Export 3MF with embedded Prusa, Bambu, and Orca slicer profiles">
+              Download Smart 3MF
+            </button>
+          </div>
+        </footer>
+      </div>
+    </div>
     <script id="app-config" type="application/json">
       {{ {
         'projectName': project_name,
         'showInfoMessages': show_info_messages,
         'reasoningEffort': reasoning_effort,
+        'activeModelKey': active_model_key,
+        'availableModels': available_models,
         'viewerGrid': {
           'size': viewer_grid_size,
           'divisions': viewer_grid_divisions,

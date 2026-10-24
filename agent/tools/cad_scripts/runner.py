@@ -162,6 +162,52 @@ def mesh_metrics(vertices: np.ndarray, triangles: np.ndarray) -> dict[str, Any]:
     solid_count = max(1, disconnected_count + 1)
     is_valid = volume > 0 and dim_x > 0 and dim_y > 0 and dim_z > 0
 
+    # Printability telemetry (surface area, bed contact, overhangs, stability)
+    e1 = v1 - v0
+    e2 = v2 - v0
+    tri_cross = np.cross(e1, e2)
+    norms = np.linalg.norm(tri_cross, axis=1)
+    tri_areas = 0.5 * norms
+    surface_area = float(np.sum(tri_areas))
+
+    safe_norms = np.where(norms > 1e-12, norms, 1.0)
+    nz = tri_cross[:, 2] / safe_norms
+    max_z_tri = np.maximum.reduce([v0[:, 2], v1[:, 2], v2[:, 2]])
+
+    bed_mask = (max_z_tri <= min_pt[2] + 0.20) & (nz <= -0.95)
+    bed_contact_area = float(np.sum(tri_areas[bed_mask]))
+    footprint_area = max(dim_x * dim_y, 1e-6)
+    bed_contact_ratio = float(min(1.0, bed_contact_area / footprint_area))
+
+    elevated_mask = max_z_tri > (min_pt[2] + 0.40)
+    overhang_45_mask = elevated_mask & (nz < -0.70710678)
+    overhang_60_mask = elevated_mask & (nz < -0.86602540)
+    overhang_area_45 = float(np.sum(tri_areas[overhang_45_mask]))
+    overhang_area_60 = float(np.sum(tri_areas[overhang_60_mask]))
+    overhang_ratio = float(min(1.0, overhang_area_45 / max(surface_area, 1e-6)))
+
+    min_horizontal_dim = max(min(dim_x, dim_y), 0.1)
+    slenderness_ratio = float(dim_z / min_horizontal_dim)
+
+    needs_support = bool(overhang_area_45 >= 15.0 or overhang_ratio >= 0.03)
+    needs_brim = bool(
+        slenderness_ratio >= 2.5
+        or (bed_contact_area < 150.0 and dim_z >= 20.0)
+        or (bed_contact_ratio < 0.08 and dim_z >= 10.0)
+    )
+
+    printability = {
+        "surface_area_mm2": round(surface_area, 2),
+        "bed_contact_area_mm2": round(bed_contact_area, 2),
+        "bed_contact_ratio": round(bed_contact_ratio, 4),
+        "overhang_area_45deg_mm2": round(overhang_area_45, 2),
+        "overhang_area_60deg_mm2": round(overhang_area_60, 2),
+        "overhang_ratio": round(overhang_ratio, 4),
+        "slenderness_ratio": round(slenderness_ratio, 2),
+        "needs_support": needs_support,
+        "needs_brim": needs_brim,
+    }
+
     return {
         "solid_count": solid_count,
         "is_valid": is_valid,
@@ -177,6 +223,7 @@ def mesh_metrics(vertices: np.ndarray, triangles: np.ndarray) -> dict[str, Any]:
         "multi_face_edges": multi_face_edges,
         "vertex_count": len(vertices),
         "triangle_count": len(triangles),
+        "printability": printability,
     }
 
 

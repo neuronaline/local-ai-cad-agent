@@ -25,6 +25,45 @@ const currentProject = appConfig.projectName || '';
 const viewer = new CadViewer(document.querySelector('#viewer'), document.querySelector('#dimensions'), appConfig);
 const reasoningEffortSelect = document.querySelector('#reasoning-effort');
 const VALID_EFFORTS = new Set(['minimal', 'low', 'medium', 'high']);
+const modelSelect = document.querySelector('#model-select');
+const availableModels = Array.isArray(appConfig.availableModels) ? appConfig.availableModels : [];
+const validModelKeys = new Set(availableModels.map(m => m.key));
+
+function getActiveModelKey() {
+  const val = modelSelect?.value;
+  return val && validModelKeys.has(val) ? val : '';
+}
+
+// Persists the selection and syncs the server. ``adoptModelEffort`` applies the
+// model's configured reasoning effort — only for explicit user picks, so a
+// restored selection never overrides the user's saved effort.
+function setActiveModelKey(key, adoptModelEffort = false) {
+  if (!key || !validModelKeys.has(key) || !modelSelect) return;
+  modelSelect.value = key;
+  try {
+    localStorage.setItem('cad_selected_model', key);
+  } catch {}
+  api('/api/settings/models', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({model_key: key}),
+  }).then(res => {
+    if (adoptModelEffort && VALID_EFFORTS.has(res?.reasoning_effort)) {
+      setActiveReasoningEffort(res.reasoning_effort, false);
+    }
+  }).catch(() => {});
+}
+
+try {
+  const savedModel = localStorage.getItem('cad_selected_model');
+  if (savedModel && savedModel !== appConfig.activeModelKey && validModelKeys.has(savedModel)) {
+    setActiveModelKey(savedModel);
+  }
+} catch {}
+
+modelSelect?.addEventListener('change', () => {
+  setActiveModelKey(modelSelect.value, true);
+});
 
 function getActiveReasoningEffort() {
   const val = reasoningEffortSelect?.value;
@@ -748,6 +787,7 @@ async function handleRetry(errorElement = null, context = null) {
       body.append('message', sub.text);
       body.append('idempotency_key', idempotencyKey);
       body.append('reasoning_effort', getActiveReasoningEffort());
+      body.append('model_key', getActiveModelKey());
       if (Array.isArray(sub.files)) {
         sub.files.forEach(file => body.append('attachments', file));
       }
@@ -785,6 +825,7 @@ async function handleRetry(errorElement = null, context = null) {
       body: JSON.stringify({
         project: currentProject,
         reasoning_effort: getActiveReasoningEffort(),
+        model_key: getActiveModelKey(),
       }),
     });
     if (!response.accepted) {
@@ -1100,6 +1141,18 @@ function addInfoMessage(type, data = {}) {
 
 const COMMANDS = [
   {
+    name: '/print',
+    args: '[notes]',
+    desc: 'Recommend 3D print & slicer settings based on full project context',
+    iconSvg: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M6 9V2h12v7M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M6 14h12v8H6z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    action: () => {
+      message.value = '/print ';
+      autoResizeMessage();
+      message.focus();
+      closeSlashPopup();
+    },
+  },
+  {
     name: '/audit',
     args: '[notes]',
     desc: 'Audit model for geometric, manifold & manufacturing defects',
@@ -1304,6 +1357,7 @@ chatForm.addEventListener('submit', async event => {
     body.append('message', promptText);
     body.append('idempotency_key', idempotencyKey);
     body.append('reasoning_effort', getActiveReasoningEffort());
+    body.append('model_key', getActiveModelKey());
     selectedFiles.forEach(file => body.append('attachments', file));
     const submissionSnapshot = {
       project: currentProject,
@@ -1550,9 +1604,213 @@ document.querySelector('#reset-view')?.addEventListener('click', () => {
     item.setAttribute('aria-pressed', String(isIso));
   });
 });
+// Print Advisor Modal & 3MF Export
+const printAdvisorModal = document.querySelector('#print-advisor-modal');
+const advisorModalClose = document.querySelector('#advisor-modal-close');
+const telemetryOverhang = document.querySelector('#telemetry-overhang');
+const telemetryBed = document.querySelector('#telemetry-bed');
+const telemetrySlenderness = document.querySelector('#telemetry-slenderness');
+const telemetryBrim = document.querySelector('#telemetry-brim');
+
+const advisorMaterial = document.querySelector('#advisor-material');
+const advisorPriority = document.querySelector('#advisor-priority');
+const advisorLayerHeight = document.querySelector('#advisor-layer-height');
+const advisorWallLoops = document.querySelector('#advisor-wall-loops');
+const advisorInfillDensity = document.querySelector('#advisor-infill-density');
+const advisorInfillPattern = document.querySelector('#advisor-infill-pattern');
+const advisorSupportEnabled = document.querySelector('#advisor-support-enabled');
+const advisorSupportType = document.querySelector('#advisor-support-type');
+const advisorBrimEnabled = document.querySelector('#advisor-brim-enabled');
+const advisorBrimWidth = document.querySelector('#advisor-brim-width');
+const advisorRationaleText = document.querySelector('#advisor-rationale-text');
+const advisorRecomputeBtn = document.querySelector('#advisor-recompute-btn');
+const advisorDownloadGeom = document.querySelector('#advisor-download-geom');
+const advisorDownloadSmart = document.querySelector('#advisor-download-smart');
+
+let currentAdvisorProfile = null;
+
+function triggerBlobDownload(blob, filename) {
+  const blobUrl = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = blobUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
+}
+
+function openPrintAdvisorModal() {
+  if (!printAdvisorModal) return;
+  printAdvisorModal.classList.remove('hidden');
+  printAdvisorModal.setAttribute('aria-hidden', 'false');
+  advisorModalClose?.focus();
+  fetchPrintAdvisorProfile();
+}
+
+function closePrintAdvisorModal() {
+  if (!printAdvisorModal) return;
+  printAdvisorModal.classList.add('hidden');
+  printAdvisorModal.setAttribute('aria-hidden', 'true');
+}
+
+advisorModalClose?.addEventListener('click', closePrintAdvisorModal);
+printAdvisorModal?.addEventListener('click', (event) => {
+  if (event.target === printAdvisorModal) closePrintAdvisorModal();
+});
+window.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && printAdvisorModal && !printAdvisorModal.classList.contains('hidden')) {
+    closePrintAdvisorModal();
+  }
+});
+
+async function fetchPrintAdvisorProfile() {
+  if (!currentProject) return;
+  if (advisorRationaleText) advisorRationaleText.textContent = 'Analyzing model geometry and generating slicer settings...';
+  if (advisorRecomputeBtn) advisorRecomputeBtn.disabled = true;
+
+  try {
+    const res = await fetch(`/api/projects/${encodeURIComponent(currentProject)}/print-profile`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        priority: advisorPriority?.value || 'auto',
+        material: advisorMaterial?.value || 'auto',
+      }),
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: 'Failed to retrieve profile' }));
+      if (advisorRationaleText) advisorRationaleText.textContent = `Error: ${err.error || res.statusText}`;
+      return;
+    }
+
+    const data = await res.json();
+    const p = data.printability || {};
+    const prof = data.profile || {};
+    currentAdvisorProfile = prof;
+
+    // Telemetry cards
+    if (telemetryOverhang) {
+      const oRatio = ((p.overhang_ratio || 0) * 100).toFixed(1);
+      const oArea = (p.overhang_area_45deg_mm2 || 0).toFixed(0);
+      telemetryOverhang.textContent = `${oRatio}% (${oArea} mm²)`;
+    }
+    if (telemetryBed) {
+      const bRatio = ((p.bed_contact_ratio || 0) * 100).toFixed(0);
+      const bArea = (p.bed_contact_area_mm2 || 0).toFixed(0);
+      telemetryBed.textContent = `${bArea} mm² (${bRatio}%)`;
+    }
+    if (telemetrySlenderness) {
+      const sVal = (p.slenderness_ratio || 1.0).toFixed(1);
+      telemetrySlenderness.textContent = `${sVal} ${p.slenderness_ratio >= 2.5 ? '(Tall)' : '(Stable)'}`;
+    }
+    if (telemetryBrim) {
+      telemetryBrim.textContent = p.needs_brim ? 'Recommended' : 'Adequate';
+    }
+
+    // Form inputs (the material select keeps the user's choice; "auto"
+    // resolves to prof.material on export).
+    if (advisorLayerHeight && prof.layer_height_mm != null) {
+      const lhStr = Number(prof.layer_height_mm).toFixed(2);
+      let matchOption = Array.from(advisorLayerHeight.options).find(opt => opt.value === lhStr);
+      if (!matchOption) {
+        matchOption = new Option(`${lhStr} mm`, lhStr);
+        advisorLayerHeight.add(matchOption);
+      }
+      advisorLayerHeight.value = lhStr;
+    }
+    if (advisorWallLoops && prof.wall_loops != null) advisorWallLoops.value = String(prof.wall_loops);
+    if (advisorInfillDensity && prof.infill_density_percent != null) advisorInfillDensity.value = String(prof.infill_density_percent);
+    if (advisorInfillPattern && prof.infill_pattern) advisorInfillPattern.value = prof.infill_pattern;
+    if (advisorSupportEnabled && prof.support_enabled != null) advisorSupportEnabled.checked = Boolean(prof.support_enabled);
+    if (advisorSupportType && prof.support_type) advisorSupportType.value = prof.support_type;
+    if (advisorBrimEnabled && prof.brim_enabled != null) advisorBrimEnabled.checked = Boolean(prof.brim_enabled);
+    if (advisorBrimWidth && prof.brim_width_mm != null) advisorBrimWidth.value = String(prof.brim_width_mm || 6);
+
+    if (advisorRationaleText) advisorRationaleText.textContent = prof.rationale || 'Settings calculated for this geometry.';
+  } catch (error) {
+    if (advisorRationaleText) advisorRationaleText.textContent = `Error: ${error.message}`;
+  } finally {
+    if (advisorRecomputeBtn) advisorRecomputeBtn.disabled = false;
+  }
+}
+
+function gatherAdvisorFormProfile() {
+  const base = currentAdvisorProfile ? { ...currentAdvisorProfile } : {};
+  return {
+    ...base,
+    material: advisorMaterial?.value === 'auto' ? (base.material || 'PLA') : (advisorMaterial?.value || 'PLA'),
+    layer_height_mm: parseFloat(advisorLayerHeight?.value || '0.20'),
+    wall_loops: parseInt(advisorWallLoops?.value || '3', 10),
+    infill_density_percent: parseInt(advisorInfillDensity?.value || '20', 10),
+    infill_pattern: advisorInfillPattern?.value || 'gyroid',
+    support_enabled: Boolean(advisorSupportEnabled?.checked),
+    support_type: advisorSupportType?.value || 'normal',
+    brim_enabled: Boolean(advisorBrimEnabled?.checked),
+    brim_width_mm: parseInt(advisorBrimWidth?.value || '6', 10),
+  };
+}
+
+advisorRecomputeBtn?.addEventListener('click', fetchPrintAdvisorProfile);
+
+advisorDownloadGeom?.addEventListener('click', async () => {
+  if (!currentProject) return;
+  advisorDownloadGeom.disabled = true;
+  try {
+    const res = await fetch(`/api/projects/${encodeURIComponent(currentProject)}/export?format=3mf`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: 'Export failed' }));
+      addMessage(`3MF Export failed: ${err.error || res.statusText}`, 'error');
+      return;
+    }
+    const blob = await res.blob();
+    triggerBlobDownload(blob, `${currentProject}.3mf`);
+    closePrintAdvisorModal();
+  } catch (error) {
+    addMessage(`3MF Export failed: ${error.message}`, 'error');
+  } finally {
+    advisorDownloadGeom.disabled = false;
+  }
+});
+
+advisorDownloadSmart?.addEventListener('click', async () => {
+  if (!currentProject) return;
+  const profile = gatherAdvisorFormProfile();
+  advisorDownloadSmart.disabled = true;
+  const originalText = advisorDownloadSmart.textContent;
+  advisorDownloadSmart.textContent = 'Exporting...';
+  try {
+    const res = await fetch(`/api/projects/${encodeURIComponent(currentProject)}/export?format=3mf`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ profile }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: 'Export failed' }));
+      addMessage(`3MF Export failed: ${err.error || res.statusText}`, 'error');
+      return;
+    }
+    const blob = await res.blob();
+    triggerBlobDownload(blob, `${currentProject}.3mf`);
+    closePrintAdvisorModal();
+  } catch (error) {
+    addMessage(`3MF Export failed: ${error.message}`, 'error');
+  } finally {
+    advisorDownloadSmart.disabled = false;
+    advisorDownloadSmart.textContent = originalText;
+  }
+});
+
 downloadModelBtn?.addEventListener('click', async () => {
   if (!currentProject || downloadModelBtn.disabled) return;
   const format = exportFormatSelect?.value || 'stl';
+
+  if (format === '3mf') {
+    openPrintAdvisorModal();
+    return;
+  }
+
   const downloadUrl = `/api/projects/${encodeURIComponent(currentProject)}/export?format=${encodeURIComponent(format)}`;
   downloadModelBtn.disabled = true;
   try {
@@ -1563,14 +1821,7 @@ downloadModelBtn?.addEventListener('click', async () => {
       return;
     }
     const blob = await res.blob();
-    const blobUrl = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = blobUrl;
-    a.download = `${currentProject}.${format}`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
+    triggerBlobDownload(blob, `${currentProject}.${format}`);
   } catch (error) {
     addMessage(`Export failed: ${error.message}`, 'error');
   } finally {
@@ -2434,6 +2685,9 @@ function connectStream() {
 
       if (data.status === 'started') {
         setThinking(true);
+        if (modelSelect && validModelKeys.has(data.model_key)) {
+          modelSelect.value = data.model_key;
+        }
         if (card && card.dataset.state !== 'done' && card.dataset.state !== 'error' && card.dataset.state !== 'stopped') {
           const label = data.message ? data.message.replace(/\.+$/, '') : 'Planning CAD task';
           setCardState(card, 'thinking', label);

@@ -114,6 +114,8 @@ def compact_for_context(tool: str, result: str) -> str:
         "volume_mm3": metrics.get("volume_mm3", 0.0),
         "summary": data.get("summary", ""),
     }
+    if "printability" in metrics and isinstance(metrics["printability"], dict):
+        compact_data["printability"] = metrics["printability"]
     features = data.get("feature_summary")
     if isinstance(features, dict) and features:
         compact_data["feature_summary"] = features

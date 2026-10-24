@@ -1,86 +1,78 @@
 # Copy this file to config.yaml and adjust it for your machine.
 workspace_root: ~/CAD-Agent-Projects
 
-agent:
-  tool_call_limit: 15
-  revision_retention_count: 0  # 0 keeps all model revisions
-  debug_log_tool_errors: false  # Writes recoverable failures to <project>/debug-errors.jsonl
-  log_tool_activity: false  # Legacy flag; alias for log_mode: debug
-  log_mode: off  # off | debug (rolling activity.jsonl) | dataset (untrimmed trajectories/<run_id>.jsonl)
-
-# LLM provider selection. Set ``provider`` to ``openrouter``, ``openai``,
-# ``ollama``, ``gemini`` (Google AI Studio Interactions API), or ``vertex``
-# (Google Cloud Vertex AI using local gcloud CLI authentication); the matching
-# namespace below supplies its model + endpoint. All namespaces are kept in sync
-# so you can switch providers without losing configuration.
+# ── 1. Active LLM Provider ───────────────────────────────────────────────────
+# Supported providers: openrouter | gemini | vertex | openai | ollama
+# Set either a provider name ("openrouter") or "<provider>:<model>"
+# ("gemini:gemini-3.8-flash"). If only a provider name is given, the first
+# model listed under that provider below is used as its default.
 llm:
   provider: openrouter
-  max_completion_tokens: 65536
-  # Optional secondary provider that takes over if the primary client
-  # raises a non-cancellation error after its own retry loop is exhausted.
-  # Must differ from ``provider`` above; leave as ``""`` to disable.
+  # Optional backup provider (same forms as `provider`, e.g. "vertex"), used
+  # once if the primary fails after its own retries. Must differ from provider.
   fallback_provider: ""
+  max_completion_tokens: 65536
+
+# ── 2. Providers & Per-Model Settings ────────────────────────────────────────
+# Each provider groups its own connection settings and models in one place.
+# Every model can define its own `reasoning_effort` ("" | minimal | low | medium | high).
+# Models configured below appear automatically in the Web UI model picker.
+# Optional provider keys (shown values are defaults where applicable):
+#   all:        base_url, timeout_seconds, reasoning_effort (default for its models)
+#   openrouter: provider_order: [], force_provider: false, reasoning_max_tokens: 0
+#               (defaults for its models), app_title, app_url, session_prefix,
+#               enable_anthropic_cache: true, enable_gemini_cache: true
+#   gemini:     store: true, project_id / location (auth_mode: gcloud only)
 
 openrouter:
-  base_url: https://openrouter.ai/api/v1
-  model:
-  timeout_seconds: 90
-  app_title: Local AI CAD Agent
-  app_url: ""
-  session_prefix: local-ai-cad-agent
-  # Optional reasoning effort ("low", "medium", "high"). Leave blank ("")
-  # for models that do not support reasoning tokens.
-  reasoning_effort: ""
-  # Optional maximum tokens to allocate to reasoning/thinking (e.g. 8192).
-  # Leave 0 or blank to let the model decide dynamically.
-  reasoning_max_tokens: 0
-  # OpenRouter provider routing order, highest priority first. OpenRouter
-  # walks this list and only falls back to its internal pool if every named
-  # upstream is unavailable. Use ``"<provider>/<quantization>"`` slugs such
-  # as ``"z-ai/fp8"`` or ``"novita/fp8"``. Leave empty to fall back to the
-  # legacy ``provider`` string below.
-  provider_order: []
-  # Legacy single-provider config. Only consulted when ``provider_order`` is
-  # empty. Pair with ``force_provider: true`` to pin to one upstream with no
-  # fallback fanout; otherwise OpenRouter routes to a less-loaded peer if the
-  # pinned provider is saturated.
-  provider: ""
-  force_provider: false
-  enable_anthropic_cache: true
-  enable_gemini_cache: true
+  # In OpenRouter, each model is hosted by different upstream sub-providers.
+  # You can bind `providers` (priority routing order), `force_provider`, and
+  # `reasoning_effort` directly per model so switching models in the UI
+  # automatically switches the OpenRouter sub-providers too:
+  models: {}
+    # deepseek/deepseek-r1:
+    #   reasoning_effort: high
+    #   providers: [novita/fp8, deepinfra/fp4]
+    #   force_provider: false
+    # z-ai/glm-5:
+    #   reasoning_effort: medium
+    #   providers: [z-ai/fp8]
 
-openai:
-  base_url: https://api.openai.com/v1
-  model:
-  timeout_seconds: 60
-  reasoning_effort: ""
+gemini:
+  auth_mode: api_key            # api_key (GEMINI_API_KEY in .env) | gcloud
+  models:
+    gemini-3.8-flash:
+      reasoning_effort: ""
+    gemini-3.8-pro:
+      reasoning_effort: ""
+
+vertex:
+  project_id: ""                # Auto-detected from gcloud / GCP_PROJECT if blank
+  location: us-central1
+  models:
+    gemini-3.8-flash:
+      reasoning_effort: ""
+    gemini-3.8-pro:
+      reasoning_effort: ""
 
 ollama:
   base_url: http://localhost:11434/v1
-  model: qwen3.8:27b
-  timeout_seconds: 120
-  reasoning_effort: ""
+  models:
+    qwen3.8:27b:
+      reasoning_effort: ""
 
-# Google AI Studio Interactions API adapter (POST /v1beta/interactions).
-# Requires GEMINI_API_KEY (or GOOGLE_API_KEY) in .env, OR set auth_mode: gcloud
-# to use your terminal gcloud authentication without needing an API key.
-gemini:
-  base_url: https://generativelanguage.googleapis.com
-  model: gemini-3.8-flash
-  timeout_seconds: 90
-  reasoning_effort: ""
-  store: true
-  auth_mode: api_key  # api_key | gcloud
+openai:
+  models: {}
+    # gpt-5:
+    #   reasoning_effort: medium
 
-# Google Cloud Vertex AI (OpenAI-compatible endpoint).
-# Authenticates directly via your terminal's `gcloud` CLI (no API key required).
-# Requires running `gcloud auth application-default login` or `gcloud auth login`.
-vertex:
-  project_id: ""  # Leave blank to auto-detect from active gcloud config or GCP_PROJECT env
-  location: "us-central1"
-  model: gemini-3.8-flash
-  timeout_seconds: 90
-  reasoning_effort: ""
+# ── 3. Agent, Server & Viewport ──────────────────────────────────────────────
+agent:
+  tool_call_limit: 15
+  revision_retention_count: 0   # 0 keeps all model revisions
+  # off | errors (<project>/debug-errors.jsonl) | debug (rolling activity.jsonl)
+  # | dataset (untrimmed trajectories/<run_id>.jsonl)
+  log_mode: off
 
 server:
   host: 127.0.0.1
@@ -89,26 +81,11 @@ server:
 ui:
   show_info_messages: true
 
-# Review rendering settings. ``review.render_workers`` and
-# ``review.required_views`` control the canonical eight-view rasteriser
-# + contact sheet produced by cad_build. The legacy
-# ``review.enabled`` toggle has been removed; ``cad_build``
-# always renders the canonical visual evidence.
+viewer:
+  grid:
+    size: 200                   # Square ground grid in mm (X and Z)
+    divisions: 20
+
 review:
   render_workers: 4
   required_views: 8
-
-# 3D preview viewer settings. ``viewer.grid`` controls the ground grid in
-# the Three.js preview viewport. ``size`` is a single dimension in mm that
-# is used for both X and Z (the grid is square); ``divisions`` is the cell
-# count per side. You can also pass the keys explicitly:
-#   viewer:
-#     grid:
-#       size: 256
-#       divisions: 256
-# Models whose bounding box exceeds the configured grid surface will show
-# a warning in the preview header.
-viewer:
-  grid:
-    size: 200
-    divisions: 20

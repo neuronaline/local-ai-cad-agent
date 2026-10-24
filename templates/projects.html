@@ -35,9 +35,8 @@
         <div class="modal-content">
           <h3 id="new-project-title">New Project</h3>
           <form id="new-project-form">
-            <input id="new-project-name" type="text" placeholder="project-name" required
-                   pattern="[a-z0-9][a-z0-9-]{0,62}" autocomplete="off">
-            <p class="hint">Only lowercase letters, numbers, and hyphens.</p>
+            <input id="new-project-name" type="text" placeholder="e.g. Balata Açıcı" required
+                   autocomplete="off" maxlength="128">
             <p id="new-project-error" class="modal-error" hidden></p>
             <div class="modal-actions">
               <button type="button" id="cancel-new-project" class="quiet">Cancel</button>
@@ -51,9 +50,8 @@
         <div class="modal-content">
           <h3 id="rename-project-title">Rename Project</h3>
           <form id="rename-form">
-            <input id="rename-name" type="text" placeholder="new-name" required
-                   pattern="[a-z0-9][a-z0-9-]{0,62}" autocomplete="off">
-            <p class="hint">Only lowercase letters, numbers, and hyphens.</p>
+            <input id="rename-name" type="text" placeholder="e.g. Balata Açıcı" required
+                   autocomplete="off" maxlength="128">
             <p id="rename-error" class="modal-error" hidden></p>
             <div class="modal-actions">
               <button type="button" id="cancel-rename" class="quiet">Cancel</button>

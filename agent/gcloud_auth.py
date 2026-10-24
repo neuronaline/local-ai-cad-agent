@@ -164,11 +164,17 @@ class GCloudAuthManager:
             if self._cached_location:
                 return self._cached_location
 
-        env_val = os.getenv("CLOUDSDK_COMPUTE_REGION", "").strip()
-        if env_val:
-            with self._lock:
-                self._cached_location = env_val
-            return env_val
+        for env_var in (
+            "GOOGLE_CLOUD_LOCATION",
+            "CLOUD_ML_REGION",
+            "CLOUDSDK_AI_REGION",
+            "CLOUDSDK_COMPUTE_REGION",
+        ):
+            env_val = os.getenv(env_var, "").strip()
+            if env_val:
+                with self._lock:
+                    self._cached_location = env_val
+                return env_val
 
         gcloud_bin = shutil.which("gcloud")
         if gcloud_bin:

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +14,54 @@ _WARNED_KEYS: set[str] = set()
 
 REASONING_EFFORTS = {"minimal", "low", "medium", "high"}
 LLM_PROVIDERS = {"openrouter", "openai", "ollama", "gemini", "google", "vertex", "gcloud"}
+_PROVIDER_ALIASES = {"google": "gemini", "gcloud": "vertex"}
+PROVIDER_LABELS = {
+    "openrouter": "OpenRouter",
+    "openai": "OpenAI",
+    "ollama": "Ollama",
+    "gemini": "Google AI Studio",
+    "vertex": "Google Cloud Vertex AI",
+}
+# Built-in default model per provider when config.yaml lists none.
+_BUILTIN_MODELS = {"gemini": "gemini-3.8-flash", "vertex": "gemini-3.8-flash", "ollama": "qwen3.8:27b"}
 
+
+def canonical_provider(provider: str) -> str:
+    """Map provider aliases (``google``, ``gcloud``) to their canonical slug."""
+    slug = provider.strip().lower()
+    return _PROVIDER_ALIASES.get(slug, slug)
+
+
+@dataclass(frozen=True)
+class ModelOption:
+    """One entry of a provider's ``models`` block in ``config.yaml``.
+
+    Every field is fully resolved at load time (model-level value, else the
+    provider-level default) so selecting the option can overwrite the
+    provider state wholesale. Routing fields only apply to OpenRouter.
+    """
+
+    provider: str  # canonical provider slug
+    model: str
+    label: str
+    reasoning_effort: str | None = None
+    provider_order: tuple[str, ...] = ()
+    force_provider: bool = False
+    reasoning_max_tokens: int | None = None
+
+    @property
+    def key(self) -> str:
+        return f"{self.provider}:{self.model}"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "key": self.key,
+            "provider": self.provider,
+            "provider_label": PROVIDER_LABELS[self.provider],
+            "model": self.model,
+            "label": self.label,
+            "reasoning_effort": self.reasoning_effort,
+        }
 
 @dataclass(frozen=True)
 class Settings:
@@ -97,6 +144,13 @@ class Settings:
     viewer_grid_size: float = 200.0
     viewer_grid_divisions: int = 20
     llm_max_completion_tokens: int | None = 65536
+    # ── Configured model catalog ──
+    available_models: tuple[ModelOption, ...] = ()
+
+    @property
+    def active_model_key(self) -> str:
+        """Return the composite ``<provider>:<model>`` key of the active model."""
+        return f"{canonical_provider(self.llm_provider)}:{self.llm_model}"
 
     @property
     def llm_model(self) -> str:
@@ -127,8 +181,6 @@ class Settings:
 
 def with_reasoning_effort(settings: Settings, effort: str | None) -> Settings:
     """Return a copy of ``settings`` with reasoning effort updated for the active provider."""
-    from dataclasses import replace
-
     cleaned = _optional_effort(effort)
     updates: dict[str, Any] = {}
     for provider in {settings.llm_provider, settings.llm_fallback_provider}:
@@ -146,6 +198,39 @@ def with_reasoning_effort(settings: Settings, effort: str | None) -> Settings:
             updates["openrouter_reasoning_effort"] = cleaned
     if not updates:
         updates["openrouter_reasoning_effort"] = cleaned
+    return replace(settings, **updates)
+
+
+def _model_option_updates(option: ModelOption) -> dict[str, Any]:
+    """Settings fields that make ``option`` the active model of its provider."""
+    p = option.provider
+    updates: dict[str, Any] = {
+        f"{p}_model": option.model,
+        f"{p}_reasoning_effort": option.reasoning_effort,
+    }
+    if p == "openrouter":
+        updates.update(
+            openrouter_provider_order=option.provider_order,
+            openrouter_force_provider=option.force_provider,
+            openrouter_reasoning_max_tokens=option.reasoning_max_tokens,
+        )
+    return updates
+
+
+def with_model_selection(settings: Settings, model_key: str) -> Settings:
+    """Return a copy of ``settings`` with the catalog model ``model_key`` active.
+
+    ``model_key`` is ``<provider>:<model>`` and must be one of
+    ``settings.available_models``. The model's configured reasoning effort and
+    (OpenRouter) upstream routing replace the provider's current values.
+    """
+    option = next((o for o in settings.available_models if o.key == model_key), None)
+    if option is None:
+        raise ValueError(f"Unknown model {model_key!r}; select one configured in config.yaml.")
+    updates = {"llm_provider": option.provider, **_model_option_updates(option)}
+    # Keep the ``fallback_provider != provider`` invariant enforced at load time.
+    if canonical_provider(settings.llm_fallback_provider) == option.provider:
+        updates["llm_fallback_provider"] = ""
     return replace(settings, **updates)
 
 
@@ -270,6 +355,23 @@ def _parse_grid_extent(value: Any) -> tuple[float, int]:
     return size, divisions
 
 
+def _parse_provider_spec(value: Any, name: str, default: str) -> tuple[str, str | None]:
+    """Parse ``<provider>`` or ``<provider>:<model>`` into ``(provider, model)``."""
+    spec = _optional_string(value)
+    if spec is None:
+        return default, None
+    provider, sep, model = spec.partition(":")
+    if provider.strip().lower() not in LLM_PROVIDERS:
+        raise ValueError(
+            f"{name} must be one of {sorted(LLM_PROVIDERS)} (optionally "
+            f"'<provider>:<model>'), got {spec!r}."
+        )
+    model = model.strip()
+    if sep and not model:
+        raise ValueError(f"{name} model name cannot be empty.")
+    return canonical_provider(provider), model or None
+
+
 def _validate_auth_mode(val: Any, field_name: str) -> str:
     s = str(val or "api_key").strip().lower()
     if s not in ("api_key", "gcloud"):
@@ -277,10 +379,72 @@ def _validate_auth_mode(val: Any, field_name: str) -> str:
     return s
 
 
+_MODEL_KEYS = {"label", "reasoning_effort"}
+_OPENROUTER_MODEL_KEYS = _MODEL_KEYS | {"providers", "force_provider", "reasoning_max_tokens"}
+
+
+def _parse_model_options(
+    section: dict[str, Any], defaults: ModelOption
+) -> list[ModelOption]:
+    """Parse ``<provider>.models`` (mapping ``name -> settings`` or list of names).
+
+    ``defaults`` carries the provider and its provider-level values, which
+    apply to every key a model entry does not set itself.
+    """
+    raw = section.get("models")
+    if raw is None:
+        return []
+    provider = defaults.provider
+    if isinstance(raw, list):
+        raw = dict.fromkeys(raw)
+    if not isinstance(raw, dict):
+        raise TypeError(f"{provider}.models must be a mapping of model name to settings.")
+    allowed = _OPENROUTER_MODEL_KEYS if provider == "openrouter" else _MODEL_KEYS
+    options: list[ModelOption] = []
+    for raw_name, cfg in raw.items():
+        model = str(raw_name).strip()
+        if not model:
+            raise ValueError(f"{provider}.models contains an empty model name.")
+        field = f"{provider}.models.{model}"
+        cfg = {} if cfg is None else cfg
+        _reject_unknown(cfg, allowed, field)
+        order = (
+            _parse_provider_order(cfg["providers"]) if "providers" in cfg else defaults.provider_order
+        )
+        force = (
+            _strict_bool(cfg["force_provider"], f"{field}.force_provider")
+            if "force_provider" in cfg
+            else defaults.force_provider
+        )
+        if force and len(order) > 1:
+            raise ValueError(f"{field}: force_provider=true requires at most one provider.")
+        options.append(
+            ModelOption(
+                provider=provider,
+                model=model,
+                label=str(cfg.get("label") or model).strip(),
+                reasoning_effort=(
+                    _optional_effort(cfg["reasoning_effort"])
+                    if "reasoning_effort" in cfg
+                    else defaults.reasoning_effort
+                ),
+                provider_order=order,
+                force_provider=force,
+                reasoning_max_tokens=(
+                    _optional_positive_int(cfg["reasoning_max_tokens"], f"{field}.reasoning_max_tokens")
+                    if "reasoning_max_tokens" in cfg
+                    else defaults.reasoning_max_tokens
+                ),
+            )
+        )
+    return options
+
+
 def load_settings(project_root: Path | None = None) -> Settings:
     project_root = project_root or Path(__file__).resolve().parents[1]
     config = _read_yaml(project_root / "config.yaml")
     llm = config.get("llm") or {}
+    _reject_unknown(llm, {"provider", "fallback_provider", "max_completion_tokens"}, "llm")
     openrouter = config.get("openrouter") or {}
     openai = config.get("openai") or {}
     ollama = config.get("ollama") or {}
@@ -294,7 +458,7 @@ def load_settings(project_root: Path | None = None) -> Settings:
     viewer_grid = viewer.get("grid") or {} if isinstance(viewer, dict) else {}
     _reject_unknown(
         ollama,
-        {"base_url", "model", "timeout_seconds", "reasoning_effort", "think"},
+        {"base_url", "model", "models", "timeout_seconds", "reasoning_effort", "think"},
         "ollama",
     )
     _reject_unknown(
@@ -302,6 +466,7 @@ def load_settings(project_root: Path | None = None) -> Settings:
         {
             "base_url",
             "model",
+            "models",
             "timeout_seconds",
             "reasoning_effort",
             "store",
@@ -313,7 +478,7 @@ def load_settings(project_root: Path | None = None) -> Settings:
     )
     _reject_unknown(
         vertex,
-        {"project_id", "location", "model", "timeout_seconds", "reasoning_effort"},
+        {"project_id", "location", "model", "models", "timeout_seconds", "reasoning_effort"},
         "vertex",
     )
     _reject_unknown(
@@ -340,30 +505,23 @@ def load_settings(project_root: Path | None = None) -> Settings:
     if isinstance(review, dict) and "max_cycles" in review:
         _warn_deprecated("review", "max_cycles")
 
-    # llm.provider selects which adapter AgentRunner should use. Settings
-    # for the inactive provider are still loaded so users can switch without
-    # losing their previous model choice.
-    llm_provider_raw = _optional_string(llm.get("provider")) or "openrouter"
-    if llm_provider_raw not in LLM_PROVIDERS:
-        raise ValueError(
-            f"llm.provider must be one of {sorted(LLM_PROVIDERS)}, got {llm_provider_raw!r}."
-        )
-    llm_provider = llm_provider_raw
-    # ``llm.fallback_provider`` is optional. An empty string disables the
+    # ``llm.provider`` selects the adapter AgentRunner uses; ``<provider>:<model>``
+    # additionally pins that provider's default model. Settings for inactive
+    # providers are still loaded so users can switch without losing them.
+    llm_provider, pinned_model = _parse_provider_spec(
+        llm.get("provider"), "llm.provider", "openrouter"
+    )
+    # ``llm.fallback_provider`` is optional. An empty value disables the
     # fallback path; any other value must still be a registered provider so a
     # misconfiguration fails at startup instead of mid-run.
-    llm_fallback_provider_raw = _optional_string(llm.get("fallback_provider")) or ""
-    if llm_fallback_provider_raw and llm_fallback_provider_raw not in LLM_PROVIDERS:
-        raise ValueError(
-            f"llm.fallback_provider must be one of {sorted(LLM_PROVIDERS)} "
-            f"or empty, got {llm_fallback_provider_raw!r}."
-        )
-    if llm_fallback_provider_raw and llm_fallback_provider_raw == llm_provider:
+    llm_fallback_provider, fallback_model = _parse_provider_spec(
+        llm.get("fallback_provider"), "llm.fallback_provider", ""
+    )
+    if llm_fallback_provider == llm_provider:
         raise ValueError(
             "llm.fallback_provider must differ from llm.provider; "
             "leave it empty to disable fallback."
         )
-    llm_fallback_provider = llm_fallback_provider_raw
 
     # OpenRouter provider routing: ``provider_order`` is the explicit,
     # priority-ordered list (highest first). It replaces the legacy
@@ -395,9 +553,16 @@ def load_settings(project_root: Path | None = None) -> Settings:
     # Each provider keeps its own model; ``settings.llm_model`` returns the
     # active one so callers do not need to branch on the provider.
     grid_size, grid_divisions = _parse_grid_extent(viewer_grid)
-    agent_log_tool_activity, agent_log_mode = _validate_log_activity(
+    (
+        agent_log_tool_activity,
+        agent_log_mode,
+        agent_debug_log_tool_errors,
+    ) = _validate_log_activity(
         agent.get("log_mode"),
         _strict_bool(agent.get("log_tool_activity", False), "agent.log_tool_activity"),
+        _strict_bool(
+            agent.get("debug_log_tool_errors", False), "agent.debug_log_tool_errors"
+        ),
     )
 
     ollama_reasoning_effort = _optional_effort(ollama.get("reasoning_effort"))
@@ -408,10 +573,75 @@ def load_settings(project_root: Path | None = None) -> Settings:
         elif think_val is not None:
             ollama_reasoning_effort = _optional_effort(think_val)
 
-    return Settings(
+    openrouter_force_provider = _strict_bool(
+        openrouter.get("force_provider", False), "openrouter.force_provider"
+    )
+    openrouter_reasoning_max_tokens = _optional_positive_int(
+        openrouter.get("reasoning_max_tokens")
+        or (
+            openrouter.get("reasoning", {}).get("max_tokens")
+            if isinstance(openrouter.get("reasoning"), dict)
+            else None
+        ),
+        "openrouter.reasoning_max_tokens",
+    )
+
+    # Model catalog: each provider's ``models`` block, ordered as the provider
+    # sections appear in config.yaml. Provider-level values are the defaults
+    # every model entry inherits.
+    sections = {
+        "openrouter": openrouter,
+        "openai": openai,
+        "ollama": ollama,
+        "gemini": gemini,
+        "vertex": vertex,
+    }
+    provider_defaults = {
+        name: ModelOption(
+            provider=name,
+            model="",
+            label="",
+            reasoning_effort=_optional_effort(section.get("reasoning_effort")),
+        )
+        for name, section in sections.items()
+    }
+    provider_defaults["ollama"] = replace(
+        provider_defaults["ollama"], reasoning_effort=ollama_reasoning_effort
+    )
+    provider_defaults["openrouter"] = replace(
+        provider_defaults["openrouter"],
+        provider_order=openrouter_provider_order,
+        force_provider=openrouter_force_provider,
+        reasoning_max_tokens=openrouter_reasoning_max_tokens,
+    )
+    pinned = {llm_provider: pinned_model, llm_fallback_provider: fallback_model}
+    in_use = {llm_provider, llm_fallback_provider}
+    catalog: list[ModelOption] = []
+    active_options: list[ModelOption] = []
+    for name in dict.fromkeys([*map(canonical_provider, map(str, config)), *sections]):
+        if name not in sections:
+            continue
+        section, defaults = sections[name], provider_defaults[name]
+        options = _parse_model_options(section, defaults)
+        # Default model: pinned via llm.* > legacy ``model`` key > first listed > built-in.
+        default_model = (
+            pinned.get(name)
+            or _optional_string(section.get("model"))
+            or (options[0].model if options else _BUILTIN_MODELS.get(name, ""))
+        )
+        active = next((o for o in options if o.model == default_model), None)
+        if active is None and default_model:
+            active = replace(defaults, model=default_model, label=default_model)
+            # Only surface unlisted defaults for configured or in-use providers.
+            if section or name in in_use:
+                options.insert(0, active)
+        catalog.extend(options)
+        if active is not None:
+            active_options.append(active)
+
+    settings = Settings(
         workspace_root=Path(config.get("workspace_root", "~/CAD-Agent-Projects")).expanduser(),
         openrouter_base_url=str(openrouter.get("base_url", "https://openrouter.ai/api/v1")).rstrip("/"),
-        openrouter_model=str(openrouter.get("model") or ""),
         openrouter_timeout_seconds=_validate_timeout_seconds(openrouter.get("timeout_seconds", 90), "openrouter.timeout_seconds"),
         host=str(server.get("host", "127.0.0.1")),
         port=_validate_port(server.get("port", 8000), "server.port"),
@@ -420,48 +650,34 @@ def load_settings(project_root: Path | None = None) -> Settings:
         openrouter_session_prefix=str(openrouter.get("session_prefix", "local-ai-cad-agent")),
         openrouter_enable_anthropic_cache=_strict_bool(openrouter.get("enable_anthropic_cache", True), "openrouter.enable_anthropic_cache"),
         openrouter_enable_gemini_cache=_strict_bool(openrouter.get("enable_gemini_cache", True), "openrouter.enable_gemini_cache"),
-        openrouter_reasoning_effort=_optional_effort(openrouter.get("reasoning_effort")),
-        openrouter_reasoning_max_tokens=_optional_positive_int(
-            openrouter.get("reasoning_max_tokens")
-            or (
-                openrouter.get("reasoning", {}).get("max_tokens")
-                if isinstance(openrouter.get("reasoning"), dict)
-                else None
-            ),
-            "openrouter.reasoning_max_tokens",
-        ),
+        openrouter_reasoning_effort=provider_defaults["openrouter"].reasoning_effort,
+        openrouter_reasoning_max_tokens=openrouter_reasoning_max_tokens,
         openrouter_provider=_optional_string(openrouter.get("provider")),
-        openrouter_force_provider=_strict_bool(openrouter.get("force_provider", False), "openrouter.force_provider"),
+        openrouter_force_provider=openrouter_force_provider,
         openrouter_provider_order=openrouter_provider_order,
         llm_provider=llm_provider,
         llm_fallback_provider=llm_fallback_provider,
         openai_base_url=str(openai.get("base_url", "https://api.openai.com/v1")).rstrip("/"),
-        openai_model=str(openai.get("model") or ""),
         openai_timeout_seconds=_validate_timeout_seconds(openai.get("timeout_seconds", 60), "openai.timeout_seconds"),
-        openai_reasoning_effort=_optional_effort(openai.get("reasoning_effort")),
+        openai_reasoning_effort=provider_defaults["openai"].reasoning_effort,
         ollama_base_url=str(ollama.get("base_url") or "http://localhost:11434/v1").rstrip("/"),
-        ollama_model=str(ollama.get("model") or "qwen3.8:27b"),
         ollama_timeout_seconds=_validate_timeout_seconds(ollama.get("timeout_seconds") or 120, "ollama.timeout_seconds"),
         ollama_reasoning_effort=ollama_reasoning_effort,
         gemini_base_url=str(gemini.get("base_url") or "https://generativelanguage.googleapis.com").rstrip("/"),
-        gemini_model=str(gemini.get("model") or "gemini-3.8-flash"),
         gemini_timeout_seconds=_validate_timeout_seconds(gemini.get("timeout_seconds") or 90, "gemini.timeout_seconds"),
-        gemini_reasoning_effort=_optional_effort(gemini.get("reasoning_effort")),
+        gemini_reasoning_effort=provider_defaults["gemini"].reasoning_effort,
         gemini_store=_strict_bool(gemini.get("store", True), "gemini.store"),
         gemini_auth_mode=_validate_auth_mode(gemini.get("auth_mode"), "gemini.auth_mode"),
         gemini_project_id=str(gemini.get("project_id") or "").strip(),
         gemini_location=str(gemini.get("location") or "us-central1").strip(),
         vertex_project_id=str(vertex.get("project_id") or "").strip(),
         vertex_location=str(vertex.get("location") or "us-central1").strip(),
-        vertex_model=str(vertex.get("model") or "gemini-3.8-flash").strip(),
         vertex_timeout_seconds=_validate_timeout_seconds(vertex.get("timeout_seconds") or 90, "vertex.timeout_seconds"),
-        vertex_reasoning_effort=_optional_effort(vertex.get("reasoning_effort")),
+        vertex_reasoning_effort=provider_defaults["vertex"].reasoning_effort,
         show_info_messages=_strict_bool(ui.get("show_info_messages", True), "ui.show_info_messages"),
         agent_tool_call_limit=_positive_int(agent.get("tool_call_limit", 15), "agent.tool_call_limit"),
         revision_retention_count=_non_negative_int(agent.get("revision_retention_count", 0), "agent.revision_retention_count"),
-        agent_debug_log_tool_errors=_strict_bool(
-            agent.get("debug_log_tool_errors", False), "agent.debug_log_tool_errors"
-        ),
+        agent_debug_log_tool_errors=agent_debug_log_tool_errors,
         agent_log_tool_activity=agent_log_tool_activity,
         agent_log_mode=agent_log_mode,
         review_render_workers=_positive_int(
@@ -475,7 +691,14 @@ def load_settings(project_root: Path | None = None) -> Settings:
         llm_max_completion_tokens=_optional_positive_int(
             llm.get("max_completion_tokens", 65536), "llm.max_completion_tokens"
         ),
+        available_models=tuple(catalog),
     )
+    # Activate each provider's default model (its effort/routing override the
+    # provider-level values exactly as a later UI selection would).
+    active_updates: dict[str, Any] = {}
+    for option in active_options:
+        active_updates.update(_model_option_updates(option))
+    return replace(settings, **active_updates)
 
 
 def _optional_string(value: Any) -> str | None:
@@ -571,19 +794,23 @@ def _optional_positive_int(value: Any, name: str) -> int | None:
 
 
 def _validate_log_activity(
-    log_mode_raw: Any, log_tool_activity: bool
-) -> tuple[bool, str]:
+    log_mode_raw: Any,
+    log_tool_activity: bool,
+    debug_log_tool_errors: bool = False,
+) -> tuple[bool, str, bool]:
     if log_mode_raw is None:
         mode = "debug" if log_tool_activity else "off"
-        return log_tool_activity, mode
+        return log_tool_activity, mode, debug_log_tool_errors
     if log_mode_raw is False:
         mode = "off"
     elif log_mode_raw is True:
         mode = "debug"
     else:
         mode = str(log_mode_raw).strip().lower()
-    if mode not in {"off", "debug", "dataset"}:
+    if mode not in {"off", "errors", "debug", "dataset"}:
         raise ValueError(
-            f"agent.log_mode must be 'off', 'debug', or 'dataset', got {log_mode_raw!r}."
+            f"agent.log_mode must be 'off', 'errors', 'debug', or 'dataset', got {log_mode_raw!r}."
         )
-    return mode != "off", mode
+    if mode == "errors":
+        return log_tool_activity, "debug" if log_tool_activity else "off", True
+    return mode != "off", mode, debug_log_tool_errors

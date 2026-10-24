@@ -210,7 +210,7 @@ newProjectForm.addEventListener('submit', async (e) => {
   e.preventDefault();
   clearModalErrors();
   const rawName = newProjectName.value.trim();
-  const name = rawName.toLowerCase().replace(/\s+/g, '-');
+  const name = rawName.replace(/\s+/g, ' ');
   if (!name) return;
   const submitBtn = newProjectForm.querySelector('button[type="submit"]');
   if (submitBtn) submitBtn.disabled = true;
@@ -253,7 +253,7 @@ renameForm.addEventListener('submit', async (e) => {
   e.preventDefault();
   clearModalErrors();
   const rawName = renameName.value.trim();
-  const newName = rawName.toLowerCase().replace(/\s+/g, '-');
+  const newName = rawName.replace(/\s+/g, ' ');
   if (!newName || newName === renameTarget) {
     closeModal(renameModal);
     return;

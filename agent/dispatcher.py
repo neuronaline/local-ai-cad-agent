@@ -18,6 +18,7 @@ from pathlib import Path
 
 from agent.activity_log import ActivityLogger
 from agent.io import atomic_write_json
+from agent.llm_base import attach_thought_signature, get_thought_signature
 from agent.revisions import MODEL_FILENAME
 from agent.tool_results import (
     build_view_image_multimodal_content,
@@ -384,18 +385,23 @@ def normalize_tool_calls(raw_calls: object) -> list[dict]:
                 clean_args_str = arguments
         elif isinstance(arguments, dict):
             clean_args_str = json.dumps(arguments, ensure_ascii=False)
-        normalized.append(
-            {
-                "id": str(call.get("id") or f"invalid-{uuid.uuid4().hex}"),
-                "type": "function",
-                "function": {
-                    "name": name
-                    if isinstance(name, str) and name
-                    else "unknown_tool",
-                    "arguments": clean_args_str,
-                },
-            }
-        )
+        entry: dict = {
+            "id": str(call.get("id") or f"invalid-{uuid.uuid4().hex}"),
+            "type": "function",
+            "function": {
+                "name": name
+                if isinstance(name, str) and name
+                else "unknown_tool",
+                "arguments": clean_args_str,
+            },
+        }
+        # Gemini thought signatures must survive persistence for turn 2+ replay.
+        if isinstance(call.get("extra_content"), dict):
+            entry["extra_content"] = call["extra_content"]
+        sig = get_thought_signature(call)
+        if sig:
+            attach_thought_signature(entry, sig)
+        normalized.append(entry)
     return normalized
 
 

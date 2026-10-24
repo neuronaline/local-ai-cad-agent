@@ -25,7 +25,11 @@ class VertexClient(ChatCompletionsClient):
     """Google Cloud Vertex AI client using gcloud terminal authentication."""
 
     requires_api_key = False
-    preserve_reasoning = True
+    # Vertex AI's OpenAPI ChatCompletions schema rejects top-level
+    # ``reasoning*`` fields on assistant turns; reasoning state travels via
+    # ``tool_calls[].extra_content.google.thought_signature`` instead, which
+    # ``sanitize_assistant_message`` always populates.
+    preserve_reasoning = False
 
     def __init__(self, settings: Settings) -> None:
         super().__init__(settings, provider_label="Google Cloud Vertex AI (gcloud)")
@@ -47,11 +51,16 @@ class VertexClient(ChatCompletionsClient):
     def _api_key(self) -> str:
         return gcloud_auth.get_access_token()
 
-    def _endpoint(self) -> str:
+    def _endpoint(self, location_override: str | None = None) -> str:
         project = self._resolved_project()
-        location = self._resolved_location()
+        location = (location_override or self._resolved_location()).strip()
+        host = (
+            "aiplatform.googleapis.com"
+            if location.lower() == "global"
+            else f"{location}-aiplatform.googleapis.com"
+        )
         return (
-            f"https://{location}-aiplatform.googleapis.com/v1beta1/"
+            f"https://{host}/v1beta1/"
             f"projects/{project}/locations/{location}/endpoints/openapi/chat/completions"
         )
 
@@ -73,8 +82,13 @@ class VertexClient(ChatCompletionsClient):
 
     @property
     def model(self) -> str:
-        raw_model = self.settings.llm_model or DEFAULT_MODEL
-        return self._normalize_model_name(raw_model)
+        # Not ``settings.llm_model``: as the fallback client, ``llm_provider``
+        # names the primary provider, not Vertex.
+        if self.settings.llm_provider in ("gemini", "google"):
+            raw_model = self.settings.gemini_model
+        else:
+            raw_model = self.settings.vertex_model
+        return self._normalize_model_name(raw_model or DEFAULT_MODEL)
 
     def _build_payload(
         self,
@@ -117,9 +131,10 @@ class VertexClient(ChatCompletionsClient):
         # Always inject current access token dynamically for each attempt
         current_token = self._api_key()
         active_headers = {**headers, "Authorization": f"Bearer {current_token}"}
+        endpoint_url = self._endpoint()
         try:
             response = post_with_cancel(
-                url=self._endpoint(),
+                url=endpoint_url,
                 payload=payload,
                 headers=active_headers,
                 timeout_seconds=timeout,
@@ -140,11 +155,11 @@ class VertexClient(ChatCompletionsClient):
             if not (self.stop_event and self.stop_event.is_set()):
                 try:
                     fresh_token = gcloud_auth.get_access_token(force_refresh=True)
-                    retry_headers = {**headers, "Authorization": f"Bearer {fresh_token}"}
+                    active_headers = {**headers, "Authorization": f"Bearer {fresh_token}"}
                     response = post_with_cancel(
-                        url=self._endpoint(),
+                        url=endpoint_url,
                         payload=payload,
-                        headers=retry_headers,
+                        headers=active_headers,
                         timeout_seconds=timeout,
                         stop_event=self.stop_event,
                     )
@@ -152,5 +167,25 @@ class VertexClient(ChatCompletionsClient):
                         gcloud_auth.invalidate_token()
                 except Exception:
                     gcloud_auth.invalidate_token()
+
+        # Many Gemini 3+ preview/frontier models on Vertex AI are provisioned exclusively
+        # on the 'global' endpoint. If a regional endpoint returns 404 NOT_FOUND,
+        # transparently retry against locations/global.
+        if (
+            getattr(response, "status_code", None) == 404
+            and self._resolved_location().lower() != "global"
+            and not (self.stop_event and self.stop_event.is_set())
+        ):
+            try:
+                response.close()
+            except Exception:
+                pass
+            response = post_with_cancel(
+                url=self._endpoint(location_override="global"),
+                payload=payload,
+                headers=active_headers,
+                timeout_seconds=timeout,
+                stop_event=self.stop_event,
+            )
         return response
 

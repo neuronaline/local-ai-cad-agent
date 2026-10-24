@@ -56,7 +56,7 @@ from agent.revisions import (
     RevisionStore,
     model_is_built,
 )
-from agent.settings import Settings, with_reasoning_effort
+from agent.settings import Settings, with_model_selection, with_reasoning_effort
 from agent.tool_schemas import TOOL_SCHEMAS
 from agent.tools.cad_tool import CadTool
 from agent.tools.file_tool import FileTool
@@ -301,6 +301,11 @@ class AgentRunner:
         with self._lock:
             self.settings = with_reasoning_effort(self.settings, effort)
 
+    def set_model_selection(self, model_key: str) -> None:
+        """Update the active ``<provider>:<model>`` dynamically for future runs."""
+        with self._lock:
+            self.settings = with_model_selection(self.settings, model_key)
+
     # ------------------------------------------------------------------ lifecycle
 
     def start(
@@ -310,6 +315,7 @@ class AgentRunner:
         image_paths: list[Path] | None = None,
         *,
         reasoning_effort: str | None = None,
+        model_key: str | None = None,
     ) -> bool:
         """Validate inputs, take ownership, then spawn the worker thread.
 
@@ -327,7 +333,12 @@ class AgentRunner:
                 project, image_paths or [], run_id
             )
             return self._start_locked(
-                project, message, prepared_paths, run_id, reasoning_effort=reasoning_effort
+                project,
+                message,
+                prepared_paths,
+                run_id,
+                reasoning_effort=reasoning_effort,
+                model_key=model_key,
             )
 
     def start_retry(
@@ -336,6 +347,7 @@ class AgentRunner:
         message: str = "",
         *,
         reasoning_effort: str | None = None,
+        model_key: str | None = None,
     ) -> bool:
         """Retry the last turn for a project without re-appending the user prompt."""
         if self.waiting_question(project):
@@ -345,7 +357,13 @@ class AgentRunner:
                 return False
             run_id = uuid.uuid4().hex
             return self._start_locked(
-                project, message, [], run_id, is_retry=True, reasoning_effort=reasoning_effort
+                project,
+                message,
+                [],
+                run_id,
+                is_retry=True,
+                reasoning_effort=reasoning_effort,
+                model_key=model_key,
             )
 
     def _start_locked(
@@ -357,6 +375,7 @@ class AgentRunner:
         *,
         is_retry: bool = False,
         reasoning_effort: str | None = None,
+        model_key: str | None = None,
     ) -> bool:
         if self._thread is not None and not self._run_complete.is_set():
             return False
@@ -366,7 +385,7 @@ class AgentRunner:
         self._active_run_id = run_id
         self._thread = threading.Thread(
             target=self._run,
-            args=(project, message, image_paths, run_id, is_retry, reasoning_effort),
+            args=(project, message, image_paths, run_id, is_retry, reasoning_effort, model_key),
             daemon=True,
         )
         self._thread.start()
@@ -520,6 +539,7 @@ class AgentRunner:
         run_id: str = "",
         is_retry: bool = False,
         reasoning_effort: str | None = None,
+        model_key: str | None = None,
     ) -> None:
         """Lifecycle wrapper: init, dispatch turns, terminal cleanup.
 
@@ -542,6 +562,7 @@ class AgentRunner:
                 run_id,
                 is_retry=is_retry,
                 reasoning_effort=reasoning_effort,
+                model_key=model_key,
             )
             activity_logger = state.activity_logger
             # Bound once: the publisher reads ``current_message_id`` lazily
@@ -581,6 +602,7 @@ class AgentRunner:
         *,
         is_retry: bool = False,
         reasoning_effort: str | None = None,
+        model_key: str | None = None,
     ) -> _RunState:
         """Build tools/client, log ``run_start``, return the run state.
 
@@ -588,11 +610,12 @@ class AgentRunner:
         dispatch. If this raises, ``_run``'s exception handlers take
         over and ``state`` is ``None`` for the ``finally`` block.
         """
-        effective_settings = (
-            with_reasoning_effort(self.settings, reasoning_effort)
-            if reasoning_effort
-            else self.settings
-        )
+        effective_settings = self.settings
+        if model_key:
+            effective_settings = with_model_selection(effective_settings, model_key)
+        if reasoning_effort:
+            effective_settings = with_reasoning_effort(effective_settings, reasoning_effort)
+
         self.publish(
             "agent_status",
             {
@@ -600,6 +623,7 @@ class AgentRunner:
                 "run_id": run_id,
                 "status": "started",
                 "message": "Planning CAD task...",
+                "model_key": effective_settings.active_model_key,
                 "reasoning_effort": effective_settings.reasoning_effort,
             },
         )

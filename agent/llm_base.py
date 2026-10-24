@@ -229,6 +229,41 @@ def extract_text_tool_calls(
     return cleaned, extracted_calls
 
 
+# Google's documented sentinel for tool calls without a real thought signature.
+THOUGHT_SIGNATURE_SENTINEL = "skip_thought_signature_validator"
+
+
+def get_thought_signature(item: Any) -> str | None:
+    """Return the Gemini thought signature carried by a tool call, delta, or message.
+
+    Signatures appear top-level (AI Studio), under ``extra_content.google``
+    (OpenAI-compatible Gemini / Vertex AI endpoints), or on ``function``.
+    """
+    if not isinstance(item, dict):
+        return None
+    sig = item.get("thought_signature")
+    for container, key in ((item.get("extra_content"), "google"), (item, "function")):
+        if not sig and isinstance(container, dict) and isinstance(container.get(key), dict):
+            sig = container[key].get("thought_signature")
+    return str(sig) if sig else None
+
+
+def attach_thought_signature(tool_call: dict[str, Any], signature: str | None) -> None:
+    """Write ``signature`` (or the sentinel) to both wire locations of ``tool_call``.
+
+    Vertex AI's OpenAI endpoint reads ``extra_content.google.thought_signature``
+    and rejects turn 2+ function calls without it; AI Studio reads the
+    top-level key. Other ``extra_content`` entries are preserved.
+    """
+    sig = signature or THOUGHT_SIGNATURE_SENTINEL
+    tool_call["thought_signature"] = sig
+    extra = tool_call.get("extra_content")
+    extra = dict(extra) if isinstance(extra, dict) else {}
+    google = extra.get("google")
+    extra["google"] = {**(google if isinstance(google, dict) else {}), "thought_signature": sig}
+    tool_call["extra_content"] = extra
+
+
 def sanitize_assistant_message(
     message: dict[str, Any],
     *,
@@ -290,10 +325,9 @@ def sanitize_assistant_message(
             if not isinstance(tc, dict):
                 continue
             tc_copy = deepcopy(tc)
-            # Ensure thought_signature is present; fallback to Google's official sentinel
-            # to prevent 400 INVALID_ARGUMENT from Gemini / Vertex AI endpoints.
-            if not tc_copy.get("thought_signature"):
-                tc_copy["thought_signature"] = "skip_thought_signature_validator"
+            # Gemini / Vertex AI reject function calls without a signature
+            # (400 INVALID_ARGUMENT); the sentinel covers calls that had none.
+            attach_thought_signature(tc_copy, get_thought_signature(tc_copy))
             cleaned_calls.append(tc_copy)
         sanitized["tool_calls"] = cleaned_calls
 
@@ -878,6 +912,7 @@ def parse_chat_stream(
     reasoning_details: list[dict[str, Any]] = []
     reasoning_details_map: dict[Any, dict[str, Any]] = {}
     active_detail_key: Any = None
+    last_thought_signature: str | None = None
     in_think_tag = False
     in_tool_tag = False
     tag_buffer = ""
@@ -1113,6 +1148,9 @@ def parse_chat_stream(
                     reasoning_text += clean_delta
                     if stream_callback:
                         stream_callback({"type": "reasoning", "delta": clean_delta})
+            delta_sig = get_thought_signature(delta)
+            if delta_sig:
+                last_thought_signature = delta_sig
             for call_delta in delta.get("tool_calls") or []:
                 index = int(call_delta.get("index", 0))
                 call = tool_calls.setdefault(
@@ -1128,13 +1166,9 @@ def parse_chat_stream(
                 arguments_delta = function.get("arguments") or ""
                 call["function"]["name"] += name_delta
                 call["function"]["arguments"] += arguments_delta
-                sig = (
-                    call_delta.get("thought_signature")
-                    or (call_delta.get("extra_content") or {}).get("google", {}).get("thought_signature")
-                    or function.get("thought_signature")
-                )
+                sig = get_thought_signature(call_delta) or delta_sig
                 if sig and "thought_signature" not in call:
-                    call["thought_signature"] = sig
+                    attach_thought_signature(call, sig)
                 if stream_callback:
                     stream_callback(
                         {
@@ -1244,8 +1278,7 @@ def parse_chat_stream(
         for idx, call in tool_calls.items():
             if not call.get("id"):
                 call["id"] = f"call_{uuid.uuid4().hex[:8]}"
-            if not call.get("thought_signature"):
-                call["thought_signature"] = "skip_thought_signature_validator"
+            attach_thought_signature(call, get_thought_signature(call) or last_thought_signature)
         message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
     if reasoning_details:
         message["reasoning_details"] = reasoning_details
@@ -1812,12 +1845,17 @@ class ChatCompletionsClient(BaseLLMClient):
         body = response.json()
         self.last_usage = normalize_usage(body.get("usage")) if isinstance(body.get("usage"), dict) else None
         choices = body.get("choices") if isinstance(body, dict) else None
-        if choices and choices[0].get("finish_reason") == "length":
-            raise RuntimeError(
+        if choices and choices[0].get("finish_reason") in ("length", "MAX_TOKENS"):
+            msg_partial = choices[0].get("message") if isinstance(choices[0].get("message"), dict) else {}
+            raise CompletionTruncatedError(
                 f"{self._provider_label} completion was truncated "
-                "(finish_reason='length'); no tool calls were executed. "
+                f"(finish_reason={choices[0].get('finish_reason')!r}); no tool calls were executed. "
                 "Consider increasing 'llm.max_completion_tokens' "
-                "in config.yaml or reducing 'reasoning_effort'."
+                "in config.yaml or reducing 'reasoning_effort'.",
+                partial_content=msg_partial.get("content") or "",
+                reasoning_text=msg_partial.get("reasoning") or msg_partial.get("reasoning_content") or "",
+                partial_tool_calls=msg_partial.get("tool_calls") or [],
+                provider_label=self._provider_label,
             )
         if choices and isinstance(choices[0].get("message"), dict):
             msg = choices[0]["message"]
@@ -1830,4 +1868,8 @@ class ChatCompletionsClient(BaseLLMClient):
             if extracted_r and not msg.get("reasoning"):
                 msg["reasoning"] = extracted_r
             msg["content"] = clean_text or None
+            msg_sig = get_thought_signature(msg)
+            for tc in msg.get("tool_calls") or []:
+                if isinstance(tc, dict):
+                    attach_thought_signature(tc, get_thought_signature(tc) or msg_sig)
         return body

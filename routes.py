@@ -38,6 +38,11 @@ from agent.converter import (
     SUPPORTED_EXPORT_FORMATS,
     export_project_model,
 )
+from agent.print_advisor import (
+    format_print_command_prompt,
+    recommend_print_profile,
+    sanitize_print_profile,
+)
 from agent.conversation import ConversationStore
 from agent.core import AgentRunner
 from agent.images import store_images
@@ -51,9 +56,22 @@ from agent.revisions import (
     RevisionStore,
     cached_model_sha256,
 )
-from agent.settings import REASONING_EFFORTS, Settings, with_reasoning_effort
+from agent.settings import (
+    REASONING_EFFORTS,
+    Settings,
+    with_model_selection,
+    with_reasoning_effort,
+)
 
-PROJECT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+# 1-128 chars; no path separators, "..", URL/shell-hostile or control
+# characters, and no leading/trailing dot or space.
+PROJECT_NAME_RE = re.compile(
+    r"^(?!.*\.\.)[^./\\:*?\"<>|#% \t\n\r\x00-\x1f](?:[^/\\:*?\"<>|#%\x00-\x1f]{0,126}[^./\\:*?\"<>|#% \t\n\r\x00-\x1f])?$"
+)
+PROJECT_NAME_ERROR = (
+    "Invalid project name. Avoid characters like / \\ : * ? \" < > | # % "
+    "or starting/ending with a dot or space."
+)
 INFO_EVENT_TYPES = frozenset({"agent_status", "tool_status", "agent_usage", "agent_stopped"})
 HISTORY_EVENT_TYPES = INFO_EVENT_TYPES | {"agent_error"}
 SSE_QUEUE_SIZE = 4096
@@ -67,9 +85,9 @@ _MAX_DIFF_LINES = 500
 
 def _project_path(settings: Settings, project_name: str) -> Path:
     if not PROJECT_NAME_RE.fullmatch(project_name):
-        raise ValueError(
-            "Project name must use lowercase letters, numbers, and hyphens (no uppercase or spaces)."
-        )
+        raise ValueError("Invalid project name.")
+    # The regex admits exactly one path component that is never "." or "..",
+    # so joining cannot escape the workspace.
     path = settings.workspace_root / project_name
     if not path.is_dir():
         raise FileNotFoundError("Project not found.")
@@ -256,6 +274,22 @@ def _sync_reasoning_effort(effort_raw: Any) -> str | None:
     return effort
 
 
+def _sync_model_selection(model_key_raw: Any) -> str | None:
+    """Validate and sync the ``<provider>:<model>`` selection with app config and agent runner.
+
+    Selecting a model also applies its configured reasoning effort, so callers
+    that receive an explicit effort must sync it *after* the model.
+    """
+    model_key = str(model_key_raw or "").strip()
+    if not model_key:
+        return None
+    settings: Settings = current_app.config["SETTINGS"]
+    current_app.config["SETTINGS"] = with_model_selection(settings, model_key)
+    runner: AgentRunner = current_app.config["AGENT_RUNNER"]
+    runner.set_model_selection(model_key)
+    return model_key
+
+
 def _run_preflight(settings: Settings) -> dict[str, Any]:
     from agent.sandbox import _BWRAP, seccomp_filter_fd
 
@@ -423,13 +457,16 @@ def project_view(name: str) -> str:
         _project_path(current_app.config["SETTINGS"], name)
     except (ValueError, FileNotFoundError):
         return "Project not found.", 404
+    settings: Settings = current_app.config["SETTINGS"]
     return render_template(
         "index.html",
         project_name=name,
-        show_info_messages=current_app.config["SETTINGS"].show_info_messages,
-        viewer_grid_size=current_app.config["SETTINGS"].viewer_grid_size,
-        viewer_grid_divisions=current_app.config["SETTINGS"].viewer_grid_divisions,
-        reasoning_effort=current_app.config["SETTINGS"].reasoning_effort or "medium",
+        show_info_messages=settings.show_info_messages,
+        viewer_grid_size=settings.viewer_grid_size,
+        viewer_grid_divisions=settings.viewer_grid_divisions,
+        reasoning_effort=settings.reasoning_effort or "medium",
+        active_model_key=settings.active_model_key,
+        available_models=[opt.to_dict() for opt in settings.available_models],
         cache_bust=int(time.time()),
         example_prompts=UI_EXAMPLE_PROMPTS,
     )
@@ -457,9 +494,9 @@ def list_projects():
 @projects_bp.post("/api/projects/new")
 def new_project():
     payload = request.get_json(silent=True) or {}
-    name = str(payload.get("name", "")).strip().lower().replace(" ", "-")
+    name = re.sub(r"\s+", " ", str(payload.get("name", "")).strip())
     if not PROJECT_NAME_RE.fullmatch(name):
-        return jsonify({"error": "Use 1-63 lowercase letters, numbers, or hyphens."}), 400
+        return jsonify({"error": PROJECT_NAME_ERROR}), 400
     settings: Settings = current_app.config["SETTINGS"]
     workspace_root = settings.workspace_root
     project_dir = workspace_root / name
@@ -535,9 +572,9 @@ def reset_project(project_name: str):
 def rename_project(project_name: str):
     settings: Settings = current_app.config["SETTINGS"]
     payload = request.get_json(silent=True) or {}
-    new_name = str(payload.get("name", "")).strip().lower().replace(" ", "-")
+    new_name = re.sub(r"\s+", " ", str(payload.get("name", "")).strip())
     if not PROJECT_NAME_RE.fullmatch(new_name):
-        return jsonify({"error": "Use 1-63 lowercase letters, numbers, or hyphens."}), 400
+        return jsonify({"error": PROJECT_NAME_ERROR}), 400
     if new_name == project_name:
         return jsonify({"project": project_name})
     target = settings.workspace_root / new_name
@@ -594,6 +631,7 @@ def chat():
     if not message:
         return jsonify({"error": "Message is required."}), 400
     try:
+        model_key = _sync_model_selection(payload.get("model_key"))
         effort = _sync_reasoning_effort(payload.get("reasoning_effort"))
     except ValueError as err:
         return jsonify({"error": str(err)}), 400
@@ -628,13 +666,24 @@ def chat():
             return jsonify({"error": str(error)}), 404
         except (ValueError, OSError) as error:
             return jsonify({"error": str(error)}), 400
+        if message.lower() == "/print" or message.lower().startswith("/print "):
+            try:
+                message = format_print_command_prompt(project_dir, message[6:].strip())
+            except FileNotFoundError as error:
+                return jsonify({"error": str(error)}), 400
         # ``AgentRunner.start`` takes transactional ownership of the
         # uploaded inputs by moving them into a run-scoped directory under
         # its own lock. Cleanup happens in ``_run``'s ``finally`` block,
         # so the HTTP handler must no longer speculatively unlink here —
         # the runner is the sole owner of the artifacts from the moment
         # ``start`` returns.
-        started = runner.start(project_name, message, image_paths, reasoning_effort=effort)
+        started = runner.start(
+            project_name,
+            message,
+            image_paths,
+            reasoning_effort=effort,
+            model_key=model_key,
+        )
     if not started:
         return jsonify({"error": "Unable to start the agent task."}), 409
     if idempotency_key:
@@ -652,6 +701,7 @@ def chat_retry():
     if not project_name:
         return jsonify({"error": "Project is required."}), 400
     try:
+        model_key = _sync_model_selection(payload.get("model_key"))
         effort = _sync_reasoning_effort(payload.get("reasoning_effort"))
     except ValueError as err:
         return jsonify({"error": str(err)}), 400
@@ -683,10 +733,44 @@ def chat_retry():
                 if isinstance(part, dict) and part.get("type") == "text":
                     parts.append(str(part.get("text", "")))
             prompt_text = "\n".join(parts)
-        started = runner.start_retry(project_name, message=prompt_text, reasoning_effort=effort)
+        started = runner.start_retry(
+            project_name,
+            message=prompt_text,
+            reasoning_effort=effort,
+            model_key=model_key,
+        )
     if not started:
         return jsonify({"error": "Unable to start retry task."}), 409
     return jsonify({"accepted": True}), 202
+
+
+@agent_bp.get("/api/settings/models")
+def get_models():
+    settings: Settings = current_app.config["SETTINGS"]
+    return jsonify({
+        "active_key": settings.active_model_key,
+        "provider": settings.llm_provider,
+        "model": settings.llm_model,
+        "reasoning_effort": settings.reasoning_effort or "medium",
+        "models": [opt.to_dict() for opt in settings.available_models],
+    })
+
+
+@agent_bp.post("/api/settings/models")
+def update_model():
+    payload = request.get_json(silent=True) or {}
+    try:
+        if not _sync_model_selection(payload.get("model_key")):
+            return jsonify({"error": "model_key is required."}), 400
+    except ValueError as err:
+        return jsonify({"error": str(err)}), 400
+    settings: Settings = current_app.config["SETTINGS"]
+    return jsonify({
+        "active_key": settings.active_model_key,
+        "provider": settings.llm_provider,
+        "model": settings.llm_model,
+        "reasoning_effort": settings.reasoning_effort or "medium",
+    })
 
 
 @agent_bp.get("/api/settings/reasoning-effort")
@@ -937,8 +1021,29 @@ def preview_meta(project_name: str):
     })
 
 
-@render_bp.get("/api/projects/<project_name>/export")
+@render_bp.post("/api/projects/<project_name>/print-profile")
+def get_print_profile(project_name: str):
+    project_dir = _resolve_project_or_404(project_name)
+    if not isinstance(project_dir, Path):
+        return project_dir
+
+    payload = request.get_json(silent=True) or {}
+    try:
+        result = recommend_print_profile(
+            project_dir,
+            priority=str(payload.get("priority", "auto")),
+            material_override=str(payload.get("material", "auto")),
+        )
+    except FileNotFoundError as error:
+        return jsonify({"error": str(error)}), 404
+    except (ValueError, OSError) as error:
+        return jsonify({"error": str(error)}), 500
+    return jsonify(result)
+
+
+@render_bp.route("/api/projects/<project_name>/export", methods=["GET", "POST"])
 def export_model(project_name: str):
+    """Export the model; a 3MF POST body ``{"profile": {...}}`` embeds slicer settings."""
     fmt = (request.args.get("format") or "stl").lower().strip()
     if fmt not in SUPPORTED_EXPORT_FORMATS:
         supported = ", ".join(sorted(SUPPORTED_EXPORT_FORMATS))
@@ -947,8 +1052,14 @@ def export_model(project_name: str):
     if not isinstance(project_dir, Path):
         return project_dir
 
+    print_profile: dict[str, Any] | None = None
+    if fmt == "3mf" and request.method == "POST":
+        raw_profile = (request.get_json(silent=True) or {}).get("profile")
+        if isinstance(raw_profile, dict):
+            print_profile = sanitize_print_profile(raw_profile)
+
     try:
-        exported_path = export_project_model(project_dir, fmt)
+        exported_path = export_project_model(project_dir, fmt, print_profile=print_profile)
     except FileNotFoundError as error:
         return jsonify({"error": str(error)}), 404
     except ValueError as error:
