@@ -47,6 +47,7 @@ from agent.llm_base import (
 )
 from agent.prompt import (
     NUDGE_CAD_FIX_REQUIRED,
+    format_budget_warning_nudge,
     format_project_state,
     format_unverified_model_nudge,
     get_system_prompt,
@@ -193,11 +194,14 @@ class _RunState:
     total_prompt_tokens: int = 0
     total_completion_tokens: int = 0
     total_reasoning_tokens: int = 0
+    total_cached_tokens: int = 0
+    total_cost: float = 0.0
     run_reasonings: list[str] = field(default_factory=list)
     current_content: str = ""
     current_reasoning: str = ""
     start_perf_time: float = 0.0
     truncation_continuations: int = 0
+    budget_warning_sent: bool = False
 
 
 def _extract_reasoning(message: dict[str, Any]) -> str:
@@ -568,7 +572,7 @@ class AgentRunner:
             # Bound once: the publisher reads ``current_message_id`` lazily
             # so the per-iteration update is just an attribute assignment.
             state.client.stream_callback = self._build_stream_publisher(state)
-            for _ in range(self.settings.agent_tool_call_limit):
+            for iteration in range(self.settings.agent_tool_call_limit):
                 if self._stop_event.is_set():
                     self._handle_stop_pre_turn(state)
                     return
@@ -577,6 +581,7 @@ class AgentRunner:
                 state.current_reasoning = ""
                 outcome = self._run_turn(state)
                 if outcome is _TurnOutcome.CONTINUE:
+                    self._maybe_nudge_budget_limit(state, iteration)
                     continue
                 # Non-CONTINUE is terminal; the helper already published
                 # the diagnostic and finalised ``state.messages``.
@@ -707,6 +712,25 @@ class AgentRunner:
                 sse_name = "agent_reasoning_delta"
             elif event_type == "tool_call":
                 sse_name = "agent_tool_delta"
+            elif event_type == "reset":
+                state.current_content = ""
+                state.current_reasoning = ""
+                state.current_message_id = uuid.uuid4().hex
+                publish(
+                    "agent_stream_reset",
+                    {
+                        "project": project,
+                        "run_id": run_id,
+                        "message_id": state.current_message_id,
+                    },
+                )
+                if log is not None:
+                    log(
+                        "agent_stream_reset",
+                        {"run_id": run_id, "message_id": state.current_message_id},
+                        run_id=run_id,
+                    )
+                return
             else:
                 sse_name = f"agent_{event_type}_delta"
             publish(
@@ -757,7 +781,17 @@ class AgentRunner:
                     state.total_prompt_tokens += int(usage.get("prompt_tokens") or 0)
                     state.total_completion_tokens += int(usage.get("completion_tokens") or 0)
                     details = usage.get("completion_tokens_details") or {}
-                    state.total_reasoning_tokens += int(details.get("reasoning_tokens") or 0)
+                    state.total_reasoning_tokens += int(details.get("reasoning_tokens") or usage.get("reasoning_tokens") or 0)
+                    ptd = usage.get("prompt_tokens_details") or {}
+                    cached_tokens = ptd.get("cached_tokens") or usage.get("cached_tokens") or 0
+                    state.total_cached_tokens += int(cached_tokens)
+                    cost = usage.get("cost")
+                    if cost is not None:
+                        try:
+                            state.total_cost += float(cost)
+                        except (ValueError, TypeError):
+                            pass
+                self._publish_usage(state.project, usage, state=state)
                 content = trunc_err.partial_content.strip() if trunc_err.partial_content else ""
                 partial_msg: dict[str, Any] = {
                     "role": "assistant",
@@ -819,7 +853,16 @@ class AgentRunner:
             details = usage.get("completion_tokens_details") or {}
             reasoning_tokens = details.get("reasoning_tokens") or usage.get("reasoning_tokens") or 0
             state.total_reasoning_tokens += int(reasoning_tokens)
-        self._publish_usage(state.project, usage)
+            ptd = usage.get("prompt_tokens_details") or {}
+            cached_tokens = ptd.get("cached_tokens") or usage.get("cached_tokens") or 0
+            state.total_cached_tokens += int(cached_tokens)
+            cost = usage.get("cost")
+            if cost is not None:
+                try:
+                    state.total_cost += float(cost)
+                except (ValueError, TypeError):
+                    pass
+        self._publish_usage(state.project, usage, state=state)
         assistant_message = sanitize_assistant_message(
             response["choices"][0]["message"],
             preserve_reasoning=getattr(state.client, "preserve_reasoning", False),
@@ -1132,6 +1175,24 @@ class AgentRunner:
             state.messages.append(item)
             ConversationStore.append(state.project_dir, item)
 
+    def _maybe_nudge_budget_limit(self, state: _RunState, iteration: int) -> None:
+        """Append a synthetic warning when approaching the tool-call budget.
+
+        The warning is placed at the prompt tail to preserve the cacheable
+        prefix for upstream LLM provider caching, while nudging the model to
+        stop over-complicating or excessively iterating and finalize.
+        """
+        limit = self.settings.agent_tool_call_limit
+        remaining = limit - (iteration + 1)
+        warn_threshold = 5 if limit >= 15 else max(1, limit // 3)
+        if 1 <= remaining <= warn_threshold and not state.budget_warning_sent:
+            if state.messages and state.messages[-1].get("role") == "user":
+                return
+            state.budget_warning_sent = True
+            nudge = _synthetic_user(format_budget_warning_nudge(remaining, MODEL_FILENAME))
+            state.messages.append(nudge)
+            self._append_message(state.project_dir, nudge)
+
     def _handle_tool_limit_reached(self, state: _RunState) -> None:
         """The ``agent.tool_call_limit`` budget was exhausted."""
         self.publish(
@@ -1149,14 +1210,25 @@ class AgentRunner:
         # If the final iteration processed at least one tool call, the
         # transcript still ends with ``role: tool``; close the tail so
         # the next user turn has a well-formed prompt prefix.
-        _close_dangling_tool_tail(
-            state.project_dir,
-            state.messages,
-            (
-                f"Tool-call limit ({self.settings.agent_tool_call_limit}) "
-                "reached without resolving the task."
-            ),
-        )
+        if (
+            not _close_dangling_tool_tail(
+                state.project_dir,
+                state.messages,
+                (
+                    f"Tool-call limit ({self.settings.agent_tool_call_limit}) "
+                    "reached without resolving the task."
+                ),
+            )
+            and state.messages
+            and state.messages[-1].get("role") == "user"
+        ):
+            item = {
+                "role": "assistant",
+                "content": f"Tool-call limit ({self.settings.agent_tool_call_limit}) reached.",
+                "synthetic": True,
+            }
+            state.messages.append(item)
+            ConversationStore.append(state.project_dir, item)
 
     def _handle_request_cancelled(self, state: _RunState | None) -> None:
         """``RequestCancelled`` raised mid-iteration: expected control flow.
@@ -1451,10 +1523,17 @@ class AgentRunner:
                 if isinstance(data, dict) and "existed" in data:
                     existed = bool(data["existed"])
                     content = str(data.get("content", ""))
-                    if existed and not content and (not history or len(history) <= 1):
+                    if not history or len(history) <= 1:
                         model_file = project_dir / MODEL_FILENAME
-                        if model_file.is_file() and model_file.stat().st_size <= 100_000:
-                            content = model_file.read_text("utf-8", errors="replace")
+                        real_exists = model_file.is_file()
+                        current_content = (
+                            model_file.read_text("utf-8", errors="replace")
+                            if (real_exists and model_file.stat().st_size <= 100_000)
+                            else ""
+                        )
+                        if real_exists != existed or current_content != content:
+                            existed = real_exists
+                            content = current_content
                             try:
                                 state_file.write_text(
                                     json.dumps({"existed": existed, "content": content}),
@@ -1587,23 +1666,50 @@ class AgentRunner:
         (project_dir / ".agent_initial_state.json").unlink(missing_ok=True)
         return ConversationStore.clear(project_dir)
 
-    def _publish_usage(self, project: str, usage: dict | None) -> None:
+    def _publish_usage(
+        self,
+        project: str,
+        usage: dict | None,
+        state: _RunState | None = None,
+    ) -> None:
         if not usage:
             return
         details = usage.get("prompt_tokens_details")
-        cached_tokens = (
-            details.get("cached_tokens", 0) if isinstance(details, dict) else 0
+        cached_tokens = int(
+            (details.get("cached_tokens", 0) if isinstance(details, dict) else 0)
+            or usage.get("cached_tokens")
+            or 0
         )
+        cache_write_tokens = int(
+            details.get("cache_write_tokens", 0) if isinstance(details, dict) else 0
+        )
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        p_val = int(prompt_tokens) if prompt_tokens is not None else 0
+        c_val = int(completion_tokens) if completion_tokens is not None else 0
+        cache_hit_rate = round((cached_tokens / p_val) * 100.0, 1) if p_val > 0 else 0.0
+        cost = usage.get("cost")
+        cost_val: float | None = None
+        if cost is not None:
+            try:
+                cost_val = float(cost)
+            except (ValueError, TypeError):
+                cost_val = None
+        total_cost = round(state.total_cost, 6) if state and state.total_cost > 0 else cost_val
         self.publish(
             "agent_usage",
             {
                 "project": project,
-                "prompt_tokens": usage.get("prompt_tokens"),
-                "completion_tokens": usage.get("completion_tokens"),
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
                 "cached_tokens": cached_tokens,
-                "cache_write_tokens": details.get("cache_write_tokens", 0)
-                if isinstance(details, dict)
-                else 0,
+                "cache_write_tokens": cache_write_tokens,
+                "cache_hit_rate": cache_hit_rate,
+                "cost": cost_val,
+                "total_cost": total_cost,
+                "total_prompt_tokens": state.total_prompt_tokens if state else p_val,
+                "total_completion_tokens": state.total_completion_tokens if state else c_val,
+                "total_cached_tokens": state.total_cached_tokens if state else cached_tokens,
             },
         )
 
@@ -1732,6 +1838,17 @@ class AgentRunner:
             or "seccomp" in lower
         ):
             return "CAD sandbox failed. Ensure bubblewrap and libseccomp2 are installed (sudo apt install bubblewrap libseccomp2)."
+        if (
+            "ssl" in lower
+            or "decryption_failed" in lower
+            or "bad record mac" in lower
+            or "handshake" in lower
+            or "tlsv" in lower
+        ):
+            return (
+                f"Network SSL/TLS connection error with {provider_name} ({detail}). "
+                "This is usually a transient network, router, or proxy interruption. Please retry."
+            )
         if (
             "openrouter" in lower
             or "openai" in lower

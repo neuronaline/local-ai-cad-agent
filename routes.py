@@ -33,20 +33,21 @@ from flask import (
     stream_with_context,
 )
 
+from agent.balance import fetch_provider_balance
+from agent.conversation import ConversationStore
 from agent.converter import (
     EXPORT_MIME_TYPES,
     SUPPORTED_EXPORT_FORMATS,
     export_project_model,
 )
+from agent.core import AgentRunner
+from agent.images import store_images
+from agent.io import utc_now_iso
 from agent.print_advisor import (
     format_print_command_prompt,
     recommend_print_profile,
     sanitize_print_profile,
 )
-from agent.conversation import ConversationStore
-from agent.core import AgentRunner
-from agent.images import store_images
-from agent.io import utc_now_iso
 from agent.prompt import UI_EXAMPLE_PROMPTS
 from agent.review_paths import review_dir
 from agent.revisions import (
@@ -798,6 +799,15 @@ def update_reasoning_effort():
         "reasoning_effort": effort,
         "provider": current_app.config["SETTINGS"].llm_provider,
     })
+
+
+@agent_bp.get("/api/provider/balance")
+def get_provider_balance():
+    settings: Settings = current_app.config["SETTINGS"]
+    provider = request.args.get("provider", "").strip() or None
+    force_refresh = request.args.get("refresh", "").lower() in ("1", "true", "yes")
+    balance_info = fetch_provider_balance(settings, provider=provider, force_refresh=force_refresh)
+    return jsonify(balance_info)
 
 
 @agent_bp.post("/api/questions/answer")

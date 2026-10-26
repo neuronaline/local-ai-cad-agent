@@ -2,7 +2,7 @@
 workspace_root: ~/CAD-Agent-Projects
 
 # ── 1. Active LLM Provider ───────────────────────────────────────────────────
-# Supported providers: openrouter | gemini | vertex | openai | ollama
+# Supported providers: openrouter | gemini (aistudio) | vertex | openai | ollama
 # Set either a provider name ("openrouter") or "<provider>:<model>"
 # ("gemini:gemini-3.8-flash"). If only a provider name is given, the first
 # model listed under that provider below is used as its default.
@@ -68,7 +68,7 @@ openai:
 
 # ── 3. Agent, Server & Viewport ──────────────────────────────────────────────
 agent:
-  tool_call_limit: 15
+  tool_call_limit: 25
   revision_retention_count: 0   # 0 keeps all model revisions
   # off | errors (<project>/debug-errors.jsonl) | debug (rolling activity.jsonl)
   # | dataset (untrimmed trajectories/<run_id>.jsonl)

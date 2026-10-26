@@ -20,6 +20,11 @@
             <h1>{{ project_name }}</h1>
             <span id="connection-status" class="connection-status" role="status" aria-label="Connecting" title="Connecting…"></span>
           </div>
+          <div id="provider-balance-badge" class="balance-badge" title="Conversation token & cost details">
+            <span class="balance-icon" aria-hidden="true">💳</span>
+            <span id="balance-badge-text" class="balance-badge-text">Spent: $0.00 · 0 tok</span>
+            <div id="balance-popover" class="balance-popover hidden"></div>
+          </div>
         </header>
         <div id="busy-project-banner" class="busy-project-banner" hidden></div>
         <div id="chat-feed" class="chat-feed" aria-live="polite"></div>

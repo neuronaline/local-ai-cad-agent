@@ -46,6 +46,10 @@ class VertexClient(ChatCompletionsClient):
             configured = self.settings.gemini_location or self.settings.vertex_location
         else:
             configured = self.settings.vertex_location or self.settings.gemini_location
+        if not configured:
+            model_lower = self.model.lower()
+            if "gemini-3" in model_lower or "gemini-4" in model_lower:
+                return "global"
         return gcloud_auth.get_location(configured or DEFAULT_LOCATION)
 
     def _api_key(self) -> str:
@@ -117,8 +121,32 @@ class VertexClient(ChatCompletionsClient):
             if self.settings.llm_provider in ("gemini", "google")
             else self.settings.vertex_reasoning_effort
         )
+        model_lower = self.model.lower()
+        is_gemini_2 = "2.5" in model_lower or "gemini-2" in model_lower
+        thinking_config: dict[str, Any] = {"include_thoughts": True}
         if effort:
-            payload["reasoning_effort"] = effort
+            eff = effort.lower().strip()
+            if not is_gemini_2:
+                level_map = {
+                    "minimal": "MINIMAL",
+                    "low": "LOW",
+                    "medium": "MEDIUM",
+                    "high": "HIGH",
+                }
+                thinking_config["thinking_level"] = level_map.get(eff, eff.upper())
+            else:
+                budget_map = {
+                    "minimal": 1024,
+                    "low": 2048,
+                    "medium": 4096,
+                    "high": 8192,
+                }
+                thinking_config["thinking_budget"] = budget_map.get(eff, 8192)
+        elif not is_gemini_2:
+            thinking_config["thinking_level"] = "HIGH"
+        else:
+            thinking_config["thinking_budget"] = 8192
+        payload["extra_body"] = {"google": {"thinking_config": thinking_config}}
 
         return payload
 

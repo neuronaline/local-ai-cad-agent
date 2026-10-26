@@ -591,11 +591,188 @@ button[aria-pressed="true"] { border-color: #5d7ed7; background: #233966; color:
 .activity-item[data-status="error"] .activity-state { color: var(--danger); }
 .activity-detail { grid-column: 1 / -1; overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
 /* Token usage pill shown next to the activity-panel summary. Updated in place
-   by the agent_usage SSE handler so users see live prompt/completion/cache
+   by the agent_usage SSE handler so users see live prompt/completion/cache/cost
    counts without polluting the per-tool activity list. */
-.usage-pill { margin-left: .5rem; padding: 0 .4rem; border-radius: 999px; background: #142340; color: var(--muted); font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; font-size: .65rem; font-weight: 600; letter-spacing: .02em; }
-.usage-pill[data-cache="hit"] { color: #7fd1a8; }
-.usage-pill[data-cache="partial"] { color: #e6c46b; }
+.usage-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  margin-left: .5rem;
+  padding: 0.1rem .45rem;
+  border-radius: 999px;
+  background: #142340;
+  border: 1px solid #22375a;
+  color: var(--muted);
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  font-size: .65rem;
+  font-weight: 600;
+  letter-spacing: .02em;
+  transition: all 0.15s ease;
+}
+.usage-pill[data-cache="hit"] {
+  color: #7fd1a8;
+  background: #0e2922;
+  border-color: #1c523d;
+}
+.usage-pill[data-cache="partial"] {
+  color: #e6c46b;
+  background: #2b2510;
+  border-color: #574519;
+}
+.usage-pill[data-cache="miss"] {
+  color: var(--muted);
+  background: #142340;
+  border-color: #22375a;
+}
+
+/* Provider Balance Badge & Popover */
+.balance-badge {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-left: auto;
+  padding: 0.2rem 0.55rem;
+  border-radius: 999px;
+  background: #101c30;
+  border: 1px solid #22375a;
+  color: var(--text);
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  user-select: none;
+  transition: all 0.15s ease;
+}
+
+.balance-badge:hover {
+  background: #162642;
+  border-color: #3b5a8c;
+}
+
+.balance-badge .balance-icon {
+  font-size: 0.72rem;
+  opacity: 0.9;
+}
+
+.balance-badge-text {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  white-space: nowrap;
+}
+
+.balance-val-remaining {
+  color: #7fd1a8;
+  font-weight: 700;
+}
+
+.balance-val-spent {
+  color: #9bb7ee;
+}
+
+.balance-badge .balance-refresh-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  margin-left: 2px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.75rem;
+  cursor: pointer;
+  border-radius: 50%;
+  transition: color 0.15s ease, transform 0.25s ease;
+}
+
+.balance-badge .balance-refresh-btn:hover {
+  color: var(--accent);
+  transform: rotate(180deg);
+}
+
+.balance-badge .balance-refresh-btn.spinning {
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+/* Balance Details Popover Card */
+.balance-popover {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  min-width: 290px;
+  width: max-content;
+  max-width: 380px;
+  padding: 0.75rem;
+  border-radius: 8px;
+  background: #0d1627;
+  border: 1px solid #2e4368;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.55);
+  z-index: 100;
+  font-family: inherit;
+  font-size: 0.75rem;
+  color: var(--text);
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.balance-popover.hidden {
+  display: none !important;
+}
+
+.balance-popover-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  border-bottom: 1px solid #1f304d;
+  padding-bottom: 0.4rem;
+  font-weight: 700;
+  color: var(--accent);
+  font-size: 0.76rem;
+}
+
+.balance-popover-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.balance-popover-row span:last-child {
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.balance-popover-row .highlight-green {
+  color: #7fd1a8 !important;
+}
+
+.balance-popover-row .highlight-blue {
+  color: #9bb7ee !important;
+}
+
+.balance-popover-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-top: 1px solid #1f304d;
+  padding-top: 0.4rem;
+  font-size: 0.65rem;
+  color: var(--muted);
+}
 
 .composer { position: relative; border: 1px solid var(--line); border-radius: 9px; padding: .4rem; background: #0e1828; }
 .slash-popup { position: absolute; bottom: calc(100% + 6px); left: 0; width: 100%; max-width: 380px; border: 1px solid #364b6e; border-radius: 8px; background: #0f192b; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45); overflow: hidden; z-index: 50; }

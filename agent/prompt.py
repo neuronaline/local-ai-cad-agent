@@ -250,6 +250,19 @@ def format_unverified_model_nudge(filename: str = "model.scad") -> str:
     return NUDGE_UNVERIFIED_MODEL_TEMPLATE.format(filename=filename)
 
 
+NUDGE_BUDGET_WARNING_TEMPLATE = (
+    "You are taking too long and approaching the tool-call limit ({remaining_text} remaining). "
+    "Stop making repetitive micro-edits, over-complicating geometry, or running unnecessary secondary checks. "
+    "Finalize the core {filename} geometry now, verify it with cad_build, and provide your final response."
+)
+
+
+def format_budget_warning_nudge(remaining: int, filename: str = "model.scad") -> str:
+    """Format synthetic reminder when approaching the tool-call limit."""
+    remaining_text = "1 turn" if remaining == 1 else f"{remaining} turns"
+    return NUDGE_BUDGET_WARNING_TEMPLATE.format(remaining_text=remaining_text, filename=filename)
+
+
 # Multimodal Visual Inspection Prompt (wrapped around relocated tool images)
 TOOL_IMAGE_PROMPT = (
     "The attached image is the visual artifact returned by the latest tool "

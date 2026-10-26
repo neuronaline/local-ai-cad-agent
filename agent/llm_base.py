@@ -12,6 +12,7 @@ import json
 import os
 import queue
 import re
+import ssl
 import threading
 import time
 import uuid
@@ -22,7 +23,7 @@ import httpx
 
 from agent.activity_log import summarize_llm_messages
 from agent.prompt import TOOL_IMAGE_PROMPT
-from agent.settings import Settings
+from agent.settings import Settings, canonical_provider
 
 PROVIDER_LABELS = {
     "openrouter": "OpenRouter",
@@ -30,6 +31,10 @@ PROVIDER_LABELS = {
     "ollama": "Ollama",
     "gemini": "Google AI Studio",
     "google": "Google AI Studio",
+    "aistudio": "Google AI Studio",
+    "google_ai_studio": "Google AI Studio",
+    "google-ai-studio": "Google AI Studio",
+    "ai_studio": "Google AI Studio",
     "vertex": "Google Cloud Vertex AI (gcloud)",
     "gcloud": "Google Cloud Vertex AI (gcloud)",
 }
@@ -487,15 +492,19 @@ def sanitize_messages(
     assistant messages breaks provider prompt caches (causing cache misses)
     and causes input token counts to fluctuate erratically across iterations.
     """
-    sanitized = normalize_messages(messages)
-    for index, message in enumerate(sanitized):
-        if message.get("role") != "assistant":
-            continue
-        sanitized[index] = sanitize_assistant_message(
-            message,
-            preserve_reasoning=preserve_reasoning,
-        )
-    return relocate_tool_images(sanitized)
+    cleaned: list[dict[str, Any]] = []
+    for message in messages:
+        if message.get("role") == "assistant":
+            cleaned.append(
+                sanitize_assistant_message(
+                    message,
+                    preserve_reasoning=preserve_reasoning,
+                )
+            )
+        else:
+            cleaned.append(deepcopy(message))
+    relocated = relocate_tool_images(cleaned)
+    return normalize_messages(relocated)
 
 
 def relocate_tool_images(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -890,6 +899,16 @@ def normalize_usage(usage: dict[str, Any] | None) -> dict[str, Any] | None:
         ctd_copy["reasoning_tokens"] = int(reasoning)
         normalized["completion_tokens_details"] = ctd_copy
 
+    # 3. Normalize generation cost (e.g. OpenRouter 'cost' or proxy 'total_cost')
+    cost = normalized.get("cost")
+    if cost is None:
+        cost = normalized.get("total_cost")
+    if cost is not None:
+        try:
+            normalized["cost"] = float(cost)
+        except (ValueError, TypeError):
+            pass
+
     return normalized
 
 
@@ -988,6 +1007,15 @@ def parse_chat_stream(
             delta = choice.get("delta") or {}
             role = delta.get("role") or role
             text = delta.get("content")
+            google_extra = (delta.get("extra_content") or {}).get("google") or {}
+            is_google_thought = bool(
+                google_extra.get("thought") is True or delta.get("thought") is True
+            )
+            if is_google_thought and isinstance(text, str) and text:
+                reasoning_text += text
+                if stream_callback:
+                    stream_callback({"type": "reasoning", "delta": text})
+                text = None
             if isinstance(text, str) and text:
                 if tag_buffer:
                     text = tag_buffer + text
@@ -1314,7 +1342,7 @@ def api_key_env(provider: str) -> str:
         return "OLLAMA_API_KEY"
     if key in ("vertex", "gcloud"):
         return ""
-    if key in ("gemini", "google", "google ai studio"):
+    if key in ("gemini", "google", "google ai studio", "aistudio", "google_ai_studio", "google-ai-studio", "ai_studio"):
         if os.getenv("GEMINI_API_KEY", "").strip():
             return "GEMINI_API_KEY"
         if os.getenv("GOOGLE_API_KEY", "").strip():
@@ -1519,8 +1547,14 @@ class BaseLLMClient:
                                 )
                             return stream_res
                         except StreamResponseError as error:
+                            _force_close_response(response)
                             if not error.retryable or is_last_attempt:
                                 raise
+                            if self.stream_callback:
+                                try:
+                                    self.stream_callback({"type": "reset"})
+                                except Exception:
+                                    pass
                             if log_payload:
                                 self.activity_logger.log(
                                     "llm_stream_retry",
@@ -1528,6 +1562,25 @@ class BaseLLMClient:
                                         "attempt": attempt,
                                         "model": payload.get("model"),
                                         "error": str(error),
+                                    },
+                                    run_id=self.run_id,
+                                )
+                        except (httpx.TransportError, httpx.HTTPError, ssl.SSLError, OSError) as error:
+                            _force_close_response(response)
+                            if is_last_attempt:
+                                raise
+                            if self.stream_callback:
+                                try:
+                                    self.stream_callback({"type": "reset"})
+                                except Exception:
+                                    pass
+                            if log_payload:
+                                self.activity_logger.log(
+                                    "llm_stream_retry",
+                                    {
+                                        "attempt": attempt,
+                                        "model": payload.get("model"),
+                                        "error": f"Stream transport failure: {error}",
                                     },
                                     run_id=self.run_id,
                                 )
@@ -1586,23 +1639,24 @@ def _build_provider_client(provider: str, settings: Settings) -> BaseLLMClient:
     Extracted from :func:`create_llm_client` so the fallback wrapper can
     reuse the exact same factory without re-implementing lazy imports.
     """
-    if provider == "openai":
+    canonical = canonical_provider(provider)
+    if canonical == "openai":
         from agent.openai_client import OpenAIClient
 
         return OpenAIClient(settings)
-    if provider == "openrouter":
+    if canonical == "openrouter":
         from agent.openrouter import OpenRouterClient
 
         return OpenRouterClient(settings)
-    if provider == "ollama":
+    if canonical == "ollama":
         from agent.ollama_client import OllamaClient
 
         return OllamaClient(settings)
-    if provider in ("vertex", "gcloud"):
+    if canonical in ("vertex", "gcloud"):
         from agent.vertex_client import VertexClient
 
         return VertexClient(settings)
-    if provider in ("gemini", "google"):
+    if canonical in ("gemini", "google"):
         if getattr(settings, "gemini_auth_mode", "api_key") == "gcloud":
             from agent.vertex_client import VertexClient
 

@@ -490,7 +490,7 @@ Settings are loaded from `config.yaml` (git-ignored) at startup. Copy `config.ex
 | Key | Default | Description |
 |---|---|---|
 | `workspace_root` | `~/CAD-Agent-Projects` | Base directory where all CAD project folders are stored |
-| `agent.tool_call_limit` | `15` | Maximum tool iterations allowed per user prompt |
+| `agent.tool_call_limit` | `25` | Maximum tool iterations allowed per user prompt |
 | `agent.revision_retention_count` | `0` | Number of previous model revisions to keep (`0` keeps all) |
 | `agent.debug_log_tool_errors` | `false` | Log recoverable tool failures to `<project>/debug-errors.jsonl` |
 | `agent.log_mode` | `off` | Activity logging mode: `off`, `debug` (rolling `activity.jsonl`), or `dataset` (untrimmed `trajectories/<run_id>.jsonl`) |

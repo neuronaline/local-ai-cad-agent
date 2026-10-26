@@ -13,14 +13,39 @@ _LOG = logging.getLogger(__name__)
 _WARNED_KEYS: set[str] = set()
 
 REASONING_EFFORTS = {"minimal", "low", "medium", "high"}
-LLM_PROVIDERS = {"openrouter", "openai", "ollama", "gemini", "google", "vertex", "gcloud"}
-_PROVIDER_ALIASES = {"google": "gemini", "gcloud": "vertex"}
+LLM_PROVIDERS = {
+    "openrouter",
+    "openai",
+    "ollama",
+    "gemini",
+    "google",
+    "vertex",
+    "gcloud",
+    "aistudio",
+    "google_ai_studio",
+    "google-ai-studio",
+    "ai_studio",
+}
+_PROVIDER_ALIASES = {
+    "google": "gemini",
+    "gcloud": "vertex",
+    "aistudio": "gemini",
+    "google_ai_studio": "gemini",
+    "google-ai-studio": "gemini",
+    "ai_studio": "gemini",
+}
 PROVIDER_LABELS = {
     "openrouter": "OpenRouter",
     "openai": "OpenAI",
     "ollama": "Ollama",
     "gemini": "Google AI Studio",
     "vertex": "Google Cloud Vertex AI",
+    "google": "Google AI Studio",
+    "aistudio": "Google AI Studio",
+    "google_ai_studio": "Google AI Studio",
+    "google-ai-studio": "Google AI Studio",
+    "ai_studio": "Google AI Studio",
+    "gcloud": "Google Cloud Vertex AI",
 }
 # Built-in default model per provider when config.yaml lists none.
 _BUILTIN_MODELS = {"gemini": "gemini-3.8-flash", "vertex": "gemini-3.8-flash", "ollama": "qwen3.8:27b"}
@@ -121,7 +146,7 @@ class Settings:
     vertex_reasoning_effort: str | None = None
     # ── end provider selection ──
     show_info_messages: bool = True
-    agent_tool_call_limit: int = 15
+    agent_tool_call_limit: int = 25
     revision_retention_count: int = 0  # 0 = unlimited, >0 = keep at most N revisions
     agent_debug_log_tool_errors: bool = False
     # When True, every agent run writes a redacted, append-only JSONL
@@ -448,7 +473,15 @@ def load_settings(project_root: Path | None = None) -> Settings:
     openrouter = config.get("openrouter") or {}
     openai = config.get("openai") or {}
     ollama = config.get("ollama") or {}
-    gemini = config.get("gemini") or config.get("google") or {}
+    gemini = (
+        config.get("gemini")
+        or config.get("google")
+        or config.get("aistudio")
+        or config.get("google_ai_studio")
+        or config.get("google-ai-studio")
+        or config.get("ai_studio")
+        or {}
+    )
     vertex = config.get("vertex") or config.get("gcloud") or {}
     server = config.get("server") or {}
     ui = config.get("ui") or {}
@@ -675,7 +708,7 @@ def load_settings(project_root: Path | None = None) -> Settings:
         vertex_timeout_seconds=_validate_timeout_seconds(vertex.get("timeout_seconds") or 90, "vertex.timeout_seconds"),
         vertex_reasoning_effort=provider_defaults["vertex"].reasoning_effort,
         show_info_messages=_strict_bool(ui.get("show_info_messages", True), "ui.show_info_messages"),
-        agent_tool_call_limit=_positive_int(agent.get("tool_call_limit", 15), "agent.tool_call_limit"),
+        agent_tool_call_limit=_positive_int(agent.get("tool_call_limit", 25), "agent.tool_call_limit"),
         revision_retention_count=_non_negative_int(agent.get("revision_retention_count", 0), "agent.revision_retention_count"),
         agent_debug_log_tool_errors=agent_debug_log_tool_errors,
         agent_log_tool_activity=agent_log_tool_activity,

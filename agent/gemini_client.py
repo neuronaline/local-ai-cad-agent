@@ -100,8 +100,9 @@ def convert_tools_to_declarations(
             if "parameters" in fn:
                 decl["parameters"] = _sanitize_schema_for_gemini(fn["parameters"])
             declarations.append(decl)
-        elif "function_declarations" in tool:
-            for decl in tool["function_declarations"]:
+        elif "function_declarations" in tool or "functionDeclarations" in tool:
+            raw_decls = tool.get("function_declarations") or tool.get("functionDeclarations") or []
+            for decl in raw_decls:
                 cleaned_decl = dict(decl)
                 if "parameters" in cleaned_decl:
                     cleaned_decl["parameters"] = _sanitize_schema_for_gemini(
@@ -184,10 +185,8 @@ def convert_messages_to_interactions(
                             parts.append(
                                 {
                                     "type": "image",
-                                    "inline_data": {
-                                        "mime_type": mime,
-                                        "data": b64_data,
-                                    },
+                                    "data": b64_data,
+                                    "mime_type": mime,
                                 }
                             )
                         elif url:
@@ -221,6 +220,7 @@ def convert_messages_to_interactions(
                         {
                             "type": "thought",
                             "signature": turn_sig,
+                            "thought_signature": turn_sig,
                             "summary": [{"type": "text", "text": clean_r}],
                             "content": [{"type": "text", "text": clean_r}],
                         }
@@ -254,6 +254,7 @@ def convert_messages_to_interactions(
                     args = raw_args
                 else:
                     args = {}
+                sig = get_thought_signature(tc) or turn_sig
                 step_item = {
                     "type": "function_call",
                     "id": call_id,
@@ -261,8 +262,9 @@ def convert_messages_to_interactions(
                     "name": fn_name,
                     "arguments": args,
                     "args": args,
+                    "thought_signature": sig,
+                    "signature": sig,
                 }
-                step_item["thought_signature"] = get_thought_signature(tc) or turn_sig
                 steps.append(step_item)
 
         elif role == "tool":
@@ -288,10 +290,8 @@ def convert_messages_to_interactions(
                             mime, b64_data = parsed
                             image_steps.append({
                                 "type": "image",
-                                "inline_data": {
-                                    "mime_type": mime,
-                                    "data": b64_data,
-                                },
+                                "data": b64_data,
+                                "mime_type": mime,
                             })
                         elif url:
                             image_steps.append({"type": "image", "image_url": url})
@@ -536,7 +536,8 @@ def parse_interactions_stream(
                     or "summary" in delta
                     or (active_step_type == "thought" and (delta_type == "text" or "text" in delta))
                 ):
-                    th = delta.get("thought") or delta.get("text") or ""
+                    raw_th = delta.get("thought")
+                    th = raw_th if isinstance(raw_th, str) and raw_th else (delta.get("text") or "")
                     if not th and isinstance(delta.get("summary"), list):
                         th = "".join(
                             p.get("text", "")
@@ -704,7 +705,8 @@ def parse_interactions_stream(
             call["id"] = cid
             tool_calls[cid] = call
 
-    if finish_reason in ("length", "MAX_TOKENS"):
+    finish_norm = str(finish_reason or "").strip().lower()
+    if finish_norm in ("length", "max_tokens"):
         raise CompletionTruncatedError(
             f"{provider_label} completion was truncated (finish_reason={finish_reason!r}); "
             "token limit was reached before completion. Consider increasing 'llm.max_completion_tokens' "
@@ -716,7 +718,7 @@ def parse_interactions_stream(
         )
 
     if not content and not tool_calls:
-        if reasoning_text.strip() and finish_reason in (None, "stop", "completed"):
+        if reasoning_text.strip() and (finish_reason is None or finish_norm in ("stop", "completed")):
             content = (
                 "Model completed its reasoning process but did not produce an action or final response."
             )
@@ -833,7 +835,8 @@ def parse_interactions_response(body: dict[str, Any]) -> dict[str, Any]:
         tool_calls = text_calls
 
     finish_reason = body.get("finish_reason") or body.get("status")
-    if finish_reason in ("length", "MAX_TOKENS"):
+    finish_norm = str(finish_reason or "").strip().lower()
+    if finish_norm in ("length", "max_tokens"):
         raise CompletionTruncatedError(
             f"Google AI Studio completion was truncated (finish_reason={finish_reason!r}); "
             "token limit was reached before completion. Consider increasing 'llm.max_completion_tokens' "
@@ -845,7 +848,7 @@ def parse_interactions_response(body: dict[str, Any]) -> dict[str, Any]:
         )
 
     if not content and not tool_calls:
-        if reasoning_text.strip() and finish_reason in (None, "stop", "completed"):
+        if reasoning_text.strip() and (finish_reason is None or finish_norm in ("stop", "completed")):
             content = (
                 "Model completed its reasoning process but did not produce an action or final response."
             )
@@ -930,7 +933,7 @@ class GoogleInteractionsClient(BaseLLMClient):
         else:
             payload["store"] = True
 
-        gen_config: dict[str, Any] = {}
+        gen_config: dict[str, Any] = {"thinking_summaries": "auto"}
         if self.settings.llm_max_completion_tokens:
             # Google GenAI API enforces maxOutputTokens < 65536.
             gen_config["max_output_tokens"] = min(self.settings.llm_max_completion_tokens, 65535)
@@ -1026,6 +1029,9 @@ class GoogleInteractionsClient(BaseLLMClient):
         new_steps: list[dict[str, Any]] = []
         for step in steps:
             if not isinstance(step, dict):
+                continue
+            if step.get("type") == "image":
+                removed = True
                 continue
             if step.get("type") == "user_input" and isinstance(step.get("content"), list):
                 filtered_content = [

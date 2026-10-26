@@ -16,6 +16,9 @@ const activityPanel = document.querySelector('#activity-panel');
 const activityTitle = document.querySelector('#activity-title');
 const activityList = document.querySelector('#activity-list');
 const usagePill = document.querySelector('#usage-pill');
+const providerBalanceBadge = document.querySelector('#provider-balance-badge');
+const balanceBadgeText = document.querySelector('#balance-badge-text');
+const balancePopover = document.querySelector('#balance-popover');
 const attachmentPreview = document.querySelector('#attachment-preview');
 const downloadModelBtn = document.querySelector('#download-model');
 const exportFormatSelect = document.querySelector('#export-format');
@@ -34,16 +37,26 @@ function getActiveModelKey() {
   return val && validModelKeys.has(val) ? val : '';
 }
 
+function escapeHTML(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
 // Persists the selection and syncs the server. ``adoptModelEffort`` applies the
 // model's configured reasoning effort — only for explicit user picks, so a
 // restored selection never overrides the user's saved effort.
 function setActiveModelKey(key, adoptModelEffort = false) {
-  if (!key || !validModelKeys.has(key) || !modelSelect) return;
+  if (!key || !validModelKeys.has(key) || !modelSelect) return Promise.resolve();
   modelSelect.value = key;
   try {
     localStorage.setItem('cad_selected_model', key);
   } catch {}
-  api('/api/settings/models', {
+  return api('/api/settings/models', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({model_key: key}),
@@ -51,7 +64,8 @@ function setActiveModelKey(key, adoptModelEffort = false) {
     if (adoptModelEffort && VALID_EFFORTS.has(res?.reasoning_effort)) {
       setActiveReasoningEffort(res.reasoning_effort, false);
     }
-  }).catch(() => {});
+    return res;
+  }).catch(() => null);
 }
 
 try {
@@ -61,8 +75,8 @@ try {
   }
 } catch {}
 
-modelSelect?.addEventListener('change', () => {
-  setActiveModelKey(modelSelect.value, true);
+modelSelect?.addEventListener('change', async () => {
+  await setActiveModelKey(modelSelect.value, true);
 });
 
 function getActiveReasoningEffort() {
@@ -553,15 +567,37 @@ function formatTokenCount(value) {
   return String(n);
 }
 
+function formatCost(amount) {
+  if (amount == null || !Number.isFinite(Number(amount))) return '';
+  const num = Number(amount);
+  if (num === 0) return '$0.00';
+  if (num < 0.0001) return '<$0.0001';
+  if (num < 0.01) return `$${num.toFixed(4)}`;
+  return `$${num.toFixed(3)}`;
+}
+
 function updateUsagePill(data = {}) {
   const prompt = Number(data.prompt_tokens);
   const completion = Number(data.completion_tokens);
   const cached = Number(data.cached_tokens || 0);
+  const cost = data.cost != null && Number.isFinite(Number(data.cost)) ? Number(data.cost) : null;
+  const totalCost = data.total_cost != null && Number.isFinite(Number(data.total_cost)) ? Number(data.total_cost) : null;
+  const hitRate = data.cache_hit_rate != null && Number.isFinite(Number(data.cache_hit_rate))
+    ? Number(data.cache_hit_rate)
+    : (prompt > 0 ? (cached / prompt) * 100 : 0);
+
   if (!usagePill) return;
   // Keep the most recent meaningful reading; the backend publishes several
   // usage events per turn (one per LLM call), and we want the latest one.
   if (Number.isFinite(prompt)) {
-    lastUsage = { prompt, completion: Number.isFinite(completion) ? completion : null, cached };
+    lastUsage = {
+      prompt,
+      completion: Number.isFinite(completion) ? completion : null,
+      cached,
+      cost,
+      totalCost,
+      hitRate,
+    };
   } else if (!lastUsage) {
     return;
   }
@@ -569,15 +605,159 @@ function updateUsagePill(data = {}) {
   const promptLabel = formatTokenCount(snapshot.prompt);
   const completionLabel = formatTokenCount(snapshot.completion);
   const cachedLabel = formatTokenCount(snapshot.cached);
-  const cacheRatio = snapshot.prompt > 0 ? snapshot.cached / snapshot.prompt : 0;
+  const hitRatePercent = Math.round(snapshot.hitRate);
+
   let cacheState = 'miss';
-  if (cacheRatio >= 0.9) cacheState = 'hit';
-  else if (cacheRatio > 0) cacheState = 'partial';
+  let cacheLabel = '';
+  if (snapshot.cached > 0 || hitRatePercent > 0) {
+    cacheState = hitRatePercent >= 80 ? 'hit' : 'partial';
+    cacheLabel = ` · ${hitRatePercent}% hit (${cachedLabel})`;
+  } else {
+    cacheState = 'miss';
+    cacheLabel = ' · 0% hit';
+  }
+
+  const costVal = snapshot.totalCost ?? snapshot.cost;
+  const costLabel = costVal != null ? ` · ${formatCost(costVal)}` : '';
+
   usagePill.dataset.cache = cacheState;
-  usagePill.textContent =
-    `↑${promptLabel} ↓${completionLabel} · cache ${cachedLabel}`;
+  usagePill.textContent = `↑${promptLabel} ↓${completionLabel}${cacheLabel}${costLabel}`;
+  usagePill.title =
+    `Prompt: ${snapshot.prompt.toLocaleString()} tokens | ` +
+    `Completion: ${(snapshot.completion || 0).toLocaleString()} tokens | ` +
+    `Cached: ${snapshot.cached.toLocaleString()} tokens (${hitRatePercent}% hit)` +
+    (costVal != null ? ` | Cost: ${formatCost(costVal)}` : '');
   usagePill.hidden = false;
 }
+
+function createEmptyConversationUsage() {
+  return {
+    totalCost: 0,
+    hasProviderCost: false,
+    totalPromptTokens: 0,
+    totalCompletionTokens: 0,
+    totalCachedTokens: 0,
+    turns: 0,
+  };
+}
+
+let conversationUsage = createEmptyConversationUsage();
+let lastUserTurnUsageSnapshot = createEmptyConversationUsage();
+
+function resetConversationUsage() {
+  conversationUsage = createEmptyConversationUsage();
+  lastUserTurnUsageSnapshot = createEmptyConversationUsage();
+  renderConversationUsage();
+}
+
+function snapshotConversationUsageForUserTurn() {
+  lastUserTurnUsageSnapshot = { ...conversationUsage };
+}
+
+function restoreConversationUsageSnapshot() {
+  conversationUsage = { ...lastUserTurnUsageSnapshot };
+  renderConversationUsage();
+}
+
+function recordConversationUsage(data = {}) {
+  const prompt = Math.max(0, Number(data.prompt_tokens) || 0);
+  const completion = Math.max(0, Number(data.completion_tokens) || 0);
+  const cached = Math.max(0, Number(data.cached_tokens) || 0);
+  const hasCost = data.cost != null && Number.isFinite(Number(data.cost));
+  const cost = hasCost ? Math.max(0, Number(data.cost)) : 0;
+
+  if (prompt === 0 && completion === 0 && !hasCost) return;
+
+  conversationUsage.totalPromptTokens += prompt;
+  conversationUsage.totalCompletionTokens += completion;
+  conversationUsage.totalCachedTokens += cached;
+  if (hasCost) {
+    conversationUsage.totalCost += cost;
+    conversationUsage.hasProviderCost = true;
+  }
+  conversationUsage.turns += 1;
+
+  renderConversationUsage();
+}
+
+function formatBadgeSpend(amount, hasProviderCost, turns) {
+  if (turns > 0 && !hasProviderCost) return '—';
+  const num = Number(amount) || 0;
+  if (num === 0) return '$0.00';
+  if (num < 0.0001) return '<$0.0001';
+  if (num < 0.01) return `$${num.toFixed(4)}`;
+  if (num < 1) return `$${num.toFixed(3)}`;
+  return `$${num.toFixed(2)}`;
+}
+
+function renderConversationUsage() {
+  if (!providerBalanceBadge) return;
+  providerBalanceBadge.hidden = false;
+
+  const totalTokens = conversationUsage.totalPromptTokens + conversationUsage.totalCompletionTokens;
+  const spendStr = formatBadgeSpend(
+    conversationUsage.totalCost,
+    conversationUsage.hasProviderCost,
+    conversationUsage.turns,
+  );
+  const tokenStr = formatTokenCount(totalTokens);
+
+  if (balanceBadgeText) {
+    balanceBadgeText.innerHTML =
+      `<span class="balance-val-spent" title="Spent in this conversation">Spent: ${spendStr}</span>` +
+      ` · ` +
+      `<span class="balance-val-remaining" title="Total tokens in this conversation">${tokenStr} tok</span>`;
+  }
+  renderConversationUsagePopover();
+}
+
+function renderConversationUsagePopover() {
+  if (!balancePopover) return;
+  const u = conversationUsage;
+  const totalTokens = u.totalPromptTokens + u.totalCompletionTokens;
+  const hitRate = u.totalPromptTokens > 0
+    ? Math.round((u.totalCachedTokens / u.totalPromptTokens) * 100)
+    : 0;
+  const spentDisplay = (u.turns > 0 && !u.hasProviderCost)
+    ? '—'
+    : `$${Number(u.totalCost || 0).toFixed(4)}`;
+
+  balancePopover.innerHTML = `
+    <div class="balance-popover-header">
+      <span>Conversation Usage</span>
+      <span style="font-size:0.65rem; color:var(--muted);">${escapeHTML((currentProject || 'Project').slice(0, 22))}</span>
+    </div>
+    <div class="balance-popover-row">
+      <span>Spent:</span>
+      <span class="highlight-green">${spentDisplay}</span>
+    </div>
+    <div class="balance-popover-row">
+      <span>Total Tokens (Input/Output):</span>
+      <span class="highlight-blue">${totalTokens.toLocaleString()} (${u.totalPromptTokens.toLocaleString()} / ${u.totalCompletionTokens.toLocaleString()})</span>
+    </div>
+    <div class="balance-popover-row">
+      <span>Cached Tokens:</span>
+      <span>${u.totalCachedTokens.toLocaleString()} (${hitRate}%)</span>
+    </div>
+    <div class="balance-popover-row">
+      <span>LLM Calls:</span>
+      <span>${u.turns}</span>
+    </div>
+    <div class="balance-popover-footer">
+      <span>Click to close</span>
+    </div>
+  `;
+}
+
+providerBalanceBadge?.addEventListener('click', () => {
+  balancePopover?.classList.toggle('hidden');
+});
+
+document.addEventListener('click', (e) => {
+  if (providerBalanceBadge && !providerBalanceBadge.contains(e.target)) {
+    balancePopover?.classList.add('hidden');
+  }
+});
 
 function resetUsagePill() {
   lastUsage = null;
@@ -814,6 +994,7 @@ async function handleRetry(errorElement = null, context = null) {
     // Server-side retry via /api/chat/retry (restores context from conversation.jsonl)
     if (errorElement) errorElement.remove();
     feed?.querySelectorAll('.message.error').forEach(el => el.remove());
+    restoreConversationUsageSnapshot();
     clearActivity();
     finalizeAllActiveCards();
     setThinking(true);
@@ -1029,6 +1210,7 @@ async function loadHistory(projectName) {
   const target = feed;
   try {
     const data = await api(`/api/projects/${encodeURIComponent(projectName)}/history`);
+    resetConversationUsage();
     clearActivity();
     target.replaceChildren();
     clearQuestionArea();
@@ -1039,6 +1221,7 @@ async function loadHistory(projectName) {
       const raw = evt.content;
       const text = normalizeHistoryContent(raw);
       if (role === 'user') {
+        snapshotConversationUsageForUserTurn();
         accumulatedReasoning = '';
         const userImages = extractHistoryImages(raw);
         addMessage(text, 'user', {target, images: userImages});
@@ -1092,10 +1275,14 @@ async function loadHistory(projectName) {
       } else if (evt.type === 'agent_error') {
         addMessage(evt.data?.message || text, 'error', {target});
         renderedAny = true;
+      } else if (evt.type === 'agent_usage') {
+        recordConversationUsage(evt.data);
+        updateUsagePill(evt.data);
       } else if (showInfoMessages) {
         addInfoMessage(evt.type, evt.data);
       }
     }
+    renderConversationUsage();
     if (accumulatedReasoning) {
       addMessage('', 'agent', {target, reasoning: accumulatedReasoning});
       renderedAny = true;
@@ -1128,6 +1315,7 @@ function addInfoMessage(type, data = {}) {
   } else if (type === 'tool_status') {
     addToolMessage(data);
   } else if (type === 'agent_usage') {
+    recordConversationUsage(data);
     updateUsagePill(data);
   } else if (type === 'agent_stopped') {
     addToolMessage({
@@ -1331,6 +1519,7 @@ chatForm.addEventListener('submit', async event => {
     alt: file.name,
   }));
   try {
+    snapshotConversationUsageForUserTurn();
     clearActivity();
     finalizeAllActiveCards();
     addMessage(text, 'user', {images: imagePayload});
@@ -2723,6 +2912,22 @@ function connectStream() {
       showQuestion(data);
       finalizeAllActiveCards();
     },
+    agent_stream_reset: data => {
+      if (data.project !== currentProject) return;
+      const runId = data.run_id;
+      const card = getActiveCard(runId);
+      if (card) {
+        card.dataset.raw = '';
+        card.dataset.reasoning = '';
+        card._rawMessage = '';
+        delete card.dataset.lastContentTurnId;
+        const body = card.querySelector('.message-body');
+        if (body) body.innerHTML = '';
+        const thought = card.querySelector('.thought-disclosure');
+        if (thought) thought.remove();
+        setCardState(card, 'thinking', 'Retrying response...');
+      }
+    },
     agent_reasoning_delta: data => {
       if (data.project !== currentProject) return;
       const chunk = data.content ?? data.delta ?? '';
@@ -2778,6 +2983,11 @@ function connectStream() {
       markActivityRecovered();
       setThinking(false);
       scrollFeedToBottom();
+    },
+    agent_usage: data => {
+      if (data.project !== currentProject) return;
+      recordConversationUsage(data);
+      updateUsagePill(data);
     },
     tool_status: data => {
       if (data.project !== currentProject) return;
@@ -2942,6 +3152,7 @@ function applyConversationReset() {
   runCards.clear();
   // Wipe the main feed, dismiss any pending question, and clear activity so
   // the UI matches the freshly truncated conversation.jsonl.
+  resetConversationUsage();
   clearActivity();
   feed.replaceChildren();
   clearQuestionArea();
@@ -3020,6 +3231,7 @@ document.addEventListener('click', async event => {
 
 (async function init() {
   autoResizeMessage();
+  renderConversationUsage();
   if (!currentProject) return;
   // Load the persisted conversation into the main feed so reopening a
   // project immediately shows its history. The empty-state element is
