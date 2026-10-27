@@ -257,25 +257,31 @@ def _active_api_key_env(settings: Settings) -> str:
     return api_key_env(settings.llm_provider)
 
 
-def _sync_reasoning_effort(effort_raw: Any) -> str | None:
+def _sync_reasoning_effort(effort_raw: Any, *, persist: bool = True) -> str | None:
     """Validate and sync reasoning effort with app config and agent runner."""
-    if not effort_raw:
+    if effort_raw is None:
         return None
     effort = str(effort_raw).strip().lower()
-    if not effort:
-        return None
+    if effort in ("", "default", "auto"):
+        if persist:
+            settings = current_app.config["SETTINGS"]
+            current_app.config["SETTINGS"] = with_reasoning_effort(settings, None)
+            runner: AgentRunner = current_app.config["AGENT_RUNNER"]
+            runner.set_reasoning_effort(None)
+        return ""
     if effort not in REASONING_EFFORTS:
         raise ValueError(
             f"Invalid reasoning_effort: {effort!r}. Must be one of: {', '.join(sorted(REASONING_EFFORTS))}"
         )
-    settings = current_app.config["SETTINGS"]
-    current_app.config["SETTINGS"] = with_reasoning_effort(settings, effort)
-    runner: AgentRunner = current_app.config["AGENT_RUNNER"]
-    runner.set_reasoning_effort(effort)
+    if persist:
+        settings = current_app.config["SETTINGS"]
+        current_app.config["SETTINGS"] = with_reasoning_effort(settings, effort)
+        runner: AgentRunner = current_app.config["AGENT_RUNNER"]
+        runner.set_reasoning_effort(effort)
     return effort
 
 
-def _sync_model_selection(model_key_raw: Any) -> str | None:
+def _sync_model_selection(model_key_raw: Any, *, persist: bool = True) -> str | None:
     """Validate and sync the ``<provider>:<model>`` selection with app config and agent runner.
 
     Selecting a model also applies its configured reasoning effort, so callers
@@ -285,9 +291,11 @@ def _sync_model_selection(model_key_raw: Any) -> str | None:
     if not model_key:
         return None
     settings: Settings = current_app.config["SETTINGS"]
-    current_app.config["SETTINGS"] = with_model_selection(settings, model_key)
-    runner: AgentRunner = current_app.config["AGENT_RUNNER"]
-    runner.set_model_selection(model_key)
+    updated = with_model_selection(settings, model_key)
+    if persist:
+        current_app.config["SETTINGS"] = updated
+        runner: AgentRunner = current_app.config["AGENT_RUNNER"]
+        runner.set_model_selection(model_key)
     return model_key
 
 
@@ -465,7 +473,7 @@ def project_view(name: str) -> str:
         show_info_messages=settings.show_info_messages,
         viewer_grid_size=settings.viewer_grid_size,
         viewer_grid_divisions=settings.viewer_grid_divisions,
-        reasoning_effort=settings.reasoning_effort or "medium",
+        reasoning_effort=settings.reasoning_effort or "",
         active_model_key=settings.active_model_key,
         available_models=[opt.to_dict() for opt in settings.available_models],
         cache_bust=int(time.time()),
@@ -632,8 +640,8 @@ def chat():
     if not message:
         return jsonify({"error": "Message is required."}), 400
     try:
-        model_key = _sync_model_selection(payload.get("model_key"))
-        effort = _sync_reasoning_effort(payload.get("reasoning_effort"))
+        model_key = _sync_model_selection(payload.get("model_key"), persist=False)
+        effort = _sync_reasoning_effort(payload.get("reasoning_effort"), persist=False)
     except ValueError as err:
         return jsonify({"error": str(err)}), 400
     runner: AgentRunner = current_app.config["AGENT_RUNNER"]
@@ -657,6 +665,8 @@ def chat():
             else "An agent task is already running."
         )
         return jsonify({"error": msg, "active_project": active}), 409
+    _sync_model_selection(payload.get("model_key"), persist=True)
+    _sync_reasoning_effort(payload.get("reasoning_effort"), persist=True)
     with _project_lock(project_name):
         project_dir = _resolve_project_or_404(project_name)
         if not isinstance(project_dir, Path):
@@ -669,7 +679,10 @@ def chat():
             return jsonify({"error": str(error)}), 400
         if message.lower() == "/print" or message.lower().startswith("/print "):
             try:
-                message = format_print_command_prompt(project_dir, message[6:].strip())
+                settings_obj: Settings = current_app.config["SETTINGS"]
+                message = format_print_command_prompt(
+                    project_dir, message[6:].strip(), settings=settings_obj
+                )
             except FileNotFoundError as error:
                 return jsonify({"error": str(error)}), 400
         # ``AgentRunner.start`` takes transactional ownership of the
@@ -702,8 +715,8 @@ def chat_retry():
     if not project_name:
         return jsonify({"error": "Project is required."}), 400
     try:
-        model_key = _sync_model_selection(payload.get("model_key"))
-        effort = _sync_reasoning_effort(payload.get("reasoning_effort"))
+        model_key = _sync_model_selection(payload.get("model_key"), persist=False)
+        effort = _sync_reasoning_effort(payload.get("reasoning_effort"), persist=False)
     except ValueError as err:
         return jsonify({"error": str(err)}), 400
     runner: AgentRunner = current_app.config["AGENT_RUNNER"]
@@ -717,6 +730,8 @@ def chat_retry():
             else "An agent task is already running."
         )
         return jsonify({"error": msg, "active_project": active}), 409
+    _sync_model_selection(payload.get("model_key"), persist=True)
+    _sync_reasoning_effort(payload.get("reasoning_effort"), persist=True)
     with _project_lock(project_name):
         project_dir = _resolve_project_or_404(project_name)
         if not isinstance(project_dir, Path):
@@ -752,7 +767,7 @@ def get_models():
         "active_key": settings.active_model_key,
         "provider": settings.llm_provider,
         "model": settings.llm_model,
-        "reasoning_effort": settings.reasoning_effort or "medium",
+        "reasoning_effort": settings.reasoning_effort or "",
         "models": [opt.to_dict() for opt in settings.available_models],
     })
 
@@ -770,17 +785,17 @@ def update_model():
         "active_key": settings.active_model_key,
         "provider": settings.llm_provider,
         "model": settings.llm_model,
-        "reasoning_effort": settings.reasoning_effort or "medium",
+        "reasoning_effort": settings.reasoning_effort or "",
     })
 
 
 @agent_bp.get("/api/settings/reasoning-effort")
 def get_reasoning_effort():
     settings: Settings = current_app.config["SETTINGS"]
-    effort = settings.reasoning_effort or "medium"
+    effort = settings.reasoning_effort or ""
     return jsonify({
         "reasoning_effort": effort,
-        "available_efforts": sorted(REASONING_EFFORTS),
+        "available_efforts": ["", *sorted(REASONING_EFFORTS)],
         "provider": settings.llm_provider,
     })
 
@@ -789,14 +804,14 @@ def get_reasoning_effort():
 def update_reasoning_effort():
     payload = request.get_json(silent=True) if request.is_json else request.form
     payload = payload or {}
+    if "effort" not in payload:
+        return jsonify({"error": "Effort is required."}), 400
     try:
         effort = _sync_reasoning_effort(payload.get("effort"))
-        if not effort:
-            return jsonify({"error": "Effort is required."}), 400
     except ValueError as err:
         return jsonify({"error": str(err)}), 400
     return jsonify({
-        "reasoning_effort": effort,
+        "reasoning_effort": effort or "",
         "provider": current_app.config["SETTINGS"].llm_provider,
     })
 
@@ -1033,59 +1048,98 @@ def preview_meta(project_name: str):
 
 @render_bp.post("/api/projects/<project_name>/print-profile")
 def get_print_profile(project_name: str):
-    project_dir = _resolve_project_or_404(project_name)
-    if not isinstance(project_dir, Path):
-        return project_dir
-
     payload = request.get_json(silent=True) or {}
-    try:
-        result = recommend_print_profile(
-            project_dir,
-            priority=str(payload.get("priority", "auto")),
-            material_override=str(payload.get("material", "auto")),
-        )
-    except FileNotFoundError as error:
-        return jsonify({"error": str(error)}), 404
-    except (ValueError, OSError) as error:
-        return jsonify({"error": str(error)}), 500
+    settings: Settings = current_app.config["SETTINGS"]
+    bus = current_app.config.get("EVENT_BUS")
+    publish = bus.publish if bus is not None else None
+    use_ai = bool(payload.get("use_ai", False))
+    with _project_lock(project_name):
+        project_dir = _resolve_project_or_404(project_name)
+        if not isinstance(project_dir, Path):
+            return project_dir
+        try:
+            result = recommend_print_profile(
+                project_dir,
+                priority=str(payload.get("priority", "auto")),
+                material_override=str(payload.get("material", "auto")),
+                settings=settings,
+                use_ai=use_ai,
+                publish=publish,
+            )
+        except FileNotFoundError as error:
+            return jsonify({"error": str(error)}), 404
+        except (ValueError, OSError) as error:
+            return jsonify({"error": str(error)}), 500
     return jsonify(result)
 
 
 @render_bp.route("/api/projects/<project_name>/export", methods=["GET", "POST"])
 def export_model(project_name: str):
-    """Export the model; a 3MF POST body ``{"profile": {...}}`` embeds slicer settings."""
+    """Export the model; 3MF exports automatically embed AI-tuned slicer settings."""
     fmt = (request.args.get("format") or "stl").lower().strip()
     if fmt not in SUPPORTED_EXPORT_FORMATS:
         supported = ", ".join(sorted(SUPPORTED_EXPORT_FORMATS))
         return jsonify({"error": f"Unsupported format '{fmt}'. Supported: {supported}"}), 400
-    project_dir = _resolve_project_or_404(project_name)
-    if not isinstance(project_dir, Path):
-        return project_dir
 
-    print_profile: dict[str, Any] | None = None
-    if fmt == "3mf" and request.method == "POST":
-        raw_profile = (request.get_json(silent=True) or {}).get("profile")
-        if isinstance(raw_profile, dict):
-            print_profile = sanitize_print_profile(raw_profile)
+    settings: Settings = current_app.config["SETTINGS"]
+    bus = current_app.config.get("EVENT_BUS")
+    publish = bus.publish if bus is not None else None
+    with _project_lock(project_name):
+        project_dir = _resolve_project_or_404(project_name)
+        if not isinstance(project_dir, Path):
+            return project_dir
 
-    try:
-        exported_path = export_project_model(project_dir, fmt, print_profile=print_profile)
-    except FileNotFoundError as error:
-        return jsonify({"error": str(error)}), 404
-    except ValueError as error:
-        return jsonify({"error": str(error)}), 422
-    except (RuntimeError, OSError) as error:
-        return jsonify({"error": str(error)}), 500
+        print_profile: dict[str, Any] | None = None
+        if fmt == "3mf":
+            from agent.print_advisor import parse_nozzle_spec
 
-    mimetype = EXPORT_MIME_TYPES.get(fmt, "application/octet-stream")
-    download_name = f"{project_name}.{fmt}"
-    return send_file(
-        exported_path,
-        mimetype=mimetype,
-        as_attachment=True,
-        download_name=download_name,
-        max_age=0,
-    )
+            req_json = (request.get_json(silent=True) or {}) if request.method == "POST" else {}
+            raw_profile = req_json.get("profile")
+            nozzle_info = parse_nozzle_spec(settings.user_nozzle)
+            if isinstance(raw_profile, dict):
+                print_profile = sanitize_print_profile(
+                    raw_profile,
+                    nozzle_diameter_mm=nozzle_info["diameter_mm"],
+                    user_printer=settings.user_printer,
+                )
+            elif req_json.get("embed_settings", True) is not False:
+                use_ai_flag = bool(req_json.get("auto_ai", True))
+                has_build_state = (
+                    (project_dir / "preview.stl").is_file()
+                    or (project_dir / ".cad_metrics.json").is_file()
+                )
+                if has_build_state or bool(req_json.get("auto_ai", False)):
+                    try:
+                        result = recommend_print_profile(
+                            project_dir,
+                            settings=settings,
+                            use_ai=use_ai_flag,
+                            publish=publish,
+                        )
+                        print_profile = result.get("profile")
+                    except FileNotFoundError as error:
+                        return jsonify({"error": str(error)}), 404
+                    except (ValueError, OSError) as error:
+                        return jsonify({"error": str(error)}), 500
+
+        try:
+            exported_path = export_project_model(project_dir, fmt, print_profile=print_profile)
+        except FileNotFoundError as error:
+            return jsonify({"error": str(error)}), 404
+        except ValueError as error:
+            return jsonify({"error": str(error)}), 422
+        except (RuntimeError, OSError) as error:
+            return jsonify({"error": str(error)}), 500
+
+        mimetype = EXPORT_MIME_TYPES.get(fmt, "application/octet-stream")
+        download_name = f"{project_name}.{fmt}"
+        return send_file(
+            exported_path,
+            mimetype=mimetype,
+            as_attachment=True,
+            download_name=download_name,
+            max_age=0,
+        )
 
 
 # ---------------------------------------------------------------------------

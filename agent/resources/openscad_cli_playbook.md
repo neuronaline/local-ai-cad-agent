@@ -103,6 +103,61 @@ module countersunk_hole(h, d_shaft, d_head, h_head) {
         cylinder(h = h_head + EPS, d1 = d_shaft, d2 = d_head);
 }
 
+// Hollowed Necked Vessel (Continuous Cavity & Self-Supporting >= 45 deg Shoulder)
+// NEVER seal the top of a bottle body under the neck or cut the body cavity past Z = body_h.
+// Union outer shell (body + conical shoulder + neck), then subtract ONE continuous inner union.
+module hollowed_bottle(body_d, body_h, shoulder_h, neck_d, neck_h, wall, bottom_t) {
+    total_h = body_h + shoulder_h + neck_h;
+    neck_id = neck_d - 2 * wall;
+    difference() {
+        union() {
+            cylinder(h = body_h + EPS, d = body_d);
+            translate([0, 0, body_h])
+                cylinder(h = shoulder_h + EPS, d1 = body_d, d2 = neck_d);
+            translate([0, 0, body_h + shoulder_h])
+                cylinder(h = neck_h, d = neck_d);
+        }
+        union() {
+            translate([0, 0, bottom_t])
+                cylinder(h = body_h - bottom_t + EPS, d = body_d - 2 * wall);
+            translate([0, 0, body_h])
+                cylinder(h = shoulder_h + EPS, d1 = body_d - 2 * wall, d2 = neck_id);
+            translate([0, 0, body_h + shoulder_h - EPS])
+                cylinder(h = neck_h + 2 * EPS, d = neck_id);
+        }
+    }
+}
+
+// CGAL-Safe Helical Screw Thread (Fast compile: keep $fn <= 36 and slices <= turns * 18)
+// Use eccentric circle extrusion for smooth, self-supporting 3D-printable threads.
+// Radial clearance: 0.35 mm for PETG, 0.25 mm for PLA.
+module helical_thread(major_d, pitch, length, depth = 1.2) {
+    turns = length / pitch;
+    core_r = major_d / 2 - depth / 2;
+    offset_r = depth / 2;
+    linear_extrude(
+        height = length,
+        twist = -360 * turns,
+        slices = max(12, round(turns * 18)),
+        convexity = 10
+    )
+        translate([ offset_r, 0, 0 ])
+            circle(r = core_r, $fn = 36);
+}
+
+// Centered Grid Pattern within a Circular Boundary (e.g. Perforated Shaker Cap)
+// Always use symmetric index range [-half_n : half_n] so (0, 0) has a center hole.
+module circular_hole_grid(hole_d, pitch, max_radius, plate_t) {
+    half_n = floor(max_radius / pitch);
+    for (ix = [-half_n : half_n], iy = [-half_n : half_n]) {
+        px = ix * pitch;
+        py = iy * pitch;
+        if (sqrt(px * px + py * py) + hole_d / 2 <= max_radius)
+            translate([px, py, -EPS])
+                cylinder(h = plate_t + 2 * EPS, d = hole_d);
+    }
+}
+
 // Multi-variant & Plate Layout Pattern (Customizer)
 PART_TYPE = "ALL"; // [ALL, A, B]
 PART_GAP = 10.0;   // mm, minimum clearance between outer bounds
@@ -120,17 +175,3 @@ module plate_layout() {
 plate_layout();
 ```
 
----
-
-## 6. Error & Diagnostic Fixes
-
-| Compiler Output | Root Cause | Fix |
-|---|---|---|
-| `Parser error: syntax error` | Missing `;`, unmatched `{}`, or Python syntax | Add `;`, match braces, replace `elif`/`**`/`True`/`#`. |
-| `Current top level object is not a 2D object` | 3D primitive inside `linear_extrude` or `rotate_extrude` | Pass only 2D shapes (`square`, `circle`, `polygon`, `text`, `offset`). |
-| `WARNING: Scaling a 2D object with 0` | 3D rotation (`rotate([90,0,0])`) applied inside extrusion | Apply 3D rotations **outside** `linear_extrude()` / `rotate_extrude()`. |
-| `all points for rotate_extrude() must have the same X coordinate sign` | 2D profile crosses the Y-axis ($X = 0$) | Shift entire 2D profile to $X \ge 0$ before revolving. |
-| `CGAL error in CGAL_Nef_polyhedron3` | Coplanar boolean faces, zero-thickness walls, or pinch point | Overshoot cutters by `EPS`; overlap `union()` parts by `EPS`. |
-| `CGAL error in applyUnion3D` / `assertion violation` | Self-intersecting 2D `polygon()` or inverted `polyhedron()` faces | Fix crossed 2D contour points; wind `polyhedron` faces clockwise from outside. |
-| `Current top level object is empty` / `No top level geometry` | Cutter consumed entire base, or `%` / `*` hid root geometry | Check cutter dimensions/offsets; remove `%` and `*` modifiers. |
-| Process lockup / timeout | 3D `minkowski()`, looped 3D `hull()`, or `$fn > 100` | Replace `minkowski()` with 2D `offset()` or `hull()`; keep `$fn <= 60`. |

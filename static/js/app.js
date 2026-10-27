@@ -16,9 +16,6 @@ const activityPanel = document.querySelector('#activity-panel');
 const activityTitle = document.querySelector('#activity-title');
 const activityList = document.querySelector('#activity-list');
 const usagePill = document.querySelector('#usage-pill');
-const providerBalanceBadge = document.querySelector('#provider-balance-badge');
-const balanceBadgeText = document.querySelector('#balance-badge-text');
-const balancePopover = document.querySelector('#balance-popover');
 const attachmentPreview = document.querySelector('#attachment-preview');
 const downloadModelBtn = document.querySelector('#download-model');
 const exportFormatSelect = document.querySelector('#export-format');
@@ -27,14 +24,43 @@ const showInfoMessages = appConfig.showInfoMessages ?? true;
 const currentProject = appConfig.projectName || '';
 const viewer = new CadViewer(document.querySelector('#viewer'), document.querySelector('#dimensions'), appConfig);
 const reasoningEffortSelect = document.querySelector('#reasoning-effort');
-const VALID_EFFORTS = new Set(['minimal', 'low', 'medium', 'high']);
+const VALID_EFFORTS = new Set(['', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
 const modelSelect = document.querySelector('#model-select');
 const availableModels = Array.isArray(appConfig.availableModels) ? appConfig.availableModels : [];
 const validModelKeys = new Set(availableModels.map(m => m.key));
 
+function getSupportedEffortsForModel(modelKey) {
+  const [provider = '', model = ''] = String(modelKey || '').toLowerCase().split(':');
+  if (provider === 'gemini' || provider === 'vertex') {
+    const efforts = new Set(['', 'none', 'low', 'medium', 'high']);
+    if (model.includes('2.5') || model.includes('gemini-2')) {
+      efforts.add('minimal');
+      efforts.add('xhigh');
+      efforts.add('max');
+    } else if (model.includes('flash') && !model.includes('gemini-4')) {
+      efforts.add('minimal');
+    }
+    return efforts;
+  }
+  return VALID_EFFORTS;
+}
+
+function syncEffortOptionsForModel(modelKey) {
+  if (!reasoningEffortSelect) return;
+  const supported = getSupportedEffortsForModel(modelKey);
+  for (const opt of reasoningEffortSelect.options) {
+    const allowed = supported.has(opt.value);
+    opt.hidden = !allowed;
+    opt.disabled = !allowed;
+  }
+  if (!supported.has(reasoningEffortSelect.value)) {
+    reasoningEffortSelect.value = '';
+  }
+}
+
 function getActiveModelKey() {
   const val = modelSelect?.value;
-  return val && validModelKeys.has(val) ? val : '';
+  return val && validModelKeys.has(val) ? val : (appConfig.activeModelKey || '');
 }
 
 function escapeHTML(str) {
@@ -47,12 +73,42 @@ function escapeHTML(str) {
     .replace(/'/g, '&#039;');
 }
 
+function getActiveReasoningEffort() {
+  const val = reasoningEffortSelect?.value ?? '';
+  return VALID_EFFORTS.has(val) ? val : '';
+}
+
+function setActiveReasoningEffort(effort, syncBackend = true, persistLocal = true) {
+  const normalized = effort || '';
+  if (!VALID_EFFORTS.has(normalized) || !reasoningEffortSelect) return;
+  const supported = getSupportedEffortsForModel(getActiveModelKey());
+  const effective = supported.has(normalized) ? normalized : '';
+  reasoningEffortSelect.value = effective;
+  if (persistLocal) {
+    try {
+      if (effective) {
+        localStorage.setItem('cad_user_reasoning_effort', effective);
+      } else {
+        localStorage.removeItem('cad_user_reasoning_effort');
+      }
+    } catch {}
+  }
+  if (syncBackend) {
+    api('/api/settings/reasoning-effort', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({effort: effective}),
+    }).catch(() => {});
+  }
+}
+
 // Persists the selection and syncs the server. ``adoptModelEffort`` applies the
 // model's configured reasoning effort — only for explicit user picks, so a
 // restored selection never overrides the user's saved effort.
 function setActiveModelKey(key, adoptModelEffort = false) {
   if (!key || !validModelKeys.has(key) || !modelSelect) return Promise.resolve();
   modelSelect.value = key;
+  syncEffortOptionsForModel(key);
   try {
     localStorage.setItem('cad_selected_model', key);
   } catch {}
@@ -61,17 +117,38 @@ function setActiveModelKey(key, adoptModelEffort = false) {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({model_key: key}),
   }).then(res => {
-    if (adoptModelEffort && VALID_EFFORTS.has(res?.reasoning_effort)) {
-      setActiveReasoningEffort(res.reasoning_effort, false);
+    if (adoptModelEffort && res && VALID_EFFORTS.has(res.reasoning_effort ?? '')) {
+      const supported = getSupportedEffortsForModel(key);
+      const nextEffort = supported.has(res.reasoning_effort ?? '') ? (res.reasoning_effort ?? '') : '';
+      setActiveReasoningEffort(nextEffort, false, false);
+      try {
+        localStorage.removeItem('cad_user_reasoning_effort');
+      } catch {}
     }
     return res;
   }).catch(() => null);
 }
 
 try {
+  localStorage.removeItem('cad_reasoning_effort');
   const savedModel = localStorage.getItem('cad_selected_model');
+  const savedEffort = localStorage.getItem('cad_user_reasoning_effort');
   if (savedModel && savedModel !== appConfig.activeModelKey && validModelKeys.has(savedModel)) {
-    setActiveModelKey(savedModel);
+    modelSelect.value = savedModel;
+    syncEffortOptionsForModel(savedModel);
+    if (savedEffort !== null && VALID_EFFORTS.has(savedEffort)) {
+      setActiveReasoningEffort(savedEffort, false, false);
+    }
+    setActiveModelKey(savedModel, false).then(() => {
+      if (savedEffort !== null && VALID_EFFORTS.has(savedEffort)) {
+        setActiveReasoningEffort(savedEffort, true, false);
+      }
+    });
+  } else {
+    syncEffortOptionsForModel(getActiveModelKey());
+    if (savedEffort !== null && VALID_EFFORTS.has(savedEffort)) {
+      setActiveReasoningEffort(savedEffort, true, false);
+    }
   }
 } catch {}
 
@@ -79,35 +156,8 @@ modelSelect?.addEventListener('change', async () => {
   await setActiveModelKey(modelSelect.value, true);
 });
 
-function getActiveReasoningEffort() {
-  const val = reasoningEffortSelect?.value;
-  return val && VALID_EFFORTS.has(val) ? val : 'medium';
-}
-
-function setActiveReasoningEffort(effort, syncBackend = true) {
-  if (!effort || !VALID_EFFORTS.has(effort) || !reasoningEffortSelect) return;
-  reasoningEffortSelect.value = effort;
-  try {
-    localStorage.setItem('cad_reasoning_effort', effort);
-  } catch {}
-  if (syncBackend) {
-    api('/api/settings/reasoning-effort', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({effort}),
-    }).catch(() => {});
-  }
-}
-
-try {
-  const savedEffort = localStorage.getItem('cad_reasoning_effort');
-  if (savedEffort && VALID_EFFORTS.has(savedEffort)) {
-    setActiveReasoningEffort(savedEffort, false);
-  }
-} catch {}
-
 reasoningEffortSelect?.addEventListener('change', () => {
-  setActiveReasoningEffort(reasoningEffortSelect.value, true);
+  setActiveReasoningEffort(reasoningEffortSelect.value, true, true);
 });
 
 function updateChatWidth(width) {
@@ -306,7 +356,7 @@ function createThoughtDisclosure(reasoningText = '', isOpen = false, isLive = fa
       ${COPY_ICON_SVG}
       <span class="copy-label">Copy</span>
     </button>
-    <span class="thought-chevron">▼</span>
+    <span class="thought-chevron">⌄</span>
   `;
 
   const content = document.createElement('div');
@@ -630,135 +680,6 @@ function updateUsagePill(data = {}) {
   usagePill.hidden = false;
 }
 
-function createEmptyConversationUsage() {
-  return {
-    totalCost: 0,
-    hasProviderCost: false,
-    totalPromptTokens: 0,
-    totalCompletionTokens: 0,
-    totalCachedTokens: 0,
-    turns: 0,
-  };
-}
-
-let conversationUsage = createEmptyConversationUsage();
-let lastUserTurnUsageSnapshot = createEmptyConversationUsage();
-
-function resetConversationUsage() {
-  conversationUsage = createEmptyConversationUsage();
-  lastUserTurnUsageSnapshot = createEmptyConversationUsage();
-  renderConversationUsage();
-}
-
-function snapshotConversationUsageForUserTurn() {
-  lastUserTurnUsageSnapshot = { ...conversationUsage };
-}
-
-function restoreConversationUsageSnapshot() {
-  conversationUsage = { ...lastUserTurnUsageSnapshot };
-  renderConversationUsage();
-}
-
-function recordConversationUsage(data = {}) {
-  const prompt = Math.max(0, Number(data.prompt_tokens) || 0);
-  const completion = Math.max(0, Number(data.completion_tokens) || 0);
-  const cached = Math.max(0, Number(data.cached_tokens) || 0);
-  const hasCost = data.cost != null && Number.isFinite(Number(data.cost));
-  const cost = hasCost ? Math.max(0, Number(data.cost)) : 0;
-
-  if (prompt === 0 && completion === 0 && !hasCost) return;
-
-  conversationUsage.totalPromptTokens += prompt;
-  conversationUsage.totalCompletionTokens += completion;
-  conversationUsage.totalCachedTokens += cached;
-  if (hasCost) {
-    conversationUsage.totalCost += cost;
-    conversationUsage.hasProviderCost = true;
-  }
-  conversationUsage.turns += 1;
-
-  renderConversationUsage();
-}
-
-function formatBadgeSpend(amount, hasProviderCost, turns) {
-  if (turns > 0 && !hasProviderCost) return '—';
-  const num = Number(amount) || 0;
-  if (num === 0) return '$0.00';
-  if (num < 0.0001) return '<$0.0001';
-  if (num < 0.01) return `$${num.toFixed(4)}`;
-  if (num < 1) return `$${num.toFixed(3)}`;
-  return `$${num.toFixed(2)}`;
-}
-
-function renderConversationUsage() {
-  if (!providerBalanceBadge) return;
-  providerBalanceBadge.hidden = false;
-
-  const totalTokens = conversationUsage.totalPromptTokens + conversationUsage.totalCompletionTokens;
-  const spendStr = formatBadgeSpend(
-    conversationUsage.totalCost,
-    conversationUsage.hasProviderCost,
-    conversationUsage.turns,
-  );
-  const tokenStr = formatTokenCount(totalTokens);
-
-  if (balanceBadgeText) {
-    balanceBadgeText.innerHTML =
-      `<span class="balance-val-spent" title="Spent in this conversation">Spent: ${spendStr}</span>` +
-      ` · ` +
-      `<span class="balance-val-remaining" title="Total tokens in this conversation">${tokenStr} tok</span>`;
-  }
-  renderConversationUsagePopover();
-}
-
-function renderConversationUsagePopover() {
-  if (!balancePopover) return;
-  const u = conversationUsage;
-  const totalTokens = u.totalPromptTokens + u.totalCompletionTokens;
-  const hitRate = u.totalPromptTokens > 0
-    ? Math.round((u.totalCachedTokens / u.totalPromptTokens) * 100)
-    : 0;
-  const spentDisplay = (u.turns > 0 && !u.hasProviderCost)
-    ? '—'
-    : `$${Number(u.totalCost || 0).toFixed(4)}`;
-
-  balancePopover.innerHTML = `
-    <div class="balance-popover-header">
-      <span>Conversation Usage</span>
-      <span style="font-size:0.65rem; color:var(--muted);">${escapeHTML((currentProject || 'Project').slice(0, 22))}</span>
-    </div>
-    <div class="balance-popover-row">
-      <span>Spent:</span>
-      <span class="highlight-green">${spentDisplay}</span>
-    </div>
-    <div class="balance-popover-row">
-      <span>Total Tokens (Input/Output):</span>
-      <span class="highlight-blue">${totalTokens.toLocaleString()} (${u.totalPromptTokens.toLocaleString()} / ${u.totalCompletionTokens.toLocaleString()})</span>
-    </div>
-    <div class="balance-popover-row">
-      <span>Cached Tokens:</span>
-      <span>${u.totalCachedTokens.toLocaleString()} (${hitRate}%)</span>
-    </div>
-    <div class="balance-popover-row">
-      <span>LLM Calls:</span>
-      <span>${u.turns}</span>
-    </div>
-    <div class="balance-popover-footer">
-      <span>Click to close</span>
-    </div>
-  `;
-}
-
-providerBalanceBadge?.addEventListener('click', () => {
-  balancePopover?.classList.toggle('hidden');
-});
-
-document.addEventListener('click', (e) => {
-  if (providerBalanceBadge && !providerBalanceBadge.contains(e.target)) {
-    balancePopover?.classList.add('hidden');
-  }
-});
-
 function resetUsagePill() {
   lastUsage = null;
   if (!usagePill) return;
@@ -938,6 +859,13 @@ function setThinking(active) {
     }
   } else {
     document.querySelectorAll('.thinking-indicator').forEach(el => el.remove());
+    if (feed) {
+      feed.querySelectorAll('.message.agent').forEach(card => {
+        if (card.dataset.state !== 'error' && card.dataset.state !== 'stopped') {
+          card.classList.remove('streaming', 'thinking', 'writing', 'working');
+        }
+      });
+    }
   }
 }
 
@@ -994,7 +922,6 @@ async function handleRetry(errorElement = null, context = null) {
     // Server-side retry via /api/chat/retry (restores context from conversation.jsonl)
     if (errorElement) errorElement.remove();
     feed?.querySelectorAll('.message.error').forEach(el => el.remove());
-    restoreConversationUsageSnapshot();
     clearActivity();
     finalizeAllActiveCards();
     setThinking(true);
@@ -1165,6 +1092,7 @@ async function loadCurrentState() {
       setThinking(true);
     } else if (data.status === 'idle') {
       setThinking(false);
+      finalizeAllActiveCards();
       const agentRunItem = activityItems.get('agent-run');
       if (agentRunItem && (agentRunItem.status === 'started' || agentRunItem.status === 'running')) {
         addToolMessage({
@@ -1210,7 +1138,6 @@ async function loadHistory(projectName) {
   const target = feed;
   try {
     const data = await api(`/api/projects/${encodeURIComponent(projectName)}/history`);
-    resetConversationUsage();
     clearActivity();
     target.replaceChildren();
     clearQuestionArea();
@@ -1221,7 +1148,6 @@ async function loadHistory(projectName) {
       const raw = evt.content;
       const text = normalizeHistoryContent(raw);
       if (role === 'user') {
-        snapshotConversationUsageForUserTurn();
         accumulatedReasoning = '';
         const userImages = extractHistoryImages(raw);
         addMessage(text, 'user', {target, images: userImages});
@@ -1264,6 +1190,9 @@ async function loadHistory(projectName) {
             : reasoning;
         }
         displayText = stripToolCallTags(displayText);
+        if (String(displayText).trim() === '...') {
+          displayText = '';
+        }
         if (!String(displayText).trim()) {
           // Tool-only intermediate turn: preserve accumulated reasoning for final response
           continue;
@@ -1276,13 +1205,11 @@ async function loadHistory(projectName) {
         addMessage(evt.data?.message || text, 'error', {target});
         renderedAny = true;
       } else if (evt.type === 'agent_usage') {
-        recordConversationUsage(evt.data);
         updateUsagePill(evt.data);
       } else if (showInfoMessages) {
         addInfoMessage(evt.type, evt.data);
       }
     }
-    renderConversationUsage();
     if (accumulatedReasoning) {
       addMessage('', 'agent', {target, reasoning: accumulatedReasoning});
       renderedAny = true;
@@ -1315,7 +1242,6 @@ function addInfoMessage(type, data = {}) {
   } else if (type === 'tool_status') {
     addToolMessage(data);
   } else if (type === 'agent_usage') {
-    recordConversationUsage(data);
     updateUsagePill(data);
   } else if (type === 'agent_stopped') {
     addToolMessage({
@@ -1519,7 +1445,6 @@ chatForm.addEventListener('submit', async event => {
     alt: file.name,
   }));
   try {
-    snapshotConversationUsageForUserTurn();
     clearActivity();
     finalizeAllActiveCards();
     addMessage(text, 'user', {images: imagePayload});
@@ -1793,31 +1718,7 @@ document.querySelector('#reset-view')?.addEventListener('click', () => {
     item.setAttribute('aria-pressed', String(isIso));
   });
 });
-// Print Advisor Modal & 3MF Export
-const printAdvisorModal = document.querySelector('#print-advisor-modal');
-const advisorModalClose = document.querySelector('#advisor-modal-close');
-const telemetryOverhang = document.querySelector('#telemetry-overhang');
-const telemetryBed = document.querySelector('#telemetry-bed');
-const telemetrySlenderness = document.querySelector('#telemetry-slenderness');
-const telemetryBrim = document.querySelector('#telemetry-brim');
-
-const advisorMaterial = document.querySelector('#advisor-material');
-const advisorPriority = document.querySelector('#advisor-priority');
-const advisorLayerHeight = document.querySelector('#advisor-layer-height');
-const advisorWallLoops = document.querySelector('#advisor-wall-loops');
-const advisorInfillDensity = document.querySelector('#advisor-infill-density');
-const advisorInfillPattern = document.querySelector('#advisor-infill-pattern');
-const advisorSupportEnabled = document.querySelector('#advisor-support-enabled');
-const advisorSupportType = document.querySelector('#advisor-support-type');
-const advisorBrimEnabled = document.querySelector('#advisor-brim-enabled');
-const advisorBrimWidth = document.querySelector('#advisor-brim-width');
-const advisorRationaleText = document.querySelector('#advisor-rationale-text');
-const advisorRecomputeBtn = document.querySelector('#advisor-recompute-btn');
-const advisorDownloadGeom = document.querySelector('#advisor-download-geom');
-const advisorDownloadSmart = document.querySelector('#advisor-download-smart');
-
-let currentAdvisorProfile = null;
-
+// 3MF & Model Export
 function triggerBlobDownload(blob, filename) {
   const blobUrl = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -1829,174 +1730,43 @@ function triggerBlobDownload(blob, filename) {
   setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
 }
 
-function openPrintAdvisorModal() {
-  if (!printAdvisorModal) return;
-  printAdvisorModal.classList.remove('hidden');
-  printAdvisorModal.setAttribute('aria-hidden', 'false');
-  advisorModalClose?.focus();
-  fetchPrintAdvisorProfile();
-}
-
-function closePrintAdvisorModal() {
-  if (!printAdvisorModal) return;
-  printAdvisorModal.classList.add('hidden');
-  printAdvisorModal.setAttribute('aria-hidden', 'true');
-}
-
-advisorModalClose?.addEventListener('click', closePrintAdvisorModal);
-printAdvisorModal?.addEventListener('click', (event) => {
-  if (event.target === printAdvisorModal) closePrintAdvisorModal();
-});
-window.addEventListener('keydown', (event) => {
-  if (event.key === 'Escape' && printAdvisorModal && !printAdvisorModal.classList.contains('hidden')) {
-    closePrintAdvisorModal();
-  }
-});
-
-async function fetchPrintAdvisorProfile() {
-  if (!currentProject) return;
-  if (advisorRationaleText) advisorRationaleText.textContent = 'Analyzing model geometry and generating slicer settings...';
-  if (advisorRecomputeBtn) advisorRecomputeBtn.disabled = true;
-
-  try {
-    const res = await fetch(`/api/projects/${encodeURIComponent(currentProject)}/print-profile`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        priority: advisorPriority?.value || 'auto',
-        material: advisorMaterial?.value || 'auto',
-      }),
-    });
-
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({ error: 'Failed to retrieve profile' }));
-      if (advisorRationaleText) advisorRationaleText.textContent = `Error: ${err.error || res.statusText}`;
-      return;
-    }
-
-    const data = await res.json();
-    const p = data.printability || {};
-    const prof = data.profile || {};
-    currentAdvisorProfile = prof;
-
-    // Telemetry cards
-    if (telemetryOverhang) {
-      const oRatio = ((p.overhang_ratio || 0) * 100).toFixed(1);
-      const oArea = (p.overhang_area_45deg_mm2 || 0).toFixed(0);
-      telemetryOverhang.textContent = `${oRatio}% (${oArea} mm²)`;
-    }
-    if (telemetryBed) {
-      const bRatio = ((p.bed_contact_ratio || 0) * 100).toFixed(0);
-      const bArea = (p.bed_contact_area_mm2 || 0).toFixed(0);
-      telemetryBed.textContent = `${bArea} mm² (${bRatio}%)`;
-    }
-    if (telemetrySlenderness) {
-      const sVal = (p.slenderness_ratio || 1.0).toFixed(1);
-      telemetrySlenderness.textContent = `${sVal} ${p.slenderness_ratio >= 2.5 ? '(Tall)' : '(Stable)'}`;
-    }
-    if (telemetryBrim) {
-      telemetryBrim.textContent = p.needs_brim ? 'Recommended' : 'Adequate';
-    }
-
-    // Form inputs (the material select keeps the user's choice; "auto"
-    // resolves to prof.material on export).
-    if (advisorLayerHeight && prof.layer_height_mm != null) {
-      const lhStr = Number(prof.layer_height_mm).toFixed(2);
-      let matchOption = Array.from(advisorLayerHeight.options).find(opt => opt.value === lhStr);
-      if (!matchOption) {
-        matchOption = new Option(`${lhStr} mm`, lhStr);
-        advisorLayerHeight.add(matchOption);
-      }
-      advisorLayerHeight.value = lhStr;
-    }
-    if (advisorWallLoops && prof.wall_loops != null) advisorWallLoops.value = String(prof.wall_loops);
-    if (advisorInfillDensity && prof.infill_density_percent != null) advisorInfillDensity.value = String(prof.infill_density_percent);
-    if (advisorInfillPattern && prof.infill_pattern) advisorInfillPattern.value = prof.infill_pattern;
-    if (advisorSupportEnabled && prof.support_enabled != null) advisorSupportEnabled.checked = Boolean(prof.support_enabled);
-    if (advisorSupportType && prof.support_type) advisorSupportType.value = prof.support_type;
-    if (advisorBrimEnabled && prof.brim_enabled != null) advisorBrimEnabled.checked = Boolean(prof.brim_enabled);
-    if (advisorBrimWidth && prof.brim_width_mm != null) advisorBrimWidth.value = String(prof.brim_width_mm || 6);
-
-    if (advisorRationaleText) advisorRationaleText.textContent = prof.rationale || 'Settings calculated for this geometry.';
-  } catch (error) {
-    if (advisorRationaleText) advisorRationaleText.textContent = `Error: ${error.message}`;
-  } finally {
-    if (advisorRecomputeBtn) advisorRecomputeBtn.disabled = false;
-  }
-}
-
-function gatherAdvisorFormProfile() {
-  const base = currentAdvisorProfile ? { ...currentAdvisorProfile } : {};
-  return {
-    ...base,
-    material: advisorMaterial?.value === 'auto' ? (base.material || 'PLA') : (advisorMaterial?.value || 'PLA'),
-    layer_height_mm: parseFloat(advisorLayerHeight?.value || '0.20'),
-    wall_loops: parseInt(advisorWallLoops?.value || '3', 10),
-    infill_density_percent: parseInt(advisorInfillDensity?.value || '20', 10),
-    infill_pattern: advisorInfillPattern?.value || 'gyroid',
-    support_enabled: Boolean(advisorSupportEnabled?.checked),
-    support_type: advisorSupportType?.value || 'normal',
-    brim_enabled: Boolean(advisorBrimEnabled?.checked),
-    brim_width_mm: parseInt(advisorBrimWidth?.value || '6', 10),
-  };
-}
-
-advisorRecomputeBtn?.addEventListener('click', fetchPrintAdvisorProfile);
-
-advisorDownloadGeom?.addEventListener('click', async () => {
-  if (!currentProject) return;
-  advisorDownloadGeom.disabled = true;
-  try {
-    const res = await fetch(`/api/projects/${encodeURIComponent(currentProject)}/export?format=3mf`);
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({ error: 'Export failed' }));
-      addMessage(`3MF Export failed: ${err.error || res.statusText}`, 'error');
-      return;
-    }
-    const blob = await res.blob();
-    triggerBlobDownload(blob, `${currentProject}.3mf`);
-    closePrintAdvisorModal();
-  } catch (error) {
-    addMessage(`3MF Export failed: ${error.message}`, 'error');
-  } finally {
-    advisorDownloadGeom.disabled = false;
-  }
-});
-
-advisorDownloadSmart?.addEventListener('click', async () => {
-  if (!currentProject) return;
-  const profile = gatherAdvisorFormProfile();
-  advisorDownloadSmart.disabled = true;
-  const originalText = advisorDownloadSmart.textContent;
-  advisorDownloadSmart.textContent = 'Exporting...';
-  try {
-    const res = await fetch(`/api/projects/${encodeURIComponent(currentProject)}/export?format=3mf`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ profile }),
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({ error: 'Export failed' }));
-      addMessage(`3MF Export failed: ${err.error || res.statusText}`, 'error');
-      return;
-    }
-    const blob = await res.blob();
-    triggerBlobDownload(blob, `${currentProject}.3mf`);
-    closePrintAdvisorModal();
-  } catch (error) {
-    addMessage(`3MF Export failed: ${error.message}`, 'error');
-  } finally {
-    advisorDownloadSmart.disabled = false;
-    advisorDownloadSmart.textContent = originalText;
-  }
-});
-
 downloadModelBtn?.addEventListener('click', async () => {
   if (!currentProject || downloadModelBtn.disabled) return;
   const format = exportFormatSelect?.value || 'stl';
 
   if (format === '3mf') {
-    openPrintAdvisorModal();
+    const originalHtml = downloadModelBtn.innerHTML;
+    downloadModelBtn.disabled = true;
+    downloadModelBtn.classList.add('loading');
+    downloadModelBtn.innerHTML = `
+      <svg class="icon spin-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2.5" stroke-dasharray="28" stroke-dashoffset="10"/>
+      </svg>
+      <span>AI 3MF Setup…</span>
+    `;
+
+    try {
+      const exportRes = await fetch(`/api/projects/${encodeURIComponent(currentProject)}/export?format=3mf`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ auto_ai: true }),
+      });
+
+      if (!exportRes.ok) {
+        const err = await exportRes.json().catch(() => ({ error: 'Export failed' }));
+        addMessage(`3MF Export failed: ${err.error || exportRes.statusText}`, 'error');
+        return;
+      }
+
+      const blob = await exportRes.blob();
+      triggerBlobDownload(blob, `${currentProject}.3mf`);
+    } catch (error) {
+      addMessage(`3MF Export failed: ${error.message}`, 'error');
+    } finally {
+      downloadModelBtn.disabled = !previewProject;
+      downloadModelBtn.classList.remove('loading');
+      downloadModelBtn.innerHTML = originalHtml;
+    }
     return;
   }
 
@@ -2836,21 +2606,42 @@ async function syncAfterStreamReset() {
   await syncCurrentPreview();
 }
 
+let streamReconnectTimer = null;
+let streamHadError = false;
+
 function connectStream() {
+  if (streamReconnectTimer) {
+    clearTimeout(streamReconnectTimer);
+    streamReconnectTimer = null;
+  }
   if (eventSource) eventSource.close();
   const status = document.querySelector('#connection-status');
   eventSource = new EventSource('/api/stream');
   eventSource.addEventListener('error', () => {
+    streamHadError = true;
     if (status) {
       status.classList.remove('connected');
       status.setAttribute('aria-label', 'Disconnected');
     }
-    setTimeout(connectStream, 2000);
+    if (eventSource) {
+      eventSource.close();
+      eventSource = null;
+    }
+    if (!streamReconnectTimer) {
+      streamReconnectTimer = setTimeout(() => {
+        streamReconnectTimer = null;
+        connectStream();
+      }, 2000);
+    }
   });
   eventSource.addEventListener('open', () => {
     if (status) {
       status.classList.add('connected');
       status.setAttribute('aria-label', 'Connected');
+    }
+    if (streamHadError) {
+      streamHadError = false;
+      syncAfterStreamReset().catch(err => console.error('stream reconnect sync failed', err));
     }
   });
   const handlers = {
@@ -2876,10 +2667,12 @@ function connectStream() {
         setThinking(true);
         if (modelSelect && validModelKeys.has(data.model_key)) {
           modelSelect.value = data.model_key;
+          syncEffortOptionsForModel(data.model_key);
         }
-        if (card && card.dataset.state !== 'done' && card.dataset.state !== 'error' && card.dataset.state !== 'stopped') {
+        const activeCard = card || getOrCreateRunCard(runId);
+        if (activeCard) {
           const label = data.message ? data.message.replace(/\.+$/, '') : 'Planning CAD task';
-          setCardState(card, 'thinking', label);
+          setCardState(activeCard, 'thinking', label);
         }
       } else if (data.status === 'reviewing' || data.status === 'verifying') {
         setThinking(true);
@@ -2921,10 +2714,10 @@ function connectStream() {
         card.dataset.reasoning = '';
         card._rawMessage = '';
         delete card.dataset.lastContentTurnId;
-        const body = card.querySelector('.message-body');
-        if (body) body.innerHTML = '';
+        delete card.dataset.lastReasoningTurnId;
         const thought = card.querySelector('.thought-disclosure');
         if (thought) thought.remove();
+        renderAgentContent(card, '');
         setCardState(card, 'thinking', 'Retrying response...');
       }
     },
@@ -2954,12 +2747,17 @@ function connectStream() {
         const combined = stripEncryptedReasoning(card.dataset.reasoning || data.reasoning || '');
         if (combined) {
           card.dataset.reasoning = combined;
-          ensureThoughtDisclosure(card, combined, false, false);
+          ensureThoughtDisclosure(card, combined, Boolean(data.has_tools || data.continuing), false);
         }
-        const text = stripToolCallTags(data.message || card.dataset.raw || '').trim();
+        const text = data.continuing
+          ? stripToolCallTags(data.message || '').trim()
+          : stripToolCallTags(data.message || card.dataset.raw || '').trim();
         if (text) {
           card.dataset.raw = text;
           renderAgentContent(card, text);
+        } else if (data.continuing) {
+          card.dataset.raw = '';
+          renderAgentContent(card, '');
         }
         if (data.has_tools) {
           if (text) {
@@ -2971,7 +2769,10 @@ function connectStream() {
           } else {
             setCardState(card, 'working', 'Running tools');
           }
+        } else if (data.continuing) {
+          setCardState(card, 'thinking', 'Continuing');
         } else {
+          if (runId) runCards.set(runId, card);
           setCardState(card, 'done');
         }
       }
@@ -2986,7 +2787,6 @@ function connectStream() {
     },
     agent_usage: data => {
       if (data.project !== currentProject) return;
-      recordConversationUsage(data);
       updateUsagePill(data);
     },
     tool_status: data => {
@@ -3152,7 +2952,6 @@ function applyConversationReset() {
   runCards.clear();
   // Wipe the main feed, dismiss any pending question, and clear activity so
   // the UI matches the freshly truncated conversation.jsonl.
-  resetConversationUsage();
   clearActivity();
   feed.replaceChildren();
   clearQuestionArea();
@@ -3231,7 +3030,6 @@ document.addEventListener('click', async event => {
 
 (async function init() {
   autoResizeMessage();
-  renderConversationUsage();
   if (!currentProject) return;
   // Load the persisted conversation into the main feed so reopening a
   // project immediately shows its history. The empty-state element is

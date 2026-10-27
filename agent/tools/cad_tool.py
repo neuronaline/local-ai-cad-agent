@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from agent.io import atomic_write_bytes
+from agent.llm_base import RequestCancelled
 from agent.review_paths import review_dir
 from agent.revisions import MODEL_FILENAME, RevisionIntegrityError, RevisionStore
 from agent.sandbox import command as sandbox_command
@@ -113,12 +114,14 @@ class CadTool:
         revisions: RevisionStore | None = None,
         review_render_workers: int = 4,
         review_required_views: int = 8,
+        stop_event: threading.Event | None = None,
     ) -> None:
         self.project_dir = project_dir.resolve()
         self._publish = publish
         self._revisions = revisions or RevisionStore(project_dir)
         self._review_render_workers = max(1, int(review_render_workers))
         self._review_required_views = max(1, int(review_required_views))
+        self._stop_event = stop_event
         # ``ProcessSlot`` is a long-lived mutable holder for the running
         # ``Popen``; passing ``[self._process]`` would produce a fresh
         # list per call site and the GC would free it before ``stop()``
@@ -209,7 +212,8 @@ class CadTool:
             can_use_cache = (cache_dir / "render.png").is_file() and (cache_dir / "render.png").stat().st_size > 0
 
         cached_review_manifest = None
-        if can_use_cache and mode.produces_manifest:
+        review_has_all_canonical_views = False
+        if mode.produces_manifest:
             review_dir_path = self._review_dir(model_sha)
             manifest = self._read_review_manifest(review_dir_path)
             if manifest and self._review_is_fresh(
@@ -221,33 +225,35 @@ class CadTool:
                 cached_views = {
                     v.get("view_id") for v in manifest.get("views", []) if isinstance(v, dict)
                 }
-                view_widths = {
-                    v.get("view_id"): int(v.get("width", 512) or 512)
-                    for v in manifest.get("views", [])
-                    if isinstance(v, dict) and "view_id" in v
-                }
-                views_to_check = requested_views if requested_views is not None else ["all"]
-                all_views_present = True
-                for rv in views_to_check:
-                    canonical = VIEW_ALIASES.get(str(rv).lower(), str(rv))
-                    if canonical == "all":
-                        if len(cached_views) < self._review_required_views:
-                            all_views_present = False
-                            break
-                        if resolution > 512 and any(w < resolution for w in view_widths.values()):
-                            all_views_present = False
-                            break
+                review_has_all_canonical_views = len(cached_views) >= self._review_required_views
+                if can_use_cache:
+                    view_widths = {
+                        v.get("view_id"): int(v.get("width", 512) or 512)
+                        for v in manifest.get("views", [])
+                        if isinstance(v, dict) and "view_id" in v
+                    }
+                    views_to_check = requested_views if requested_views is not None else ["all"]
+                    all_views_present = True
+                    for rv in views_to_check:
+                        canonical = VIEW_ALIASES.get(str(rv).lower(), str(rv))
+                        if canonical == "all":
+                            if not review_has_all_canonical_views:
+                                all_views_present = False
+                                break
+                            if resolution > 512 and any(w < resolution for w in view_widths.values()):
+                                all_views_present = False
+                                break
+                        else:
+                            if canonical not in cached_views:
+                                all_views_present = False
+                                break
+                            if resolution > 512 and view_widths.get(canonical, 512) < resolution:
+                                all_views_present = False
+                                break
+                    if all_views_present:
+                        cached_review_manifest = manifest
                     else:
-                        if canonical not in cached_views:
-                            all_views_present = False
-                            break
-                        if resolution > 512 and view_widths.get(canonical, 512) < resolution:
-                            all_views_present = False
-                            break
-                if all_views_present:
-                    cached_review_manifest = manifest
-                else:
-                    can_use_cache = False
+                        can_use_cache = False
             else:
                 can_use_cache = False
 
@@ -281,13 +287,20 @@ class CadTool:
             except (OSError, json.JSONDecodeError, ValueError):
                 pass  # Fall back to normal sandbox execution on cache read issue
 
+        # Only allow selective single/subset view rendering when all 8 canonical
+        # views already exist on disk for this model_sha; otherwise render the
+        # full canonical set so the contact sheet and get_view_images stay complete.
+        effective_requested_views = (
+            requested_views if review_has_all_canonical_views else None
+        )
+
         # Copy ``renderer.py`` / ``runner.py`` as siblings into the
         # workspace and pass render settings as JSON on ``argv[1]`` so
         # the sandbox stays at arm's length from the host.
         settings_payload = json.dumps(
             self._runner_settings(
                 mode,
-                requested_views=requested_views,
+                requested_views=effective_requested_views,
                 resolution=resolution,
             )
         )
@@ -419,8 +432,14 @@ class CadTool:
         bubblewrap teardown so ``promote_review`` can verify and
         promote the PNGs.
         """
+        staging_parent = self.project_dir / ".cad-agent"
+        staging_parent.mkdir(parents=True, exist_ok=True)
+        for parent in (self.project_dir, staging_parent):
+            for stale_dir in parent.glob("cad-review-staging-*"):
+                if stale_dir.is_dir():
+                    shutil.rmtree(stale_dir, ignore_errors=True)
         staging_root = Path(
-            tempfile.mkdtemp(prefix="cad-review-staging-", dir=self.project_dir)
+            tempfile.mkdtemp(prefix="cad-review-staging-", dir=staging_parent)
         )
         source_views = workspace / ".review-views"
         source_sheet = workspace / ".review-sheet.png"
@@ -630,6 +649,9 @@ class CadTool:
         finally:
             if staging.exists():
                 shutil.rmtree(staging, ignore_errors=True)
+            for staged_candidate in (views_dir.parent, sheet_path.parent):
+                if staged_candidate.name.startswith("cad-review-staging-"):
+                    shutil.rmtree(staged_candidate, ignore_errors=True)
         return self._read_review_manifest(review_dir) or persisted_manifest
 
     @staticmethod
@@ -817,26 +839,58 @@ class CadTool:
         if mode.produces_manifest:
             review_manifest = payload.get("review_manifest")
             review_path: str | None = None
-            if review_manifest:
-                if payload.get("cached"):
-                    review_path = review_manifest.get("artifact_dir") or (
-                        self._review_dir(model_sha).name if model_sha else None
-                    )
-                else:
-                    promoted = self.promote_review(
-                        review_manifest,
-                        sandbox_views_dir=payload.get("review_views_dir") or "",
-                        sandbox_sheet_path=payload.get("review_sheet_path") or "",
-                    )
-                    review_path = promoted.get("artifact_dir")
+            staging_views_dir = payload.get("review_views_dir") or ""
+            staging_sheet_path = payload.get("review_sheet_path") or ""
+            try:
+                if review_manifest:
+                    if payload.get("cached"):
+                        review_path = review_manifest.get("artifact_dir") or (
+                            self._review_dir(model_sha).name if model_sha else None
+                        )
+                    else:
+                        promoted = self.promote_review(
+                            review_manifest,
+                            sandbox_views_dir=staging_views_dir,
+                            sandbox_sheet_path=staging_sheet_path,
+                        )
+                        review_path = promoted.get("artifact_dir")
+                        if isinstance(promoted, dict) and promoted.get("view_count") != review_manifest.get("view_count"):
+                            for m_path in (
+                                self.project_dir / ".cad_metrics.json",
+                                (self.project_dir / ".cad-agent" / "cache" / model_sha / ".cad_metrics.json") if model_sha else None,
+                            ):
+                                if m_path is not None and m_path.is_file():
+                                    try:
+                                        m_data = json.loads(m_path.read_text(encoding="utf-8"))
+                                        if isinstance(m_data, dict):
+                                            m_data["review_manifest"] = promoted
+                                            atomic_write_bytes(
+                                                m_path,
+                                                json.dumps(m_data).encode("utf-8"),
+                                            )
+                                    except (OSError, json.JSONDecodeError):
+                                        pass
+            finally:
+                for staged_path_str in (staging_views_dir, staging_sheet_path):
+                    if staged_path_str:
+                        staged_parent = Path(staged_path_str).parent
+                        if staged_parent.name.startswith("cad-review-staging-"):
+                            shutil.rmtree(staged_parent, ignore_errors=True)
             if review_path:
                 result["review"] = review_path
 
+        if self._stop_event is not None and self._stop_event.is_set():
+            raise RequestCancelled("CAD build cancelled.")
+
         # Run deterministic verification directly on compiled model and preview mesh
-        verifier = CadVerifier(self.project_dir, self._publish)
+        verifier = CadVerifier(
+            self.project_dir,
+            self._publish,
+            stop_event=self._stop_event,
+        )
         if self._call_id:
             verifier.with_call_id(self._call_id)
-        verification = verifier.verify()
+        verification = verifier.verify(precomputed_metrics=metrics if isinstance(metrics, dict) else None)
         result["verification"] = verification
 
         result["summary"] = self._summarize_payload(

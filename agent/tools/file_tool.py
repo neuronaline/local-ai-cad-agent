@@ -126,7 +126,37 @@ class OpenScadPreflight:
             self.blocked_errors.append(err_msg)
             return
 
-        # 4. Check for UPPER_CASE parameter definition
+        # 4. Block minkowski() and extreme facet/slice counts that lock up OpenSCAD
+        minkowski_match = re.search(r"\bminkowski\s*\(", clean_code)
+        if minkowski_match:
+            line_num = clean_code[: minkowski_match.start()].count("\n") + 1
+            self.blocked_errors.append(
+                f"Unsafe CSG operation: minkowski() at line {line_num} causes severe OpenSCAD "
+                "CSG lockups and timeouts. Use 2D offset() before extrusion or hull() instead."
+            )
+            return
+
+        for fn_m in re.finditer(r"\$fn\s*=\s*([0-9]+)", clean_code):
+            fn_val = int(fn_m.group(1))
+            if fn_val > 256:
+                line_num = clean_code[: fn_m.start()].count("\n") + 1
+                self.blocked_errors.append(
+                    f"Excessive facet resolution: $fn = {fn_val} at line {line_num} exceeds the "
+                    "maximum safe limit (256) and will stall OpenSCAD compilation. Use $fn <= 64 (or <= 36 for threads)."
+                )
+                return
+
+        for sl_m in re.finditer(r"\bslices\s*=\s*([0-9]+)", clean_code):
+            sl_val = int(sl_m.group(1))
+            if sl_val > 180:
+                line_num = clean_code[: sl_m.start()].count("\n") + 1
+                self.blocked_errors.append(
+                    f"Excessive extrusion slices: slices = {sl_val} at line {line_num} exceeds the "
+                    "maximum safe limit (180) and will stall OpenSCAD compilation. Use slices <= turns * 18."
+                )
+                return
+
+        # 5. Check for UPPER_CASE parameter definition
         has_params = bool(re.search(r"^[ \t]*[A-Z][A-Z0-9_]*[ \t]*=", code, re.MULTILINE))
         if not has_params:
             self.warnings.append(

@@ -9,10 +9,12 @@ import hashlib
 import json
 import math
 import re
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from agent.llm_base import RequestCancelled
 from agent.revisions import MODEL_FILENAME, model_is_built
 from agent.tools.cad_scripts.renderer import load_stl
 from agent.tools.cad_scripts.runner import mesh_metrics
@@ -42,6 +44,46 @@ class Finding:
 
 
 _clean_code_preserve_lines = OpenScadPreflight.clean_code_preserve_lines
+
+
+def _detect_expected_part_count(code: str) -> int | None:
+    """Extract the expected number of parts when PART_TYPE defines explicit single-part variants."""
+    clean = _clean_code_preserve_lines(code)
+    multi_tokens = {
+        "ALL",
+        "PLATE",
+        "BOTH",
+        "ASSEMBLY",
+        "SET",
+        "COMBINED",
+        "PRINT_BED",
+    }
+    variants: set[str] = set()
+    for m in re.finditer(
+        r"\bPART_TYPE\s*==\s*[\"\']([A-Za-z0-9_]+)[\"\']",
+        clean,
+    ):
+        token = m.group(1).upper()
+        if token not in multi_tokens:
+            variants.add(token)
+    if len(variants) >= 2:
+        return len(variants)
+
+    # Also check Customizer option comment: PART_TYPE = "ALL"; // [ALL, BOTTLE, CAP]
+    comment_match = re.search(
+        r"^[ \t]*PART_TYPE[ \t]*=[ \t]*[\"\'][^\"\']+[\"\'][ \t]*;[ \t]*//[ \t]*\[([^\]]+)\]",
+        code,
+        re.MULTILINE,
+    )
+    if comment_match:
+        opts = [
+            opt.strip().split(":")[0].strip().strip("\"'").upper()
+            for opt in comment_match.group(1).split(",")
+        ]
+        single_opts = {o for o in opts if o and o not in multi_tokens}
+        if len(single_opts) >= 2:
+            return len(single_opts)
+    return None
 
 
 def _detect_multi_part_intent(code: str) -> bool:
@@ -89,14 +131,25 @@ def _detect_multi_part_intent(code: str) -> bool:
 class CadVerifier:
     """Deterministic verifier for CAD models, producing categorized findings and a risk score."""
 
-    def __init__(self, project_dir: Path, publish: Any = None) -> None:
+    def __init__(
+        self,
+        project_dir: Path,
+        publish: Any = None,
+        *,
+        stop_event: threading.Event | None = None,
+    ) -> None:
         self.project_dir = project_dir.resolve()
         self._publish = publish
         self._call_id = ""
+        self._stop_event = stop_event
 
     def with_call_id(self, call_id: str) -> CadVerifier:
         self._call_id = call_id
         return self
+
+    def _check_cancelled(self) -> None:
+        if self._stop_event is not None and self._stop_event.is_set():
+            raise RequestCancelled("CAD verification cancelled.")
 
     def _publish_status(self, status: str, message: str) -> None:
         if self._publish:
@@ -109,8 +162,13 @@ class CadVerifier:
                 message=message,
             )
 
-    def verify(self) -> dict[str, Any]:
+    def verify(
+        self,
+        *,
+        precomputed_metrics: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Run complete deterministic verification on model.scad and preview.stl."""
+        self._check_cancelled()
         self._publish_status("verifying", "Running deterministic CAD verification…")
 
         model_path = self.project_dir / MODEL_FILENAME
@@ -129,13 +187,15 @@ class CadVerifier:
 
         model_code = model_path.read_text(encoding="utf-8", errors="replace")
         code_findings, code_meta = self._verify_code(model_code)
+        self._check_cancelled()
 
         preview_path = self.project_dir / "preview.stl"
         build_findings: list[Finding] = []
         is_stale = False
 
         if (
-            preview_path.is_file()
+            precomputed_metrics is None
+            and preview_path.is_file()
             and preview_path.stat().st_size > 0
             and not model_is_built(self.project_dir)
         ):
@@ -156,6 +216,8 @@ class CadVerifier:
             mesh_findings, mesh_meta = self._verify_mesh(
                 preview_path,
                 multi_part_intent=bool(code_meta.get("multi_part_intent")),
+                expected_part_count=code_meta.get("expected_part_count"),
+                precomputed_metrics=precomputed_metrics,
             )
 
         all_findings = code_findings + build_findings + mesh_findings
@@ -286,20 +348,28 @@ class CadVerifier:
                 )
             )
 
+        multi_part = _detect_multi_part_intent(code)
+        expected_parts = _detect_expected_part_count(code) if multi_part else None
         code_meta = {
             "exists": True,
             "syntax_valid": not syntax_error,
             "parameters_defined": param_names,
             "fn_value": fn_val,
             "eps_defined": has_eps,
-            "multi_part_intent": _detect_multi_part_intent(code),
+            "multi_part_intent": multi_part,
+            "expected_part_count": expected_parts,
         }
         return findings, code_meta
 
     def _verify_mesh(
-        self, stl_path: Path, multi_part_intent: bool = False
+        self,
+        stl_path: Path,
+        multi_part_intent: bool = False,
+        expected_part_count: int | None = None,
+        precomputed_metrics: dict[str, Any] | None = None,
     ) -> tuple[list[Finding], dict[str, Any]]:
         findings: list[Finding] = []
+        self._check_cancelled()
 
         if not stl_path.is_file() or stl_path.stat().st_size == 0:
             findings.append(
@@ -312,15 +382,24 @@ class CadVerifier:
             )
             return findings, {"exists": False}
 
-        metrics_file = self.project_dir / ".cad_metrics.json"
         cached_metrics: dict[str, Any] | None = None
-        if metrics_file.is_file():
+        if (
+            isinstance(precomputed_metrics, dict)
+            and "dimensions_mm" in precomputed_metrics
+            and "volume_mm3" in precomputed_metrics
+            and "boundary_edges" in precomputed_metrics
+        ):
+            cached_metrics = precomputed_metrics
+
+        metrics_file = self.project_dir / ".cad_metrics.json"
+        if cached_metrics is None and metrics_file.is_file():
             try:
                 cached_data = json.loads(metrics_file.read_text(encoding="utf-8"))
                 if isinstance(cached_data, dict) and isinstance(cached_data.get("metrics"), dict):
                     expected_sha = cached_data.get("preview_sha256")
                     is_valid_cache = True
                     if expected_sha and isinstance(expected_sha, str):
+                        self._check_cancelled()
                         actual_sha = hashlib.sha256(stl_path.read_bytes()).hexdigest()
                         if actual_sha != expected_sha:
                             is_valid_cache = False
@@ -332,6 +411,7 @@ class CadVerifier:
                 pass
 
         if cached_metrics is None:
+            self._check_cancelled()
             try:
                 vertices, triangles = load_stl(stl_path)
             except Exception as err:  # noqa: BLE001
@@ -356,6 +436,7 @@ class CadVerifier:
                 )
                 return findings, {"exists": True, "valid": False}
 
+            self._check_cancelled()
             try:
                 cached_metrics = mesh_metrics(vertices, triangles)
             except Exception as err:  # noqa: BLE001
@@ -468,18 +549,54 @@ class CadVerifier:
                 )
             )
 
-        # 4. Disconnected Solid Components
+        # 4. Disconnected Solid Components & Floating Part Check
+        floating_solid_count = int(cached_metrics.get("floating_solid_count", 0) or 0)
+        solids_min_z = cached_metrics.get("solids_min_z") or []
+        printability = cached_metrics.get("printability") or {}
+
         if solid_count > 1:
-            if multi_part_intent:
+            if floating_solid_count > 0:
+                floating_zs = [z for z in solids_min_z[1:] if z > (solids_min_z[0] if solids_min_z else 0.0) + 0.5]
+                z_desc = f" (at Z = {floating_zs} mm)" if floating_zs else ""
+                findings.append(
+                    Finding(
+                        category="CRITICAL",
+                        code="FLOATING_DISCONNECTED_SOLID",
+                        message=(
+                            f"Model has {floating_solid_count} disconnected solid component(s) floating in mid-air{z_desc} "
+                            f"out of {solid_count} total solids."
+                        ),
+                        impact=(
+                            "A feature (such as a bottle neck, boss, or wall) was severed from its base by an "
+                            "excessive difference() cavity or Z-offset gap, or a separate part is not resting on Z = 0."
+                        ),
+                    )
+                )
+            if multi_part_intent and expected_part_count is not None and solid_count != expected_part_count:
+                findings.append(
+                    Finding(
+                        category="CRITICAL" if solid_count > expected_part_count else "WARNING",
+                        code="UNEXPECTED_SOLID_COUNT",
+                        message=(
+                            f"PART_TYPE defines {expected_part_count} part variant(s), but the compiled mesh "
+                            f"contains {solid_count} disconnected solids."
+                        ),
+                        impact=(
+                            "One of the components is split into disconnected pieces (if solid_count > expected) "
+                            "or fused/missing (if solid_count < expected)."
+                        ),
+                    )
+                )
+            elif multi_part_intent and floating_solid_count == 0:
                 findings.append(
                     Finding(
                         category="INFO",
                         code="MULTI_PART_ASSEMBLY",
-                        message=f"Model contains {solid_count} intentional components (multi-part assembly or plate arrangement detected).",
+                        message=f"Model contains {solid_count} intentional components resting on the build plate.",
                         impact="Multiple separate components arranged in one file.",
                     )
                 )
-            else:
+            elif not multi_part_intent and floating_solid_count == 0:
                 findings.append(
                     Finding(
                         category="WARNING",
@@ -489,7 +606,39 @@ class CadVerifier:
                             "If intended as a multi-part assembly or plate layout, set PART_TYPE = \"ALL\" "
                             "or add a '// multi-part' comment."
                         ),
-                        impact="Parts may be floating in air unattached unless explicitly intended as a multi-part assembly.",
+                        impact="Parts may be detached unless explicitly intended as a multi-part assembly.",
+                    )
+                )
+
+        # 5. Printability & Severe Overhang Check
+        if isinstance(printability, dict) and printability:
+            bed_area = float(printability.get("bed_contact_area_mm2", 0.0) or 0.0)
+            overhang_60 = float(printability.get("overhang_area_60deg_mm2", 0.0) or 0.0)
+            overhang_ratio = float(printability.get("overhang_ratio", 0.0) or 0.0)
+            if volume > 100.0 and bed_area < 1.0:
+                findings.append(
+                    Finding(
+                        category="WARNING",
+                        code="LOW_BED_CONTACT",
+                        message=f"Model has near-zero build plate contact area ({bed_area:.2f} mm²).",
+                        impact="Part will not adhere to the print bed without supports; orient flat base at Z = 0.",
+                    )
+                )
+            footprint_xy = max(dim_x * dim_y, 1.0)
+            if overhang_60 >= 150.0 and (
+                overhang_ratio >= 0.06 or overhang_60 >= 0.15 * footprint_xy
+            ):
+                findings.append(
+                    Finding(
+                        category="WARNING",
+                        code="SEVERE_OVERHANG",
+                        message=(
+                            f"Model has {overhang_60:.1f} mm² of steep (>60 deg) unsupported overhang area."
+                        ),
+                        impact=(
+                            "Horizontal internal roofs or unchamfered transitions will sag during FDM printing; "
+                            "use >= 45 deg conical shoulders or orient caps upside-down."
+                        ),
                     )
                 )
 
@@ -497,6 +646,8 @@ class CadVerifier:
             "exists": True,
             "watertight": is_watertight,
             "solid_count": solid_count,
+            "floating_solid_count": floating_solid_count,
+            "solids_min_z": solids_min_z,
             "volume_mm3": round(volume, 2),
             "dimensions_mm": {
                 "x": round(dim_x, 2),
@@ -507,6 +658,7 @@ class CadVerifier:
             "vertex_count": vertex_count,
             "boundary_edge_count": boundary_edges,
             "non_manifold_edge_count": multi_face_edges,
+            "printability": printability,
         }
         return findings, mesh_meta
 

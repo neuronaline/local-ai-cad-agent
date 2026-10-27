@@ -382,6 +382,10 @@ def redact(value: Any) -> Any:
 
 def _redact_value(value: Any) -> Any:
     if isinstance(value, dict):
+        if _looks_like_image_url_part(None, value):
+            return _redact_image_url_part(None, value)
+        if _looks_like_inline_data_part(None, value):
+            return _redact_inline_data_part(None, value)
         result: dict[str, Any] = {}
         for key, item in value.items():
             if isinstance(key, str) and key.lower() in _REDACTED_KEYS:

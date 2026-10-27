@@ -46,10 +46,12 @@ class VertexClient(ChatCompletionsClient):
             configured = self.settings.gemini_location or self.settings.vertex_location
         else:
             configured = self.settings.vertex_location or self.settings.gemini_location
-        if not configured:
-            model_lower = self.model.lower()
-            if "gemini-3" in model_lower or "gemini-4" in model_lower:
-                return "global"
+        model_lower = self.model.lower()
+        if "gemini-3" in model_lower or "gemini-4" in model_lower:
+            # Vertex AI provisions Gemini 3+ preview/frontier models exclusively on the 'global' endpoint.
+            if configured and configured.lower() != "us-central1":
+                return gcloud_auth.get_location(configured)
+            return "global"
         return gcloud_auth.get_location(configured or DEFAULT_LOCATION)
 
     def _api_key(self) -> str:
@@ -112,8 +114,8 @@ class VertexClient(ChatCompletionsClient):
 
         max_tokens = self.settings.llm_max_completion_tokens
         if max_tokens:
-            # Vertex AI OpenAPI enforces maxOutputTokens < 65536 (exclusive upper bound).
-            # Clamp to 65535 to prevent 400 INVALID_ARGUMENT when 65536 is configured.
+            # Vertex AI OpenAPI enforces maxOutputTokens < 65536. Clamp to 65535 to
+            # prevent 400 INVALID_ARGUMENT when 65536 is configured.
             payload["max_tokens"] = min(max_tokens, 65535)
 
         effort = (
@@ -123,29 +125,41 @@ class VertexClient(ChatCompletionsClient):
         )
         model_lower = self.model.lower()
         is_gemini_2 = "2.5" in model_lower or "gemini-2" in model_lower
-        thinking_config: dict[str, Any] = {"include_thoughts": True}
-        if effort:
-            eff = effort.lower().strip()
+        eff = (effort or "").lower().strip()
+        thinking_config: dict[str, Any] = {"include_thoughts": eff != "none"}
+        if eff and eff != "none":
             if not is_gemini_2:
                 level_map = {
-                    "minimal": "MINIMAL",
+                    "minimal": "MINIMAL" if "flash" in model_lower else "LOW",
                     "low": "LOW",
                     "medium": "MEDIUM",
                     "high": "HIGH",
+                    "xhigh": "HIGH",
+                    "max": "HIGH",
                 }
-                thinking_config["thinking_level"] = level_map.get(eff, eff.upper())
+                level = level_map.get(eff, "HIGH")
+                if "gemini-4" in model_lower and level == "MINIMAL":
+                    level = "LOW"
+                thinking_config["thinking_level"] = level
             else:
                 budget_map = {
                     "minimal": 1024,
                     "low": 2048,
                     "medium": 4096,
                     "high": 8192,
+                    "xhigh": 16384,
+                    "max": 24576,
                 }
                 thinking_config["thinking_budget"] = budget_map.get(eff, 8192)
-        elif not is_gemini_2:
-            thinking_config["thinking_level"] = "HIGH"
-        else:
-            thinking_config["thinking_budget"] = 8192
+        elif eff == "none":
+            if not is_gemini_2:
+                thinking_config["thinking_level"] = (
+                    "MINIMAL"
+                    if ("flash" in model_lower and "gemini-4" not in model_lower)
+                    else "LOW"
+                )
+            elif "pro" not in model_lower:
+                thinking_config["thinking_budget"] = 0
         payload["extra_body"] = {"google": {"thinking_config": thinking_config}}
 
         return payload

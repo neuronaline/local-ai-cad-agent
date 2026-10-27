@@ -18,50 +18,60 @@ _SUFFIX_FORMAT = """\n<openscad_cli_playbook>\n{playbook}\n</openscad_cli_playbo
 _HOT_RELOAD_ENV = "CAD_AGENT_PROMPT_HOT_RELOAD"
 
 _DESIGN_PRINCIPLES = """\
-Satisfy explicit dimensions and functional requirements first. Prefer compact,
-material-efficient geometry and the fewest features needed for the job. Do not
-invent decorative details or enlarge the part for appearance. When a reference
-image is provided, use it for shape and proportion while treating stated
-dimensions as authoritative. State any important assumption in the final reply."""
+Satisfy explicit user dimensions (authoritative) and functional requirements first.
+Infer unstated dimensions from standard hardware and mechanical practices (fastener clearances,
+wall thicknesses, mating tolerances). Always include essential functional and mechanical
+features implied by the object's real-world purpose (e.g. mating screw threads or snap/bayonet
+joints on caps and jars, >= 45 deg conical transition shoulders on necked vessels so internal
+cavities are continuous and self-supporting without flat internal roofs, lead-in chamfers, and
+mating clearances). Avoid unrequested purely decorative ornaments, but never omit functional
+mechanics. When a reference image is provided, use it for shape and proportion while keeping
+stated dimensions exact."""
 
 # Single source of truth for parameter formatting and units.
 # OpenSCAD syntax, EPS cutter conventions, manifold union, and difference rules
 # are fully defined in the attached Playbook.
 _GOLDEN_RULES = """\
 - Units: millimeters for linear dimensions, degrees for angles.
+- Code language: always write OpenSCAD code (parameter names, module/function identifiers,
+  Customizer labels, and comments in model.scad) in English by default, regardless of the user's chat language.
 - Parameters: declare every numeric dimension, angle, clearance, and count at the
   top of model.scad as an UPPER_CASE parameter with a unit-and-purpose comment
   (e.g. ``PLATE_LENGTH = 120.0; // mm, X span of the base plate``).
-- Geometry & syntax: adhere to EPS cutter clearance, manifold union, and difference
-  rules defined in the attached Playbook."""
+- Geometry & Playbook: use the attached Playbook (<openscad_cli_playbook>) as a practical
+  reference for OpenSCAD syntax, EPS cutter clearance, manifold rules, and helpers while
+  adapting designs creatively to the task."""
+
+_HARDWARE_AND_MATERIAL_RULES = """\
+- Material-aware tolerances & walls (explicit user prompt material always overrides <user_preferences>):
+  * PLA: radial mating/thread clearance 0.20-0.25 mm (0.40-0.50 mm diametral), min wall 1.2-1.6 mm, max unsupported overhang 45 deg.
+  * PETG: higher friction and layer adhesion; use radial thread/sliding clearance 0.30-0.40 mm (0.60-0.80 mm diametral), min wall 1.6-2.0 mm, generous lead-in chamfers, and >= 45 deg transition cones to prevent internal bridging/fusion.
+  * ABS / ASA: account for thermal shrinkage; use radial clearance 0.25-0.35 mm, min wall 1.6-2.0 mm, and filleted internal corners to prevent warping/delamination.
+  * TPU / Flex: use 0.10-0.20 mm press-fit clearance and >= 2.0 mm walls unless designing a thin living hinge or gasket.
+- Nozzle-aware wall & feature sizing: scale minimum wall thicknesses and fine features to multiples of the nozzle diameter / line width when specified in <user_preferences> (e.g. for a 0.6 mm nozzle with ~0.62-0.65 mm line width, design load-bearing walls >= 1.8 mm (3 perimeters) or thin walls >= 1.25 mm (2 perimeters), avoid thin features < 0.65 mm, and account for coarser Z layer steps of 0.20-0.36 mm on vertical clearances and shallow slopes).
+- Printer build volume: keep single parts and plate_layout arrangements within the target printer's build envelope when specified."""
 
 _OPERATIONAL_RULES = """\
 - Edit only the active project's model.scad.
+- Plan coordinates concisely, build early: Verify Z-stacking continuity (e.g. body + conical
+  shoulder + neck), continuous internal cavity spans, and centered grid offsets
+  (e.g. ``-(N - 1) * PITCH / 2``) with brief, exact arithmetic before calling ``write_file``.
+  Decouple conflicting features into separate spatial zones and let ``cad_build`` verify geometry.
 - Multi-variant & multi-part models: When multiple components or variants are requested,
-  declare a top-level Customizer parameter: ``PART_TYPE = "ALL"; // [ALL, 50, 15, 5]``.
-  Arrange components side-by-side with clear spacing (dx >= (width_1 + width_2)/2 + 10 mm)
-  and support isolating single components (e.g. ``PART_TYPE = "50";``).
-- Fine detail verification: Use ``crop=[ymin, xmin, ymax, xmax]`` and ``resolution=1024``
-  in ``cad_build`` or ``get_view_images`` to inspect fine features and debossed text.
+  declare a top-level Customizer selector (e.g. ``PART_TYPE = "ALL";``) and arrange parts
+  side-by-side with >= 10 mm clearance following the Playbook's ``plate_layout`` pattern, with
+  every independent part resting flat on the build plate (``min_z = 0``).
 - Tool workflow:
-  * Create new models directly with ``write_file``.
-  * Modify existing code incrementally with ``edit_file`` (using ``old_string`` and ``new_string``, or ``edits`` for batch changes).
-  * Build, inspect physical metrics, and verify geometry in one step with ``cad_build(views=['isometric'])``.
-  * Inspect additional camera angles without rebuilding via ``get_view_images``.
+  * Create new models directly with ``write_file``. For complex or multi-part assemblies, scaffold iteratively: write and build the core geometry and layout first, then add secondary features with ``edit_file``.
+  * Modify existing code incrementally with ``edit_file``. When multiple edits have accumulated across turns, call ``read_file`` to inspect the current file directly.
+  * Build, inspect metrics, and verify geometry in one step with ``cad_build(views=['isometric', 'front', 'top'])``. On build or verification failure, fix model.scad and rebuild.
+  * When the user reports a visual or spatial defect (e.g. a floating part, missing/off-center hole, sealed opening, or misaligned feature), call ``get_view_images(views=['front', 'top', 'isometric'])`` (or ``views=['all']``) to inspect the rendered geometry before editing model.scad.
+  * Inspect additional camera angles without rebuilding via ``get_view_images``, or zoom into fine details/text with ``crop=[ymin, xmin, ymax, xmax]`` and ``resolution=1024``.
   * Clarify blocking physical contradictions with a single batched ``question``.
-- Dimensions: Preserve explicit user dimensions as authoritative. Infer unstated dimensions
-  from standard hardware practices (fastener clearances, wall thicknesses) and disclose all
-  assumptions in the final reply.
 - Verification requirement: A task is ready only after model.scad compiles and passes
   ``cad_build`` without critical verification issues.
 - Response style: Keep final answers concise and factual (1-3 sentences or clear bullet points),
-  stating what was created, confirmed dimensions, and notable assumptions."""
-
-_OPENSCAD_RULES = """\
-- On build failure, inspect the compiler error location, edit model.scad to resolve it, and rebuild.
-- Validate dimensions, volume, solid count, and manifoldness against requirements.
-- Follow the attached Playbook (<openscad_cli_playbook>) as the authoritative reference for
-  variable scope, loop semantics, hull()/offset() replacements, and standard helpers."""
+  stating what was created, confirmed dimensions, and any notable assumptions."""
 
 # Ordered list of (section_tag, body) pairs. Adding or reordering a section is a
 # one-line change here; the render loop below produces the final prompt.
@@ -75,23 +85,19 @@ _PROMPT_SECTIONS: list[tuple[str, str]] = [
     ),
     ("design_principles", _DESIGN_PRINCIPLES),
     ("golden_rules", _GOLDEN_RULES),
-    ("openscad_rules", _OPENSCAD_RULES),
+    ("hardware_and_material_rules", _HARDWARE_AND_MATERIAL_RULES),
     ("operational_rules", _OPERATIONAL_RULES),
 ]
 
-_STATIC_BUNDLE_TAG = "<!-- StaticBundle:v5.3 -->"
-
-# Template-driven render keeps section markers, the bundle tag, and the optional
-# playbook suffix in one consistent style — no f-string brace escaping is needed
-# when adding a new section.
+# Template-driven render keeps section markers and the optional playbook suffix
+# in one consistent style — no f-string brace escaping is needed when adding a section.
 _BASE_PROMPT_TEMPLATE = Template(
-    "$bundle_tag\n" + "\n".join(f"<{tag}>\n${tag}\n</{tag}>" for tag, _ in _PROMPT_SECTIONS)
+    "\n".join(f"<{tag}>\n${tag}\n</{tag}>" for tag, _ in _PROMPT_SECTIONS)
 )
 
 
 def _render_base_prompt() -> str:
     return _BASE_PROMPT_TEMPLATE.substitute(
-        bundle_tag=_STATIC_BUNDLE_TAG,
         **{tag: body.strip() for tag, body in _PROMPT_SECTIONS},
     )
 
@@ -201,7 +207,8 @@ PROJECT_STATE_EXISTS_WITH_CONTENT_TEMPLATE = (
     "```scad\n"
     "{content}\n"
     "```\n"
-    "Inspect it directly. Do not call read_file unless needed.\n"
+    "Inspect it directly; call read_file only after multiple edits have diverged the file from this initial snapshot. "
+    "If the user reports a visual or spatial defect, call get_view_images(views=['front', 'top', 'isometric']) to inspect the rendered views alongside the code before editing.\n"
     "</project_state>"
 )
 
@@ -213,31 +220,63 @@ PROJECT_STATE_EXISTS_TEMPLATE = (
 
 PROJECT_STATE_MISSING_TEMPLATE = (
     "<project_state>\n"
-    "{filename} does not exist. Create it directly with write_file; do not "
-    "call read_file, edit_file, or cad_build first.\n"
+    "{filename} does not exist. Keep reasoning to a concise structural outline—verify key "
+    "Z-stack boundaries, continuous cavity spans, and symmetry offsets—and create {filename} "
+    "immediately with write_file (do not call read_file, edit_file, or cad_build first).\n"
     "</project_state>"
 )
 
 
+def clean_preference_string(val: str | None, max_len: int = 80) -> str:
+    """Sanitize user hardware/filament preference strings for prompt injection."""
+    if not val or not isinstance(val, str):
+        return ""
+    cleaned = "".join(ch if ch.isprintable() and ch not in "<>" else " " for ch in val)
+    return " ".join(cleaned.split())[:max_len]
+
+
 def format_project_state(
-    exists: bool, filename: str = "model.scad", content: str = ""
+    exists: bool,
+    filename: str = "model.scad",
+    content: str = "",
+    *,
+    user_printer: str = "",
+    user_nozzle: str = "",
+    user_filament: str = "",
 ) -> str:
     """Format the workspace state message appended after the cacheable system prefix."""
     if not exists:
-        return PROJECT_STATE_MISSING_TEMPLATE.format(filename=filename)
-    if content.strip():
-        return PROJECT_STATE_EXISTS_WITH_CONTENT_TEMPLATE.format(
+        state_block = PROJECT_STATE_MISSING_TEMPLATE.format(filename=filename)
+    elif content.strip():
+        state_block = PROJECT_STATE_EXISTS_WITH_CONTENT_TEMPLATE.format(
             filename=filename, content=content.rstrip()
         )
-    return PROJECT_STATE_EXISTS_TEMPLATE.format(filename=filename)
+    else:
+        state_block = PROJECT_STATE_EXISTS_TEMPLATE.format(filename=filename)
+
+    printer_clean = clean_preference_string(user_printer)
+    nozzle_clean = clean_preference_string(user_nozzle)
+    filament_clean = clean_preference_string(user_filament)
+    if printer_clean or nozzle_clean or filament_clean:
+        pref_lines = ["<user_preferences>"]
+        if printer_clean:
+            pref_lines.append(f"Target 3D Printer: {printer_clean}")
+        if nozzle_clean:
+            pref_lines.append(f"Nozzle Configuration: {nozzle_clean}")
+        if filament_clean:
+            pref_lines.append(f"Default Filament Material: {filament_clean}")
+        pref_lines.append(
+            "Apply the matching printer build volume, nozzle line-width/wall multiples, and material clearances "
+            "from <hardware_and_material_rules> unless the user's message explicitly requests a different material or configuration."
+        )
+        pref_lines.append("</user_preferences>")
+        return state_block + "\n" + "\n".join(pref_lines)
+    return state_block
 
 
 # Synthetic Nudges & Reminders (role: user nudges during agent loop)
 NUDGE_UNVERIFIED_MODEL_TEMPLATE = (
-    "{filename} exists but has not been built. Call cad_build now."
-)
-NUDGE_FINAL_VERIFICATION = (
-    "Build and verification required before finalizing. Call cad_build."
+    "{filename} exists but has not been built. Call cad_build(views=['isometric', 'front', 'top']) now."
 )
 NUDGE_CAD_FIX_REQUIRED = (
     "CAD build succeeded, but geometry verification reported critical issues. "
@@ -265,8 +304,10 @@ def format_budget_warning_nudge(remaining: int, filename: str = "model.scad") ->
 
 # Multimodal Visual Inspection Prompt (wrapped around relocated tool images)
 TOOL_IMAGE_PROMPT = (
-    "The attached image is the visual artifact returned by the latest tool "
-    "call. Inspect it and continue the task."
+    "Rendered view(s) from the preceding tool call. Visually verify: "
+    "(1) no component floats in mid-air above Z=0, "
+    "(2) hollow vessels have an unobstructed through-opening from neck to body, and "
+    "(3) hole patterns and mating features are centered and symmetric:"
 )
 
 
@@ -274,7 +315,10 @@ TOOL_IMAGE_PROMPT = (
 TOOL_HINTS = {
     "INVALID_TOOL_ARGUMENTS": "Send valid JSON arguments conforming strictly to the tool schema.",
     "REVISION_INTEGRITY": "Inspect the latest file content before retrying edits.",
-    "TIMEOUT": "Simplify geometry or reduce $fn to accelerate compilation.",
+    "TIMEOUT": (
+        "OpenSCAD compilation timed out. Avoid 3D minkowski(), hull() loops over spheres, "
+        "or high-slice linear_extrude(twist=...). Keep $fn <= 48 and slices <= turns*18 for threads."
+    ),
     "MODEL_MISSING": "Create {filename} with write_file before calling other tools.",
     "CAD_BUILD_FAILED": "Inspect the compiler error output, fix syntax or geometry in {filename}, then rebuild.",
     "CAD_CGAL_ERROR": (
@@ -315,47 +359,44 @@ TOOL_DESCRIPTIONS = {
             "for a single replacement, or edits for multiple atomic replacements."
         ),
         "old_string": "Exact text in model.scad to replace.",
-        "new_string": "Replacement text (use empty string to delete).",
-        "edits": "Optional list of {old_string, new_string} replacements to apply atomically.",
+        "new_string": "Replacement text (empty string to delete).",
+        "edits": "Batch list of {old_string, new_string} replacements applied atomically.",
     },
     "cad_build": {
         "description": (
-            "Compile model.scad into 3D preview (STL), render images, and verify geometry in the sandbox. "
-            "Produces physical dimensions, volume, and deterministic quality validation (manifoldness, "
-            "watertightness, $fn, EPS rules, risk score). Pass optional 'views' (e.g. ['isometric'], ['all']) "
-            "to inspect renders in the same turn. Supports 'resolution' (512 or 1024) and 'crop' [ymin, xmin, ymax, xmax] "
-            "to zoom into fine details."
+            "Compile model.scad into 3D preview (STL), render views, and verify geometry "
+            "(dimensions, volume, solid count, manifoldness, $fn, EPS rules). "
+            "Pass views=['isometric'] for standard one-step build and visual verification."
         ),
         "views": (
-            "Optional view list to return immediately (e.g. ['isometric'], ['all']). "
+            "Views to return as images in this turn (e.g. ['isometric'], ['all']). "
             "If omitted, returns only geometric metrics."
         ),
-        "resolution": "Optional render resolution: 512 (default) or 1024 for high detail.",
-        "crop": "Optional normalized crop box [ymin, xmin, ymax, xmax] (0.0 to 1.0) to zoom into a sub-region.",
+        "resolution": "Render resolution: 512 (default) or 1024 for fine detail.",
+        "crop": "Normalized crop box [ymin, xmin, ymax, xmax] (0.0 to 1.0) to zoom into a sub-region.",
     },
     "get_view_images": {
         "description": (
-            "Retrieve visual render image(s) from a previously completed cad_build. Options: 'all' (composite "
-            "contact sheet showing all 8 views, default), 'isometric', 'top', 'bottom', "
-            "'front', 'back', 'left', 'right'. Pass optional 'crop' [ymin, xmin, ymax, xmax] to zoom in. "
-            "Requires a successful cad_build; to compile or re-render, call cad_build(views=[...])."
+            "Retrieve rendered view image(s) from the latest cad_build without recompiling. "
+            "Valid views: 'all' (8-view contact sheet, default), 'isometric', 'isometric_negative', "
+            "'top', 'bottom', 'front', 'back', 'left', 'right'."
         ),
-        "views": "List of views to inspect. Defaults to ['all'].",
-        "crop": "Optional normalized crop box [ymin, xmin, ymax, xmax] (0.0 to 1.0) to zoom into a sub-region.",
+        "views": "List of views to inspect (defaults to ['all']).",
+        "crop": "Normalized crop box [ymin, xmin, ymax, xmax] (0.0 to 1.0) to zoom into a sub-region.",
     },
     "question": {
         "description": (
-            "Ask all blocking clarification questions together, then stop and wait. "
-            "``input_type`` defaults to ``text``; pass ``select`` or ``multiselect`` "
-            "for choice questions. ``required`` defaults to ``true``."
+            "Ask blocking clarification questions in a single batch, then stop and wait. "
+            "Use ONLY when conflicting or missing requirements make it impossible to proceed; "
+            "otherwise infer standard dimensions."
         ),
         "title": "Optional short heading.",
-        "questions": "Blocking questions to present in one form (max 3 per batch).",
+        "questions": "Blocking questions to present in one form (max 3).",
         "id": "Short key, such as hole_diameter.",
         "question": "Direct user-facing question.",
-        "input_type": "Answer control; defaults to text.",
-        "options": "Required for select and multiselect.",
-        "required": "Whether an answer is mandatory; defaults to true.",
+        "input_type": "Control type: 'text' (default), 'number', 'select', or 'multiselect'.",
+        "options": "Choices list (required for 'select' and 'multiselect').",
+        "required": "Whether an answer is mandatory (defaults to true).",
     },
 }
 

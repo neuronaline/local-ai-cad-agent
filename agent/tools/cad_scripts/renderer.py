@@ -218,56 +218,74 @@ def _shade_pixels(
     diffuse = np.maximum(0.0, np.dot(unit_normals, light))
     colors = np.clip(_BASE_COLOR * (0.48 + 0.52 * diffuse[:, None]), 0, 255).astype(np.uint8)
 
-    # 4. Rasterize candidate front-facing triangles
-    for idx in cand_indices:
-        triangle = triangles[idx]
-        points = screen_vertices[triangle]
-        min_xy = points.min(axis=0)
-        max_xy = points.max(axis=0)
-        if min_xy[0] >= width or min_xy[1] >= height or max_xy[0] < 0 or max_xy[1] < 0:
-            continue
-        x0 = max(int(np.floor(min_xy[0])), 0)
-        y0 = max(int(np.floor(min_xy[1])), 0)
-        x1 = min(int(np.ceil(max_xy[0])), width - 1)
-        y1 = min(int(np.ceil(max_xy[1])), height - 1)
-        if x1 < x0 or y1 < y0:
-            continue
+    # 4. Rasterize candidate front-facing triangles (vectorized setup + slice broadcasting)
+    if len(cand_indices) > 0:
+        cand_tris = triangles[cand_indices]
+        cand_pts = screen_vertices[cand_tris]
+        p0 = cand_pts[:, 0, :]
+        p1 = cand_pts[:, 1, :]
+        p2 = cand_pts[:, 2, :]
 
-        p0, p1, p2 = points
-        denominator = (p1[1] - p2[1]) * (p0[0] - p2[0]) + (p2[0] - p1[0]) * (
-            p0[1] - p2[1]
+        min_xy = np.min(cand_pts, axis=1)
+        max_xy = np.max(cand_pts, axis=1)
+        x0_arr = np.maximum(np.floor(min_xy[:, 0]).astype(np.int32), 0)
+        y0_arr = np.maximum(np.floor(min_xy[:, 1]).astype(np.int32), 0)
+        x1_arr = np.minimum(np.ceil(max_xy[:, 0]).astype(np.int32), width - 1)
+        y1_arr = np.minimum(np.ceil(max_xy[:, 1]).astype(np.int32), height - 1)
+
+        denom_arr = (p1[:, 1] - p2[:, 1]) * (p0[:, 0] - p2[:, 0]) + (
+            p2[:, 0] - p1[:, 0]
+        ) * (p0[:, 1] - p2[:, 1])
+
+        valid_mask = (
+            (min_xy[:, 0] < width)
+            & (min_xy[:, 1] < height)
+            & (max_xy[:, 0] >= 0)
+            & (max_xy[:, 1] >= 0)
+            & (x1_arr >= x0_arr)
+            & (y1_arr >= y0_arr)
+            & (np.abs(denom_arr) >= 1e-12)
         )
-        if abs(denominator) < 1e-12:
-            continue
+        valid_pos = np.where(valid_mask)[0]
+        xs_full = (np.arange(width, dtype=np.float64) + 0.5)[None, :]
+        ys_full = (np.arange(height, dtype=np.float64) + 0.5)[:, None]
 
-        grid_y, grid_x = np.mgrid[y0 : y1 + 1, x0 : x1 + 1]
-        sample_x = grid_x + 0.5
-        sample_y = grid_y + 0.5
-        weight0 = (
-            (p1[1] - p2[1]) * (sample_x - p2[0])
-            + (p2[0] - p1[0]) * (sample_y - p2[1])
-        ) / denominator
-        weight1 = (
-            (p2[1] - p0[1]) * (sample_x - p2[0])
-            + (p0[0] - p2[0]) * (sample_y - p2[1])
-        ) / denominator
-        weight2 = 1.0 - weight0 - weight1
-        inside = (weight0 >= -1e-7) & (weight1 >= -1e-7) & (weight2 >= -1e-7)
+        for k in valid_pos:
+            idx = cand_indices[k]
+            x0 = int(x0_arr[k])
+            y0 = int(y0_arr[k])
+            x1 = int(x1_arr[k])
+            y1 = int(y1_arr[k])
+            p0x, p0y = float(p0[k, 0]), float(p0[k, 1])
+            p1x, p1y = float(p1[k, 0]), float(p1[k, 1])
+            p2x, p2y = float(p2[k, 0]), float(p2[k, 1])
+            inv_denom = 1.0 / float(denom_arr[k])
 
-        triangle_depths = depths[triangle]
-        depth = (
-            weight0 * triangle_depths[0]
-            + weight1 * triangle_depths[1]
-            + weight2 * triangle_depths[2]
-        )
-        target_depth = depth_buffer[y0 : y1 + 1, x0 : x1 + 1]
-        visible = inside & (depth > target_depth)
-        if not np.any(visible):
-            continue
+            sample_x = xs_full[:, x0 : x1 + 1]
+            sample_y = ys_full[y0 : y1 + 1, :]
+            weight0 = (
+                (p1y - p2y) * (sample_x - p2x) + (p2x - p1x) * (sample_y - p2y)
+            ) * inv_denom
+            weight1 = (
+                (p2y - p0y) * (sample_x - p2x) + (p0x - p2x) * (sample_y - p2y)
+            ) * inv_denom
+            weight2 = 1.0 - weight0 - weight1
+            inside = (weight0 >= -1e-7) & (weight1 >= -1e-7) & (weight2 >= -1e-7)
 
-        target_depth[visible] = depth[visible]
-        pixels[y0 : y1 + 1, x0 : x1 + 1][visible] = colors[idx]
-        normal_buffer[y0 : y1 + 1, x0 : x1 + 1][visible] = unit_normals[idx]
+            t0, t1, t2 = cand_tris[k]
+            depth = (
+                weight0 * float(depths[t0])
+                + weight1 * float(depths[t1])
+                + weight2 * float(depths[t2])
+            )
+            target_depth = depth_buffer[y0 : y1 + 1, x0 : x1 + 1]
+            visible = inside & (depth > target_depth)
+            if not np.any(visible):
+                continue
+
+            target_depth[visible] = depth[visible]
+            pixels[y0 : y1 + 1, x0 : x1 + 1][visible] = colors[idx]
+            normal_buffer[y0 : y1 + 1, x0 : x1 + 1][visible] = unit_normals[idx]
 
     # 5. Image-space feature crease and depth step enhancement
     fg_mask = depth_buffer > -1e20

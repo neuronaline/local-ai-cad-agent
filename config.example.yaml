@@ -11,11 +11,13 @@ llm:
   # Optional backup provider (same forms as `provider`, e.g. "vertex"), used
   # once if the primary fails after its own retries. Must differ from provider.
   fallback_provider: ""
-  max_completion_tokens: 65536
+  # Optional limit across providers (Gemini API enforces maxOutputTokens <= 65535).
+  # Defaults to 16384 when omitted.
+  # max_completion_tokens: 16384
 
 # ── 2. Providers & Per-Model Settings ────────────────────────────────────────
 # Each provider groups its own connection settings and models in one place.
-# Every model can define its own `reasoning_effort` ("" | minimal | low | medium | high).
+# Every model can define its own `reasoning_effort` ("" | none | minimal | low | medium | high | xhigh | max).
 # Models configured below appear automatically in the Web UI model picker.
 # Optional provider keys (shown values are defaults where applicable):
 #   all:        base_url, timeout_seconds, reasoning_effort (default for its models)
@@ -89,3 +91,9 @@ viewer:
 review:
   render_workers: 4
   required_views: 8
+
+# ── 4. User 3D Printing Setup ────────────────────────────────────────────────
+user:
+  printer: ""                   # 3D printer / device model (e.g. Bambu Lab A1, Prusa MK4, Ender 3)
+  nozzle: "0.4 mm"              # Nozzle type & diameter (e.g. Stainless Steel 0.6 mm, Hardened Steel 0.4 mm, Brass 0.4 mm)
+  filament: PLA                 # Favorite filament material (PLA, PETG, ABS, ASA, TPU, etc.)

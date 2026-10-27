@@ -240,7 +240,16 @@ def dispatch(
         if not views and crop:
             views = ["all"]
         mode = RenderMode.FULL_REVIEW
-        raw_build = cad.build(mode=mode, resolution=resolution)
+        selective_views = (
+            views
+            if (resolution > 512 and views and "all" not in [v.lower() for v in views])
+            else None
+        )
+        raw_build = cad.build(
+            mode=mode,
+            requested_views=selective_views,
+            resolution=resolution,
+        )
         if views:
             try:
                 view_req: dict[str, object] = {"views": views}

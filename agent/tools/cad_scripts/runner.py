@@ -90,14 +90,19 @@ def _declared_parameters(model_code: str) -> list[dict[str, Any]]:
     return parameters
 
 
-def _count_disconnected_solids(triangles: np.ndarray) -> int:
-    """Return number of disconnected mesh components beyond the first."""
+def _analyze_connected_components(
+    vertices: np.ndarray, triangles: np.ndarray
+) -> tuple[int, list[float], int]:
+    """Analyze connected triangle components and return (disconnected_count, solids_min_z, floating_solid_count)."""
     if len(triangles) == 0:
-        return 0
-    # Map edges to triangle indices
+        return 0, [], 0
     edges_to_tris: dict[tuple[int, int], list[int]] = {}
     for idx, (v0, v1, v2) in enumerate(triangles):
-        for e in ((min(v0, v1), max(v0, v1)), (min(v1, v2), max(v1, v2)), (min(v2, v0), max(v2, v0))):
+        for e in (
+            (min(v0, v1), max(v0, v1)),
+            (min(v1, v2), max(v1, v2)),
+            (min(v2, v0), max(v2, v0)),
+        ):
             edges_to_tris.setdefault(e, []).append(idx)
 
     parent = list(range(len(triangles)))
@@ -119,8 +124,35 @@ def _count_disconnected_solids(triangles: np.ndarray) -> int:
             for other in tri_list[1:]:
                 union(first, other)
 
-    roots = {find(i) for i in range(len(triangles))}
-    return max(0, len(roots) - 1)
+    comp_tris: dict[int, list[int]] = {}
+    for i in range(len(triangles)):
+        comp_tris.setdefault(find(i), []).append(i)
+
+    disconnected_count = max(0, len(comp_tris) - 1)
+    if len(vertices) == 0:
+        return disconnected_count, [], 0
+
+    comp_min_zs: list[float] = []
+    for tri_indices in comp_tris.values():
+        comp_verts = triangles[tri_indices].ravel()
+        comp_min_zs.append(float(np.min(vertices[comp_verts, 2])))
+
+    comp_min_zs.sort()
+    solids_min_z = [round(z, 3) for z in comp_min_zs]
+    if len(comp_min_zs) <= 1:
+        return disconnected_count, solids_min_z, 0
+
+    base_z = comp_min_zs[0]
+    floating_solid_count = sum(1 for z in comp_min_zs if z > base_z + 0.5)
+    return disconnected_count, solids_min_z, floating_solid_count
+
+
+def _count_disconnected_solids(triangles: np.ndarray) -> int:
+    """Return number of disconnected mesh components beyond the first."""
+    disconnected_count, _, _ = _analyze_connected_components(
+        np.empty((0, 3), dtype=np.float64), triangles
+    )
+    return disconnected_count
 
 
 def mesh_metrics(vertices: np.ndarray, triangles: np.ndarray) -> dict[str, Any]:
@@ -158,7 +190,9 @@ def mesh_metrics(vertices: np.ndarray, triangles: np.ndarray) -> dict[str, Any]:
     boundary_edges = sum(1 for count in edges.values() if count == 1)
     multi_face_edges = sum(1 for count in edges.values() if count > 2)
 
-    disconnected_count = _count_disconnected_solids(triangles)
+    disconnected_count, solids_min_z, floating_solid_count = _analyze_connected_components(
+        vertices, triangles
+    )
     solid_count = max(1, disconnected_count + 1)
     is_valid = volume > 0 and dim_x > 0 and dim_y > 0 and dim_z > 0
 
@@ -219,6 +253,8 @@ def mesh_metrics(vertices: np.ndarray, triangles: np.ndarray) -> dict[str, Any]:
             "z": round(dim_z, 3),
         },
         "disconnected_solid_count": disconnected_count,
+        "floating_solid_count": floating_solid_count,
+        "solids_min_z": solids_min_z,
         "boundary_edges": boundary_edges,
         "multi_face_edges": multi_face_edges,
         "vertex_count": len(vertices),
@@ -275,6 +311,23 @@ def _run_model(
                 check=False,
             )
             ret, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
+        except subprocess.TimeoutExpired:
+            uncommented = re.sub(r"//[^\n]*|/\*[\s\S]*?\*/", "", model_code)
+            culprits: list[str] = []
+            if re.search(r"\bminkowski\s*\(", uncommented):
+                culprits.append("minkowski()")
+            if re.search(r"\blinear_extrude\s*\([^)]*\btwist\s*=", uncommented):
+                culprits.append("twisted linear_extrude() (keep $fn <= 36 and slices <= turns*18)")
+            if re.search(r"\bhull\s*\(", uncommented) and re.search(r"\bfor\s*\(", uncommented):
+                culprits.append("hull() inside for() loops")
+            hint_suffix = (
+                f" Likely culprits in model.scad: {', '.join(culprits)}."
+                if culprits
+                else " Reduce $fn (<= 36) and simplify boolean differences."
+            )
+            raise RuntimeError(
+                f"OpenSCAD compilation timed out after {_OPENSCAD_TIMEOUT_SECONDS} seconds.{hint_suffix}"
+            ) from None
         except (subprocess.SubprocessError, OSError) as exc:
             ret, stdout, stderr = 1, "", str(exc)
 

@@ -64,7 +64,10 @@ class OpenAIClient(ChatCompletionsClient):
             effort = self.settings.openai_reasoning_effort
             if effort == "minimal":
                 effort = "low"
-            payload["reasoning_effort"] = effort
+            elif effort in ("xhigh", "max"):
+                effort = "high"
+            if effort != "none":
+                payload["reasoning_effort"] = effort
         return payload
 
     @staticmethod

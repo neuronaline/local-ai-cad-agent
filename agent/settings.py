@@ -12,7 +12,7 @@ import yaml
 _LOG = logging.getLogger(__name__)
 _WARNED_KEYS: set[str] = set()
 
-REASONING_EFFORTS = {"minimal", "low", "medium", "high"}
+REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 LLM_PROVIDERS = {
     "openrouter",
     "openai",
@@ -93,7 +93,7 @@ class Settings:
     workspace_root: Path = Path("/tmp/cad_workspace")
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_model: str = ""
-    openrouter_timeout_seconds: int = 90
+    openrouter_timeout_seconds: int = 300
     host: str = "127.0.0.1"
     port: int = 8000
     openrouter_app_title: str = "Local AI CAD Agent"
@@ -122,17 +122,17 @@ class Settings:
     # OpenAI Chat Completions adapter.
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = ""
-    openai_timeout_seconds: int = 60
+    openai_timeout_seconds: int = 300
     openai_reasoning_effort: str | None = None
     # Ollama local Chat Completions adapter.
     ollama_base_url: str = "http://localhost:11434/v1"
     ollama_model: str = "qwen3.8:27b"
-    ollama_timeout_seconds: int = 120
+    ollama_timeout_seconds: int = 300
     ollama_reasoning_effort: str | None = None
     # Gemini / Google AI Studio Interactions API adapter.
     gemini_base_url: str = "https://generativelanguage.googleapis.com"
     gemini_model: str = "gemini-3.8-flash"
-    gemini_timeout_seconds: int = 90
+    gemini_timeout_seconds: int = 300
     gemini_reasoning_effort: str | None = None
     gemini_store: bool = True
     gemini_auth_mode: str = "api_key"  # "api_key" | "gcloud"
@@ -142,7 +142,7 @@ class Settings:
     vertex_project_id: str = ""
     vertex_location: str = "us-central1"
     vertex_model: str = "gemini-3.8-flash"
-    vertex_timeout_seconds: int = 90
+    vertex_timeout_seconds: int = 300
     vertex_reasoning_effort: str | None = None
     # ── end provider selection ──
     show_info_messages: bool = True
@@ -168,7 +168,10 @@ class Settings:
     # is the cell count per side. Defaults match the previous hard-coded grid.
     viewer_grid_size: float = 200.0
     viewer_grid_divisions: int = 20
-    llm_max_completion_tokens: int | None = 65536
+    llm_max_completion_tokens: int | None = 16384
+    user_printer: str = ""
+    user_nozzle: str = ""
+    user_filament: str = "PLA"
     # ── Configured model catalog ──
     available_models: tuple[ModelOption, ...] = ()
 
@@ -319,7 +322,9 @@ def _validate_port(value: Any, name: str) -> int:
     return port
 
 
-def _validate_timeout_seconds(value: Any, name: str) -> int:
+def _validate_timeout_seconds(value: Any, name: str, default: int = 300) -> int:
+    if value is None or value == "":
+        return default
     return _positive_int(value, name)
 
 
@@ -489,6 +494,8 @@ def load_settings(project_root: Path | None = None) -> Settings:
     review = config.get("review") or {}
     viewer = config.get("viewer") or {}
     viewer_grid = viewer.get("grid") or {} if isinstance(viewer, dict) else {}
+    user_cfg = config.get("user") or {}
+    _reject_unknown(user_cfg, {"printer", "nozzle", "filament"}, "user")
     _reject_unknown(
         ollama,
         {"base_url", "model", "models", "timeout_seconds", "reasoning_effort", "think"},
@@ -675,7 +682,7 @@ def load_settings(project_root: Path | None = None) -> Settings:
     settings = Settings(
         workspace_root=Path(config.get("workspace_root", "~/CAD-Agent-Projects")).expanduser(),
         openrouter_base_url=str(openrouter.get("base_url", "https://openrouter.ai/api/v1")).rstrip("/"),
-        openrouter_timeout_seconds=_validate_timeout_seconds(openrouter.get("timeout_seconds", 90), "openrouter.timeout_seconds"),
+        openrouter_timeout_seconds=_validate_timeout_seconds(openrouter.get("timeout_seconds"), "openrouter.timeout_seconds"),
         host=str(server.get("host", "127.0.0.1")),
         port=_validate_port(server.get("port", 8000), "server.port"),
         openrouter_app_title=str(openrouter.get("app_title", "Local AI CAD Agent")),
@@ -691,13 +698,13 @@ def load_settings(project_root: Path | None = None) -> Settings:
         llm_provider=llm_provider,
         llm_fallback_provider=llm_fallback_provider,
         openai_base_url=str(openai.get("base_url", "https://api.openai.com/v1")).rstrip("/"),
-        openai_timeout_seconds=_validate_timeout_seconds(openai.get("timeout_seconds", 60), "openai.timeout_seconds"),
+        openai_timeout_seconds=_validate_timeout_seconds(openai.get("timeout_seconds"), "openai.timeout_seconds"),
         openai_reasoning_effort=provider_defaults["openai"].reasoning_effort,
         ollama_base_url=str(ollama.get("base_url") or "http://localhost:11434/v1").rstrip("/"),
-        ollama_timeout_seconds=_validate_timeout_seconds(ollama.get("timeout_seconds") or 120, "ollama.timeout_seconds"),
+        ollama_timeout_seconds=_validate_timeout_seconds(ollama.get("timeout_seconds"), "ollama.timeout_seconds"),
         ollama_reasoning_effort=ollama_reasoning_effort,
         gemini_base_url=str(gemini.get("base_url") or "https://generativelanguage.googleapis.com").rstrip("/"),
-        gemini_timeout_seconds=_validate_timeout_seconds(gemini.get("timeout_seconds") or 90, "gemini.timeout_seconds"),
+        gemini_timeout_seconds=_validate_timeout_seconds(gemini.get("timeout_seconds"), "gemini.timeout_seconds"),
         gemini_reasoning_effort=provider_defaults["gemini"].reasoning_effort,
         gemini_store=_strict_bool(gemini.get("store", True), "gemini.store"),
         gemini_auth_mode=_validate_auth_mode(gemini.get("auth_mode"), "gemini.auth_mode"),
@@ -705,7 +712,7 @@ def load_settings(project_root: Path | None = None) -> Settings:
         gemini_location=str(gemini.get("location") or "us-central1").strip(),
         vertex_project_id=str(vertex.get("project_id") or "").strip(),
         vertex_location=str(vertex.get("location") or "us-central1").strip(),
-        vertex_timeout_seconds=_validate_timeout_seconds(vertex.get("timeout_seconds") or 90, "vertex.timeout_seconds"),
+        vertex_timeout_seconds=_validate_timeout_seconds(vertex.get("timeout_seconds"), "vertex.timeout_seconds"),
         vertex_reasoning_effort=provider_defaults["vertex"].reasoning_effort,
         show_info_messages=_strict_bool(ui.get("show_info_messages", True), "ui.show_info_messages"),
         agent_tool_call_limit=_positive_int(agent.get("tool_call_limit", 25), "agent.tool_call_limit"),
@@ -722,8 +729,11 @@ def load_settings(project_root: Path | None = None) -> Settings:
         viewer_grid_size=grid_size,
         viewer_grid_divisions=grid_divisions,
         llm_max_completion_tokens=_optional_positive_int(
-            llm.get("max_completion_tokens", 65536), "llm.max_completion_tokens"
+            llm.get("max_completion_tokens", 16384), "llm.max_completion_tokens"
         ),
+        user_printer=str(user_cfg.get("printer") or "").strip(),
+        user_nozzle=str(user_cfg.get("nozzle") or "").strip(),
+        user_filament=str(user_cfg.get("filament") or "PLA").strip() or "PLA",
         available_models=tuple(catalog),
     )
     # Activate each provider's default model (its effort/routing override the
@@ -784,7 +794,9 @@ def _parse_provider_order(value: Any) -> tuple[str, ...]:
 def _optional_effort(value: Any) -> str | None:
     effort = _optional_string(value)
     if effort is not None and effort not in REASONING_EFFORTS:
-        raise ValueError("reasoning_effort must be minimal, low, medium, or high.")
+        raise ValueError(
+            "reasoning_effort must be none, minimal, low, medium, high, xhigh, or max."
+        )
     return effort
 
 

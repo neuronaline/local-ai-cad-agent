@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import atexit
 import json
+import logging
 import os
 import queue
+import random
 import re
+import socket
 import ssl
 import threading
 import time
@@ -24,6 +27,8 @@ import httpx
 from agent.activity_log import summarize_llm_messages
 from agent.prompt import TOOL_IMAGE_PROMPT
 from agent.settings import Settings, canonical_provider
+
+_LOG = logging.getLogger(__name__)
 
 PROVIDER_LABELS = {
     "openrouter": "OpenRouter",
@@ -39,15 +44,42 @@ PROVIDER_LABELS = {
     "gcloud": "Google Cloud Vertex AI (gcloud)",
 }
 
+
+def _build_http_client() -> httpx.Client:
+    """Create the shared HTTP/2 streaming client with TCP keep-alive enabled.
+
+    Long reasoning turns (e.g. ``reasoning_effort="high"``) and server-buffered
+    tool call payloads (such as 300+ line OpenSCAD ``write_file`` arguments)
+    can leave an open SSE stream silent for 60–180 seconds. Enabling OS-level
+    TCP keep-alive probes prevents NAT routers, firewalls, and upstream load
+    balancers from silently dropping the connection during thinking pauses.
+    """
+    limits = httpx.Limits(max_keepalive_connections=20, max_connections=50)
+    socket_options: list[tuple[int, int, int]] = [
+        (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+    ]
+    if hasattr(socket, "TCP_KEEPIDLE"):
+        socket_options.append((socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30))
+    if hasattr(socket, "TCP_KEEPINTVL"):
+        socket_options.append((socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10))
+    if hasattr(socket, "TCP_KEEPCNT"):
+        socket_options.append((socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 6))
+    try:
+        transport = httpx.HTTPTransport(
+            http2=True,
+            limits=limits,
+            socket_options=socket_options,
+        )
+        return httpx.Client(transport=transport, timeout=None)
+    except TypeError:
+        return httpx.Client(http2=True, limits=limits, timeout=None)
+
+
 # Module-level HTTP/2 client for streaming Chat Completions without HTTP/1.1
 # chunk-size reassembly buffering. HTTP/2 binary DATA frames multiplex over
 # a persistent connection, eliminating the standard library chunked transfer
 # accumulation defect (http.client._read_chunked with amt=None).
-_HTTP_CLIENT: httpx.Client = httpx.Client(
-    http2=True,
-    limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
-    timeout=None,
-)
+_HTTP_CLIENT: httpx.Client = _build_http_client()
 atexit.register(_HTTP_CLIENT.close)
 
 
@@ -320,7 +352,11 @@ def sanitize_assistant_message(
         if not sanitized.get("tool_calls") and extra_calls:
             sanitized["tool_calls"] = extra_calls
 
-    if not sanitized.get("tool_calls") and not (sanitized.get("content") or "").strip():
+    if (
+        not for_storage
+        and not sanitized.get("tool_calls")
+        and not (sanitized.get("content") or "").strip()
+    ):
         sanitized["content"] = "..."
 
     tool_calls = sanitized.get("tool_calls")
@@ -487,18 +523,30 @@ def sanitize_messages(
     """Strip only unsupported assistant metadata, retaining content and tools.
 
     When ``preserve_reasoning`` is set, ``reasoning`` / ``reasoning_details`` are
-    retained across all assistant turns so the prompt prefix remains strictly
-    append-only. Mutating historical turns by dropping reasoning from earlier
-    assistant messages breaks provider prompt caches (causing cache misses)
-    and causes input token counts to fluctuate erratically across iterations.
+    retained across all assistant turns in the active user run (after the last
+    non-synthetic user message) so the active tool-loop prefix remains strictly
+    append-only for provider prompt caches, while stale reasoning from prior
+    completed runs is dropped.
     """
+    last_user_idx = -1
+    for idx, message in enumerate(messages):
+        if message.get("role") == "user" and not message.get("synthetic"):
+            last_user_idx = idx
+
     cleaned: list[dict[str, Any]] = []
-    for message in messages:
+    for idx, message in enumerate(messages):
         if message.get("role") == "assistant":
+            is_aborted_stub = (
+                not message.get("tool_calls")
+                and (message.get("content") or "").strip() == "Task stopped."
+            )
+            keep_reasoning = (
+                preserve_reasoning and idx > last_user_idx and not is_aborted_stub
+            )
             cleaned.append(
                 sanitize_assistant_message(
                     message,
-                    preserve_reasoning=preserve_reasoning,
+                    preserve_reasoning=keep_reasoning,
                 )
             )
         else:
@@ -654,15 +702,51 @@ def _is_image_rejection(response: Any) -> bool:
     )
 
 
-def retry_delay(response: Any | None, attempt: int) -> float:
-    """Honor ``Retry-After`` when present, otherwise exponential backoff."""
+def retry_delay(response: Any | None, attempt: int, status_code: int | None = None) -> float:
+    """Honor ``Retry-After`` or server body hints when present; use jittered backoff for 429."""
+    code = status_code
     if response is not None:
-        retry_after = response.headers.get("Retry-After")
-        if retry_after:
-            try:
-                return max(0.0, float(retry_after))
-            except ValueError:
-                pass
+        if code is None:
+            code = getattr(response, "status_code", None)
+        headers = getattr(response, "headers", None)
+        if isinstance(headers, dict) or hasattr(headers, "get"):
+            retry_after = headers.get("Retry-After")
+            if retry_after:
+                try:
+                    return max(0.0, float(retry_after))
+                except ValueError:
+                    pass
+
+        # Check response body for Google RPC RetryInfo / details or error message hints
+        try:
+            body_text = _response_text(response)
+            if body_text:
+                if "{" in body_text:
+                    try:
+                        data = json.loads(body_text)
+                        if isinstance(data, dict):
+                            err = data.get("error") if isinstance(data.get("error"), dict) else data
+                            details = err.get("details") or []
+                            if isinstance(details, list):
+                                for detail in details:
+                                    if isinstance(detail, dict) and "retryDelay" in detail:
+                                        rd = str(detail["retryDelay"]).strip()
+                                        if rd.endswith("s"):
+                                            rd = rd[:-1]
+                                        return max(0.0, float(rd))
+                    except Exception:
+                        pass
+                match = re.search(r"retry\s+(?:after|in)\s+([0-9]+(?:\.[0-9]+)?)\s*(?:s|sec|seconds)?", body_text, re.I)
+                if match:
+                    return max(0.0, float(match.group(1)))
+        except Exception:
+            pass
+
+    if code == 429:
+        base = 3.0
+        jitter = random.uniform(0.5, 1.5)
+        return min(60.0, base * (2**attempt) + jitter)
+
     return float(2**attempt)
 
 
@@ -687,12 +771,13 @@ def post_with_cancel(
         try:
             req_headers = dict(headers)
             req_headers.setdefault("Accept", "text/event-stream")
+            connect_timeout = min(15.0, float(timeout_seconds))
             req = _HTTP_CLIENT.build_request(
                 "POST",
                 url,
                 headers=req_headers,
                 json=payload,
-                timeout=httpx.Timeout(timeout_seconds, connect=15.0),
+                timeout=httpx.Timeout(timeout_seconds, connect=connect_timeout),
             )
             response = _HTTP_CLIENT.send(req, stream=True)
         except BaseException as error:  # Propagate worker failures unchanged.
@@ -918,6 +1003,7 @@ def parse_chat_stream(
     provider_label: str,
     stop_event: threading.Event | None = None,
     stream_callback: Any | None = None,
+    idle_timeout: float = 90.0,
 ) -> dict[str, Any]:
     """Consume an SSE Chat Completions stream and rebuild a non-streaming response."""
     content = ""
@@ -926,6 +1012,7 @@ def parse_chat_stream(
     saw_done = False
     finish_reason: str | None = None
     finish_time: float | None = None
+    last_activity_time = time.monotonic()
     last_usage: dict[str, Any] | None = None
     reasoning_text = ""
     reasoning_details: list[dict[str, Any]] = []
@@ -937,8 +1024,6 @@ def parse_chat_stream(
     tag_buffer = ""
     tool_tag_buffer = ""
 
-    last_activity_time = time.monotonic()
-
     try:
         for raw_line in iter_lines_with_cancel(response, stop_event=stop_event):
             if stop_event and stop_event.is_set():
@@ -947,15 +1032,17 @@ def parse_chat_stream(
             now = time.monotonic()
             if raw_line is None:
                 if finish_reason is not None and finish_time is not None:
-                    if now - finish_time >= 1.0:
+                    if last_usage is not None or (now - finish_time) >= 1.0:
                         saw_done = True
                         break
-                # Inactivity guard: if content/tool/reasoning was already streamed
-                # and no chunk has arrived for 15s, treat stream as completed
-                if (content or tool_calls or reasoning_text) and (now - last_activity_time >= 15.0):
-                    saw_done = True
-                    break
+                elif idle_timeout > 0 and (now - last_activity_time) >= idle_timeout:
+                    _force_close_response(response)
+                    raise StreamResponseError(
+                        f"{provider_label} stream timed out after {idle_timeout:.0f}s of inactivity.",
+                        retryable=not (content or tool_calls or reasoning_text or reasoning_details),
+                    )
                 continue
+            last_activity_time = now
             line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
             if not line:
                 continue
@@ -972,7 +1059,6 @@ def parse_chat_stream(
                 raise RuntimeError(
                     f"{provider_label} returned malformed streaming JSON."
                 ) from error
-            last_activity_time = now
             stream_error = chunk.get("error")
             if stream_error:
                 raise StreamResponseError(
@@ -983,7 +1069,7 @@ def parse_chat_stream(
                 last_usage = normalize_usage(chunk["usage"])
             choices = chunk.get("choices") or []
             if not choices:
-                if finish_reason is not None and last_usage is not None:
+                if finish_reason is not None and isinstance(chunk.get("usage"), dict):
                     saw_done = True
                     break
                 continue
@@ -1208,9 +1294,6 @@ def parse_chat_stream(
                             "arguments_delta": arguments_delta,
                         }
                     )
-            if finish_reason is not None and last_usage is not None:
-                saw_done = True
-                break
         if tag_buffer:
             if in_think_tag:
                 reasoning_text += tag_buffer
@@ -1288,13 +1371,12 @@ def parse_chat_stream(
 
     # Some reasoning-first models (Anthropic extended thinking, OpenAI o-series,
     # Gemini thinking) emit reasoning deltas with no text content and finish
-    # cleanly. Set a safe placeholder message instead of leaking raw internal
-    # monologue into the user chat bubble.
+    # cleanly. Leave content empty so the runner can nudge continuation rather
+    # than treating placeholder text as a completed final answer.
+    finish_norm = str(finish_reason or "").strip().lower()
     if not content and not tool_calls:
-        if reasoning_text.strip() and finish_reason in (None, "stop"):
-            content = (
-                "Model completed its reasoning process but did not produce an action or final response."
-            )
+        if reasoning_text.strip() and (finish_reason is None or finish_norm in ("stop", "completed", "end_turn")):
+            content = ""
         else:
             reason = finish_reason or "unknown"
             raise RuntimeError(
@@ -1357,6 +1439,7 @@ class BaseLLMClient:
     preserve_reasoning: bool = False
     requires_api_key: bool = True
     _DEFAULT_RETRY_ATTEMPTS: int = 3
+    _DEFAULT_RATE_LIMIT_RETRIES: int = 5
 
     def __init__(self, settings: Settings, provider_label: str) -> None:
         self.settings = settings
@@ -1457,7 +1540,12 @@ class BaseLLMClient:
         *,
         max_attempts: int | None = None,
     ) -> dict[str, Any]:
-        attempts = (
+        max_rate_limit_attempts = (
+            max_attempts
+            if max_attempts is not None
+            else self._DEFAULT_RATE_LIMIT_RETRIES
+        )
+        max_general_attempts = (
             max_attempts
             if max_attempts is not None
             else self._DEFAULT_RETRY_ATTEMPTS
@@ -1472,8 +1560,11 @@ class BaseLLMClient:
         log_payload = self.activity_logger is not None
 
         image_fallback_used = False
-        for attempt in range(attempts):
-            is_last_attempt = attempt == attempts - 1
+        attempt = 0
+        rate_limit_attempt = 0
+        general_attempt = 0
+
+        while True:
             response: Any | None = None
             attempt_payload = None
             if log_payload:
@@ -1491,8 +1582,14 @@ class BaseLLMClient:
                     )
                 raise
             except Exception:
+                general_attempt += 1
+                is_last_attempt = general_attempt >= max_general_attempts
                 if is_last_attempt:
                     raise
+                attempt += 1
+                delay = float(2 ** (general_attempt - 1))
+                sleep_with_cancel(delay, self.stop_event)
+                continue
             else:
                 image_rejection = _is_image_rejection(response)
                 if image_rejection and not image_fallback_used:
@@ -1548,11 +1645,21 @@ class BaseLLMClient:
                             return stream_res
                         except StreamResponseError as error:
                             _force_close_response(response)
+                            general_attempt += 1
+                            is_last_attempt = general_attempt >= max_general_attempts
                             if not error.retryable or is_last_attempt:
                                 raise
+                            _LOG.warning(
+                                "Retrying %s stream (attempt %d/%d, model=%s) after StreamResponseError: %s",
+                                self._provider_label,
+                                general_attempt,
+                                max_general_attempts,
+                                payload.get("model"),
+                                error,
+                            )
                             if self.stream_callback:
                                 try:
-                                    self.stream_callback({"type": "reset"})
+                                    self.stream_callback({"type": "reset", "reason": str(error)})
                                 except Exception:
                                     pass
                             if log_payload:
@@ -1564,14 +1671,25 @@ class BaseLLMClient:
                                         "error": str(error),
                                     },
                                     run_id=self.run_id,
-                                )
+                                    )
                         except (httpx.TransportError, httpx.HTTPError, ssl.SSLError, OSError) as error:
                             _force_close_response(response)
+                            general_attempt += 1
+                            is_last_attempt = general_attempt >= max_general_attempts
                             if is_last_attempt:
                                 raise
+                            _LOG.warning(
+                                "Retrying %s stream (attempt %d/%d, model=%s) after transport error (%s): %s",
+                                self._provider_label,
+                                general_attempt,
+                                max_general_attempts,
+                                payload.get("model"),
+                                type(error).__name__,
+                                error,
+                            )
                             if self.stream_callback:
                                 try:
-                                    self.stream_callback({"type": "reset"})
+                                    self.stream_callback({"type": "reset", "reason": str(error)})
                                 except Exception:
                                     pass
                             if log_payload:
@@ -1591,6 +1709,7 @@ class BaseLLMClient:
                                 attempt, payload.get("model"), call_start, parsed_body
                             )
                         return parsed_body
+
                 if log_payload:
                     self.activity_logger.log(
                         "llm_retry",
@@ -1601,15 +1720,62 @@ class BaseLLMClient:
                         },
                         run_id=self.run_id,
                     )
-                if is_last_attempt:
-                    response.raise_for_status()
-            finally:
-                close = getattr(response, "close", None)
-                if callable(close):
-                    close()
-            if not is_last_attempt:
-                delay = retry_delay(response, attempt)
+
+                is_rate_limit = response.status_code == 429
+                if is_rate_limit:
+                    rate_limit_attempt += 1
+                    is_last_attempt = rate_limit_attempt >= max_rate_limit_attempts
+                    current_retry_num = rate_limit_attempt
+                    total_retry_limit = max_rate_limit_attempts
+                else:
+                    general_attempt += 1
+                    is_last_attempt = general_attempt >= max_general_attempts
+                    current_retry_num = general_attempt
+                    total_retry_limit = max_general_attempts
+
+                delay = retry_delay(response, current_retry_num - 1, status_code=response.status_code)
+
+                try:
+                    if is_last_attempt:
+                        response.raise_for_status()
+                finally:
+                    close = getattr(response, "close", None)
+                    if callable(close):
+                        close()
+
+                attempt += 1
+                if is_rate_limit:
+                    _LOG.warning(
+                        "Rate limit (429) from %s (attempt %d/%d, model=%s). Retrying in %.1fs...",
+                        self._provider_label,
+                        current_retry_num,
+                        total_retry_limit,
+                        payload.get("model"),
+                        delay,
+                    )
+                    if self.stream_callback:
+                        try:
+                            self.stream_callback({
+                                "type": "status",
+                                "message": f"Rate limit reached (429). Retrying in {int(delay)}s (attempt {current_retry_num}/{total_retry_limit})...",
+                            })
+                        except Exception:
+                            pass
+
+                    # Adaptively clamp max_tokens on repeated rate limits to reduce TPM quota reservation
+                    if rate_limit_attempt >= 2:
+                        if "max_tokens" in payload and isinstance(payload["max_tokens"], int) and payload["max_tokens"] > 8192:
+                            payload["max_tokens"] = 8192
+                        if "generation_config" in payload and isinstance(payload["generation_config"], dict):
+                            if payload["generation_config"].get("max_output_tokens", 0) > 8192:
+                                payload["generation_config"]["max_output_tokens"] = 8192
+
                 sleep_with_cancel(delay, self.stop_event)
+                if is_rate_limit and self.stream_callback:
+                    try:
+                        self.stream_callback({"type": "status", "message": "Thinking..."})
+                    except Exception:
+                        pass
         raise RuntimeError(f"{self._provider_label} retry loop ended unexpectedly.")
 
 
@@ -1657,6 +1823,11 @@ def _build_provider_client(provider: str, settings: Settings) -> BaseLLMClient:
 
         return VertexClient(settings)
     if canonical in ("gemini", "google"):
+        raw_slug = provider.strip().lower()
+        if raw_slug in ("aistudio", "google_ai_studio", "google-ai-studio", "ai_studio"):
+            from agent.gemini_client import GoogleInteractionsClient
+
+            return GoogleInteractionsClient(settings)
         if getattr(settings, "gemini_auth_mode", "api_key") == "gcloud":
             from agent.vertex_client import VertexClient
 

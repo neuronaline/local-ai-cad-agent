@@ -80,12 +80,18 @@ class _RingBuffer:
 
 def terminate(process: subprocess.Popen[str], *, force: bool) -> None:
     """Kill a subprocess process group."""
-    if process.poll() is not None:
-        return
+    sig = signal.SIGKILL if force else signal.SIGTERM
     try:
-        os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
-    except ProcessLookupError:
-        pass
+        os.killpg(process.pid, sig)
+    except (ProcessLookupError, PermissionError, OSError):
+        if process.poll() is None:
+            try:
+                if force:
+                    process.kill()
+                else:
+                    process.terminate()
+            except OSError:
+                pass
 
 
 def stream_with_limit(
@@ -204,6 +210,12 @@ def run_sandbox_subprocess(
         # bubblewrap namespace and any spawned python interpreter exit.
         if process is not None:
             terminate(process, force=True)
+            for pipe in (process.stdout, process.stderr):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except OSError:
+                        pass
             try:
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired:

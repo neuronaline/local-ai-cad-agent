@@ -69,6 +69,7 @@ def command(
     writable: bool,
     timeout_seconds: int,
     writable_tmp: bool = True,
+    executable: str = "/venv/bin/python",
 ) -> tuple[list[str], int]:
     """Build a fail-closed Bubblewrap command and its inherited seccomp fd."""
     if not _BWRAP:
@@ -136,6 +137,11 @@ def command(
         "--ro-bind", "/etc", "/etc",
         "--ro-bind", str(python_root), "/venv",
         bind_mode, str(workspace), "/workspace",
+        *(
+            [bind_mode, str(workspace), str(workspace)]
+            if str(workspace) != "/workspace"
+            else []
+        ),
         "--chdir", "/workspace",
         "--clearenv",
         "--setenv", "HOME", "/tmp",
@@ -143,16 +149,20 @@ def command(
         "--setenv", "PYTHONDONTWRITEBYTECODE", "1",
         "--setenv", "TMPDIR", "/tmp",
         "--setenv", "LANG", "C.UTF-8",
+        "--setenv", "OPENBLAS_NUM_THREADS", "1",
+        "--setenv", "MKL_NUM_THREADS", "1",
+        "--setenv", "OMP_NUM_THREADS", "1",
+        "--setenv", "NUMEXPR_NUM_THREADS", "1",
         "--seccomp", str(seccomp_fd),
         "--",
         "/usr/bin/prlimit",
         f"--cpu={timeout_seconds + 5}",
         "--fsize=536870912",
         "--nofile=512",
-        "--nproc=64",
-        "--as=8589934592",
+        "--nproc=256",
+        "--as=17179869184",
         "--",
-        "/venv/bin/python",
+        executable,
         *arguments,
     ]
     return sandbox, seccomp_fd

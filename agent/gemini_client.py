@@ -37,6 +37,7 @@ from agent.llm_base import (
     iter_lines_with_cancel,
     normalize_messages,
     post_with_cancel,
+    relocate_tool_images,
     strip_encrypted_reasoning,
 )
 from agent.prompt import TOOL_IMAGE_PROMPT
@@ -120,20 +121,25 @@ def convert_messages_to_interactions(
     Returns:
         (system_instruction, steps)
     """
-    messages = normalize_messages(messages)
+    messages = normalize_messages(relocate_tool_images(messages))
     system_instruction: str | None = None
     steps: list[dict[str, Any]] = []
     call_id_to_name: dict[str, str] = {}
     pending_tool_images: list[dict[str, Any]] = []
 
+    def _append_user_step(parts: list[dict[str, Any]]) -> None:
+        if not parts:
+            return
+        if steps and steps[-1].get("type") == "user_input" and isinstance(steps[-1].get("content"), list):
+            steps[-1]["content"].extend(parts)
+        else:
+            steps.append({"type": "user_input", "content": list(parts)})
+
     def _flush_pending_images() -> None:
         nonlocal pending_tool_images
         if pending_tool_images:
-            steps.append(
-                {
-                    "type": "user_input",
-                    "content": [{"type": "text", "text": TOOL_IMAGE_PROMPT}] + pending_tool_images,
-                }
+            _append_user_step(
+                [{"type": "text", "text": TOOL_IMAGE_PROMPT}] + pending_tool_images
             )
             pending_tool_images = []
 
@@ -192,7 +198,7 @@ def convert_messages_to_interactions(
                         elif url:
                             parts.append({"type": "image", "image_url": url})
             if parts:
-                steps.append({"type": "user_input", "content": parts})
+                _append_user_step(parts)
 
         elif role == "assistant":
             tool_calls = msg.get("tool_calls") or []
@@ -328,25 +334,47 @@ def convert_messages_to_interactions(
     return system_instruction, steps
 
 
+def _extract_text(obj: Any) -> str:
+    """Extract plain text recursively from text, content, summary, or part structures."""
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, dict):
+        if isinstance(obj.get("text"), str):
+            return obj["text"]
+        if "content" in obj:
+            return _extract_text(obj["content"])
+        if "summary" in obj:
+            return _extract_text(obj["summary"])
+        if "thought" in obj and isinstance(obj["thought"], (str, dict, list)):
+            return _extract_text(obj["thought"])
+        if "output" in obj:
+            return _extract_text(obj["output"])
+    elif isinstance(obj, list):
+        return "".join(_extract_text(item) for item in obj)
+    return ""
+
+
 def parse_interactions_stream(
     response: Any,
     *,
     provider_label: str = "Google AI Studio",
     stop_event: threading.Event | None = None,
     stream_callback: Any | None = None,
+    idle_timeout: float = 90.0,
 ) -> dict[str, Any]:
     """Parse Server-Sent Events from the Interactions API."""
     content = ""
     reasoning_text = ""
     tool_calls: dict[str, dict[str, Any]] = {}
     step_meta: dict[str, dict[str, Any]] = {}
+    active_step: dict[str, Any] = {}
     last_thought_signature: str | None = None
     last_usage: dict[str, Any] | None = None
     interaction_id: str | None = None
     finish_reason: str | None = None
     finish_time: float | None = None
-
     last_activity_time = time.monotonic()
+    current_event_type: str | None = None
 
     try:
         for raw_line in iter_lines_with_cancel(response, stop_event=stop_event):
@@ -356,25 +384,35 @@ def parse_interactions_stream(
             now = time.monotonic()
             if raw_line is None:
                 if finish_reason is not None and finish_time is not None:
-                    if now - finish_time >= 1.0:
+                    if last_usage is not None or (now - finish_time) >= 1.0:
                         break
-                if (content or tool_calls or reasoning_text) and (now - last_activity_time >= 15.0):
-                    break
+                elif idle_timeout > 0 and (now - last_activity_time) >= idle_timeout:
+                    _force_close_response(response)
+                    raise StreamResponseError(
+                        f"{provider_label} stream timed out after {idle_timeout:.0f}s of inactivity.",
+                        retryable=not (content or tool_calls or reasoning_text),
+                    )
                 continue
+            last_activity_time = now
             line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
             if not line:
+                current_event_type = None
                 continue
             line = line.strip()
+            if line.startswith("event:"):
+                current_event_type = line[6:].strip()
+                continue
             if not line.startswith("data:"):
                 continue
             payload = line[5:].strip()
-            if payload in ("[DONE]", ""):
+            if payload == "[DONE]":
                 break
+            if not payload:
+                continue
             try:
                 event = json.loads(payload)
             except json.JSONDecodeError as error:
                 raise RuntimeError(f"{provider_label} returned malformed streaming JSON.") from error
-            last_activity_time = now
 
             if not isinstance(event, dict):
                 continue
@@ -391,13 +429,30 @@ def parse_interactions_stream(
                 else {}
             )
 
-            ev_id = event.get("id") or interaction_obj.get("id")
+            event_type = (
+                current_event_type
+                or event.get("event_type")
+                or event.get("type")
+            )
+            event_type_str = str(event_type or "").strip().lower()
+            is_step_event = bool(
+                event_type_str.startswith(("step.", "content.", "delta", "interaction.step."))
+                or event_type_str in ("step", "delta", "thought", "function_call", "model_output")
+                or ("step" in event and "interaction" not in event)
+            )
+
+            ev_id = (None if is_step_event else event.get("id")) or interaction_obj.get("id")
             if ev_id:
                 interaction_id = str(ev_id)
 
-            ev_finish = event.get("finish_reason") or interaction_obj.get("finish_reason")
-            ev_status = event.get("status") or interaction_obj.get("status")
-            event_type = event.get("event_type") or event.get("type")
+            ev_finish = (
+                (None if is_step_event else event.get("finish_reason"))
+                or interaction_obj.get("finish_reason")
+            )
+            ev_status = (
+                (None if is_step_event else event.get("status"))
+                or interaction_obj.get("status")
+            )
 
             if ev_finish:
                 if finish_reason is None:
@@ -405,10 +460,11 @@ def parse_interactions_stream(
                 finish_reason = str(ev_finish)
             elif ev_status:
                 status_val = str(ev_status)
-                if finish_reason is None and status_val.lower() == "completed":
-                    finish_time = time.monotonic()
-                finish_reason = status_val
-            elif event_type in ("interaction.completed", "interaction.complete", "response.completed"):
+                if status_val.lower() in ("completed", "complete", "done", "stop", "end_turn", "cancelled", "failed"):
+                    if finish_reason is None:
+                        finish_time = time.monotonic()
+                    finish_reason = status_val
+            elif event_type_str in ("interaction.completed", "interaction.complete", "response.completed"):
                 if finish_reason is None:
                     finish_time = time.monotonic()
                     finish_reason = "completed"
@@ -455,28 +511,50 @@ def parse_interactions_stream(
 
             # Handle step.start / step.stop events carrying a single 'step' object
             step_obj = event.get("step") if isinstance(event.get("step"), dict) else None
+            s_idx = event.get("index") if event.get("index") is not None else event.get("step_index")
             if step_obj:
                 sid = (
                     step_obj.get("id")
                     or step_obj.get("step_id")
                     or step_obj.get("call_id")
                     or event.get("step_id")
+                    or event.get("id")
                 )
-                stype = step_obj.get("type") or step_obj.get("step_type")
-                if sid:
-                    step_meta[str(sid)] = {"type": stype, "id": str(sid)}
-                sig = step_obj.get("signature") or step_obj.get("thought_signature")
+                raw_stype = step_obj.get("type") or step_obj.get("step_type") or ""
+                if raw_stype in ("model_generation", "model_output", "text"):
+                    stype = "model_output"
+                elif raw_stype in ("thought", "thought_summary"):
+                    stype = "thought"
+                elif raw_stype in ("function_call", "tool_call"):
+                    stype = "function_call"
+                else:
+                    stype = raw_stype
+
+                sig = (
+                    step_obj.get("signature")
+                    or step_obj.get("thought_signature")
+                    or event.get("signature")
+                    or event.get("thought_signature")
+                )
                 if sig:
                     last_thought_signature = str(sig)
+
+                step_info: dict[str, Any] = {
+                    "id": str(sid) if sid else None,
+                    "index": s_idx,
+                    "type": stype,
+                    "name": step_obj.get("name") or "",
+                    "signature": str(sig) if sig else None,
+                }
+
                 if stype == "function_call":
                     call_id = (
                         step_obj.get("call_id")
                         or step_obj.get("id")
-                        or step_obj.get("step_id")
+                        or sid
                         or f"call_{uuid.uuid4().hex[:8]}"
                     )
-                    if sid:
-                        step_meta[str(sid)]["call_id"] = str(call_id)
+                    step_info["call_id"] = str(call_id)
                     fn_name = step_obj.get("name") or ""
                     raw_args = step_obj.get("arguments") or step_obj.get("args")
                     arg_str = ""
@@ -501,87 +579,89 @@ def parse_interactions_stream(
                         entry["thought_signature"] = str(sig)
                 elif stype == "thought" and event_type in ("step.stop", "interaction.step.done"):
                     if not reasoning_text:
-                        parts = step_obj.get("summary") or step_obj.get("content") or []
-                        if isinstance(parts, list):
-                            for p in parts:
-                                if isinstance(p, dict) and p.get("type") == "text":
-                                    reasoning_text += p.get("text", "")
+                        th_text = _extract_text(step_obj.get("summary")) or _extract_text(step_obj.get("content"))
+                        if th_text:
+                            reasoning_text += th_text
                 elif stype == "model_output" and event_type in ("step.stop", "interaction.step.done"):
                     if not content:
-                        parts = step_obj.get("content") or []
-                        if isinstance(parts, list):
-                            for p in parts:
-                                if isinstance(p, dict) and p.get("type") == "text":
-                                    content += p.get("text", "")
+                        out_text = _extract_text(step_obj.get("content")) or _extract_text(step_obj.get("output"))
+                        if out_text:
+                            content += out_text
+
+                active_step = step_info
+                if sid:
+                    step_meta[str(sid)] = step_info
+                if s_idx is not None:
+                    step_meta[str(s_idx)] = step_info
+                if step_info.get("call_id"):
+                    step_meta[str(step_info["call_id"])] = step_info
 
             delta = event.get("delta")
-            active_step_id = event.get("step_id") or (delta.get("step_id") if isinstance(delta, dict) else None)
-            active_step_type = (
-                step_meta.get(str(active_step_id), {}).get("type")
-                if active_step_id
-                else None
-            )
+            delta_sid = event.get("step_id") or (delta.get("step_id") if isinstance(delta, dict) else None)
+            delta_idx = event.get("index") if event.get("index") is not None else event.get("step_index")
+            if delta_sid and str(delta_sid) in step_meta:
+                matched_step = step_meta[str(delta_sid)]
+            elif delta_idx is not None and str(delta_idx) in step_meta:
+                matched_step = step_meta[str(delta_idx)]
+            else:
+                matched_step = active_step
+
+            active_step_type = matched_step.get("type")
 
             # Handle step.delta events
             if (event_type in ("step.delta", "content.delta") or delta) and isinstance(delta, dict):
-                delta_type = delta.get("type")
-                d_sig = delta.get("signature") or delta.get("thought_signature")
+                delta_type = delta.get("type") or ""
+                d_sig = (
+                    delta.get("signature")
+                    or delta.get("thought_signature")
+                    or event.get("signature")
+                    or event.get("thought_signature")
+                )
                 if d_sig:
                     last_thought_signature = str(d_sig)
 
-                # 1. Thought deltas (explicit thought delta or text delta inside a thought step)
-                if (
+                # 1. Thought deltas (explicit thought delta or delta inside a thought step)
+                is_thought = bool(
                     delta_type in ("thought", "thought_summary")
+                    or active_step_type == "thought"
                     or "thought" in delta
                     or "summary" in delta
-                    or (active_step_type == "thought" and (delta_type == "text" or "text" in delta))
-                ):
+                    or "thought_summary" in delta
+                )
+
+                if is_thought:
                     raw_th = delta.get("thought")
-                    th = raw_th if isinstance(raw_th, str) and raw_th else (delta.get("text") or "")
-                    if not th and isinstance(delta.get("summary"), list):
-                        th = "".join(
-                            p.get("text", "")
-                            for p in delta["summary"]
-                            if isinstance(p, dict)
-                        )
-                    elif not th and isinstance(delta.get("summary"), str):
-                        th = delta["summary"]
-                    if isinstance(th, str) and th:
+                    th = (
+                        _extract_text(delta.get("content"))
+                        or _extract_text(raw_th if not isinstance(raw_th, bool) else None)
+                        or _extract_text(delta.get("summary"))
+                        or _extract_text(delta.get("text"))
+                    )
+                    if th:
                         reasoning_text += th
                         if stream_callback:
                             stream_callback({"type": "reasoning", "delta": th})
 
-                # 2. Text deltas
-                elif delta_type == "text" or "text" in delta:
-                    t = delta.get("text", "")
-                    if isinstance(t, str) and t:
-                        content += t
-                        if stream_callback:
-                            stream_callback({"type": "content", "delta": t})
-
-                # 3. Function call / arguments_delta events
+                # 2. Function call / arguments_delta events
                 elif (
-                    delta_type in ("function_call", "arguments_delta")
+                    delta_type in ("function_call", "arguments_delta", "arguments", "args")
                     or "function_call" in delta
                     or "arguments_delta" in delta
                     or "args_delta" in delta
-                    or (active_step_type == "function_call" and "arguments" in delta)
+                    or "partial_arguments" in delta
+                    or (active_step_type == "function_call" and ("arguments" in delta or "partial_arguments" in delta))
                 ):
                     fc_data = (
                         delta.get("function_call")
                         if isinstance(delta.get("function_call"), dict)
                         else delta
                     )
-                    mapped_call_id = (
-                        step_meta.get(str(active_step_id), {}).get("call_id")
-                        if active_step_id
-                        else None
-                    )
                     call_id = (
                         fc_data.get("call_id")
                         or fc_data.get("id")
-                        or mapped_call_id
-                        or active_step_id
+                        or matched_step.get("call_id")
+                        or delta_sid
+                        or matched_step.get("id")
                     )
                     if not call_id:
                         if tool_calls and not fc_data.get("name"):
@@ -589,11 +669,13 @@ def parse_interactions_stream(
                         else:
                             call_id = f"call_{uuid.uuid4().hex[:8]}"
                     call_id = str(call_id)
-                    fn_name = fc_data.get("name") or ""
+                    fn_name = fc_data.get("name") or matched_step.get("name") or ""
                     args_delta = (
-                        fc_data.get("arguments_delta")
+                        fc_data.get("partial_arguments")
+                        or fc_data.get("arguments_delta")
                         or fc_data.get("args_delta")
                         or fc_data.get("arguments")
+                        or fc_data.get("args")
                         or ""
                     )
                     if isinstance(args_delta, dict):
@@ -633,6 +715,18 @@ def parse_interactions_stream(
                             }
                         )
 
+                # 3. Text deltas
+                elif delta_type in ("text", "model_output", "model_generation") or "text" in delta or active_step_type == "model_output":
+                    t = (
+                        _extract_text(delta.get("text"))
+                        or _extract_text(delta.get("content"))
+                        or _extract_text(delta.get("output"))
+                    )
+                    if t:
+                        content += t
+                        if stream_callback:
+                            stream_callback({"type": "content", "delta": t})
+
             # Handle direct step completions or full step items in the event / interaction
             steps = event.get("steps") or interaction_obj.get("steps") or []
             if isinstance(steps, list):
@@ -643,16 +737,14 @@ def parse_interactions_stream(
                     s_sig = s.get("signature") or s.get("thought_signature")
                     if s_sig:
                         last_thought_signature = str(s_sig)
-                    if stype == "model_output" and not content:
-                        parts = s.get("content") or []
-                        for p in parts:
-                            if isinstance(p, dict) and p.get("type") == "text":
-                                content += p.get("text", "")
+                    if stype in ("model_output", "model_generation") and not content:
+                        out_t = _extract_text(s.get("content")) or _extract_text(s.get("output")) or _extract_text(s.get("text"))
+                        if out_t:
+                            content += out_t
                     elif stype == "thought" and not reasoning_text:
-                        parts = s.get("summary") or s.get("content") or []
-                        for p in parts:
-                            if isinstance(p, dict) and p.get("type") == "text":
-                                reasoning_text += p.get("text", "")
+                        th_t = _extract_text(s.get("summary")) or _extract_text(s.get("content"))
+                        if th_t:
+                            reasoning_text += th_t
                     elif stype == "function_call":
                         cid = str(
                             s.get("call_id")
@@ -673,7 +765,11 @@ def parse_interactions_stream(
                         if sig:
                             tc_entry["thought_signature"] = str(sig)
                         tool_calls[cid] = tc_entry
-            if finish_reason is not None and last_usage is not None:
+            if (
+                event_type_str in ("interaction.completed", "interaction.complete", "response.completed")
+                and finish_reason is not None
+                and last_usage is not None
+            ):
                 break
 
     except Exception as err:
@@ -718,10 +814,8 @@ def parse_interactions_stream(
         )
 
     if not content and not tool_calls:
-        if reasoning_text.strip() and (finish_reason is None or finish_norm in ("stop", "completed")):
-            content = (
-                "Model completed its reasoning process but did not produce an action or final response."
-            )
+        if reasoning_text.strip() and (finish_reason is None or finish_norm in ("stop", "completed", "end_turn")):
+            content = ""
         else:
             reason = finish_reason or "unknown"
             raise RuntimeError(
@@ -762,16 +856,14 @@ def parse_interactions_response(body: dict[str, Any]) -> dict[str, Any]:
         step_sig = step.get("signature") or step.get("thought_signature")
         if step_sig:
             last_thought_signature = str(step_sig)
-        if step_type == "model_output":
-            parts = step.get("content") or []
-            for part in parts:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    content += part.get("text", "")
-        elif step_type == "thought":
-            parts = step.get("summary") or step.get("content") or []
-            for part in parts:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    reasoning_text += part.get("text", "")
+        if step_type in ("model_output", "model_generation"):
+            out_t = _extract_text(step.get("content")) or _extract_text(step.get("output")) or _extract_text(step.get("text"))
+            if out_t:
+                content += out_t
+        elif step_type in ("thought", "thought_summary"):
+            th_t = _extract_text(step.get("summary")) or _extract_text(step.get("content")) or _extract_text(step.get("thought"))
+            if th_t:
+                reasoning_text += th_t
         elif step_type == "function_call":
             call_id = step.get("call_id") or step.get("id") or step.get("step_id") or f"call_{uuid.uuid4().hex[:8]}"
             fn_name = step.get("name") or ""
@@ -848,10 +940,8 @@ def parse_interactions_response(body: dict[str, Any]) -> dict[str, Any]:
         )
 
     if not content and not tool_calls:
-        if reasoning_text.strip() and (finish_reason is None or finish_norm in ("stop", "completed")):
-            content = (
-                "Model completed its reasoning process but did not produce an action or final response."
-            )
+        if reasoning_text.strip() and (finish_reason is None or finish_norm in ("stop", "completed", "end_turn")):
+            content = ""
         else:
             reason = finish_reason or "unknown"
             raise RuntimeError(
@@ -923,6 +1013,7 @@ class GoogleInteractionsClient(BaseLLMClient):
             "model": raw_model,
             "input": steps,
             "stream": True,
+            "thinking_summaries": "auto",
         }
         if system_instruction:
             payload["system_instruction"] = system_instruction
@@ -939,32 +1030,48 @@ class GoogleInteractionsClient(BaseLLMClient):
             gen_config["max_output_tokens"] = min(self.settings.llm_max_completion_tokens, 65535)
 
         model_name = raw_model.lower()
-        # Gemini 2.x takes a token ``thinking_budget``; newer models take ``thinking_level``.
         is_gemini_2 = "2.5" in model_name or "gemini-2" in model_name
         effort = (self.settings.gemini_reasoning_effort or "").lower().strip()
 
-        thinking_config: dict[str, Any] = {"include_thoughts": True}
-        if effort:
+        thinking_config: dict[str, Any] = {
+            "include_thoughts": effort != "none",
+            "thinking_summaries": "auto",
+        }
+        if effort and effort != "none":
             if not is_gemini_2:
                 level_map = {
+                    "minimal": "MINIMAL" if "flash" in model_name else "LOW",
                     "low": "LOW",
                     "medium": "MEDIUM",
                     "high": "HIGH",
-                    "minimal": "MINIMAL",
+                    "xhigh": "HIGH",
+                    "max": "HIGH",
                 }
-                thinking_config["thinking_level"] = level_map.get(effort, effort.upper())
+                level = level_map.get(effort, "HIGH")
+                if "gemini-4" in model_name and level == "MINIMAL":
+                    level = "LOW"
+                thinking_config["thinking_level"] = level
             else:
                 budget_map = {
                     "minimal": 1024,
                     "low": 2048,
                     "medium": 4096,
                     "high": 8192,
+                    "xhigh": 16384,
+                    "max": 24576,
                 }
                 thinking_config["thinking_budget"] = budget_map.get(effort, 8192)
-        elif not is_gemini_2:
-            thinking_config["thinking_level"] = "HIGH"
-        else:
-            thinking_config["thinking_budget"] = 8192
+        elif effort == "none":
+            thinking_config.pop("thinking_summaries", None)
+            gen_config.pop("thinking_summaries", None)
+            if not is_gemini_2:
+                thinking_config["thinking_level"] = (
+                    "MINIMAL"
+                    if ("flash" in model_name and "gemini-4" not in model_name)
+                    else "LOW"
+                )
+            elif "pro" not in model_name:
+                thinking_config["thinking_budget"] = 0
 
         gen_config["thinking_config"] = thinking_config
         if gen_config:

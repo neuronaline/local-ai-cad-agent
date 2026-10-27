@@ -112,13 +112,19 @@ def compact_for_context(tool: str, result: str) -> str:
         "solid_count": metrics.get("solid_count", 1),
         "dimensions_mm": metrics.get("dimensions_mm", {}),
         "volume_mm3": metrics.get("volume_mm3", 0.0),
-        "summary": data.get("summary", ""),
     }
-    if "printability" in metrics and isinstance(metrics["printability"], dict):
-        compact_data["printability"] = metrics["printability"]
-    features = data.get("feature_summary")
-    if isinstance(features, dict) and features:
-        compact_data["feature_summary"] = features
+    if metrics.get("floating_solid_count", 0) or metrics.get("solid_count", 1) > 1:
+        compact_data["floating_solid_count"] = metrics.get("floating_solid_count", 0)
+        if metrics.get("solids_min_z"):
+            compact_data["solids_min_z"] = metrics.get("solids_min_z")
+    printability = metrics.get("printability")
+    if isinstance(printability, dict) and printability:
+        compact_data["printability"] = {
+            "bed_contact_area_mm2": printability.get("bed_contact_area_mm2"),
+            "overhang_area_45deg_mm2": printability.get("overhang_area_45deg_mm2"),
+            "overhang_area_60deg_mm2": printability.get("overhang_area_60deg_mm2"),
+            "needs_support": printability.get("needs_support"),
+        }
     verif = data.get("verification")
     if isinstance(verif, dict) and verif:
         verif_dict: dict[str, Any] = {

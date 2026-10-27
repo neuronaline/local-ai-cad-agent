@@ -73,6 +73,7 @@ from agent.tools.question_validator import QuestionValidator
 # tests can target the predicate directly without re-rolling the literals.
 _BUILD_FAILURE_TOTAL_MAX = 6
 _BUILD_FAILURE_PER_SIGNATURE_MAX = 3
+_MAX_TOTAL_TRUNCATION_CONTINUATIONS = 5
 
 # Run-scoped artifact directories. ``AgentRunner.start`` takes ownership of
 # uploaded inputs by moving them into a per-run directory under the agent
@@ -110,6 +111,7 @@ class ProjectTools:
             self.revisions,
             review_render_workers=(settings.review_render_workers if settings else 4),
             review_required_views=(settings.review_required_views if settings else 8),
+            stop_event=stop_event,
         )
         self.image = ImageTool(project_dir, publish)
         self.question = QuestionTool(publish)
@@ -186,6 +188,8 @@ class _RunState:
     any_tool_used: bool = False
     nudged_cad: bool = False
     nudged_final_verification: bool = False
+    cad_nudge_count: int = 0
+    verification_nudge_count: int = 0
     build_failure_count: int = 0
     build_failure_signatures: dict[str, int] = field(default_factory=dict)
     current_message_id: str | None = None
@@ -201,7 +205,10 @@ class _RunState:
     current_reasoning: str = ""
     start_perf_time: float = 0.0
     truncation_continuations: int = 0
+    total_truncation_continuations: int = 0
     budget_warning_sent: bool = False
+    last_turn_was_continuation: bool = False
+    settings: Settings | None = None
 
 
 def _extract_reasoning(message: dict[str, Any]) -> str:
@@ -516,7 +523,7 @@ class AgentRunner:
             thread_to_join = self._thread if stop_active_task else None
 
         if thread_to_join is not None and thread_to_join.is_alive():
-            thread_to_join.join(timeout=2.0)
+            thread_to_join.join(timeout=3.5)
 
         with self._lock:
             if stop_active_task and (self._thread is None or not self._thread.is_alive()):
@@ -554,7 +561,9 @@ class AgentRunner:
             # ``start()`` always passes a run_id; the default keeps the
             # parameter optional for direct tests that bypass ``start()``.
             run_id = uuid.uuid4().hex
-        project_dir = self.settings.workspace_root / project
+        with self._lock:
+            workspace_root = self.settings.workspace_root
+        project_dir = workspace_root / project
         state: _RunState | None = None
         activity_logger: ActivityLogger | None = None
         try:
@@ -572,16 +581,25 @@ class AgentRunner:
             # Bound once: the publisher reads ``current_message_id`` lazily
             # so the per-iteration update is just an attribute assignment.
             state.client.stream_callback = self._build_stream_publisher(state)
-            for iteration in range(self.settings.agent_tool_call_limit):
+            run_settings = state.settings or self.settings
+            limit = run_settings.agent_tool_call_limit
+            max_iterations = limit + _MAX_TOTAL_TRUNCATION_CONTINUATIONS + 4
+            tool_turn = 0
+            for _ in range(max_iterations):
                 if self._stop_event.is_set():
                     self._handle_stop_pre_turn(state)
                     return
                 state.current_message_id = uuid.uuid4().hex
                 state.current_content = ""
                 state.current_reasoning = ""
+                state.last_turn_was_continuation = False
                 outcome = self._run_turn(state)
                 if outcome is _TurnOutcome.CONTINUE:
-                    self._maybe_nudge_budget_limit(state, iteration)
+                    if not state.last_turn_was_continuation:
+                        tool_turn += 1
+                        if tool_turn >= limit:
+                            break
+                        self._maybe_nudge_budget_limit(state, tool_turn - 1)
                     continue
                 # Non-CONTINUE is terminal; the helper already published
                 # the diagnostic and finalised ``state.messages``.
@@ -615,10 +633,11 @@ class AgentRunner:
         dispatch. If this raises, ``_run``'s exception handlers take
         over and ``state`` is ``None`` for the ``finally`` block.
         """
-        effective_settings = self.settings
+        with self._lock:
+            effective_settings = self.settings
         if model_key:
             effective_settings = with_model_selection(effective_settings, model_key)
-        if reasoning_effort:
+        if reasoning_effort is not None:
             effective_settings = with_reasoning_effort(effective_settings, reasoning_effort)
 
         self.publish(
@@ -646,7 +665,13 @@ class AgentRunner:
         with self._lock:
             self._active_tools = tools
             self._active_client = client
-        messages = self._context(project_dir, message, image_paths, is_retry=is_retry)
+        messages = self._context(
+            project_dir,
+            message,
+            image_paths,
+            is_retry=is_retry,
+            settings=effective_settings,
+        )
         activity_logger: ActivityLogger | None = None
         if activity_logging_enabled(effective_settings):
             activity_logger = get_logger(
@@ -680,6 +705,7 @@ class AgentRunner:
             cad_fix_required=not model_is_built(project_dir),
             project=project,
             start_perf_time=time.perf_counter(),
+            settings=effective_settings,
         )
 
     def _build_stream_publisher(
@@ -712,6 +738,24 @@ class AgentRunner:
                 sse_name = "agent_reasoning_delta"
             elif event_type == "tool_call":
                 sse_name = "agent_tool_delta"
+            elif event_type == "status":
+                status_msg = event.get("message") or "Thinking..."
+                publish(
+                    "agent_status",
+                    {
+                        "project": project,
+                        "run_id": run_id,
+                        "status": "started",
+                        "message": status_msg,
+                    },
+                )
+                if log is not None:
+                    log(
+                        "agent_status",
+                        {"run_id": run_id, "message": status_msg},
+                        run_id=run_id,
+                    )
+                return
             elif event_type == "reset":
                 state.current_content = ""
                 state.current_reasoning = ""
@@ -769,13 +813,21 @@ class AgentRunner:
         try:
             response = state.client.chat(state.messages, TOOL_SCHEMAS)
         except CompletionTruncatedError as trunc_err:
+            has_partial = bool(
+                trunc_err.reasoning_text
+                or trunc_err.partial_content
+                or trunc_err.partial_tool_calls
+            )
             if (
                 state.truncation_continuations < 2
-                and (trunc_err.reasoning_text or trunc_err.partial_content)
+                and state.total_truncation_continuations < _MAX_TOTAL_TRUNCATION_CONTINUATIONS
+                and has_partial
                 and not self._stop_event.is_set()
             ):
                 state.total_turns += 1
                 state.truncation_continuations += 1
+                state.total_truncation_continuations += 1
+                state.last_turn_was_continuation = True
                 usage = getattr(state.client, "last_usage", None)
                 if isinstance(usage, dict):
                     state.total_prompt_tokens += int(usage.get("prompt_tokens") or 0)
@@ -793,18 +845,52 @@ class AgentRunner:
                             pass
                 self._publish_usage(state.project, usage, state=state)
                 content = trunc_err.partial_content.strip() if trunc_err.partial_content else ""
+                truncated_tools = [
+                    (tc.get("function") or {}).get("name") or "tool"
+                    for tc in (trunc_err.partial_tool_calls or [])
+                    if isinstance(tc, dict)
+                ]
+                stored_content = content
+                if not stored_content and not trunc_err.reasoning_text and truncated_tools:
+                    stored_content = f"[Truncated tool call: {', '.join(truncated_tools)}]"
                 partial_msg: dict[str, Any] = {
                     "role": "assistant",
-                    "content": content,
+                    "content": stored_content,
                 }
                 if trunc_err.reasoning_text:
                     partial_msg["reasoning"] = trunc_err.reasoning_text
-                state.messages.append(partial_msg)
-                ConversationStore.append(state.project_dir, partial_msg)
-                continuation_nudge = _synthetic_user(
-                    "Your previous response reached the token limit. "
-                    "Please output your tool call (e.g. write_file, cad_build) or final answer directly now without repeating your reasoning."
+                    if (
+                        not state.run_reasonings
+                        or state.run_reasonings[-1] != trunc_err.reasoning_text
+                    ):
+                        state.run_reasonings.append(trunc_err.reasoning_text)
+                self.publish(
+                    "agent_stream_end",
+                    {
+                        "project": state.project,
+                        "run_id": state.run_id,
+                        "message_id": state.current_message_id,
+                        "message": content,
+                        "reasoning": trunc_err.reasoning_text or "",
+                        "has_tools": False,
+                        "continuing": True,
+                    },
                 )
+                state.messages.append(partial_msg)
+                ConversationStore.append(state.project_dir, {**partial_msg, "synthetic": True})
+                if truncated_tools:
+                    nudge_text = (
+                        f"Your previous tool call ({', '.join(truncated_tools)}) reached the output token limit "
+                        "before its arguments finished. Emit the tool call now with more concise arguments "
+                        "(for write_file/edit_file: keep OpenSCAD code compact, omit verbose comments, or scaffold core geometry first and refine with edit_file) "
+                        "without repeating your reasoning."
+                    )
+                else:
+                    nudge_text = (
+                        "Your previous response reached the token limit. "
+                        "Please output your tool call (e.g. write_file, cad_build) or final answer directly now without repeating your reasoning."
+                    )
+                continuation_nudge = _synthetic_user(nudge_text)
                 state.messages.append(continuation_nudge)
                 ConversationStore.append(state.project_dir, continuation_nudge)
                 self.publish(
@@ -869,12 +955,88 @@ class AgentRunner:
             for_storage=True,
         )
         tool_calls = normalize_tool_calls(assistant_message.get("tool_calls"))
+        raw_content = (assistant_message.get("content") or "").strip()
+        turn_reasoning = _extract_reasoning(assistant_message)
         if tool_calls:
             assistant_message["tool_calls"] = tool_calls
             state.tool_call_count += len(tool_calls)
+            state.truncation_continuations = 0
         else:
             assistant_message.pop("tool_calls", None)
-            if not assistant_message.get("content"):
+            if not raw_content and turn_reasoning:
+                can_continue = (
+                    state.truncation_continuations < 2
+                    and state.total_truncation_continuations < _MAX_TOTAL_TRUNCATION_CONTINUATIONS
+                    and not self._stop_event.is_set()
+                )
+                self.publish(
+                    "agent_stream_end",
+                    {
+                        "project": state.project,
+                        "run_id": state.run_id,
+                        "message_id": state.current_message_id,
+                        "message": "",
+                        "reasoning": turn_reasoning,
+                        "has_tools": False,
+                        "continuing": can_continue,
+                    },
+                )
+                if can_continue:
+                    state.truncation_continuations += 1
+                    state.total_truncation_continuations += 1
+                    state.last_turn_was_continuation = True
+                    if (
+                        not state.run_reasonings
+                        or state.run_reasonings[-1] != turn_reasoning
+                    ):
+                        state.run_reasonings.append(turn_reasoning)
+                    assistant_message["content"] = ""
+                    self._append_message(
+                        state.project_dir,
+                        {**assistant_message, "synthetic": True},
+                    )
+                    state.messages.append(assistant_message)
+                    continuation_nudge = _synthetic_user(
+                        "You completed your reasoning without emitting a tool call or final response. "
+                        "Please output your tool call (e.g. write_file, cad_build) or final answer directly now without repeating your reasoning."
+                    )
+                    state.messages.append(continuation_nudge)
+                    self._append_message(state.project_dir, continuation_nudge)
+                    self.publish(
+                        "agent_status",
+                        {
+                            "project": state.project,
+                            "run_id": state.run_id,
+                            "status": "started",
+                            "message": "Continuing after reasoning...",
+                        },
+                    )
+                    if state.activity_logger is not None:
+                        state.activity_logger.log(
+                            "assistant_turn",
+                            {
+                                "project": state.project,
+                                "turn": state.total_turns,
+                                "message": assistant_message,
+                                "reasoning_only": True,
+                            },
+                            run_id=state.run_id,
+                        )
+                    return _TurnOutcome.CONTINUE
+                self.publish(
+                    "agent_error",
+                    {
+                        "project": state.project,
+                        "run_id": state.run_id,
+                        "message": (
+                            "Model completed its reasoning process but did not produce "
+                            "an action or final response."
+                        ),
+                    },
+                )
+                self._publish_terminal_failure(state.project, run_id=state.run_id)
+                return _TurnOutcome.DRAWING_NOT_CREATED
+            if not raw_content:
                 assistant_message["content"] = "Task completed."
         invalid_final = (
             not tool_calls
@@ -896,13 +1058,18 @@ class AgentRunner:
         """Persist and broadcast the assistant turn; handle invalid-final.
 
         An *invalid final* is a text-only turn after the agent invoked
-        tools but visual verification is still missing. We skip the JSONL
-        append (a History reload would surface a ghost turn) but keep
-        the message in ``state.messages`` for prompt-prefix stability.
+        tools but visual verification is still missing. We persist it with
+        ``"synthetic": True`` so ``ConversationStore.load`` preserves the
+        prompt prefix across turns while UI history reloads skip the
+        unverified ghost turn.
         """
         reasoning = _extract_reasoning(assistant_message)
-        if reasoning:
+        has_tools = bool(assistant_message.get("tool_calls"))
+        if reasoning and (
+            not state.run_reasonings or state.run_reasonings[-1] != reasoning
+        ):
             state.run_reasonings.append(reasoning)
+
         if invalid_final:
             self.publish(
                 "agent_status",
@@ -922,9 +1089,21 @@ class AgentRunner:
                     "message": "",
                     "reasoning": reasoning,
                     "has_tools": False,
+                    "continuing": True,
                 },
             )
+            self._append_message(
+                state.project_dir,
+                {**assistant_message, "synthetic": True},
+            )
         else:
+            published_reasoning = reasoning
+            if not has_tools and state.run_reasonings:
+                combined_reasoning = "\n\n".join(state.run_reasonings)
+                content_text = (assistant_message.get("content") or "").strip()
+                if combined_reasoning and combined_reasoning.strip() != content_text:
+                    assistant_message["reasoning"] = combined_reasoning
+                    published_reasoning = combined_reasoning
             self.publish(
                 "agent_stream_end",
                 {
@@ -932,12 +1111,12 @@ class AgentRunner:
                     "run_id": state.run_id,
                     "message_id": state.current_message_id,
                     "message": assistant_message.get("content") or "",
-                    "reasoning": reasoning,
-                    "has_tools": bool(assistant_message.get("tool_calls")),
+                    "reasoning": published_reasoning,
+                    "has_tools": has_tools,
                 },
             )
             self._append_message(state.project_dir, assistant_message)
-            if assistant_message.get("content") and assistant_message.get("tool_calls"):
+            if assistant_message.get("content") and has_tools:
                 state.run_reasonings.clear()
         state.messages.append(assistant_message)
         if state.activity_logger is not None:
@@ -976,10 +1155,13 @@ class AgentRunner:
                 self._publish_terminal_failure(state.project, run_id=state.run_id)
                 return _TurnOutcome.DRAWING_NOT_CREATED
             if state.any_tool_used:
-                if not state.nudged_cad and (
-                    state.project_dir / MODEL_FILENAME
-                ).is_file():
+                if (
+                    not state.nudged_cad
+                    and state.cad_nudge_count < 2
+                    and (state.project_dir / MODEL_FILENAME).is_file()
+                ):
                     state.nudged_cad = True
+                    state.cad_nudge_count += 1
                     reminder = _synthetic_user(
                         format_unverified_model_nudge(MODEL_FILENAME)
                     )
@@ -1002,8 +1184,9 @@ class AgentRunner:
             self._complete(state.project, content, reasoning=full_reasoning, run_id=state.run_id)
             return _TurnOutcome.COMPLETED
         if state.cad_fix_required:
-            if not state.nudged_final_verification:
+            if not state.nudged_final_verification and state.verification_nudge_count < 2:
                 state.nudged_final_verification = True
+                state.verification_nudge_count += 1
                 reminder = _synthetic_user(NUDGE_CAD_FIX_REQUIRED)
                 state.messages.append(reminder)
                 self._append_message(state.project_dir, reminder)
@@ -1067,21 +1250,26 @@ class AgentRunner:
             processed_call_ids.add(call_id)
             tool_name = call.get("function", {}).get("name", "")
             if tool_name in {"write_file", "edit_file"}:
-                state.nudged_cad = False
-                state.nudged_final_verification = False
+                if state.cad_nudge_count < 2:
+                    state.nudged_cad = False
+                if state.verification_nudge_count < 2:
+                    state.nudged_final_verification = False
             elif is_cad_build(tool_name):
                 state.nudged_cad = False
-                # Circuit-breaker for repeated CAD build failures; reset
-                # on every successful build so a stale history cannot
-                # trip the breaker on a future invocation.
-                if not state.cad_error:
+                # Circuit-breaker for repeated CAD build or verification failures.
+                # Consecutive failure count resets on a clean, verified build,
+                # while per-signature counts persist across the turn to catch
+                # alternating break/revert/break loops.
+                if not state.cad_error and not state.cad_fix_required:
                     state.build_failure_count = 0
-                    state.build_failure_signatures.clear()
-                    if not state.cad_fix_required:
-                        state.nudged_final_verification = False
+                    state.nudged_final_verification = False
                 else:
                     state.build_failure_count += 1
-                    signature = self._failure_signature(state.cad_error)
+                    signature = (
+                        self._failure_signature(state.cad_error)
+                        if state.cad_error
+                        else self._verification_failure_signature(state.messages)
+                    )
                     state.build_failure_signatures[signature] = (
                         state.build_failure_signatures.get(signature, 0) + 1
                     )
@@ -1100,13 +1288,14 @@ class AgentRunner:
                             "agent_error",
                             {
                                 "project": state.project,
+                                "run_id": state.run_id,
                                 "message": (
                                     "Task stopped after repeated CAD build failures. "
                                     "Review the latest error or continue with a narrower repair."
                                 ),
                             },
                         )
-                        self._publish_terminal_failure(state.project)
+                        self._publish_terminal_failure(state.project, run_id=state.run_id)
                         _close_dangling_tool_tail(
                             state.project_dir,
                             state.messages,
@@ -1182,7 +1371,8 @@ class AgentRunner:
         prefix for upstream LLM provider caching, while nudging the model to
         stop over-complicating or excessively iterating and finalize.
         """
-        limit = self.settings.agent_tool_call_limit
+        run_settings = state.settings or self.settings
+        limit = run_settings.agent_tool_call_limit
         remaining = limit - (iteration + 1)
         warn_threshold = 5 if limit >= 15 else max(1, limit // 3)
         if 1 <= remaining <= warn_threshold and not state.budget_warning_sent:
@@ -1195,13 +1385,15 @@ class AgentRunner:
 
     def _handle_tool_limit_reached(self, state: _RunState) -> None:
         """The ``agent.tool_call_limit`` budget was exhausted."""
+        run_settings = state.settings or self.settings
+        limit = run_settings.agent_tool_call_limit
         self.publish(
             "agent_error",
             {
                 "project": state.project,
                 "run_id": state.run_id,
                 "message": (
-                    f"Tool-call limit ({self.settings.agent_tool_call_limit}) reached; "
+                    f"Tool-call limit ({limit}) reached; "
                     "increase agent.tool_call_limit or continue with a narrower request."
                 ),
             },
@@ -1215,7 +1407,7 @@ class AgentRunner:
                 state.project_dir,
                 state.messages,
                 (
-                    f"Tool-call limit ({self.settings.agent_tool_call_limit}) "
+                    f"Tool-call limit ({limit}) "
                     "reached without resolving the task."
                 ),
             )
@@ -1224,7 +1416,7 @@ class AgentRunner:
         ):
             item = {
                 "role": "assistant",
-                "content": f"Tool-call limit ({self.settings.agent_tool_call_limit}) reached.",
+                "content": f"Tool-call limit ({limit}) reached.",
                 "synthetic": True,
             }
             state.messages.append(item)
@@ -1362,13 +1554,14 @@ class AgentRunner:
                 stop_payload["run_id"] = run_id
             self.publish("agent_status", stop_payload)
             return
+        run_settings = (state.settings if state is not None else None) or self.settings
         err_payload: dict[str, Any] = {
             "project": project,
             "error_type": err_type,
             "message": self._user_error_message(
                 detail,
                 err_type,
-                provider=self.settings.llm_provider,
+                provider=run_settings.llm_provider,
             ),
         }
         if run_id:
@@ -1385,23 +1578,26 @@ class AgentRunner:
     ) -> None:
         """Terminal ``finally`` block — runs on every exit path.
 
-        Active-handle cleanup is unconditional; activity-log
-        finalisation and run-directory removal are guarded so a partial
-        init does not crash the cleanup pass.
+        Active-handle cleanup is guarded by ``run_id`` so an exiting thread
+        from a stopped run never clobbers a newly started run's state.
         """
         with self._lock:
-            self._active_tools = None
-            self._active_client = None
-            if self._active_project == project:
-                self._active_project = None
-                self._active_run_id = None
+            is_current_run = (
+                self._active_run_id is None or self._active_run_id == run_id
+            )
+            if is_current_run:
+                self._active_tools = None
+                self._active_client = None
+                if self._active_project == project:
+                    self._active_project = None
+                    self._active_run_id = None
+                self._active_activity_logger = None
             # Mark the run finished and drop the thread reference so a
             # subsequent ``start()`` / ``answer()`` never observes a
             # stale ``_thread``.
             if self._thread is None or self._thread is threading.current_thread():
                 self._thread = None
                 self._run_complete.set()
-        self._active_activity_logger = None
         if activity_logger is not None:
             try:
                 if state is not None:
@@ -1461,7 +1657,9 @@ class AgentRunner:
         image_paths: list[Path],
         *,
         is_retry: bool = False,
+        settings: Settings | None = None,
     ) -> list[dict]:
+        eff_settings = settings or self.settings
         history = self._load_history(project_dir)
         if not is_retry:
             user_message: dict[str, object] = {"role": "user", "content": message}
@@ -1476,13 +1674,25 @@ class AgentRunner:
                 self._append_message(project_dir, user_message)
         return [
             {"role": "system", "content": get_system_prompt()},
-            self._project_state_message(project_dir, history),
+            self._project_state_message(
+                project_dir,
+                history,
+                user_printer=eff_settings.user_printer,
+                user_nozzle=eff_settings.user_nozzle,
+                user_filament=eff_settings.user_filament,
+            ),
             *history,
         ]
 
     @classmethod
     def _project_state_message(
-        cls, project_dir: Path, history: list[dict] | None = None
+        cls,
+        project_dir: Path,
+        history: list[dict] | None = None,
+        *,
+        user_printer: str = "",
+        user_nozzle: str = "",
+        user_filament: str = "",
     ) -> dict[str, str]:
         """Provide initial workspace state after the cacheable system prefix.
 
@@ -1492,7 +1702,14 @@ class AgentRunner:
         model receives.
         """
         existed, code = cls._initial_model_state(project_dir, history)
-        content = format_project_state(existed, MODEL_FILENAME, code)
+        content = format_project_state(
+            existed,
+            MODEL_FILENAME,
+            code,
+            user_printer=user_printer,
+            user_nozzle=user_nozzle,
+            user_filament=user_filament,
+        )
         # Gemini normalizes all system messages into an immutable instruction.
         # Keeping workspace state in a later user message lets its
         # explicit system-message cache breakpoint remain reusable.
@@ -1614,6 +1831,35 @@ class AgentRunner:
         # the staging namespace (``/tmp/tmp_*/.staging/...``).
         normalized = re.sub(r"/tmp/[^/\s]+/", "/tmp/<scratch>/", normalized)
         return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+    @classmethod
+    def _verification_failure_signature(cls, messages: list[dict]) -> str:
+        """Build a stable signature from critical CAD verification findings in the latest tool result."""
+        if not messages:
+            return cls._failure_signature("verification_failed")
+        last_content = messages[-1].get("content")
+        raw_text = ""
+        if isinstance(last_content, str):
+            raw_text = last_content
+        elif isinstance(last_content, list):
+            for part in last_content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    raw_text = str(part.get("text") or "")
+                    break
+        try:
+            payload = json.loads(raw_text) if raw_text else {}
+            verif = (payload.get("data") or {}).get("verification") or {}
+            findings = verif.get("findings") or []
+            codes = sorted(
+                str(f.get("code"))
+                for f in findings
+                if isinstance(f, dict) and f.get("category") == "CRITICAL" and f.get("code")
+            )
+            if codes:
+                return cls._failure_signature("VERIFY_FAIL:" + ",".join(codes))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+        return cls._failure_signature("verification_failed")
 
     @staticmethod
     def _build_failure_exhausted(
