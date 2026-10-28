@@ -21,9 +21,9 @@ llm:
 # Models configured below appear automatically in the Web UI model picker.
 # Optional provider keys (shown values are defaults where applicable):
 #   all:        base_url, timeout_seconds, reasoning_effort (default for its models)
-#   openrouter: provider_order: [], force_provider: false, reasoning_max_tokens: 0
-#               (defaults for its models), app_title, app_url, session_prefix,
-#               enable_anthropic_cache: true, enable_gemini_cache: true
+#   openrouter: provider_order: [], force_provider: false, reasoning_max_tokens: 2048
+#               (defaults for its models; 2048 bounds reasoning so tool calls never truncate, 0 = unlimited),
+#               app_title, app_url, session_prefix, enable_anthropic_cache: true, enable_gemini_cache: true
 #   gemini:     store: true, project_id / location (auth_mode: gcloud only)
 
 openrouter:
@@ -31,13 +31,14 @@ openrouter:
   # You can bind `providers` (priority routing order), `force_provider`, and
   # `reasoning_effort` directly per model so switching models in the UI
   # automatically switches the OpenRouter sub-providers too:
+  # reasoning_max_tokens: 2048   # Default 2048 aggressively caps thinking tokens so tools never truncate (0 = unlimited)
   models: {}
     # deepseek/deepseek-r1:
-    #   reasoning_effort: high
+    #   reasoning_effort: high       # Takes precedence over reasoning_max_tokens when set
     #   providers: [novita/fp8, deepinfra/fp4]
     #   force_provider: false
     # z-ai/glm-5:
-    #   reasoning_effort: medium
+    #   reasoning_max_tokens: 2048   # Caps reasoning tokens when reasoning_effort is omitted (0 = unlimited)
     #   providers: [z-ai/fp8]
 
 gemini:
@@ -45,7 +46,7 @@ gemini:
   models:
     gemini-3.8-flash:
       reasoning_effort: ""
-    gemini-3.8-pro:
+    gemini-4-argon:
       reasoning_effort: ""
 
 vertex:
@@ -54,7 +55,7 @@ vertex:
   models:
     gemini-3.8-flash:
       reasoning_effort: ""
-    gemini-3.8-pro:
+    gemini-4-argon:
       reasoning_effort: ""
 
 ollama:

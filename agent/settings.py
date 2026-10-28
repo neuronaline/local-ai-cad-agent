@@ -88,6 +88,9 @@ class ModelOption:
             "reasoning_effort": self.reasoning_effort,
         }
 
+DEFAULT_OPENROUTER_REASONING_MAX_TOKENS = 2048
+
+
 @dataclass(frozen=True)
 class Settings:
     workspace_root: Path = Path("/tmp/cad_workspace")
@@ -102,7 +105,7 @@ class Settings:
     openrouter_enable_anthropic_cache: bool = True
     openrouter_enable_gemini_cache: bool = True
     openrouter_reasoning_effort: str | None = None
-    openrouter_reasoning_max_tokens: int | None = None
+    openrouter_reasoning_max_tokens: int | None = DEFAULT_OPENROUTER_REASONING_MAX_TOKENS
     openrouter_provider: str | None = None
     openrouter_force_provider: bool = False
     # Ordered list of OpenRouter provider routing slugs (highest priority
@@ -461,7 +464,7 @@ def _parse_model_options(
                 provider_order=order,
                 force_provider=force,
                 reasoning_max_tokens=(
-                    _optional_positive_int(cfg["reasoning_max_tokens"], f"{field}.reasoning_max_tokens")
+                    _optional_non_negative_int(cfg["reasoning_max_tokens"], f"{field}.reasoning_max_tokens")
                     if "reasoning_max_tokens" in cfg
                     else defaults.reasoning_max_tokens
                 ),
@@ -616,15 +619,17 @@ def load_settings(project_root: Path | None = None) -> Settings:
     openrouter_force_provider = _strict_bool(
         openrouter.get("force_provider", False), "openrouter.force_provider"
     )
-    openrouter_reasoning_max_tokens = _optional_positive_int(
-        openrouter.get("reasoning_max_tokens")
-        or (
-            openrouter.get("reasoning", {}).get("max_tokens")
-            if isinstance(openrouter.get("reasoning"), dict)
-            else None
-        ),
-        "openrouter.reasoning_max_tokens",
-    )
+    raw_openrouter_reasoning_max = openrouter.get("reasoning_max_tokens")
+    if raw_openrouter_reasoning_max is None and isinstance(openrouter.get("reasoning"), dict):
+        raw_openrouter_reasoning_max = openrouter.get("reasoning", {}).get("max_tokens")
+
+    if raw_openrouter_reasoning_max is not None:
+        openrouter_reasoning_max_tokens = _optional_non_negative_int(
+            raw_openrouter_reasoning_max,
+            "openrouter.reasoning_max_tokens",
+        )
+    else:
+        openrouter_reasoning_max_tokens = DEFAULT_OPENROUTER_REASONING_MAX_TOKENS
 
     # Model catalog: each provider's ``models`` block, ordered as the provider
     # sections appear in config.yaml. Provider-level values are the defaults
@@ -835,6 +840,22 @@ def _optional_positive_int(value: Any, name: str) -> int | None:
         return None
     if number < 0:
         raise ValueError(f"{name} must be a positive integer.")
+    return number
+
+
+def _optional_non_negative_int(value: Any, name: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be a non-negative integer.") from error
+    if number < 0:
+        raise ValueError(f"{name} must be a non-negative integer.")
     return number
 
 

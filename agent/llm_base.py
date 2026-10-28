@@ -46,13 +46,18 @@ PROVIDER_LABELS = {
 
 
 def _build_http_client() -> httpx.Client:
-    """Create the shared HTTP/2 streaming client with TCP keep-alive enabled.
+    """Create the shared HTTP/1.1 streaming client with TCP keep-alive enabled.
 
     Long reasoning turns (e.g. ``reasoning_effort="high"``) and server-buffered
     tool call payloads (such as 300+ line OpenSCAD ``write_file`` arguments)
     can leave an open SSE stream silent for 60–180 seconds. Enabling OS-level
     TCP keep-alive probes prevents NAT routers, firewalls, and upstream load
     balancers from silently dropping the connection during thinking pauses.
+
+    Uses HTTP/1.1 (``http2=False``) so each streaming SSE response owns an
+    isolated socket that closes cleanly on early termination or cancellation,
+    avoiding ``httpcore`` HTTP/2 multiplexed stream read-lock contention when
+    a background reader thread is interrupted.
     """
     limits = httpx.Limits(max_keepalive_connections=20, max_connections=50)
     socket_options: list[tuple[int, int, int]] = [
@@ -66,19 +71,16 @@ def _build_http_client() -> httpx.Client:
         socket_options.append((socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 6))
     try:
         transport = httpx.HTTPTransport(
-            http2=True,
+            http2=False,
             limits=limits,
             socket_options=socket_options,
         )
         return httpx.Client(transport=transport, timeout=None)
     except TypeError:
-        return httpx.Client(http2=True, limits=limits, timeout=None)
+        return httpx.Client(http2=False, limits=limits, timeout=None)
 
 
-# Module-level HTTP/2 client for streaming Chat Completions without HTTP/1.1
-# chunk-size reassembly buffering. HTTP/2 binary DATA frames multiplex over
-# a persistent connection, eliminating the standard library chunked transfer
-# accumulation defect (http.client._read_chunked with amt=None).
+# Module-level HTTP client for streaming Chat Completions.
 _HTTP_CLIENT: httpx.Client = _build_http_client()
 atexit.register(_HTTP_CLIENT.close)
 
@@ -816,6 +818,14 @@ def _force_close_response(response: Any | None) -> None:
     if response is None:
         return
     try:
+        ext = getattr(response, "extensions", None)
+        if isinstance(ext, dict):
+            net_stream = ext.get("network_stream")
+            if net_stream is not None and callable(getattr(net_stream, "close", None)):
+                net_stream.close()
+    except Exception:
+        pass
+    try:
         close = getattr(response, "close", None)
         if callable(close):
             close()
@@ -840,6 +850,7 @@ def iter_lines_with_cancel(
     line_queue: queue.Queue[Any] = queue.Queue(maxsize=100)
     _EOF = object()
     closed_event = threading.Event()
+    reader_done = threading.Event()
 
     def reader() -> None:
         try:
@@ -860,6 +871,7 @@ def iter_lines_with_cancel(
             except queue.Full:
                 pass
         finally:
+            reader_done.set()
             try:
                 line_queue.put(_EOF, timeout=0.5)
             except queue.Full:
@@ -885,7 +897,38 @@ def iter_lines_with_cancel(
             yield item
     finally:
         closed_event.set()
-        _force_close_response(response)
+        if reader_done.is_set() and not effective_stop.is_set():
+            try:
+                close = getattr(response, "close", None)
+                if callable(close):
+                    close()
+            except Exception:
+                pass
+        else:
+            _force_close_response(response)
+
+
+def is_continuation_messages(messages: list[dict[str, Any]] | None) -> bool:
+    """Return True when the trailing message is a synthetic truncation/reasoning continuation nudge."""
+    if not messages:
+        return False
+    last = messages[-1]
+    if not isinstance(last, dict) or last.get("role") != "user":
+        return False
+    content = str(last.get("content") or "").lower()
+    if last.get("synthetic"):
+        return (
+            "token limit" in content
+            or "cease all internal reasoning" in content
+            or "without repeating your reasoning" in content
+            or "reasoning finished but no tool call" in content
+            or "do not reason further" in content
+        )
+    return (
+        "critical: output token limit reached" in content
+        or "critical: your previous tool call" in content
+        or "critical: reasoning finished but no tool call" in content
+    )
 
 
 def strip_encrypted_reasoning(text: str | None) -> str:
@@ -1003,7 +1046,7 @@ def parse_chat_stream(
     provider_label: str,
     stop_event: threading.Event | None = None,
     stream_callback: Any | None = None,
-    idle_timeout: float = 90.0,
+    idle_timeout: float = 180.0,
 ) -> dict[str, Any]:
     """Consume an SSE Chat Completions stream and rebuild a non-streaming response."""
     content = ""
@@ -1039,16 +1082,26 @@ def parse_chat_stream(
                     _force_close_response(response)
                     raise StreamResponseError(
                         f"{provider_label} stream timed out after {idle_timeout:.0f}s of inactivity.",
-                        retryable=not (content or tool_calls or reasoning_text or reasoning_details),
+                        retryable=not (content or tool_calls),
                     )
                 continue
-            last_activity_time = now
             line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
             if not line:
                 continue
             line = line.strip()
             if not line.startswith("data:"):
+                if finish_reason is not None and finish_time is not None:
+                    if last_usage is not None or (now - finish_time) >= 1.0:
+                        saw_done = True
+                        break
+                elif idle_timeout > 0 and (now - last_activity_time) >= idle_timeout:
+                    _force_close_response(response)
+                    raise StreamResponseError(
+                        f"{provider_label} stream timed out after {idle_timeout:.0f}s of inactivity.",
+                        retryable=not (content or tool_calls),
+                    )
                 continue
+            last_activity_time = now
             payload = line[5:].strip()
             if payload == "[DONE]":
                 saw_done = True
@@ -1063,7 +1116,7 @@ def parse_chat_stream(
             if stream_error:
                 raise StreamResponseError(
                     f"{provider_label} stream failed: {_stream_error_detail(stream_error)}",
-                    retryable=not (content or tool_calls or reasoning_text or reasoning_details),
+                    retryable=not (content or tool_calls),
                 )
             if isinstance(chunk.get("usage"), dict):
                 last_usage = normalize_usage(chunk["usage"])
@@ -1088,7 +1141,7 @@ def parse_chat_stream(
                 )
                 raise StreamResponseError(
                     f"{provider_label} stream failed: {detail}",
-                    retryable=not (content or tool_calls or reasoning_text or reasoning_details),
+                    retryable=not (content or tool_calls),
                 )
             delta = choice.get("delta") or {}
             role = delta.get("role") or role
@@ -1294,29 +1347,41 @@ def parse_chat_stream(
                             "arguments_delta": arguments_delta,
                         }
                     )
-        if tag_buffer:
-            if in_think_tag:
-                reasoning_text += tag_buffer
-                if stream_callback:
-                    stream_callback({"type": "reasoning", "delta": tag_buffer})
-            elif in_tool_tag:
-                tool_tag_buffer += tag_buffer
-            else:
-                if len(tag_buffer) >= 2 and any(
-                    tag_buffer.startswith(tt[: len(tag_buffer)])
-                    for tt in ("<function=", "<tool_call>", "[TOOL_CALLS]")
-                ):
-                    tool_tag_buffer += tag_buffer
-                else:
-                    content += tag_buffer
-                    if stream_callback:
-                        stream_callback({"type": "content", "delta": tag_buffer})
-            tag_buffer = ""
+            if finish_reason is not None and finish_reason != "error" and last_usage is not None:
+                saw_done = True
+                break
     except Exception:
         if stop_event and stop_event.is_set():
             _force_close_response(response)
             raise RequestCancelled(f"{provider_label} request cancelled.")
-        raise
+        if (
+            finish_reason is not None
+            and finish_reason != "error"
+            and (content or tool_calls or reasoning_text or reasoning_details or tag_buffer or tool_tag_buffer)
+        ):
+            _force_close_response(response)
+            saw_done = True
+        else:
+            raise
+
+    if tag_buffer:
+        if in_think_tag:
+            reasoning_text += tag_buffer
+            if stream_callback:
+                stream_callback({"type": "reasoning", "delta": tag_buffer})
+        elif in_tool_tag:
+            tool_tag_buffer += tag_buffer
+        else:
+            if len(tag_buffer) >= 2 and any(
+                tag_buffer.startswith(tt[: len(tag_buffer)])
+                for tt in ("<function=", "<tool_call>", "[TOOL_CALLS]")
+            ):
+                tool_tag_buffer += tag_buffer
+            else:
+                content += tag_buffer
+                if stream_callback:
+                    stream_callback({"type": "content", "delta": tag_buffer})
+        tag_buffer = ""
 
     if stop_event and stop_event.is_set():
         _force_close_response(response)

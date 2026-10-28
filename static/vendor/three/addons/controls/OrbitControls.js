@@ -427,6 +427,20 @@ class OrbitControls extends EventDispatcher {
 
 			}
 
+			const doc = scope.domElement.ownerDocument || document;
+			const win = doc.defaultView || window;
+			if ( doc && doc.removeEventListener ) {
+
+				doc.removeEventListener( 'keydown', interceptControlDown, { capture: true } );
+				doc.removeEventListener( 'keyup', interceptControlUp, { capture: true } );
+
+			}
+			if ( win && win.removeEventListener ) {
+
+				win.removeEventListener( 'blur', onWindowBlur );
+
+			}
+
 			//scope.dispatchEvent( { type: 'dispose' } ); // should this be added here?
 
 		};
@@ -477,6 +491,7 @@ class OrbitControls extends EventDispatcher {
 
 		const pointers = [];
 		const pointerPositions = {};
+		let controlActive = false;
 
 		function getAutoRotationAngle( deltaTime ) {
 
@@ -494,8 +509,10 @@ class OrbitControls extends EventDispatcher {
 
 		function getZoomScale( delta ) {
 
-			const normalized_delta = Math.abs( delta ) / ( 100 * ( window.devicePixelRatio | 0 ) );
-			return Math.pow( 0.95, scope.zoomSpeed * normalized_delta );
+			const rawDelta = Number.isFinite( delta ) ? delta : 0;
+			const normalizedDelta = Math.min( Math.max( 0, Math.abs( rawDelta * 0.01 ) ), 3 );
+			const speed = Number.isFinite( scope.zoomSpeed ) && scope.zoomSpeed > 0 ? scope.zoomSpeed : 1.0;
+			return Math.min( 0.9999, Math.max( 0.1, Math.pow( 0.95, speed * normalizedDelta ) ) );
 
 		}
 
@@ -1192,9 +1209,69 @@ class OrbitControls extends EventDispatcher {
 
 			scope.dispatchEvent( _startEvent );
 
-			handleMouseWheel( event );
+			handleMouseWheel( customWheelEvent( event ) );
 
 			scope.dispatchEvent( _endEvent );
+
+		}
+
+		function customWheelEvent( event ) {
+
+			const mode = event.deltaMode;
+
+			// minimal wheel event altered to meet delta-zoom demand
+			const newEvent = {
+				clientX: event.clientX,
+				clientY: event.clientY,
+				deltaY: Number.isFinite( event.deltaY ) ? event.deltaY : 0,
+			};
+
+			switch ( mode ) {
+
+				case 1: // LINE_MODE
+					newEvent.deltaY *= 16;
+					break;
+
+				case 2: // PAGE_MODE
+					newEvent.deltaY *= 100;
+					break;
+
+			}
+
+			// detect if event was triggered by pinching
+			if ( event.ctrlKey && ! controlActive ) {
+
+				newEvent.deltaY *= 10;
+
+			}
+
+			return newEvent;
+
+		}
+
+		function interceptControlDown( event ) {
+
+			if ( event.key === 'Control' ) {
+
+				controlActive = true;
+
+			}
+
+		}
+
+		function interceptControlUp( event ) {
+
+			if ( event.key === 'Control' ) {
+
+				controlActive = false;
+
+			}
+
+		}
+
+		function onWindowBlur() {
+
+			controlActive = false;
 
 		}
 
@@ -1405,6 +1482,20 @@ class OrbitControls extends EventDispatcher {
 		scope.domElement.addEventListener( 'pointerdown', onPointerDown );
 		scope.domElement.addEventListener( 'pointercancel', onPointerUp );
 		scope.domElement.addEventListener( 'wheel', onMouseWheel, { passive: false } );
+
+		const doc = scope.domElement.ownerDocument || document;
+		const win = doc.defaultView || window;
+		if ( doc && doc.addEventListener ) {
+
+			doc.addEventListener( 'keydown', interceptControlDown, { passive: true, capture: true } );
+			doc.addEventListener( 'keyup', interceptControlUp, { passive: true, capture: true } );
+
+		}
+		if ( win && win.addEventListener ) {
+
+			win.addEventListener( 'blur', onWindowBlur );
+
+		}
 
 		// force an update at start
 

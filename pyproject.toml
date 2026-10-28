@@ -9,6 +9,7 @@ target-version = "py310"
 # look unused to a static checker but are part of the sandbox entry-point
 # surface or sibling-module imports.
 "agent/tools/cad_scripts/runner.py" = ["F401", "S102"]
+"agent/tools/cad_scripts/python_runner.py" = ["F401", "S102", "BLE001"]
 "agent/dispatcher.py" = ["TRY004"]
 "agent/tools/file_tool.py" = ["TRY004"]
 "agent/tools/process_runner.py" = ["TRY004"]

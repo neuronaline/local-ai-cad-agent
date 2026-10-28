@@ -4,6 +4,13 @@ import { STLLoader } from 'three/addons/loaders/STLLoader.js';
 
 const DEFAULT_GRID = Object.freeze({size: 200, divisions: 20});
 
+const VIEW_DIRECTIONS = Object.freeze({
+  iso: new THREE.Vector3(1.4, 1.1, 1.4).normalize(),
+  front: new THREE.Vector3(0, 0, 1),
+  top: new THREE.Vector3(0, 1, 0.001).normalize(),
+  right: new THREE.Vector3(1, 0, 0),
+});
+
 function readGridConfig(appConfig) {
   // ``app-config`` ships the viewer grid size from the server (parsed from
   // ``viewer.grid`` in config.yaml). Fall back to the legacy defaults
@@ -25,7 +32,7 @@ export class CadViewer {
     this.container = container;
     this.dimensions = dimensions;
     this.emptyState = container.querySelector('#viewer-empty');
-    this.gridWarning = document.querySelector('#grid-warning');
+    this.gridWarning = container.parentElement?.querySelector('#grid-warning') || document.querySelector('#grid-warning');
     this.grid = readGridConfig(appConfig);
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color('#0d1524');
@@ -46,6 +53,7 @@ export class CadViewer {
     this.scene.add(this.gridHelper);
     this.loader = new STLLoader();
     this.model = null;
+    this.modelBounds = null;
     this.boxHelper = null;
     this.cadDimensions = null;
     this.wireframe = false;
@@ -85,22 +93,18 @@ export class CadViewer {
 
   _refreshGridWarning() {
     if (!this.gridWarning) return;
-    if (!this.model || !this.cadDimensions) {
-      this.gridWarning.hidden = true;
-      this.gridWarning.textContent = '';
-      delete this.gridWarning.dataset.state;
-      return;
-    }
+    this.gridWarning.hidden = true;
+    this.gridWarning.textContent = '';
+    delete this.gridWarning.dataset.state;
+
+    if (!this.model || !this.cadDimensions) return;
+
     const dims = this.cadDimensions;
     const exceedsX = dims.x > this.grid.size;
     const exceedsY = dims.y > this.grid.size;
     const exceedsHeight = dims.z > this.grid.size * 2;
-    if (!exceedsX && !exceedsY && !exceedsHeight) {
-      this.gridWarning.hidden = true;
-      this.gridWarning.textContent = '';
-      delete this.gridWarning.dataset.state;
-      return;
-    }
+    if (!exceedsX && !exceedsY && !exceedsHeight) return;
+
     const offenders = [];
     if (exceedsX) offenders.push(`X ${dims.x.toFixed(1)} mm > ${this.grid.size} mm`);
     if (exceedsY) offenders.push(`Y ${dims.y.toFixed(1)} mm > ${this.grid.size} mm`);
@@ -125,15 +129,18 @@ export class CadViewer {
     this.startAnimation();
   }
 
+  _canRender() {
+    return !document.hidden && this.container.clientWidth > 0 && this.container.clientHeight > 0;
+  }
+
   startAnimation() {
-    if (this._animating) return;
-    if (document.hidden || this.container.clientWidth === 0 || this.container.clientHeight === 0) return;
+    if (this._animating || !this._canRender()) return;
     this._animating = true;
     this.animate();
   }
 
   animate() {
-    if (document.hidden || this.container.clientWidth === 0 || this.container.clientHeight === 0) {
+    if (!this._canRender()) {
       this._animating = false;
       return;
     }
@@ -143,7 +150,6 @@ export class CadViewer {
       this._needsRender = false;
     }
     if (isDamping || this._needsRender) {
-      this._animating = true;
       requestAnimationFrame(() => this.animate());
     } else {
       this._animating = false;
@@ -162,10 +168,14 @@ export class CadViewer {
       this.boxHelper.material.dispose();
     }
     this.model = null;
+    this.modelBounds = null;
     this.boxHelper = null;
     this.cadDimensions = null;
+    this.controls.minDistance = 1;
+    this.controls.maxDistance = 50000;
     this.dimensions.textContent = message;
-    this.emptyState.querySelector('strong').textContent = message;
+    const strong = this.emptyState?.querySelector('strong');
+    if (strong) strong.textContent = message;
     this.emptyState.hidden = false;
     this._refreshGridWarning();
     this.requestRender();
@@ -209,6 +219,14 @@ export class CadViewer {
             const groundedBox = new THREE.Box3().setFromObject(this.model);
             this.model.position.y -= groundedBox.min.y;
             this.model.updateMatrixWorld(true);
+            const box = new THREE.Box3().setFromObject(this.model);
+            const center = box.getCenter(new THREE.Vector3());
+            const modelSize = box.getSize(new THREE.Vector3());
+            this.modelBounds = {
+              center,
+              size: modelSize,
+              largest: Math.max(modelSize.x, modelSize.y, modelSize.z, 1),
+            };
             this.boxHelper = new THREE.BoxHelper(this.model, 0xb9c9ff);
             this.scene.add(this.model, this.boxHelper);
             this.emptyState.hidden = true;
@@ -234,11 +252,10 @@ export class CadViewer {
   }
 
   fit() {
-    if (!this.model) return;
-    const box = new THREE.Box3().setFromObject(this.model);
-    const center = box.getCenter(new THREE.Vector3());
-    const size = box.getSize(new THREE.Vector3());
-    const largest = Math.max(size.x, size.y, size.z, 1);
+    if (!this.model || !this.modelBounds) return;
+    const { center, size, largest } = this.modelBounds;
+    this.controls.minDistance = Math.max(largest * 0.05, 0.5);
+    this.controls.maxDistance = Math.max(largest * 25, 2000);
     this.camera.position.set(center.x + largest * 1.4, center.y + largest * 1.1, center.z + largest * 1.4);
     this.camera.near = Math.max(largest / 10000, 0.001);
     this.camera.far = Math.max(10000, largest * 8);
@@ -251,19 +268,11 @@ export class CadViewer {
   }
 
   setView(view) {
-    if (!this.model) return;
-    const box = new THREE.Box3().setFromObject(this.model);
-    const center = box.getCenter(new THREE.Vector3());
-    const size = box.getSize(new THREE.Vector3());
-    const distance = Math.max(size.x, size.y, size.z, 1) * 2.2;
-    const directions = {
-      iso: new THREE.Vector3(1.4, 1.1, 1.4),
-      front: new THREE.Vector3(0, 0, 1),
-      top: new THREE.Vector3(0, 1, 0.001),
-      right: new THREE.Vector3(1, 0, 0),
-    };
-    const direction = directions[view] || directions.iso;
-    this.camera.position.copy(center).addScaledVector(direction.normalize(), distance);
+    if (!this.model || !this.modelBounds) return;
+    const { center, largest } = this.modelBounds;
+    const distance = largest * 2.2;
+    const direction = VIEW_DIRECTIONS[view] || VIEW_DIRECTIONS.iso;
+    this.camera.position.copy(center).addScaledVector(direction, distance);
     this.controls.target.copy(center);
     this.controls.update();
     this.requestRender();

@@ -732,11 +732,20 @@ def chat_retry():
         return jsonify({"error": msg, "active_project": active}), 409
     _sync_model_selection(payload.get("model_key"), persist=True)
     _sync_reasoning_effort(payload.get("reasoning_effort"), persist=True)
+    user_index = -1
+    raw_user_index = payload.get("user_index")
+    if raw_user_index is not None:
+        try:
+            user_index = int(raw_user_index)
+        except (ValueError, TypeError):
+            user_index = -1
     with _project_lock(project_name):
         project_dir = _resolve_project_or_404(project_name)
         if not isinstance(project_dir, Path):
             return project_dir
-        last_user_turn = ConversationStore.rewind_to_last_user_message(project_dir)
+        last_user_turn = ConversationStore.rewind_to_user_message(
+            project_dir, user_index=user_index
+        )
         if not last_user_turn:
             return jsonify({"error": "No previous user message found to retry."}), 400
         prompt_text = ""
@@ -1379,13 +1388,16 @@ def restore_revision(project_name: str, revision_id: str):
             else:
                 (project_dir / "render.png").unlink(missing_ok=True)
             metrics = {}
+            verification = {}
             if cached_metrics.is_file() and cached_metrics.stat().st_size > 0:
                 shutil.copy2(cached_metrics, project_dir / ".cad_metrics.json")
                 try:
                     loaded = json.loads(cached_metrics.read_text(encoding="utf-8"))
                     metrics = loaded.get("metrics") or {}
+                    verification = loaded.get("verification") or {}
                 except (OSError, json.JSONDecodeError):
                     metrics = {}
+                    verification = {}
 
             store.record_build_success(
                 revision.id,
@@ -1408,6 +1420,7 @@ def restore_revision(project_name: str, revision_id: str):
                 "revision_id": revision.id,
                 "build_status": "succeeded",
                 "metrics": metrics,
+                "verification": verification,
                 "preview_id": preview_id,
                 "cached": True,
             })
@@ -1420,10 +1433,18 @@ def restore_revision(project_name: str, revision_id: str):
         })
 
         from agent.tools.cad_tool import CadTool, RenderMode
-        cad = CadTool(project_dir, bus.publish, store)
+        cad = CadTool(
+            project_dir,
+            bus.publish,
+            store,
+            user_printer=settings.user_printer,
+            user_nozzle=settings.user_nozzle,
+            user_filament=settings.user_filament,
+        )
         try:
             build = cad.build_and_verify(mode=RenderMode.NONE)
             metrics = build.get("metrics") or {}
+            verification = build.get("verification") or {}
             (project_dir / "render.png").unlink(missing_ok=True)
         except (RuntimeError, ValueError, TypeError) as error:
             bus.publish("agent_error", {
@@ -1459,6 +1480,7 @@ def restore_revision(project_name: str, revision_id: str):
             "revision_id": revision.id,
             "build_status": "succeeded",
             "metrics": metrics,
+            "verification": verification,
             "preview_id": preview_id,
         })
 
@@ -1496,10 +1518,18 @@ def build_project(project_name: str):
 
         bus = current_app.config["EVENT_BUS"]
         from agent.tools.cad_tool import CadTool, RenderMode
-        cad = CadTool(project_dir, None, store)
+        cad = CadTool(
+            project_dir,
+            None,
+            store,
+            user_printer=settings.user_printer,
+            user_nozzle=settings.user_nozzle,
+            user_filament=settings.user_filament,
+        )
         try:
             build = cad.build_and_verify(mode=RenderMode.NONE)
             metrics = build.get("metrics") or {}
+            verification = build.get("verification") or {}
             (project_dir / "render.png").unlink(missing_ok=True)
         except (RuntimeError, ValueError, TypeError) as error:
             return jsonify({
@@ -1517,6 +1547,7 @@ def build_project(project_name: str):
             "ok": True,
             "build_status": "succeeded",
             "metrics": metrics,
+            "verification": verification,
             "preview_id": preview_id,
         })
 

@@ -51,13 +51,13 @@ function cardTemplate(project) {
           </svg>
         </a>
         <div class="card-actions">
-          <button type="button" class="icon-btn rename-btn" title="Rename" data-name="${name}" aria-label="Rename ${name}">
+          <button type="button" class="icon-btn rename-btn" title="Rename" aria-label="Rename ${name}">
             <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
               <path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
               <path d="m15 5 4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
             </svg>
           </button>
-          <button type="button" class="icon-btn delete-btn" title="Delete" data-name="${name}" aria-label="Delete ${name}">
+          <button type="button" class="icon-btn delete-btn" title="Delete" aria-label="Delete ${name}">
             <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
               <path d="M19 7l-.867 12.142A2 2 0 0 1 16.138 21H7.862a2 2 0 0 1-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v3M4 7h16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
             </svg>
@@ -140,10 +140,10 @@ grid.addEventListener('click', (e) => {
     filterAndRenderProjects();
     return;
   }
-  const renameBtn = e.target.closest('.rename-btn');
-  if (renameBtn) return openRenameModal(renameBtn.dataset.name);
-  const deleteBtn = e.target.closest('.delete-btn');
-  if (deleteBtn) return openDeleteConfirm(deleteBtn.dataset.name);
+  const card = e.target.closest('.project-card');
+  const projectName = card?.dataset.name;
+  if (e.target.closest('.rename-btn') && projectName) return openRenameModal(projectName);
+  if (e.target.closest('.delete-btn') && projectName) return openDeleteConfirm(projectName);
   if (e.target.closest('#empty-cta')) return openNewProjectModal();
 });
 
@@ -163,6 +163,16 @@ function showModalError(selector, message) {
   el.hidden = false;
 }
 
+function openModal(modal, focusTarget = null) {
+  lastFocusedElement = document.activeElement;
+  clearModalErrors();
+  modal.classList.remove('hidden');
+  if (focusTarget) {
+    focusTarget.focus();
+    if (typeof focusTarget.select === 'function') focusTarget.select();
+  }
+}
+
 function closeModal(modal) {
   modal.classList.add('hidden');
   clearModalErrors();
@@ -172,19 +182,37 @@ function closeModal(modal) {
   }
 }
 
+async function handleModalSubmit(submitBtn, errorSelector, actionAsync) {
+  clearModalErrors();
+  if (submitBtn) submitBtn.disabled = true;
+  try {
+    await actionAsync();
+  } catch (error) {
+    showModalError(errorSelector, error.message);
+  } finally {
+    if (submitBtn) submitBtn.disabled = false;
+  }
+}
+
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
-    const openModal = document.querySelector('.modal:not(.hidden)');
-    if (openModal) closeModal(openModal);
+    const open = document.querySelector('.modal:not(.hidden)');
+    if (open) closeModal(open);
   }
 });
 
 document.querySelectorAll('.modal').forEach(modal => {
   modal.addEventListener('click', (e) => {
-    if (e.target === modal) {
-      closeModal(modal);
-    }
+    if (e.target === modal) closeModal(modal);
   });
+});
+
+document.addEventListener('click', (e) => {
+  const cancelBtn = e.target.closest('#cancel-new-project, #cancel-rename, #cancel-delete');
+  if (cancelBtn) {
+    const modal = cancelBtn.closest('.modal');
+    if (modal) closeModal(modal);
+  }
 });
 
 /* ── New Project Modal ── */
@@ -194,38 +222,24 @@ const newProjectForm = document.querySelector('#new-project-form');
 const newProjectName = document.querySelector('#new-project-name');
 
 function openNewProjectModal() {
-  lastFocusedElement = document.activeElement;
-  clearModalErrors();
-  newProjectModal.classList.remove('hidden');
   newProjectName.value = '';
-  newProjectName.focus();
+  openModal(newProjectModal, newProjectName);
 }
 
-document.querySelector('#new-project-btn').addEventListener('click', openNewProjectModal);
-document.querySelector('#cancel-new-project').addEventListener('click', () => {
-  closeModal(newProjectModal);
-});
+document.querySelector('#new-project-btn')?.addEventListener('click', openNewProjectModal);
 
-newProjectForm.addEventListener('submit', async (e) => {
+newProjectForm?.addEventListener('submit', async (e) => {
   e.preventDefault();
-  clearModalErrors();
-  const rawName = newProjectName.value.trim();
-  const name = rawName.replace(/\s+/g, ' ');
+  const name = newProjectName.value.trim().replace(/\s+/g, ' ');
   if (!name) return;
-  const submitBtn = newProjectForm.querySelector('button[type="submit"]');
-  if (submitBtn) submitBtn.disabled = true;
-  try {
+  await handleModalSubmit(newProjectForm.querySelector('button[type="submit"]'), '#new-project-error', async () => {
     await api('/api/projects/new', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name }),
     });
     window.location.href = `/project/${encodeURIComponent(name)}`;
-  } catch (error) {
-    showModalError('#new-project-error', error.message);
-  } finally {
-    if (submitBtn) submitBtn.disabled = false;
-  }
+  });
 });
 
 /* ── Rename Modal ── */
@@ -236,43 +250,27 @@ const renameName = document.querySelector('#rename-name');
 let renameTarget = '';
 
 function openRenameModal(name) {
-  lastFocusedElement = document.activeElement;
-  clearModalErrors();
   renameTarget = name;
   renameName.value = name;
-  renameModal.classList.remove('hidden');
-  renameName.focus();
-  renameName.select();
+  openModal(renameModal, renameName);
 }
 
-document.querySelector('#cancel-rename').addEventListener('click', () => {
-  closeModal(renameModal);
-});
-
-renameForm.addEventListener('submit', async (e) => {
+renameForm?.addEventListener('submit', async (e) => {
   e.preventDefault();
-  clearModalErrors();
-  const rawName = renameName.value.trim();
-  const newName = rawName.replace(/\s+/g, ' ');
+  const newName = renameName.value.trim().replace(/\s+/g, ' ');
   if (!newName || newName === renameTarget) {
     closeModal(renameModal);
     return;
   }
-  const submitBtn = renameForm.querySelector('button[type="submit"]');
-  if (submitBtn) submitBtn.disabled = true;
-  try {
+  await handleModalSubmit(renameForm.querySelector('button[type="submit"]'), '#rename-error', async () => {
     await api(`/api/projects/${encodeURIComponent(renameTarget)}/rename`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: newName }),
     });
-    closeModal(renameModal);
     await loadProjects();
-  } catch (error) {
-    showModalError('#rename-error', error.message);
-  } finally {
-    if (submitBtn) submitBtn.disabled = false;
-  }
+    closeModal(renameModal);
+  });
 });
 
 /* ── Delete Confirm ── */
@@ -282,31 +280,17 @@ const deleteName = document.querySelector('#delete-project-name');
 let deleteTarget = '';
 
 function openDeleteConfirm(name) {
-  lastFocusedElement = document.activeElement;
-  clearModalErrors();
   deleteTarget = name;
   deleteName.textContent = name;
-  deleteModal.classList.remove('hidden');
-  document.querySelector('#cancel-delete')?.focus();
+  openModal(deleteModal, document.querySelector('#cancel-delete'));
 }
 
-document.querySelector('#cancel-delete').addEventListener('click', () => {
-  closeModal(deleteModal);
-});
-
-document.querySelector('#confirm-delete').addEventListener('click', async (e) => {
-  clearModalErrors();
-  const btn = e.currentTarget;
-  if (btn) btn.disabled = true;
-  try {
+document.querySelector('#confirm-delete')?.addEventListener('click', async (e) => {
+  await handleModalSubmit(e.currentTarget, '#delete-error', async () => {
     await api(`/api/projects/${encodeURIComponent(deleteTarget)}`, { method: 'DELETE' });
-    closeModal(deleteModal);
     await loadProjects();
-  } catch (error) {
-    showModalError('#delete-error', error.message);
-  } finally {
-    if (btn) btn.disabled = false;
-  }
+    closeModal(deleteModal);
+  });
 });
 
 /* ── Init ── */

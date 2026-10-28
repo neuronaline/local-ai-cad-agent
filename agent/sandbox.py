@@ -76,6 +76,15 @@ def command(
         raise RuntimeError("bubblewrap (bwrap) is required for CAD sandboxing.")
     workspace = workspace.resolve()
     python_root = Path(sys.prefix).resolve()
+    if executable == "/venv/bin/python" and not (python_root / "bin" / "python").is_file():
+        if (python_root / "bin" / "python3").is_file():
+            executable = "/venv/bin/python3"
+        elif Path(sys.executable).is_file():
+            try:
+                rel = Path(sys.executable).resolve().relative_to(python_root)
+                executable = f"/venv/{rel.as_posix()}"
+            except ValueError:
+                executable = str(sys.executable)
     bind_mode = "--bind" if writable else "--ro-bind"
     tmp_mount = ["--tmpfs", "/tmp"]
     if not writable_tmp:
@@ -116,6 +125,16 @@ def command(
             extra_binds.extend(["--ro-bind-try", str(repo_scad_bin), str(repo_scad_bin)])
             path_dirs.append(str(repo_scad_bin))
 
+    python_env_vars: list[str] = []
+    try:
+        import site
+        user_site = Path(site.getusersitepackages()).resolve()
+        if user_site.is_dir():
+            extra_binds.extend(["--ro-bind-try", str(user_site), str(user_site)])
+            python_env_vars.extend(["--setenv", "PYTHONPATH", str(user_site)])
+    except Exception:
+        pass
+
     sandbox = [
         _BWRAP,
         "--die-with-parent",
@@ -149,6 +168,7 @@ def command(
         "--setenv", "PYTHONDONTWRITEBYTECODE", "1",
         "--setenv", "TMPDIR", "/tmp",
         "--setenv", "LANG", "C.UTF-8",
+        *python_env_vars,
         "--setenv", "OPENBLAS_NUM_THREADS", "1",
         "--setenv", "MKL_NUM_THREADS", "1",
         "--setenv", "OMP_NUM_THREADS", "1",

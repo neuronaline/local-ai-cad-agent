@@ -60,7 +60,14 @@ def _truncate_error_message(msg: str, max_chars: int = 600, max_lines: int = 10)
 
 def compact_for_context(tool: str, result: str) -> str:
     """Compact verbose tool envelopes for LLM context while keeping essential metrics."""
-    if tool not in {"cad_build", "cad_build_and_verify", "get_view_images"}:
+    if tool not in {
+        "cad_build",
+        "cad_build_and_verify",
+        "get_view_images",
+        "python",
+        "run_python",
+        "calculate",
+    }:
         return result
     try:
         payload = json.loads(result)
@@ -85,6 +92,14 @@ def compact_for_context(tool: str, result: str) -> str:
         return result
     data = payload.get("data")
     if not isinstance(data, dict):
+        return result
+
+    if tool in {"python", "run_python", "calculate"}:
+        if not data.get("stdout"):
+            return json.dumps(
+                {"ok": True, "tool": tool, "data": {"result": data.get("result")}},
+                ensure_ascii=False,
+            )
         return result
 
     if tool == "get_view_images":
@@ -117,14 +132,35 @@ def compact_for_context(tool: str, result: str) -> str:
         compact_data["floating_solid_count"] = metrics.get("floating_solid_count", 0)
         if metrics.get("solids_min_z"):
             compact_data["solids_min_z"] = metrics.get("solids_min_z")
+        if metrics.get("floating_solids"):
+            compact_data["floating_solids"] = metrics.get("floating_solids")
+        if metrics.get("min_part_gap_mm") is not None:
+            compact_data["min_part_gap_mm"] = metrics.get("min_part_gap_mm")
+        if metrics.get("overlapping_part_count"):
+            compact_data["overlapping_part_count"] = metrics.get("overlapping_part_count")
+    if metrics.get("trapped_cavity_count"):
+        compact_data["trapped_cavity_count"] = metrics.get("trapped_cavity_count")
+        if metrics.get("trapped_cavities"):
+            compact_data["trapped_cavities"] = metrics.get("trapped_cavities")
     printability = metrics.get("printability")
     if isinstance(printability, dict) and printability:
-        compact_data["printability"] = {
+        compact_printability: dict[str, Any] = {
             "bed_contact_area_mm2": printability.get("bed_contact_area_mm2"),
             "overhang_area_45deg_mm2": printability.get("overhang_area_45deg_mm2"),
             "overhang_area_60deg_mm2": printability.get("overhang_area_60deg_mm2"),
             "needs_support": printability.get("needs_support"),
         }
+        for opt_key in (
+            "center_of_mass_mm",
+            "is_statically_stable",
+            "stability_margin_mm",
+            "support_footprint_bounds_mm",
+            "slenderness_ratio",
+            "needs_brim",
+        ):
+            if printability.get(opt_key) is not None:
+                compact_printability[opt_key] = printability.get(opt_key)
+        compact_data["printability"] = compact_printability
     verif = data.get("verification")
     if isinstance(verif, dict) and verif:
         verif_dict: dict[str, Any] = {
@@ -267,6 +303,20 @@ def _classify(tool: str, error: Exception, message: str) -> tuple[str, str, bool
             "persistence",
             False,
             TOOL_HINTS["REVISION_INTEGRITY"],
+        )
+    if tool in {"python", "run_python", "calculate"}:
+        if "timed out" in lower or "timeout" in lower:
+            return (
+                "PYTHON_TIMEOUT",
+                "execution",
+                True,
+                TOOL_HINTS["PYTHON_TIMEOUT"],
+            )
+        return (
+            "PYTHON_EXECUTION_FAILED",
+            "execution",
+            True,
+            TOOL_HINTS["PYTHON_EXECUTION_FAILED"],
         )
     if "timed out" in lower or "timeout" in lower:
         return "TIMEOUT", "execution", True, TOOL_HINTS["TIMEOUT"]

@@ -74,6 +74,10 @@ class OpenScadPreflight:
         (re.compile(r"^[ \t]*elif\b"), "elif", "OpenSCAD uses 'else if'."),
         (re.compile(r"^[ \t]*from\s+[a-zA-Z_][a-zA-Z0-9_]*\s+import\b"), "from ... import", "OpenSCAD uses 'use <...>' or 'include <...>'."),
         (re.compile(r"^[ \t]*import\s+[a-zA-Z_][a-zA-Z0-9_]*(?!\s*\()"), "import", "OpenSCAD uses 'use <...>' or 'include <...>'. Built-in import() requires parentheses."),
+        (re.compile(r"\bTrue\b"), "True", "OpenSCAD uses lowercase 'true'. Capital 'True' evaluates to undef."),
+        (re.compile(r"\bFalse\b"), "False", "OpenSCAD uses lowercase 'false'. Capital 'False' evaluates to undef."),
+        (re.compile(r"\bNone\b"), "None", "OpenSCAD uses 'undef'. 'None' is a Python literal that evaluates to undef."),
+        (re.compile(r"(?<!\*)\*\*(?!\*)"), "**", "OpenSCAD uses '^' or pow(base, exponent) for exponentiation, not '**'."),
     )
 
     @classmethod
@@ -109,7 +113,7 @@ class OpenScadPreflight:
             return
 
         # 2. Check for unsafe file inclusions / path traversal
-        inc_matches = re.findall(r"(?:include|use)\s*<([^>]+)>", code)
+        inc_matches = re.findall(r"(?:include|use)\s*<([^>]+)>", clean_code)
         for inc_path in inc_matches:
             inc_path = inc_path.strip()
             if inc_path.startswith("/") or ".." in inc_path or "\\" in inc_path:
@@ -157,12 +161,115 @@ class OpenScadPreflight:
                 return
 
         # 5. Check for UPPER_CASE parameter definition
-        has_params = bool(re.search(r"^[ \t]*[A-Z][A-Z0-9_]*[ \t]*=", code, re.MULTILINE))
+        has_params = bool(re.search(r"^[ \t]*[A-Z][A-Z0-9_]*[ \t]*=", clean_code, re.MULTILINE))
         if not has_params:
             self.warnings.append(
                 "PRE-FLIGHT WARNING: No UPPER_CASE parameters declared at top of model.scad. "
                 "Define numeric parameters at top (e.g. WIDTH = 50;)."
             )
+
+        # 6. Check radian conversion in OpenSCAD degree-based trig functions
+        for line_num, trig_fn in self.check_radian_trig(clean_code):
+            self.warnings.append(
+                f"PRE-FLIGHT WARNING: Degree-to-radian conversion in trig function at line {line_num} ('{trig_fn}()'). "
+                "OpenSCAD sin(), cos(), and tan() expect degrees directly, not radians."
+            )
+
+        # 7. Check 3D primitives directly inside 2D extrusions
+        for line_num, ext_name, prim_name in self.check_extrusion_children(clean_code):
+            self.warnings.append(
+                f"PRE-FLIGHT WARNING: 3D primitive '{prim_name}()' used inside {ext_name}() at line {line_num}. "
+                f"{ext_name}() requires 2D shapes (circle, square, polygon) as children."
+            )
+
+    @staticmethod
+    def check_radian_trig(clean_code: str) -> list[tuple[int, str]]:
+        """Return list of (line_num, trig_fn) where degree-to-radian conversion is detected."""
+        results: list[tuple[int, str]] = []
+        for m in re.finditer(
+            r"\b(sin|cos|tan)\s*\([^;\n)]*(?:PI\s*\*\s*[^;\n)]*/\s*180|[^;\n)]*\*\s*PI\s*/\s*180|[^;\n)]*/\s*180\s*\*\s*PI|\*\s*3\.14159\s*/\s*180)",
+            clean_code,
+            re.IGNORECASE,
+        ):
+            line_num = clean_code[: m.start()].count("\n") + 1
+            results.append((line_num, m.group(1)))
+        return results
+
+    @staticmethod
+    def _consume_balanced_parens(text: str, start_after_open_paren: int) -> int | None:
+        """Return index immediately after the matching ')' or None if unbalanced."""
+        depth = 1
+        idx = start_after_open_paren
+        while idx < len(text) and depth > 0:
+            ch = text[idx]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            idx += 1
+        return idx if depth == 0 else None
+
+    @classmethod
+    def check_extrusion_children(cls, clean_code: str) -> list[tuple[int, str, str]]:
+        """Return list of (line_num, ext_name, prim_name) where a 3D primitive is placed in a 2D extrusion."""
+        results: list[tuple[int, str, str]] = []
+        for ext_m in re.finditer(r"\b(linear_extrude|rotate_extrude)\s*\(", clean_code):
+            ext_name = ext_m.group(1)
+            rest_idx = cls._consume_balanced_parens(clean_code, ext_m.end())
+            if rest_idx is None:
+                continue
+            while rest_idx < len(clean_code) and clean_code[rest_idx].isspace():
+                rest_idx += 1
+            if rest_idx >= len(clean_code):
+                continue
+            if clean_code[rest_idx] == "{":
+                brace_depth = 1
+                end_idx = rest_idx + 1
+                while end_idx < len(clean_code) and brace_depth > 0:
+                    if clean_code[end_idx] == "{":
+                        brace_depth += 1
+                    elif clean_code[end_idx] == "}":
+                        brace_depth -= 1
+                    end_idx += 1
+                block = clean_code[rest_idx:end_idx]
+
+                # Identify projection ranges inside the block
+                proj_ranges: list[tuple[int, int]] = []
+                for p_m in re.finditer(r"\bprojection\s*\(", block):
+                    p_rest = cls._consume_balanced_parens(block, p_m.end())
+                    if p_rest is None:
+                        continue
+                    while p_rest < len(block) and block[p_rest].isspace():
+                        p_rest += 1
+                    if p_rest < len(block) and block[p_rest] == "{":
+                        p_depth = 1
+                        p_end = p_rest + 1
+                        while p_end < len(block) and p_depth > 0:
+                            if block[p_end] == "{":
+                                p_depth += 1
+                            elif block[p_end] == "}":
+                                p_depth -= 1
+                            p_end += 1
+                        proj_ranges.append((p_m.start(), p_end))
+                    else:
+                        stmt_end = block.find(";", p_rest)
+                        proj_ranges.append((p_m.start(), stmt_end + 1 if stmt_end != -1 else len(block)))
+
+                for prim_m in re.finditer(r"\b(cube|cylinder|sphere|polyhedron)\s*\(", block):
+                    p_start = prim_m.start()
+                    if any(pr_start <= p_start < pr_end for pr_start, pr_end in proj_ranges):
+                        continue
+                    prim_name = prim_m.group(1)
+                    line_num = clean_code[: rest_idx + p_start].count("\n") + 1
+                    results.append((line_num, ext_name, prim_name))
+            else:
+                child_m = re.match(r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", clean_code[rest_idx:])
+                if child_m:
+                    child_name = child_m.group(1)
+                    if child_name in ("cube", "cylinder", "sphere", "polyhedron"):
+                        line_num = clean_code[:rest_idx].count("\n") + 1
+                        results.append((line_num, ext_name, child_name))
+        return results
 
     @staticmethod
     def check_delimiters(code: str) -> tuple[str, str, int | None] | None:
@@ -372,7 +479,7 @@ class FileTool:
 
     def _write_model(self, content: str, operation: str) -> str:
         """Validate, commit revision, and atomically write model.scad."""
-        self.validate_model(content)
+        warnings = self.validate_model(content)
         revision = self._revisions.commit(
             content,
             RevisionOrigin(
@@ -381,10 +488,13 @@ class FileTool:
                 tool_call_id=self._tool_call_id,
             ),
         )
-        return (
+        msg = (
             f"Wrote model.scad ({len(content.splitlines())} lines, "
             f"{len(content)} chars, revision {revision.id[:8]})."
         )
+        if warnings:
+            msg += "\n" + "\n".join(warnings)
+        return msg
 
     @classmethod
     def _resolve_match(

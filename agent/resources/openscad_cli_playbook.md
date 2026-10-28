@@ -3,7 +3,7 @@
 ## 1. Global Setup & Syntax Traps
 
 ```scad
-$fn = 32;     // Arc resolution (24-32 for fast drafting, <= 60 for final render)
+$fn = 32;     // Arc resolution (24-32 for fast drafting, <= 64 for final render, <= 36 for threads)
 EPS = 0.01;   // Manifold clearance for boolean cutters and solid overlaps
 ```
 

@@ -237,6 +237,9 @@ button[aria-pressed="true"] { border-color: #5d7ed7; background: #233966; color:
 .message.agent .message-copy-btn {
   margin-left: auto;
 }
+.message.agent .message-state:not(:empty) + .message-copy-btn {
+  margin-left: 0;
+}
 .message-state:empty {
   display: none;
 }

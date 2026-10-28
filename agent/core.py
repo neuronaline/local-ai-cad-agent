@@ -17,6 +17,7 @@ import time
 import traceback
 import uuid
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -31,7 +32,9 @@ from agent.conversation import (
 )
 from agent.dispatcher import (
     cancel_remaining_tool_calls,
+    group_tool_calls_into_waves,
     is_cad_build,
+    is_model_mutation,
     normalize_tool_calls,
     process_tool_call,
 )
@@ -62,6 +65,7 @@ from agent.tool_schemas import TOOL_SCHEMAS
 from agent.tools.cad_tool import CadTool
 from agent.tools.file_tool import FileTool
 from agent.tools.image_tool import ImageTool
+from agent.tools.python_tool import PythonTool
 from agent.tools.question_tool import QuestionTool
 from agent.tools.question_validator import QuestionValidator
 
@@ -73,7 +77,7 @@ from agent.tools.question_validator import QuestionValidator
 # tests can target the predicate directly without re-rolling the literals.
 _BUILD_FAILURE_TOTAL_MAX = 6
 _BUILD_FAILURE_PER_SIGNATURE_MAX = 3
-_MAX_TOTAL_TRUNCATION_CONTINUATIONS = 5
+_MAX_TOTAL_TRUNCATION_CONTINUATIONS = 8
 
 # Run-scoped artifact directories. ``AgentRunner.start`` takes ownership of
 # uploaded inputs by moving them into a per-run directory under the agent
@@ -111,13 +115,18 @@ class ProjectTools:
             self.revisions,
             review_render_workers=(settings.review_render_workers if settings else 4),
             review_required_views=(settings.review_required_views if settings else 8),
+            user_printer=(settings.user_printer if settings else ""),
+            user_nozzle=(settings.user_nozzle if settings else ""),
+            user_filament=(settings.user_filament if settings else "PLA"),
             stop_event=stop_event,
         )
         self.image = ImageTool(project_dir, publish)
         self.question = QuestionTool(publish)
+        self.python = PythonTool(project_dir, publish, stop_event=stop_event)
 
     def stop(self) -> None:
         self.cad.stop()
+        self.python.stop()
 
 
 def _synthetic_user(content: str) -> dict[str, object]:
@@ -186,6 +195,7 @@ class _RunState:
     cad_error: str | None = None
     cad_fix_required: bool = True
     any_tool_used: bool = False
+    model_mutated: bool = False
     nudged_cad: bool = False
     nudged_final_verification: bool = False
     cad_nudge_count: int = 0
@@ -819,7 +829,7 @@ class AgentRunner:
                 or trunc_err.partial_tool_calls
             )
             if (
-                state.truncation_continuations < 2
+                state.truncation_continuations < 3
                 and state.total_truncation_continuations < _MAX_TOTAL_TRUNCATION_CONTINUATIONS
                 and has_partial
                 and not self._stop_event.is_set()
@@ -858,7 +868,13 @@ class AgentRunner:
                     "content": stored_content,
                 }
                 if trunc_err.reasoning_text:
-                    partial_msg["reasoning"] = trunc_err.reasoning_text
+                    if len(trunc_err.reasoning_text) > 4000:
+                        partial_msg["reasoning"] = (
+                            "...[earlier reasoning truncated]...\n"
+                            + trunc_err.reasoning_text[-4000:]
+                        )
+                    else:
+                        partial_msg["reasoning"] = trunc_err.reasoning_text
                     if (
                         not state.run_reasonings
                         or state.run_reasonings[-1] != trunc_err.reasoning_text
@@ -880,15 +896,16 @@ class AgentRunner:
                 ConversationStore.append(state.project_dir, {**partial_msg, "synthetic": True})
                 if truncated_tools:
                     nudge_text = (
-                        f"Your previous tool call ({', '.join(truncated_tools)}) reached the output token limit "
-                        "before its arguments finished. Emit the tool call now with more concise arguments "
-                        "(for write_file/edit_file: keep OpenSCAD code compact, omit verbose comments, or scaffold core geometry first and refine with edit_file) "
-                        "without repeating your reasoning."
+                        f"CRITICAL: Your previous tool call ({', '.join(truncated_tools)}) was cut off by token limits before arguments finished. "
+                        "Cease all internal reasoning immediately. Do NOT explain, repeat your reasoning, or apologize. "
+                        "Emit the complete tool call NOW with concise, compact arguments "
+                        "(for write_file/edit_file: keep OpenSCAD code compact, omit verbose comments, scaffold core geometry first)."
                     )
                 else:
                     nudge_text = (
-                        "Your previous response reached the token limit. "
-                        "Please output your tool call (e.g. write_file, cad_build) or final answer directly now without repeating your reasoning."
+                        "CRITICAL: Output token limit reached. Cease all internal reasoning immediately. "
+                        "Do NOT repeat reasoning or output commentary. Emit your tool call "
+                        "(e.g. write_file, edit_file, cad_build) or final answer directly NOW."
                     )
                 continuation_nudge = _synthetic_user(nudge_text)
                 state.messages.append(continuation_nudge)
@@ -965,7 +982,7 @@ class AgentRunner:
             assistant_message.pop("tool_calls", None)
             if not raw_content and turn_reasoning:
                 can_continue = (
-                    state.truncation_continuations < 2
+                    state.truncation_continuations < 3
                     and state.total_truncation_continuations < _MAX_TOTAL_TRUNCATION_CONTINUATIONS
                     and not self._stop_event.is_set()
                 )
@@ -997,8 +1014,9 @@ class AgentRunner:
                     )
                     state.messages.append(assistant_message)
                     continuation_nudge = _synthetic_user(
-                        "You completed your reasoning without emitting a tool call or final response. "
-                        "Please output your tool call (e.g. write_file, cad_build) or final answer directly now without repeating your reasoning."
+                        "CRITICAL: Reasoning finished but no tool call was emitted. "
+                        "Do NOT reason further or repeat your analysis. "
+                        "Output your tool call (e.g. write_file, cad_build) or final answer directly NOW."
                     )
                     state.messages.append(continuation_nudge)
                     self._append_message(state.project_dir, continuation_nudge)
@@ -1038,16 +1056,21 @@ class AgentRunner:
                 return _TurnOutcome.DRAWING_NOT_CREATED
             if not raw_content:
                 assistant_message["content"] = "Task completed."
-        invalid_final = (
-            not tool_calls
-            and state.any_tool_used
-            and (not state.preview_id or state.cad_fix_required)
-        )
+        invalid_final = not tool_calls and self._should_nudge_incomplete_turn(state)
         self._publish_assistant_turn(state, assistant_message, invalid_final)
         if not tool_calls:
             return self._handle_no_tool_calls(state, assistant_message)
         state.any_tool_used = True
         return self._handle_tool_calls(state, tool_calls)
+
+    @staticmethod
+    def _should_nudge_incomplete_turn(state: _RunState) -> bool:
+        """Return True when a text-only turn should be intercepted and nudged."""
+        if not state.model_mutated:
+            return False
+        if not state.preview_id:
+            return not state.cad_error and state.cad_nudge_count < 2
+        return state.cad_fix_required and state.verification_nudge_count < 2
 
     def _publish_assistant_turn(
         self,
@@ -1154,12 +1177,8 @@ class AgentRunner:
                 )
                 self._publish_terminal_failure(state.project, run_id=state.run_id)
                 return _TurnOutcome.DRAWING_NOT_CREATED
-            if state.any_tool_used:
-                if (
-                    not state.nudged_cad
-                    and state.cad_nudge_count < 2
-                    and (state.project_dir / MODEL_FILENAME).is_file()
-                ):
+            if state.model_mutated:
+                if state.cad_nudge_count < 2:
                     state.nudged_cad = True
                     state.cad_nudge_count += 1
                     reminder = _synthetic_user(
@@ -1183,8 +1202,8 @@ class AgentRunner:
                 return _TurnOutcome.DRAWING_NOT_CREATED
             self._complete(state.project, content, reasoning=full_reasoning, run_id=state.run_id)
             return _TurnOutcome.COMPLETED
-        if state.cad_fix_required:
-            if not state.nudged_final_verification and state.verification_nudge_count < 2:
+        if state.model_mutated and state.cad_fix_required:
+            if state.verification_nudge_count < 2:
                 state.nudged_final_verification = True
                 state.verification_nudge_count += 1
                 reminder = _synthetic_user(NUDGE_CAD_FIX_REQUIRED)
@@ -1210,15 +1229,15 @@ class AgentRunner:
     def _handle_tool_calls(
         self, state: _RunState, tool_calls: list[dict[str, Any]]
     ) -> _TurnOutcome:
-        """Process every tool call in this iteration.
+        """Process every tool call in this iteration, executing compatible waves in parallel.
 
         Stops early on user-cancellation, repeated CAD build failures,
         or a tool that parked the agent waiting for user input. Returns
         :class:`_TurnOutcome.CONTINUE` once the batch completes.
         """
         processed_call_ids: set[str] = set()
-        for call in tool_calls:
-            call_id = call.get("id", "")
+        waves = group_tool_calls_into_waves(tool_calls)
+        for wave in waves:
             if self._stop_event.is_set():
                 self._cancel_remaining_tool_calls(
                     state.project_dir,
@@ -1232,80 +1251,154 @@ class AgentRunner:
                     "Task stopped by the user mid-batch.",
                 )
                 return _TurnOutcome.STOPPED
-            (
-                state.preview_id,
-                state.cad_error,
-                state.cad_fix_required,
-                waiting,
-            ) = self._process_tool_call(
-                state.tools,
-                state.project,
-                state.project_dir,
-                call,
-                state.cad_fix_required,
-                state.preview_id,
-                state.cad_error,
-                state.messages,
-            )
-            processed_call_ids.add(call_id)
-            tool_name = call.get("function", {}).get("name", "")
-            if tool_name in {"write_file", "edit_file"}:
-                if state.cad_nudge_count < 2:
-                    state.nudged_cad = False
-                if state.verification_nudge_count < 2:
-                    state.nudged_final_verification = False
-            elif is_cad_build(tool_name):
-                state.nudged_cad = False
-                # Circuit-breaker for repeated CAD build or verification failures.
-                # Consecutive failure count resets on a clean, verified build,
-                # while per-signature counts persist across the turn to catch
-                # alternating break/revert/break loops.
-                if not state.cad_error and not state.cad_fix_required:
-                    state.build_failure_count = 0
-                    state.nudged_final_verification = False
-                else:
-                    state.build_failure_count += 1
-                    signature = (
-                        self._failure_signature(state.cad_error)
-                        if state.cad_error
-                        else self._verification_failure_signature(state.messages)
+
+            if len(wave) == 1:
+                call = wave[0]
+                res_preview_id, res_cad_error, res_cad_fix_required, waiting = (
+                    self._process_tool_call(
+                        state.tools,
+                        state.project,
+                        state.project_dir,
+                        call,
+                        state.cad_fix_required,
+                        state.preview_id,
+                        state.cad_error,
+                        state.messages,
                     )
-                    state.build_failure_signatures[signature] = (
-                        state.build_failure_signatures.get(signature, 0) + 1
-                    )
-                    if self._build_failure_exhausted(
-                        state.build_failure_count,
-                        state.build_failure_signatures,
-                        signature,
-                    ):
-                        self._cancel_remaining_tool_calls(
-                            state.project_dir,
-                            tool_calls,
-                            processed_call_ids,
-                            state.messages,
-                        )
-                        self.publish(
-                            "agent_error",
-                            {
-                                "project": state.project,
-                                "run_id": state.run_id,
-                                "message": (
-                                    "Task stopped after repeated CAD build failures. "
-                                    "Review the latest error or continue with a narrower repair."
-                                ),
-                            },
-                        )
-                        self._publish_terminal_failure(state.project, run_id=state.run_id)
-                        _close_dangling_tool_tail(
-                            state.project_dir,
-                            state.messages,
-                            "Task stopped after repeated CAD build failures.",
-                        )
-                        return _TurnOutcome.BUILD_FAILURE_EXHAUSTED
-            if waiting:
-                return self._park_for_question(
-                    state, tool_calls, processed_call_ids
                 )
+                wave_outcomes: list[
+                    tuple[
+                        dict[str, Any],
+                        str | None,
+                        str | None,
+                        bool,
+                        bool,
+                        list[dict] | None,
+                    ]
+                ] = [
+                    (
+                        call,
+                        res_preview_id,
+                        res_cad_error,
+                        res_cad_fix_required,
+                        waiting,
+                        None,
+                    )
+                ]
+            else:
+                base_fix_required = state.cad_fix_required
+                base_preview_id = state.preview_id
+                base_cad_error = state.cad_error
+
+                def _exec_parallel_call(
+                    call_item: dict[str, Any],
+                ) -> tuple[str | None, str | None, bool, bool, list[dict]]:
+                    local_msgs: list[dict] = []
+                    p_id, c_err, c_fix, wait = process_tool_call(
+                        state.tools,
+                        state.project,
+                        state.project_dir,
+                        call_item,
+                        base_fix_required,
+                        base_preview_id,
+                        base_cad_error,
+                        local_msgs,
+                        publish=self.publish,
+                        register_preview=self._register_preview,
+                        append_message=lambda _p, _m: None,
+                        debug_log=self._debug_tool_error,
+                        activity_logger=state.activity_logger,
+                        run_id=state.run_id,
+                    )
+                    return p_id, c_err, c_fix, wait, local_msgs
+
+                with ThreadPoolExecutor(max_workers=min(len(wave), 4)) as pool:
+                    futures = [pool.submit(_exec_parallel_call, c) for c in wave]
+                    wave_outcomes = [
+                        (c, *fut.result()) for c, fut in zip(wave, futures)
+                    ]
+
+            for (
+                call,
+                res_preview_id,
+                res_cad_error,
+                res_cad_fix_required,
+                waiting,
+                deferred_msgs,
+            ) in wave_outcomes:
+                if deferred_msgs is not None:
+                    for msg in deferred_msgs:
+                        state.messages.append(msg)
+                        self._append_message(state.project_dir, msg)
+                call_id = call.get("id", "")
+                processed_call_ids.add(call_id)
+                tool_name = call.get("function", {}).get("name", "")
+                if (
+                    len(wave) == 1
+                    or is_model_mutation(tool_name)
+                    or is_cad_build(tool_name)
+                ):
+                    state.preview_id = res_preview_id
+                    state.cad_error = res_cad_error
+                    state.cad_fix_required = res_cad_fix_required
+                if is_model_mutation(tool_name):
+                    state.model_mutated = True
+                    if state.cad_nudge_count < 2:
+                        state.nudged_cad = False
+                    if state.verification_nudge_count < 2:
+                        state.nudged_final_verification = False
+                elif is_cad_build(tool_name):
+                    state.nudged_cad = False
+                    # Circuit-breaker for repeated CAD build or verification failures.
+                    # Consecutive failure count resets on a clean, verified build,
+                    # while per-signature counts persist across the turn to catch
+                    # alternating break/revert/break loops.
+                    if not state.cad_error and not state.cad_fix_required:
+                        state.build_failure_count = 0
+                        state.nudged_final_verification = False
+                    else:
+                        state.build_failure_count += 1
+                        signature = (
+                            self._failure_signature(state.cad_error)
+                            if state.cad_error
+                            else self._verification_failure_signature(state.messages)
+                        )
+                        state.build_failure_signatures[signature] = (
+                            state.build_failure_signatures.get(signature, 0) + 1
+                        )
+                        if self._build_failure_exhausted(
+                            state.build_failure_count,
+                            state.build_failure_signatures,
+                            signature,
+                        ):
+                            self._cancel_remaining_tool_calls(
+                                state.project_dir,
+                                tool_calls,
+                                processed_call_ids,
+                                state.messages,
+                            )
+                            self.publish(
+                                "agent_error",
+                                {
+                                    "project": state.project,
+                                    "run_id": state.run_id,
+                                    "message": (
+                                        "Task stopped after repeated CAD build failures. "
+                                        "Review the latest error or continue with a narrower repair."
+                                    ),
+                                },
+                            )
+                            self._publish_terminal_failure(state.project, run_id=state.run_id)
+                            _close_dangling_tool_tail(
+                                state.project_dir,
+                                state.messages,
+                                "Task stopped after repeated CAD build failures.",
+                            )
+                            return _TurnOutcome.BUILD_FAILURE_EXHAUSTED
+                if waiting:
+                    return self._park_for_question(
+                        state, tool_calls, processed_call_ids
+                    )
         return _TurnOutcome.CONTINUE
 
     def _park_for_question(
@@ -1607,7 +1700,7 @@ class AgentRunner:
                         outcome = "CAD_ERROR"
                     elif not state.cad_fix_required and state.preview_id:
                         outcome = "SUCCESS"
-                    elif state.any_tool_used and not state.preview_id:
+                    elif state.model_mutated and not state.preview_id:
                         outcome = "DRAWING_NOT_CREATED"
                     else:
                         outcome = "INCOMPLETE"
@@ -1766,18 +1859,19 @@ class AgentRunner:
         existed = False
         content = ""
         if history and len(history) > 1:
-            first_turn_wrote_model = False
+            first_file_tool = None
             for m in history:
                 if isinstance(m, dict) and m.get("role") == "assistant":
                     tool_calls = m.get("tool_calls") or []
-                    if any(
-                        isinstance(tc, dict)
-                        and tc.get("function", {}).get("name") == "write_file"
-                        for tc in tool_calls
-                    ):
-                        first_turn_wrote_model = True
-                    break
-            existed = not first_turn_wrote_model
+                    for tc in tool_calls:
+                        if isinstance(tc, dict):
+                            fn_name = tc.get("function", {}).get("name")
+                            if fn_name in {"write_file", "edit_file", "read_file"}:
+                                first_file_tool = fn_name
+                                break
+                    if first_file_tool is not None:
+                        break
+            existed = first_file_tool in {"edit_file", "read_file"}
         else:
             existed = model_file.is_file()
 
@@ -1801,11 +1895,16 @@ class AgentRunner:
     def _last_message_has_tool_image(messages: list[dict]) -> bool:
         if not messages or messages[-1].get("role") != "tool":
             return False
-        content = messages[-1].get("content")
-        return isinstance(content, list) and any(
-            isinstance(part, dict) and part.get("type") == "image_url"
-            for part in content
-        )
+        for msg in reversed(messages):
+            if msg.get("role") != "tool":
+                break
+            content = msg.get("content")
+            if isinstance(content, list) and any(
+                isinstance(part, dict) and part.get("type") == "image_url"
+                for part in content
+            ):
+                return True
+        return False
 
     @staticmethod
     def _failure_signature(message: str) -> str:

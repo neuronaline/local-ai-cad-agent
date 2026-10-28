@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -114,27 +115,48 @@ class CadTool:
         revisions: RevisionStore | None = None,
         review_render_workers: int = 4,
         review_required_views: int = 8,
+        user_printer: str = "",
+        user_nozzle: str = "",
+        user_filament: str = "PLA",
         stop_event: threading.Event | None = None,
+        _process: ProcessSlot | None = None,
+        _lock: threading.Lock | None = None,
+        _call_id: str = "",
     ) -> None:
         self.project_dir = project_dir.resolve()
         self._publish = publish
         self._revisions = revisions or RevisionStore(project_dir)
         self._review_render_workers = max(1, int(review_render_workers))
         self._review_required_views = max(1, int(review_required_views))
+        self.user_printer = user_printer
+        self.user_nozzle = user_nozzle
+        self.user_filament = user_filament
         self._stop_event = stop_event
         # ``ProcessSlot`` is a long-lived mutable holder for the running
         # ``Popen``; passing ``[self._process]`` would produce a fresh
         # list per call site and the GC would free it before ``stop()``
         # could read it back.
-        self._process = ProcessSlot()
-        self._lock = threading.Lock()
-        self._call_id = ""
+        self._process = _process if _process is not None else ProcessSlot()
+        self._lock = _lock if _lock is not None else threading.Lock()
+        self._call_id = _call_id
 
     # ------------------------------------------------------------------ review
 
     def with_call_id(self, call_id: str) -> CadTool:
-        self._call_id = call_id
-        return self
+        return CadTool(
+            self.project_dir,
+            self._publish,
+            revisions=self._revisions,
+            review_render_workers=self._review_render_workers,
+            review_required_views=self._review_required_views,
+            user_printer=self.user_printer,
+            user_nozzle=self.user_nozzle,
+            user_filament=self.user_filament,
+            stop_event=self._stop_event,
+            _process=self._process,
+            _lock=self._lock,
+            _call_id=call_id or "",
+        )
 
     def _review_dir(self, model_sha256: str) -> Path:
         return review_dir(self.project_dir, model_sha256)
@@ -434,10 +456,15 @@ class CadTool:
         """
         staging_parent = self.project_dir / ".cad-agent"
         staging_parent.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        stale_cutoff = now - max(MAX_SANDBOX_TIMEOUT_SECONDS * 2, 300)
         for parent in (self.project_dir, staging_parent):
             for stale_dir in parent.glob("cad-review-staging-*"):
-                if stale_dir.is_dir():
-                    shutil.rmtree(stale_dir, ignore_errors=True)
+                try:
+                    if stale_dir.is_dir() and stale_dir.stat().st_mtime < stale_cutoff:
+                        shutil.rmtree(stale_dir, ignore_errors=True)
+                except OSError:
+                    pass
         staging_root = Path(
             tempfile.mkdtemp(prefix="cad-review-staging-", dir=staging_parent)
         )
@@ -886,12 +913,33 @@ class CadTool:
         verifier = CadVerifier(
             self.project_dir,
             self._publish,
+            user_printer=self.user_printer,
+            user_nozzle=self.user_nozzle,
+            user_filament=self.user_filament,
             stop_event=self._stop_event,
         )
         if self._call_id:
-            verifier.with_call_id(self._call_id)
+            verifier = verifier.with_call_id(self._call_id)
         verification = verifier.verify(precomputed_metrics=metrics if isinstance(metrics, dict) else None)
         result["verification"] = verification
+
+        # Persist verification in working copy and cache .cad_metrics.json
+        model_sha = result.get("model_sha256")
+        for m_path in (
+            self.project_dir / ".cad_metrics.json",
+            (self.project_dir / ".cad-agent" / "cache" / model_sha / ".cad_metrics.json") if model_sha else None,
+        ):
+            if m_path is not None and m_path.is_file():
+                try:
+                    m_data = json.loads(m_path.read_text(encoding="utf-8"))
+                    if isinstance(m_data, dict):
+                        m_data["verification"] = verification
+                        atomic_write_bytes(
+                            m_path,
+                            json.dumps(m_data).encode("utf-8"),
+                        )
+                except (OSError, json.JSONDecodeError):
+                    pass
 
         result["summary"] = self._summarize_payload(
             metrics,

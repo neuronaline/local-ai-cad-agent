@@ -77,6 +77,7 @@ TOOL_SCHEMAS = [
             },
             "edits": {
                 "type": "array",
+                "minItems": 1,
                 "items": {
                     "type": "object",
                     "properties": {
@@ -217,5 +218,16 @@ TOOL_SCHEMAS = [
             },
         },
         ["questions"],
+    ),
+    _tool(
+        "python",
+        TOOL_DESCRIPTIONS["python"]["description"],
+        {
+            "code": {
+                "type": "string",
+                "description": TOOL_DESCRIPTIONS["python"]["code"],
+            },
+        },
+        ["code"],
     ),
 ]

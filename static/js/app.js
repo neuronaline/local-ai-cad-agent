@@ -248,7 +248,7 @@ marked.setOptions({
     if (lang && hljs.getLanguage(lang)) {
       return hljs.highlight(code, { language: lang }).value;
     }
-    return hljs.highlightAuto(code).value;
+    return escapeHTML(code);
   },
 });
 
@@ -309,6 +309,23 @@ const RETRY_ICON_SVG = `
   </svg>
 `;
 
+function flashButtonFeedback(button, tempText, { className = 'success', duration = 1500, resetText = null } = {}) {
+  if (!button) return;
+  const label = button.querySelector('.copy-label') || button.querySelector('span') || (button.childElementCount === 0 ? button : null);
+  if (!label) return;
+  const original = resetText ?? button._originalFeedbackText ?? label.textContent;
+  button._originalFeedbackText = original;
+  if (className) button.classList.add(className);
+  label.textContent = tempText;
+  if (button._feedbackTimeout) clearTimeout(button._feedbackTimeout);
+  button._feedbackTimeout = setTimeout(() => {
+    if (className) button.classList.remove(className);
+    label.textContent = original;
+    button._feedbackTimeout = null;
+    button._originalFeedbackText = null;
+  }, duration);
+}
+
 async function copyTextToClipboard(text, buttonEl = null) {
   if (!text) return false;
   try {
@@ -326,15 +343,7 @@ async function copyTextToClipboard(text, buttonEl = null) {
       textarea.remove();
     }
     if (buttonEl) {
-      const label = buttonEl.querySelector('.copy-label');
-      buttonEl.classList.add('copied');
-      if (label) label.textContent = 'Copied!';
-      if (buttonEl._copiedTimeout) clearTimeout(buttonEl._copiedTimeout);
-      buttonEl._copiedTimeout = setTimeout(() => {
-        buttonEl.classList.remove('copied');
-        if (label) label.textContent = 'Copy';
-        buttonEl._copiedTimeout = null;
-      }, 1500);
+      flashButtonFeedback(buttonEl, 'Copied!', { className: 'copied', duration: 1500 });
     }
     return true;
   } catch (err) {
@@ -400,41 +409,54 @@ function ensureThoughtDisclosure(card, reasoning, isOpen = false, isLive = false
   return disclosure;
 }
 
+function createAgentCardElement({ runId = null, streaming = false, showSkeleton = false } = {}) {
+  const item = document.createElement('div');
+  item.className = `message agent${streaming ? ' streaming thinking' : ''}`;
+  item.dataset.state = streaming ? 'thinking' : 'done';
+  item.dataset.raw = '';
+  item.dataset.reasoning = '';
+  if (runId) item.dataset.runId = runId;
+  item.innerHTML = `
+    <div class="message-meta">
+      <span class="agent-mark">AI</span>
+      <span class="message-author">Agent</span>
+      <span class="message-state ${streaming ? 'state-thinking' : ''}">${streaming ? 'Thinking' : ''}</span>
+      <button type="button" class="message-copy-btn" title="Copy message" aria-label="Copy message">
+        ${COPY_ICON_SVG}
+        <span class="copy-label">Copy</span>
+      </button>
+    </div>
+    <div class="message-content">${showSkeleton ? `
+      <div class="message-skeleton" aria-label="Waiting for response">
+        <div class="skeleton-line" style="width: 88%;"></div>
+        <div class="skeleton-line" style="width: 74%;"></div>
+        <div class="skeleton-line" style="width: 52%;"></div>
+      </div>` : ''}</div>
+  `;
+  return item;
+}
+
 function addMessage(text, type = 'agent', options = {}) {
   const target = options.target || feed;
   const empty = target.querySelector('.empty-state');
   if (empty) empty.remove();
-  const item = document.createElement('div');
-  item.className = `message ${type}`;
-  item.dataset.raw = text;
-  item._rawMessage = text;
-  if (options.messageId) item.dataset.messageId = options.messageId;
   if (type === 'agent') {
     const isStreaming = Boolean(options.streaming);
-    if (isStreaming) {
-      item.classList.add('streaming', 'thinking');
-    }
-    item.innerHTML = `
-      <div class="message-meta">
-        <span class="agent-mark">AI</span>
-        <span class="message-author">Agent</span>
-        <span class="message-state ${isStreaming ? 'state-thinking' : ''}">${isStreaming ? 'Thinking' : ''}</span>
-        <button type="button" class="message-copy-btn" title="Copy message" aria-label="Copy message">
-          ${COPY_ICON_SVG}
-          <span class="copy-label">Copy</span>
-        </button>
-      </div>
-      <div class="message-content"></div>
-    `;
+    const item = createAgentCardElement({ streaming: isStreaming, showSkeleton: isStreaming && !text });
+    item.dataset.raw = text || '';
+    item._rawMessage = text || '';
+    if (options.messageId) item.dataset.messageId = options.messageId;
     ensureThoughtDisclosure(item, options.reasoning, false, false);
     target.appendChild(item);
     renderAgentContent(item, text || '');
     return item;
   }
+  const item = document.createElement('div');
+  item.className = `message ${type}`;
+  item.dataset.raw = text;
+  item._rawMessage = text;
+  if (options.messageId) item.dataset.messageId = options.messageId;
   if (type === 'user') {
-    if (target === feed) {
-      feed.querySelectorAll('.message.user .message-retry-btn').forEach(btn => btn.remove());
-    }
     item.classList.add('user-message');
     const meta = document.createElement('div');
     meta.className = 'message-meta user-meta';
@@ -503,7 +525,7 @@ function addMessage(text, type = 'agent', options = {}) {
       retryBtn.addEventListener('click', (e) => {
         e.preventDefault();
         e.stopPropagation();
-        handleRetry(item, options.retryContext);
+        handleRetry(item, options.retryContext, retryBtn);
       });
       actions.appendChild(retryBtn);
       errorBody.appendChild(actions);
@@ -527,6 +549,9 @@ const activityLabels = {
   write_file: 'Updating model',
   edit_file: 'Updating model',
   read_file: 'Reading model',
+  python: 'Running calculation',
+  calculate: 'Running calculation',
+  run_python: 'Running calculation',
   question: 'Requesting input',
   // Phase labels surfaced via ``tool_status`` from the new split tools. The
   // agent no longer auto-reviews; both steps are opt-in, so we give each one
@@ -584,6 +609,18 @@ function activityDetail(tool, status, value) {
   if (tool === 'cad_build' || tool === 'cad_build_and_verify') return 'Model built and review artifacts created.';
   if (tool === 'get_view_images' && data && Array.isArray(data.images)) {
     return `${data.images.length} view(s) retrieved.`;
+  }
+  if ((tool === 'python' || tool === 'calculate' || tool === 'run_python') && data && typeof data === 'object') {
+    const hasResult = data.result !== undefined && data.result !== null;
+    const stdout = typeof data.stdout === 'string' ? data.stdout.trim() : '';
+    if (hasResult) {
+      const resStr = typeof data.result === 'object' ? JSON.stringify(data.result) : String(data.result);
+      return stdout ? `${stdout}\nResult: ${resStr}` : `Result: ${resStr}`;
+    }
+    if (stdout) {
+      return stdout;
+    }
+    return 'Calculation completed.';
   }
   if (data && typeof data === 'object') {
     const output = data.stdout || data.stderr || data.message || data.summary;
@@ -688,14 +725,16 @@ function resetUsagePill() {
   delete usagePill.dataset.cache;
 }
 
+const TERMINAL_STATUSES = new Set(['completed', 'error', 'failed', 'stopped']);
+
 function updateActivitySummary() {
   const items = [...activityItems.values()];
   if (!items.length) {
     activityPanel.hidden = true;
     return;
   }
-  const running = items.filter(item => ['preparing', 'running', 'started', 'reviewing', 'rendering_views', 'rendering_subset', 'screenshot_auto'].includes(item.status));
-  const failed = items.filter(item => item.status === 'error');
+  const running = items.filter(item => !TERMINAL_STATUSES.has(item.status));
+  const failed = items.filter(item => item.status === 'error' || item.status === 'failed');
   const current = running.at(-1);
   activityTitle.textContent = current
     ? `${activityLabel(current.tool)} · ${activityLabel(current.status)}`
@@ -712,12 +751,13 @@ function markActivityRecovered() {
   // Final completion should clear any in-flight activity rows but must NOT
   // hide failed rows — the failure was real and the user needs to see it.
   for (const item of activityItems.values()) {
-    const row = activityList.querySelector(`[data-call-id="${CSS.escape(item.callId)}"]`);
-    if (['preparing', 'running', 'started', 'reviewing', 'rendering', 'rendering_views', 'rendering_subset', 'screenshot_auto'].includes(item.status)) {
+    if (!TERMINAL_STATUSES.has(item.status)) {
       item.status = 'completed';
+      const row = activityList.querySelector(`[data-call-id="${CSS.escape(item.callId)}"]`);
       if (row) {
         row.dataset.status = 'completed';
-        row.querySelector('.activity-state').textContent = 'Completed';
+        const stateEl = row.querySelector('.activity-state');
+        if (stateEl) stateEl.textContent = 'Completed';
       }
     }
   }
@@ -834,7 +874,7 @@ function refreshLatestToolRow(tool, updates = {}) {
 }
 
 function isAgentActive() {
-  return sendToggle?.dataset.mode === 'stop' || Boolean(document.querySelector('.thinking-indicator'));
+  return sendToggle?.dataset.mode === 'stop';
 }
 
 function updateRetryButtonsState(active) {
@@ -858,7 +898,6 @@ function setThinking(active) {
       getOrCreateRunCard(null, { optimistic: true });
     }
   } else {
-    document.querySelectorAll('.thinking-indicator').forEach(el => el.remove());
     if (feed) {
       feed.querySelectorAll('.message.agent').forEach(card => {
         if (card.dataset.state !== 'error' && card.dataset.state !== 'stopped') {
@@ -869,81 +908,85 @@ function setThinking(active) {
   }
 }
 
-async function handleRetry(errorElement = null, context = null) {
+async function sendChatRequest({ text, files = [] }) {
+  clearActivity();
+  finalizeAllActiveCards();
+  setThinking(true);
+  scrollFeedToBottom(true);
+
+  const idempotencyKey = generateUUID();
+  const body = new FormData();
+  body.append('project', currentProject);
+  body.append('message', text);
+  body.append('idempotency_key', idempotencyKey);
+  body.append('reasoning_effort', getActiveReasoningEffort());
+  body.append('model_key', getActiveModelKey());
+  if (Array.isArray(files)) {
+    files.forEach(file => body.append('attachments', file));
+  }
+  const response = await api('/api/chat', { method: 'POST', body });
+  if (response.duplicate) {
+    finalizeAllActiveCards();
+    setThinking(false);
+    return response;
+  }
+  if (response.attachments?.length) {
+    addToolMessage({
+      call_id: `attachments-${generateUUID()}`,
+      tool: 'Images',
+      status: 'completed',
+      result: `${response.attachments.length} reference image(s) uploaded.`,
+    });
+  }
+  return response;
+}
+
+async function handleRetry(errorElement = null, context = null, triggerBtn = null) {
   if (!currentProject || isAgentActive()) return;
-  const retryBtn = errorElement?.querySelector('.error-retry-btn') || document.querySelector('.message-retry-btn');
+  const retryBtn = triggerBtn || errorElement?.querySelector('.error-retry-btn') || document.querySelector('.message-retry-btn');
   if (retryBtn) {
     retryBtn.disabled = true;
     retryBtn.classList.add('retrying');
   }
   try {
+    if (errorElement) errorElement.remove();
+    feed?.querySelectorAll('.message.error').forEach(el => el.remove());
+
     // If we have a cached client-side submission from a failed initial fetch
     if (context && context.clientSubmission) {
       const sub = context.clientSubmission;
       if (sub.project && sub.project !== currentProject) {
         throw new Error('Cannot retry prompt for a different project.');
       }
-      if (errorElement) errorElement.remove();
-      feed?.querySelectorAll('.message.error').forEach(el => el.remove());
-      clearActivity();
-      finalizeAllActiveCards();
-      setThinking(true);
-      scrollFeedToBottom(true);
-      const idempotencyKey = generateUUID();
-      const body = new FormData();
-      body.append('project', currentProject);
-      body.append('message', sub.text);
-      body.append('idempotency_key', idempotencyKey);
-      body.append('reasoning_effort', getActiveReasoningEffort());
-      body.append('model_key', getActiveModelKey());
-      if (Array.isArray(sub.files)) {
-        sub.files.forEach(file => body.append('attachments', file));
-      }
-      const response = await api('/api/chat', {method: 'POST', body});
-      if (response.duplicate) {
-        if (optimisticCard) {
-          optimisticCard.remove();
-          optimisticCard = null;
-        }
-        setThinking(false);
-        return;
-      }
-      if (response.attachments?.length) {
-        addToolMessage({
-          call_id: `attachments-${generateUUID()}`,
-          tool: 'Images',
-          status: 'completed',
-          result: `${response.attachments.length} reference image(s) uploaded.`,
-        });
-      }
+      await sendChatRequest({ text: sub.text, files: sub.files });
       return;
     }
 
     // Server-side retry via /api/chat/retry (restores context from conversation.jsonl)
-    if (errorElement) errorElement.remove();
-    feed?.querySelectorAll('.message.error').forEach(el => el.remove());
     clearActivity();
     finalizeAllActiveCards();
     setThinking(true);
     scrollFeedToBottom(true);
 
+    const retryPayload = {
+      project: currentProject,
+      reasoning_effort: getActiveReasoningEffort(),
+      model_key: getActiveModelKey(),
+    };
+    if (context && typeof context.userIndex === 'number' && context.userIndex >= 0) {
+      retryPayload.user_index = context.userIndex;
+    }
+
     const response = await api('/api/chat/retry', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({
-        project: currentProject,
-        reasoning_effort: getActiveReasoningEffort(),
-        model_key: getActiveModelKey(),
-      }),
+      body: JSON.stringify(retryPayload),
     });
     if (!response.accepted) {
       throw new Error(response.error || 'Retry request not accepted.');
     }
   } catch (error) {
-    if (optimisticCard) {
-      optimisticCard.remove();
-      optimisticCard = null;
-    }
+    finalizeAllActiveCards();
     setThinking(false);
     addMessage(`Retry failed: ${error.message}`, 'error', {retryable: true, retryContext: context});
   } finally {
@@ -1134,6 +1177,18 @@ function normalizeHistoryContent(content) {
   return lines.join('\n');
 }
 
+function restoreEmptyState(target = feed, projectName = currentProject) {
+  const emptyTpl = document.querySelector('#chat-empty');
+  if (emptyTpl) {
+    target.appendChild(emptyTpl.content.cloneNode(true));
+  } else {
+    const empty = document.createElement('div');
+    empty.className = 'empty-state';
+    empty.textContent = `Project "${projectName}" selected. Describe a part to begin.`;
+    target.appendChild(empty);
+  }
+}
+
 async function loadHistory(projectName) {
   const target = feed;
   try {
@@ -1215,16 +1270,8 @@ async function loadHistory(projectName) {
       renderedAny = true;
     }
     if (!renderedAny) {
-      // Project with no conversation → restore the empty state from the
-      // template (preserves the project name and example prompts).
-      const emptyTpl = document.querySelector('#chat-empty');
-      if (emptyTpl) target.appendChild(emptyTpl.content.cloneNode(true));
-      else {
-        const empty = document.createElement('div');
-        empty.className = 'empty-state';
-        empty.textContent = `Project "${projectName}" selected. Describe a part to begin.`;
-        target.appendChild(empty);
-      }
+      // Project with no conversation → restore the empty state from the template
+      restoreEmptyState(target, projectName);
     }
   } catch (error) {
     addMessage(error.message, 'error', {target});
@@ -1438,19 +1485,12 @@ chatForm.addEventListener('submit', async event => {
   }
   if (sendToggle) sendToggle.disabled = true;
   message.disabled = true;
-  // Snapshot attached files and their preview URLs so we can render the
-  // images inline in the chat feed before sending them to the server.
   const imagePayload = selectedFiles.map((file) => ({
     src: file._previewUrl || URL.createObjectURL(file),
     alt: file.name,
   }));
   try {
-    clearActivity();
-    finalizeAllActiveCards();
-    addMessage(text, 'user', {images: imagePayload});
-    getOrCreateRunCard(null, { optimistic: true });
-    setThinking(true);
-    scrollFeedToBottom(true);
+    addMessage(text, 'user', { images: imagePayload });
     message.value = '';
     autoResizeMessage();
     let promptText = text;
@@ -1465,45 +1505,18 @@ chatForm.addEventListener('submit', async event => {
         promptText += `\n\nAlso, please pay special attention to: ${extraInstructions}`;
       }
     }
-    const idempotencyKey = generateUUID();
-    const body = new FormData();
-    body.append('project', currentProject);
-    body.append('message', promptText);
-    body.append('idempotency_key', idempotencyKey);
-    body.append('reasoning_effort', getActiveReasoningEffort());
-    body.append('model_key', getActiveModelKey());
-    selectedFiles.forEach(file => body.append('attachments', file));
-    const submissionSnapshot = {
+    const currentFiles = [...selectedFiles];
+    lastUserSubmission = {
       project: currentProject,
       text: promptText,
       originalText: text,
-      files: [...selectedFiles],
+      files: currentFiles,
       images: imagePayload,
     };
-    lastUserSubmission = submissionSnapshot;
-    const response = await api('/api/chat', {method: 'POST', body});
-    if (response.duplicate) {
-      if (optimisticCard) {
-        optimisticCard.remove();
-        optimisticCard = null;
-      }
-      setThinking(false);
-      return;
-    }
-    if (response.attachments?.length) {
-      addToolMessage({
-        call_id: `attachments-${generateUUID()}`,
-        tool: 'Images',
-        status: 'completed',
-        result: `${response.attachments.length} reference image(s) uploaded.`,
-      });
-    }
+    await sendChatRequest({ text: promptText, files: currentFiles });
     clearAttachments();
   } catch (error) {
-    if (optimisticCard) {
-      optimisticCard.remove();
-      optimisticCard = null;
-    }
+    finalizeAllActiveCards();
     addMessage(error.message, 'error', {
       retryable: true,
       retryContext: { clientSubmission: lastUserSubmission },
@@ -1666,6 +1679,7 @@ const imageModalClose = document.querySelector('#image-modal-close');
 function openImageModal(src, title = 'Reference Image') {
   if (!imagePreviewModal || !imageModalImg) return;
   imageModalImg.src = src;
+  imageModalImg.alt = title || 'Reference Image';
   if (imageModalTitle) imageModalTitle.textContent = title;
   imagePreviewModal.classList.remove('hidden');
   imagePreviewModal.setAttribute('aria-hidden', 'false');
@@ -1696,7 +1710,7 @@ document.addEventListener('click', (event) => {
   if (!item) return;
   const img = item.tagName === 'IMG' ? item : item.querySelector('img');
   if (!img) return;
-  const src = img.currentSrc || img.src;
+  const src = img.currentSrc || img.src || img.getAttribute('src');
   if (src) {
     const title = img.alt || 'Reference Image';
     openImageModal(src, title);
@@ -1733,10 +1747,11 @@ function triggerBlobDownload(blob, filename) {
 downloadModelBtn?.addEventListener('click', async () => {
   if (!currentProject || downloadModelBtn.disabled) return;
   const format = exportFormatSelect?.value || 'stl';
+  const is3mf = format === '3mf';
+  const originalHtml = downloadModelBtn.innerHTML;
 
-  if (format === '3mf') {
-    const originalHtml = downloadModelBtn.innerHTML;
-    downloadModelBtn.disabled = true;
+  downloadModelBtn.disabled = true;
+  if (is3mf) {
     downloadModelBtn.classList.add('loading');
     downloadModelBtn.innerHTML = `
       <svg class="icon spin-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
@@ -1744,47 +1759,29 @@ downloadModelBtn?.addEventListener('click', async () => {
       </svg>
       <span>AI 3MF Setup…</span>
     `;
-
-    try {
-      const exportRes = await fetch(`/api/projects/${encodeURIComponent(currentProject)}/export?format=3mf`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ auto_ai: true }),
-      });
-
-      if (!exportRes.ok) {
-        const err = await exportRes.json().catch(() => ({ error: 'Export failed' }));
-        addMessage(`3MF Export failed: ${err.error || exportRes.statusText}`, 'error');
-        return;
-      }
-
-      const blob = await exportRes.blob();
-      triggerBlobDownload(blob, `${currentProject}.3mf`);
-    } catch (error) {
-      addMessage(`3MF Export failed: ${error.message}`, 'error');
-    } finally {
-      downloadModelBtn.disabled = !previewProject;
-      downloadModelBtn.classList.remove('loading');
-      downloadModelBtn.innerHTML = originalHtml;
-    }
-    return;
   }
 
-  const downloadUrl = `/api/projects/${encodeURIComponent(currentProject)}/export?format=${encodeURIComponent(format)}`;
-  downloadModelBtn.disabled = true;
   try {
-    const res = await fetch(downloadUrl);
+    const exportUrl = `/api/projects/${encodeURIComponent(currentProject)}/export?format=${encodeURIComponent(format)}`;
+    const options = is3mf
+      ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ auto_ai: true }) }
+      : { method: 'GET' };
+
+    const res = await fetch(exportUrl, options);
     if (!res.ok) {
       const err = await res.json().catch(() => ({ error: 'Export failed' }));
-      addMessage(`Export failed: ${err.error || res.statusText}`, 'error');
-      return;
+      throw new Error(err.error || res.statusText);
     }
     const blob = await res.blob();
     triggerBlobDownload(blob, `${currentProject}.${format}`);
   } catch (error) {
-    addMessage(`Export failed: ${error.message}`, 'error');
+    addMessage(`${is3mf ? '3MF ' : ''}Export failed: ${error.message}`, 'error');
   } finally {
     downloadModelBtn.disabled = !previewProject;
+    if (is3mf) {
+      downloadModelBtn.classList.remove('loading');
+      downloadModelBtn.innerHTML = originalHtml;
+    }
   }
 });
 document.querySelectorAll('[data-view]').forEach(button => {
@@ -1903,26 +1900,15 @@ codeEditor?.addEventListener('keydown', async event => {
 
 async function handleSaveCodeAction() {
   if (!currentProject || !codeEditor) return;
-  const label = saveCodeBtn?.querySelector('span');
-  const originalText = 'Save';
   try {
     const saved = await saveModelCode();
-    if (saved && label) {
-      saveCodeBtn?.classList.add('success');
-      label.textContent = 'Saved!';
-      setTimeout(() => {
-        saveCodeBtn?.classList.remove('success');
-        if (label) label.textContent = originalText;
-      }, 1500);
-    } else if (!saved && label) {
-      label.textContent = 'Error';
-      setTimeout(() => { if (label) label.textContent = originalText; }, 1500);
+    if (saved) {
+      flashButtonFeedback(saveCodeBtn, 'Saved!');
+    } else {
+      flashButtonFeedback(saveCodeBtn, 'Error', { className: 'error' });
     }
   } catch {
-    if (label) {
-      label.textContent = 'Error';
-      setTimeout(() => { if (label) label.textContent = originalText; }, 1500);
-    }
+    flashButtonFeedback(saveCodeBtn, 'Error', { className: 'error' });
   }
 }
 
@@ -1930,25 +1916,8 @@ saveCodeBtn?.addEventListener('click', handleSaveCodeAction);
 
 copyCodeBtn?.addEventListener('click', async () => {
   if (!codeEditor?.value) return;
-  const showFeedback = () => {
-    const span = copyCodeBtn.querySelector('span');
-    if (span) {
-      copyCodeBtn?.classList.add('success');
-      span.textContent = 'Copied!';
-      setTimeout(() => {
-        copyCodeBtn?.classList.remove('success');
-        span.textContent = 'Copy';
-      }, 1500);
-    }
-  };
-  try {
-    await navigator.clipboard.writeText(codeEditor.value);
-    showFeedback();
-  } catch {
-    codeEditor.select();
-    document.execCommand('copy');
-    showFeedback();
-  }
+  const ok = await copyTextToClipboard(codeEditor.value);
+  if (ok) flashButtonFeedback(copyCodeBtn, 'Copied!');
 });
 
 const buildBtn = document.querySelector('#build-btn');
@@ -1957,12 +1926,15 @@ buildBtn?.addEventListener('click', async () => {
   if (buildBtn.disabled) return;
   buildBtn.disabled = true;
   const label = buildBtn.querySelector('span');
-  const originalText = 'Build';
+  const defaultLabel = 'Build';
   if (label) label.textContent = 'Building…';
   try {
     if (codeDirty) {
       const saved = await saveModelCode();
-      if (!saved) return;
+      if (!saved) {
+        if (label) label.textContent = defaultLabel;
+        return;
+      }
     }
     const res = await api(`/api/projects/${encodeURIComponent(currentProject)}/build`, {
       method: 'POST',
@@ -1970,16 +1942,18 @@ buildBtn?.addEventListener('click', async () => {
     if (res.ok) {
       if (res.preview_id) await loadCurrentPreview(res.preview_id);
       await loadModelCode();
-      if (label) {
-        label.textContent = 'Built!';
-        setTimeout(() => { if (label) label.textContent = originalText; }, 1200);
-      }
+      flashButtonFeedback(buildBtn, 'Built!', { duration: 1200, resetText: defaultLabel });
+    } else {
+      throw new Error(res.error || 'Build failed.');
     }
   } catch (error) {
+    if (label) label.textContent = defaultLabel;
     addMessage(`CAD build failed: ${error.message}`, 'error');
   } finally {
     buildBtn.disabled = false;
-    if (label && label.textContent === 'Building…') label.textContent = originalText;
+    if (label && label.textContent === 'Building…') {
+      label.textContent = defaultLabel;
+    }
   }
 });
 
@@ -2270,8 +2244,7 @@ function showQuestion(question) {
 
 // SSE event stream & Run-Card State Machine
 let eventSource = null;
-const runCards = new Map(); // run_id -> message card element
-let optimisticCard = null;  // Card created on user submit, adopted when run_id is known
+let activeRunCard = null;
 
 function scrollFeedToBottom(force = false) {
   if (!feed) return;
@@ -2281,66 +2254,36 @@ function scrollFeedToBottom(force = false) {
   }
 }
 
-function getActiveCard(runId) {
-  if (runId && runCards.has(runId)) {
-    const card = runCards.get(runId);
-    if (card && card.dataset.state !== 'done' && card.dataset.state !== 'error' && card.dataset.state !== 'stopped') {
-      return card;
+function getActiveCard(runId = null) {
+  if (activeRunCard && activeRunCard.isConnected) {
+    if (runId && !activeRunCard.dataset.runId) activeRunCard.dataset.runId = runId;
+    const state = activeRunCard.dataset.state;
+    if (state !== 'done' && state !== 'error' && state !== 'stopped') {
+      return activeRunCard;
     }
   }
-  if (optimisticCard && optimisticCard.dataset.state !== 'done' && optimisticCard.dataset.state !== 'error' && optimisticCard.dataset.state !== 'stopped') {
-    if (runId) {
-      optimisticCard.dataset.runId = runId;
-      runCards.set(runId, optimisticCard);
-      const card = optimisticCard;
-      optimisticCard = null;
-      return card;
-    }
-    return optimisticCard;
-  }
-  for (const c of runCards.values()) {
-    if (c.dataset.state !== 'done' && c.dataset.state !== 'error' && c.dataset.state !== 'stopped') {
-      if (runId && !c.dataset.runId) {
-        c.dataset.runId = runId;
-        runCards.set(runId, c);
-      }
-      return c;
-    }
-  }
-  if (feed) {
-    const streaming = feed.querySelectorAll('.message.agent.streaming');
-    for (let i = streaming.length - 1; i >= 0; i--) {
-      const c = streaming[i];
-      if (c.dataset.state !== 'done' && c.dataset.state !== 'error' && c.dataset.state !== 'stopped') {
-        if (runId) {
-          c.dataset.runId = runId;
-          runCards.set(runId, c);
-        }
-        return c;
-      }
+  const streaming = feed?.querySelector('.message.agent.streaming');
+  if (streaming) {
+    if (runId && !streaming.dataset.runId) streaming.dataset.runId = runId;
+    const state = streaming.dataset.state;
+    if (state !== 'done' && state !== 'error' && state !== 'stopped') {
+      activeRunCard = streaming;
+      return streaming;
     }
   }
   return null;
 }
 
 function finalizeAllActiveCards() {
-  for (const card of runCards.values()) {
-    if (card && card.dataset.state !== 'done' && card.dataset.state !== 'error' && card.dataset.state !== 'stopped') {
+  if (activeRunCard) {
+    const card = activeRunCard;
+    activeRunCard = null;
+    if (card.dataset.state !== 'done' && card.dataset.state !== 'error' && card.dataset.state !== 'stopped') {
       setCardState(card, 'done');
     }
-    if (card && !card.dataset.raw && !card.dataset.reasoning) {
+    if (!card.dataset.raw && !card.dataset.reasoning) {
       card.remove();
     }
-  }
-  runCards.clear();
-  if (optimisticCard) {
-    if (optimisticCard.dataset.state !== 'done' && optimisticCard.dataset.state !== 'error' && optimisticCard.dataset.state !== 'stopped') {
-      setCardState(optimisticCard, 'done');
-    }
-    if (!optimisticCard.dataset.raw && !optimisticCard.dataset.reasoning) {
-      optimisticCard.remove();
-    }
-    optimisticCard = null;
   }
   if (feed) {
     feed.querySelectorAll('.message.agent.streaming').forEach(card => {
@@ -2352,111 +2295,66 @@ function finalizeAllActiveCards() {
       }
     });
   }
-  document.querySelectorAll('.thinking-indicator').forEach(el => el.remove());
 }
 
-function getOrCreateRunCard(runId, { target = feed, optimistic = false } = {}) {
+function getOrCreateRunCard(runId, { target = feed } = {}) {
   const existing = getActiveCard(runId);
   if (existing) {
+    if (runId) existing.dataset.runId = runId;
     return existing;
   }
 
-  // Finalize any prior active cards before mounting a new card into feed
   finalizeAllActiveCards();
 
   const empty = target.querySelector('.empty-state');
   if (empty) empty.remove();
-  const indicator = target.querySelector('.thinking-indicator');
-  if (indicator) indicator.remove();
 
-  const item = document.createElement('div');
-  item.className = 'message agent streaming thinking';
-  item.dataset.state = 'thinking';
-  item.dataset.raw = '';
-  item.dataset.reasoning = '';
-  if (runId) item.dataset.runId = runId;
-
-  item.innerHTML = `
-    <div class="message-meta">
-      <span class="agent-mark">AI</span>
-      <span class="message-author">Agent</span>
-      <span class="message-state state-thinking">Thinking</span>
-      <button type="button" class="message-copy-btn" title="Copy message" aria-label="Copy message">
-        ${COPY_ICON_SVG}
-        <span class="copy-label">Copy</span>
-      </button>
-    </div>
-    <div class="message-content">
-      <div class="message-skeleton" aria-label="Waiting for response">
-        <div class="skeleton-line" style="width: 88%;"></div>
-        <div class="skeleton-line" style="width: 74%;"></div>
-        <div class="skeleton-line" style="width: 52%;"></div>
-      </div>
-    </div>
-  `;
+  const item = createAgentCardElement({ runId, streaming: true, showSkeleton: true });
   target.appendChild(item);
-  if (runId) {
-    runCards.set(runId, item);
-  } else if (optimistic) {
-    optimisticCard = item;
-  }
+  activeRunCard = item;
   scrollFeedToBottom(true);
   return item;
 }
+
+const CARD_STATES = {
+  thinking: { cls: 'state-thinking', defaultLabel: 'Thinking', streaming: true },
+  writing:  { cls: 'state-writing',  defaultLabel: 'Writing',  streaming: true },
+  working:  { cls: 'state-working',  defaultLabel: 'Working',  streaming: true },
+  done:     { cls: '',               defaultLabel: '',         streaming: false },
+  error:    { cls: 'state-error',    defaultLabel: 'Failed',   streaming: false },
+  stopped:  { cls: 'state-stopped',  defaultLabel: 'Stopped',  streaming: false },
+};
 
 function setCardState(card, state, labelText = null) {
   if (!card) return;
   card.dataset.state = state;
   const stateEl = card.querySelector('.message-state');
-  if (!stateEl) return;
+  const conf = CARD_STATES[state] || CARD_STATES.done;
 
   if (state === 'done') {
     const disclosure = card.querySelector('.thought-disclosure');
-    if (disclosure) {
-      disclosure.open = false;
+    if (disclosure) disclosure.open = false;
+  }
+
+  card.classList.toggle('streaming', conf.streaming);
+  card.classList.toggle('thinking', state === 'thinking');
+  card.classList.toggle('writing', state === 'writing');
+  card.classList.toggle('working', state === 'working');
+
+  if (stateEl) {
+    stateEl.className = `message-state ${conf.cls}`.trim();
+    stateEl.textContent = labelText ?? conf.defaultLabel;
+  }
+
+  const skeleton = card.querySelector('.message-skeleton');
+  if (skeleton) {
+    if (!conf.streaming || (state === 'thinking' && card.dataset.reasoning) || (state === 'writing' && card.dataset.raw?.trim())) {
+      skeleton.remove();
     }
   }
 
-  if (state === 'thinking') {
-    card.classList.add('streaming', 'thinking');
-    card.classList.remove('writing', 'working');
-    stateEl.className = 'message-state state-thinking';
-    stateEl.textContent = labelText || 'Thinking';
-    if (card.dataset.reasoning) {
-      const skeleton = card.querySelector('.message-skeleton');
-      if (skeleton) skeleton.remove();
-      ensureThoughtDisclosure(card, card.dataset.reasoning, true, true);
-    }
-  } else if (state === 'writing') {
-    card.classList.add('streaming', 'writing');
-    card.classList.remove('thinking', 'working');
-    stateEl.className = 'message-state state-writing';
-    stateEl.textContent = labelText || 'Writing';
-    const skeleton = card.querySelector('.message-skeleton');
-    if (skeleton && card.dataset.raw && card.dataset.raw.trim()) skeleton.remove();
-  } else if (state === 'working') {
-    card.classList.add('streaming', 'working');
-    card.classList.remove('thinking', 'writing');
-    stateEl.className = 'message-state state-working';
-    stateEl.textContent = labelText || 'Working';
-  } else if (state === 'done') {
-    card.classList.remove('streaming', 'thinking', 'writing', 'working');
-    stateEl.textContent = '';
-    stateEl.className = 'message-state';
-    const skeleton = card.querySelector('.message-skeleton');
-    if (skeleton) skeleton.remove();
-  } else if (state === 'error') {
-    card.classList.remove('streaming', 'thinking', 'writing', 'working');
-    stateEl.textContent = labelText || 'Failed';
-    stateEl.className = 'message-state state-error';
-    const skeleton = card.querySelector('.message-skeleton');
-    if (skeleton) skeleton.remove();
-  } else if (state === 'stopped') {
-    card.classList.remove('streaming', 'thinking', 'writing', 'working');
-    stateEl.textContent = labelText || 'Stopped';
-    stateEl.className = 'message-state state-stopped';
-    const skeleton = card.querySelector('.message-skeleton');
-    if (skeleton) skeleton.remove();
+  if (state === 'thinking' && card.dataset.reasoning) {
+    ensureThoughtDisclosure(card, card.dataset.reasoning, true, true);
   }
 }
 
@@ -2544,13 +2442,73 @@ function appendStreamingDelta(runId, delta, messageId = null) {
 function handleStreamingToolDelta(runId, data) {
   const card = getActiveCard(runId) || getOrCreateRunCard(runId);
   const toolName = data?.name || data?.tool || (data?.function && data.function.name) || '';
-  const label = toolName ? activityLabel(toolName) : 'Calling tool';
+  const callId = data?.id || `${ data?.index ?? 0 }`;
+  if (card._streamedToolCallId !== callId) {
+    card._streamedToolCallId = callId;
+    card._streamedToolArgs = '';
+  }
+  if (typeof data?.arguments_delta === 'string' && data.arguments_delta) {
+    card._streamedToolArgs = (card._streamedToolArgs || '') + data.arguments_delta;
+  }
+  let label = toolName ? activityLabel(toolName) : 'Calling tool';
+  const args = card._streamedToolArgs || '';
+  if (args.length > 40) {
+    const lineCount = (args.match(/\\n|\n/g) || []).length;
+    if (lineCount > 0) {
+      label = `${label} (${lineCount} ${lineCount === 1 ? 'line' : 'lines'})`;
+    } else if (args.length >= 256) {
+      label = `${label} (${(args.length / 1024).toFixed(1)} KB)`;
+    }
+  }
   setCardState(card, 'working', label);
 }
 
 function finalizeRunCard(runId, finalText, reasoning) {
   flushStreamingRender();
-  let card = (runId && runCards.get(runId)) || getActiveCard(runId);
+  let card = null;
+
+  // 1. Prefer activeRunCard if attached and belongs to this run (or has no runId yet)
+  if (activeRunCard && activeRunCard.isConnected) {
+    if (!runId || !activeRunCard.dataset.runId || activeRunCard.dataset.runId === runId) {
+      card = activeRunCard;
+    }
+  }
+
+  // 2. Query feed for cards matching this runId, taking the LAST card in chronological order
+  if (!card && runId && feed) {
+    const matching = feed.querySelectorAll(`.message.agent[data-run-id="${CSS.escape(runId)}"]`);
+    if (matching.length > 0) {
+      card = matching[matching.length - 1];
+    }
+  }
+
+  // 3. Fallback to getActiveCard (e.g. streaming card not yet assigned to activeRunCard)
+  if (!card) {
+    card = getActiveCard(runId);
+  }
+
+  // 4. Fallback to the latest agent card in the feed
+  if (!card && feed) {
+    const agentCards = feed.querySelectorAll('.message.agent');
+    if (agentCards.length > 0) {
+      const last = agentCards[agentCards.length - 1];
+      if (!runId || !last.dataset.runId || last.dataset.runId === runId || (finalText && last.dataset.raw === stripToolCallTags(finalText).trim())) {
+        card = last;
+      }
+    }
+  }
+
+  // 5. Deduplication safety: if any agent card in feed already matches the final text, adopt it
+  if (!card && feed && finalText) {
+    const cleanFinal = stripToolCallTags(finalText).trim();
+    const agentCards = feed.querySelectorAll('.message.agent');
+    for (let i = agentCards.length - 1; i >= 0; i--) {
+      if (agentCards[i].dataset.raw === cleanFinal) {
+        card = agentCards[i];
+        break;
+      }
+    }
+  }
 
   const text = stripToolCallTags(finalText || card?.dataset.raw || '').trim();
   const cardReasoning = stripEncryptedReasoning(card?.dataset.reasoning || '').trim();
@@ -2561,8 +2519,7 @@ function finalizeRunCard(runId, finalText, reasoning) {
   if (card) {
     if (!text && !cleanReasoning) {
       card.remove();
-      if (runId) runCards.delete(runId);
-      if (optimisticCard === card) optimisticCard = null;
+      if (activeRunCard === card) activeRunCard = null;
       scrollFeedToBottom();
       return null;
     }
@@ -2576,16 +2533,8 @@ function finalizeRunCard(runId, finalText, reasoning) {
       const existing = card.querySelector('.thought-disclosure');
       if (existing) existing.remove();
     }
-    if (runId) runCards.delete(runId);
-    if (optimisticCard === card) optimisticCard = null;
-
-    // Safety sweep: ensure any other dangling cards are also set to done and pruned
-    for (const [id, dangling] of runCards.entries()) {
-      if (dangling.dataset.state !== 'done') setCardState(dangling, 'done');
-      if (!dangling.dataset.raw && !dangling.dataset.reasoning) dangling.remove();
-      runCards.delete(id);
-    }
-    optimisticCard = null;
+    if (activeRunCard === card) activeRunCard = null;
+    finalizeAllActiveCards();
 
     scrollFeedToBottom();
     return card;
@@ -2601,9 +2550,11 @@ function finalizeRunCard(runId, finalText, reasoning) {
 
 async function syncAfterStreamReset() {
   if (!currentProject) return;
-  await loadHistory(currentProject);
-  await loadCurrentState();
-  await syncCurrentPreview();
+  await Promise.all([
+    loadHistory(currentProject),
+    loadCurrentState(),
+    syncCurrentPreview(),
+  ]);
 }
 
 let streamReconnectTimer = null;
@@ -2713,6 +2664,8 @@ function connectStream() {
         card.dataset.raw = '';
         card.dataset.reasoning = '';
         card._rawMessage = '';
+        card._streamedToolCallId = '';
+        card._streamedToolArgs = '';
         delete card.dataset.lastContentTurnId;
         delete card.dataset.lastReasoningTurnId;
         const thought = card.querySelector('.thought-disclosure');
@@ -2742,7 +2695,18 @@ function connectStream() {
       if (data.project !== currentProject) return;
       flushStreamingRender();
       const runId = data.run_id || data.message_id;
-      const card = getActiveCard(runId);
+      let card = getActiveCard(runId);
+      if (!card && activeRunCard && activeRunCard.isConnected) {
+        if (!runId || !activeRunCard.dataset.runId || activeRunCard.dataset.runId === runId) {
+          card = activeRunCard;
+        }
+      }
+      if (!card && runId && feed) {
+        const matching = feed.querySelectorAll(`.message.agent[data-run-id="${CSS.escape(runId)}"]`);
+        if (matching.length > 0) {
+          card = matching[matching.length - 1];
+        }
+      }
       if (card) {
         const combined = stripEncryptedReasoning(card.dataset.reasoning || data.reasoning || '');
         if (combined) {
@@ -2762,8 +2726,7 @@ function connectStream() {
         if (data.has_tools) {
           if (text) {
             setCardState(card, 'done');
-            if (runId) runCards.delete(runId);
-            if (optimisticCard === card) optimisticCard = null;
+            if (activeRunCard === card) activeRunCard = null;
             const nextCard = getOrCreateRunCard(runId);
             setCardState(nextCard, 'working', 'Running tools');
           } else {
@@ -2772,7 +2735,6 @@ function connectStream() {
         } else if (data.continuing) {
           setCardState(card, 'thinking', 'Continuing');
         } else {
-          if (runId) runCards.set(runId, card);
           setCardState(card, 'done');
         }
       }
@@ -2864,38 +2826,11 @@ function connectStream() {
       // review summary, so we leave it untouched.
       refreshLatestToolRow('cad_review', {state: verdict});
     },
-  };
-  for (const [eventName, handler] of Object.entries(handlers)) {
-    eventSource.addEventListener(eventName, event => {
-      try {
-        handler(JSON.parse(event.data));
-      } catch (error) {
-        console.error('Failed to parse event', eventName, error);
-      }
-    });
-  }
-  function handleAgentTerminalState(runId, state, labelText) {
-    const card = getActiveCard(runId);
-    if (card) {
-      if (!card.dataset.raw && !card.dataset.reasoning) {
-        card.remove();
-      } else {
-        setCardState(card, state, labelText);
-      }
-      if (runId) runCards.delete(runId);
-      if (optimisticCard === card) optimisticCard = null;
-    }
-    finalizeAllActiveCards();
-  }
-
-  eventSource.addEventListener('agent_error', event => {
-    try {
-      const data = JSON.parse(event.data);
+    agent_error: data => {
       if (data.project !== currentProject) return;
       const runId = data.run_id || data.message_id;
       handleAgentTerminalState(runId, 'error', 'Failed');
       addMessage(data.message || 'Agent error.', 'error', {retryable: true});
-      // Errors are terminal; ensure the thinking indicator clears.
       setThinking(false);
       addToolMessage({
         call_id: 'agent-run',
@@ -2903,11 +2838,8 @@ function connectStream() {
         status: 'failed',
         result: data.message || 'Agent error.',
       });
-    } catch {}
-  });
-  eventSource.addEventListener('agent_stopped', event => {
-    try {
-      const data = JSON.parse(event.data);
+    },
+    agent_stopped: data => {
       if (busyWithOtherProject && (data.project === busyWithOtherProject || (data.affected_projects && data.affected_projects.includes(busyWithOtherProject)))) {
         setBusyWithOther(null);
       }
@@ -2921,24 +2853,38 @@ function connectStream() {
         status: 'stopped',
         result: 'Agent task stopped.',
       });
-    } catch {}
-  });
-  eventSource.addEventListener('stream_reset', () => {
-    // The backend disconnected an overflowed subscriber and signalled that
-    // some events were dropped. Re-fetch the canonical state so the UI
-    // converges to the persisted conversation, project state, and preview.
-    syncAfterStreamReset().catch(err => console.error('stream_reset sync failed', err));
-  });
-
-  eventSource.addEventListener('conversation_reset', event => {
-    // The backend cleared this project's conversation.jsonl. The model and
-    // preview are unchanged, but the chat feed (and the history drawer if
-    // open) must drop everything so the next turn starts on an empty canvas.
-    try {
-      const data = JSON.parse(event.data);
+    },
+    conversation_reset: data => {
       if (!data || data.project !== currentProject) return;
       applyConversationReset();
-    } catch {}
+    },
+  };
+
+  function handleAgentTerminalState(runId, state, labelText) {
+    const card = getActiveCard(runId);
+    if (card) {
+      if (!card.dataset.raw && !card.dataset.reasoning) {
+        card.remove();
+      } else {
+        setCardState(card, state, labelText);
+      }
+      if (activeRunCard === card) activeRunCard = null;
+    }
+    finalizeAllActiveCards();
+  }
+
+  for (const [eventName, handler] of Object.entries(handlers)) {
+    eventSource.addEventListener(eventName, event => {
+      try {
+        handler(JSON.parse(event.data));
+      } catch (error) {
+        console.error('Failed to parse event', eventName, error);
+      }
+    });
+  }
+
+  eventSource.addEventListener('stream_reset', () => {
+    syncAfterStreamReset().catch(err => console.error('stream_reset sync failed', err));
   });
 }
 
@@ -2948,21 +2894,11 @@ function applyConversationReset() {
     renderRafId = null;
     pendingRenderCard = null;
   }
-  optimisticCard = null;
-  runCards.clear();
-  // Wipe the main feed, dismiss any pending question, and clear activity so
-  // the UI matches the freshly truncated conversation.jsonl.
+  activeRunCard = null;
   clearActivity();
   feed.replaceChildren();
   clearQuestionArea();
-  const emptyTpl = document.querySelector('#chat-empty');
-  if (emptyTpl) feed.appendChild(emptyTpl.content.cloneNode(true));
-  else {
-    const empty = document.createElement('div');
-    empty.className = 'empty-state';
-    empty.textContent = `Project "${currentProject}" selected. Describe a part to begin.`;
-    feed.appendChild(empty);
-  }
+  restoreEmptyState(feed, currentProject);
   setThinking(false);
 }
 
@@ -3016,6 +2952,9 @@ document.addEventListener('click', async event => {
     messageRetryBtn.disabled = true;
     messageRetryBtn.classList.add('retrying');
 
+    const allUserMessages = Array.from(feed?.querySelectorAll('.message.user') || []);
+    const userIndex = allUserMessages.indexOf(messageEl);
+
     // Remove any trailing elements after messageEl so the DOM matches the rewound history
     let sibling = messageEl.nextElementSibling;
     while (sibling) {
@@ -3023,7 +2962,7 @@ document.addEventListener('click', async event => {
       sibling.remove();
       sibling = next;
     }
-    await handleRetry(null);
+    await handleRetry(null, { userIndex }, messageRetryBtn);
     return;
   }
 });
@@ -3034,9 +2973,11 @@ document.addEventListener('click', async event => {
   // Load the persisted conversation into the main feed so reopening a
   // project immediately shows its history. The empty-state element is
   // removed automatically once any displayable message is rendered.
-  await loadHistory(currentProject);
-  await loadCurrentState();
-  await syncCurrentPreview();
-  await loadModelCode();
+  await Promise.all([
+    loadHistory(currentProject),
+    loadCurrentState(),
+    syncCurrentPreview(),
+    loadModelCode(),
+  ]);
   connectStream();
 })();

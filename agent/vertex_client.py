@@ -12,7 +12,7 @@ import logging
 from typing import Any
 
 from agent.gcloud_auth import gcloud_auth
-from agent.llm_base import ChatCompletionsClient, post_with_cancel
+from agent.llm_base import ChatCompletionsClient, is_continuation_messages, post_with_cancel
 from agent.settings import Settings
 
 _LOG = logging.getLogger(__name__)
@@ -125,9 +125,12 @@ class VertexClient(ChatCompletionsClient):
         )
         model_lower = self.model.lower()
         is_gemini_2 = "2.5" in model_lower or "gemini-2" in model_lower
-        eff = (effort or "").lower().strip()
+        effort_raw = (effort or "").lower().strip()
+        eff = effort_raw if effort_raw else ("minimal" if "flash" in model_lower else "low")
+        if is_continuation_messages(messages) and eff != "none":
+            eff = "minimal" if "flash" in model_lower else "low"
         thinking_config: dict[str, Any] = {"include_thoughts": eff != "none"}
-        if eff and eff != "none":
+        if eff != "none":
             if not is_gemini_2:
                 level_map = {
                     "minimal": "MINIMAL" if "flash" in model_lower else "LOW",
@@ -137,7 +140,7 @@ class VertexClient(ChatCompletionsClient):
                     "xhigh": "HIGH",
                     "max": "HIGH",
                 }
-                level = level_map.get(eff, "HIGH")
+                level = level_map.get(eff, "LOW")
                 if "gemini-4" in model_lower and level == "MINIMAL":
                     level = "LOW"
                 thinking_config["thinking_level"] = level
@@ -146,11 +149,11 @@ class VertexClient(ChatCompletionsClient):
                     "minimal": 1024,
                     "low": 2048,
                     "medium": 4096,
-                    "high": 8192,
-                    "xhigh": 16384,
-                    "max": 24576,
+                    "high": 6144,
+                    "xhigh": 8192,
+                    "max": 8192,
                 }
-                thinking_config["thinking_budget"] = budget_map.get(eff, 8192)
+                thinking_config["thinking_budget"] = budget_map.get(eff, 2048)
         elif eff == "none":
             if not is_gemini_2:
                 thinking_config["thinking_level"] = (

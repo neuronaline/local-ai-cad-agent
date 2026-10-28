@@ -8,4 +8,5 @@ h2>=4.1,<5
 
 # CAD and image processing
 numpy>=1.26,<3
+sympy>=1.12,<2
 Pillow>=10.0,<13

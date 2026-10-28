@@ -34,13 +34,13 @@ from agent.llm_base import (
     extract_text_tool_calls,
     extract_think_tags,
     get_thought_signature,
+    is_continuation_messages,
     iter_lines_with_cancel,
     normalize_messages,
     post_with_cancel,
     relocate_tool_images,
     strip_encrypted_reasoning,
 )
-from agent.prompt import TOOL_IMAGE_PROMPT
 from agent.settings import Settings
 
 _LOG = logging.getLogger(__name__)
@@ -125,7 +125,6 @@ def convert_messages_to_interactions(
     system_instruction: str | None = None
     steps: list[dict[str, Any]] = []
     call_id_to_name: dict[str, str] = {}
-    pending_tool_images: list[dict[str, Any]] = []
 
     def _append_user_step(parts: list[dict[str, Any]]) -> None:
         if not parts:
@@ -135,18 +134,8 @@ def convert_messages_to_interactions(
         else:
             steps.append({"type": "user_input", "content": list(parts)})
 
-    def _flush_pending_images() -> None:
-        nonlocal pending_tool_images
-        if pending_tool_images:
-            _append_user_step(
-                [{"type": "text", "text": TOOL_IMAGE_PROMPT}] + pending_tool_images
-            )
-            pending_tool_images = []
-
     for msg in messages:
         role = msg.get("role")
-        if role != "tool":
-            _flush_pending_images()
 
         if role == "system":
             text = ""
@@ -277,30 +266,12 @@ def convert_messages_to_interactions(
             call_id = msg.get("tool_call_id") or ""
             fn_name = msg.get("name") or call_id_to_name.get(call_id, "unknown_tool")
             content = msg.get("content")
-            image_steps: list[dict[str, Any]] = []
             if isinstance(content, list):
-                text_parts: list[str] = []
-                for p in content:
-                    if not isinstance(p, dict):
-                        continue
-                    ptype = p.get("type")
-                    if ptype == "text":
-                        t = p.get("text", "")
-                        if t:
-                            text_parts.append(t)
-                    elif ptype == "image_url":
-                        img_dict = p.get("image_url") or {}
-                        url = img_dict.get("url", "")
-                        parsed = _parse_data_uri(url)
-                        if parsed:
-                            mime, b64_data = parsed
-                            image_steps.append({
-                                "type": "image",
-                                "data": b64_data,
-                                "mime_type": mime,
-                            })
-                        elif url:
-                            image_steps.append({"type": "image", "image_url": url})
+                text_parts = [
+                    p.get("text", "")
+                    for p in content
+                    if isinstance(p, dict) and p.get("type") == "text" and p.get("text")
+                ]
                 content = "\n".join(text_parts)
 
             if isinstance(content, str):
@@ -322,10 +293,7 @@ def convert_messages_to_interactions(
                     "result": res_val if isinstance(res_val, dict) else {"output": res_val},
                 }
             )
-            if image_steps:
-                pending_tool_images.extend(image_steps)
 
-    _flush_pending_images()
     if steps and steps[-1].get("type") in ("model_output", "thought", "function_call"):
         steps.append({
             "type": "user_input",
@@ -360,7 +328,7 @@ def parse_interactions_stream(
     provider_label: str = "Google AI Studio",
     stop_event: threading.Event | None = None,
     stream_callback: Any | None = None,
-    idle_timeout: float = 90.0,
+    idle_timeout: float = 180.0,
 ) -> dict[str, Any]:
     """Parse Server-Sent Events from the Interactions API."""
     content = ""
@@ -390,10 +358,9 @@ def parse_interactions_stream(
                     _force_close_response(response)
                     raise StreamResponseError(
                         f"{provider_label} stream timed out after {idle_timeout:.0f}s of inactivity.",
-                        retryable=not (content or tool_calls or reasoning_text),
+                        retryable=not (content or tool_calls),
                     )
                 continue
-            last_activity_time = now
             line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
             if not line:
                 current_event_type = None
@@ -401,9 +368,20 @@ def parse_interactions_stream(
             line = line.strip()
             if line.startswith("event:"):
                 current_event_type = line[6:].strip()
+                last_activity_time = now
                 continue
             if not line.startswith("data:"):
+                if finish_reason is not None and finish_time is not None:
+                    if last_usage is not None or (now - finish_time) >= 1.0:
+                        break
+                elif idle_timeout > 0 and (now - last_activity_time) >= idle_timeout:
+                    _force_close_response(response)
+                    raise StreamResponseError(
+                        f"{provider_label} stream timed out after {idle_timeout:.0f}s of inactivity.",
+                        retryable=not (content or tool_calls),
+                    )
                 continue
+            last_activity_time = now
             payload = line[5:].strip()
             if payload == "[DONE]":
                 break
@@ -420,7 +398,7 @@ def parse_interactions_stream(
             if "error" in event:
                 raise StreamResponseError(
                     f"{provider_label} stream failed: {_stream_error_detail(event['error'])}",
-                    retryable=not (content or tool_calls or reasoning_text),
+                    retryable=not (content or tool_calls),
                 )
 
             interaction_obj = (
@@ -779,10 +757,13 @@ def parse_interactions_stream(
         if stop_event and stop_event.is_set():
             raise RequestCancelled(f"{provider_label} request cancelled.") from err
         had_partial = bool(content or tool_calls or reasoning_text)
-        raise StreamResponseError(
-            f"{provider_label} streaming error: {err}",
-            retryable=not had_partial,
-        ) from err
+        if finish_reason is not None and had_partial:
+            pass
+        else:
+            raise StreamResponseError(
+                f"{provider_label} streaming error: {err}",
+                retryable=not (content or tool_calls),
+            ) from err
 
     if stop_event and stop_event.is_set():
         _force_close_response(response)
@@ -1032,12 +1013,15 @@ class GoogleInteractionsClient(BaseLLMClient):
         model_name = raw_model.lower()
         is_gemini_2 = "2.5" in model_name or "gemini-2" in model_name
         effort = (self.settings.gemini_reasoning_effort or "").lower().strip()
+        eff = effort if effort else ("minimal" if "flash" in model_name else "low")
+        if is_continuation_messages(messages) and eff != "none":
+            eff = "minimal" if "flash" in model_name else "low"
 
         thinking_config: dict[str, Any] = {
-            "include_thoughts": effort != "none",
+            "include_thoughts": eff != "none",
             "thinking_summaries": "auto",
         }
-        if effort and effort != "none":
+        if eff != "none":
             if not is_gemini_2:
                 level_map = {
                     "minimal": "MINIMAL" if "flash" in model_name else "LOW",
@@ -1047,7 +1031,7 @@ class GoogleInteractionsClient(BaseLLMClient):
                     "xhigh": "HIGH",
                     "max": "HIGH",
                 }
-                level = level_map.get(effort, "HIGH")
+                level = level_map.get(eff, "LOW")
                 if "gemini-4" in model_name and level == "MINIMAL":
                     level = "LOW"
                 thinking_config["thinking_level"] = level
@@ -1056,12 +1040,12 @@ class GoogleInteractionsClient(BaseLLMClient):
                     "minimal": 1024,
                     "low": 2048,
                     "medium": 4096,
-                    "high": 8192,
-                    "xhigh": 16384,
-                    "max": 24576,
+                    "high": 6144,
+                    "xhigh": 8192,
+                    "max": 8192,
                 }
-                thinking_config["thinking_budget"] = budget_map.get(effort, 8192)
-        elif effort == "none":
+                thinking_config["thinking_budget"] = budget_map.get(eff, 2048)
+        elif eff == "none":
             thinking_config.pop("thinking_summaries", None)
             gen_config.pop("thinking_summaries", None)
             if not is_gemini_2:

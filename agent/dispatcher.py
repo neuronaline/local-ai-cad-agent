@@ -56,6 +56,13 @@ def _pick_intended_value(key: str, existing: object, candidate: object) -> objec
     if isinstance(existing, str) and isinstance(candidate, str):
         return candidate if len(candidate) > len(existing) else existing
 
+    # For collection payloads (e.g. edits list, views list, questions list),
+    # prefer the more complete collection when a streaming model re-emits a key.
+    if (isinstance(existing, list) and isinstance(candidate, list)) or (
+        isinstance(existing, dict) and isinstance(candidate, dict)
+    ):
+        return candidate if len(candidate) >= len(existing) else existing
+
     # For all other keys (or equal values), preserve the first emitted value.
     return existing
 
@@ -90,8 +97,13 @@ def _deduplicate_tool_keys(pairs: list) -> dict:
 
 
 def _clean_code_fences(code: str) -> str:
-    """Strip markdown code block fences if an LLM wraps code in ```scad ... ```."""
-    if not isinstance(code, str):
+    """Strip markdown code block fences if an LLM wraps code in ```scad ... ```.
+
+    When ``code`` is not wrapped in markdown fences, the original string is
+    returned verbatim so leading indentation and trailing newlines in
+    ``edit_file`` snippets are preserved.
+    """
+    if not isinstance(code, str) or not code:
         return ""
     text = code.strip()
     if not text:
@@ -100,15 +112,17 @@ def _clean_code_fences(code: str) -> str:
         inner = text[3:-3].strip()
         m = re.match(r"^[a-zA-Z0-9_-]+\s+(.*)$", inner)
         return m.group(1) if m else inner
-    match = re.search(r"```(?:[a-zA-Z0-9_-]+)?\s*\r?\n(.*?)\r?\n```", text, re.DOTALL)
+    match = re.search(r"```(?:[a-zA-Z0-9_-]+)?[ \t]*\r?\n(.*?)\r?\n```", text, re.DOTALL)
     if match:
         return match.group(1)
-    lines = text.splitlines()
-    if lines and lines[0].startswith("```"):
-        lines = lines[1:]
-    if lines and lines[-1].strip() == "```":
-        lines = lines[:-1]
-    return "\n".join(lines)
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        return "\n".join(lines)
+    return code
 
 
 def _strip_json_trailing_commas(text: str) -> str:
@@ -169,11 +183,11 @@ def _parse_tool_arguments(argument_text: str | None) -> dict:
         if not text:
             return {}
     try:
-        parsed = json.loads(text, object_pairs_hook=_deduplicate_tool_keys)
+        parsed = json.loads(text, object_pairs_hook=_deduplicate_tool_keys, strict=False)
     except ValueError:
         cleaned = _strip_json_trailing_commas(text)
         if cleaned != text:
-            parsed = json.loads(cleaned, object_pairs_hook=_deduplicate_tool_keys)
+            parsed = json.loads(cleaned, object_pairs_hook=_deduplicate_tool_keys, strict=False)
         else:
             raise
     if not isinstance(parsed, dict):
@@ -192,6 +206,70 @@ def is_cad_build(name: str) -> bool:
     return name in {"cad_build", "cad_build_and_verify"}
 
 
+def is_python_calculation(name: str) -> bool:
+    """True for stateless Python math/engineering calculation tool calls."""
+    return name in {"python", "run_python", "calculate"}
+
+
+def _can_join_wave(wave: list[dict], candidate_name: str) -> bool:
+    """Return whether ``candidate_name`` can safely execute in parallel with ``wave``."""
+    if not wave:
+        return True
+    wave_names = [
+        (c.get("function") if isinstance(c.get("function"), dict) else {}).get("name", "")
+        for c in wave
+    ]
+    parallel_safe = {"read_file", "get_view_images"}
+
+    def _is_known_parallel_safe(name: str) -> bool:
+        return (
+            is_python_calculation(name)
+            or is_model_mutation(name)
+            or is_cad_build(name)
+            or name in parallel_safe
+        )
+
+    if not _is_known_parallel_safe(candidate_name) or not all(
+        _is_known_parallel_safe(w) for w in wave_names
+    ):
+        return False
+
+    # Stateless Python sandbox runs in an isolated tempdir and never touches model.scad.
+    if is_python_calculation(candidate_name):
+        return True
+
+    # Model mutations (write_file/edit_file) can run alongside Python calculations,
+    # but never concurrently with another mutation, read_file, get_view_images, or cad_build.
+    if is_model_mutation(candidate_name):
+        return all(is_python_calculation(w) for w in wave_names)
+
+    if any(is_model_mutation(w) for w in wave_names):
+        return False
+
+    # cad_build can run alongside Python calculations or read_file, but not another
+    # cad_build or get_view_images (which reads the review artifacts cad_build writes).
+    if is_cad_build(candidate_name):
+        return all(is_python_calculation(w) or w == "read_file" for w in wave_names)
+
+    if candidate_name == "get_view_images":
+        return not any(is_cad_build(w) for w in wave_names)
+
+    return True
+
+
+def group_tool_calls_into_waves(tool_calls: list[dict]) -> list[list[dict]]:
+    """Partition ``tool_calls`` into sequential waves of parallel-compatible calls."""
+    waves: list[list[dict]] = []
+    for call in tool_calls:
+        func = call.get("function") if isinstance(call, dict) else None
+        name = func.get("name", "") if isinstance(func, dict) else ""
+        if waves and _can_join_wave(waves[-1], name):
+            waves[-1].append(call)
+        else:
+            waves.append([call])
+    return waves
+
+
 
 
 def dispatch(
@@ -205,9 +283,9 @@ def dispatch(
     ``waiting`` is True only for the question tool (the LLM is parked
     until the user replies).
 
-    Only the six model-facing tools published by
+    Only the model-facing tools published by
     :mod:`agent.tool_schemas` (``cad_build``, ``read_file``,
-    ``write_file``, ``edit_file``, ``get_view_images``, and ``question``)
+    ``write_file``, ``edit_file``, ``get_view_images``, ``python``, and ``question``)
     are recognised. Tool instances expose a per-call ``with_call_id``
     method that propagates the call id into activity-log / debug-log
     entries; this dispatcher uses an explicit ``if/elif`` table so
@@ -307,6 +385,19 @@ def dispatch(
     if name == "get_view_images":
         image = tools.image.with_call_id(call_id) if call_id else tools.image
         return image.get_view_images(args), False
+    if name in {"python", "run_python", "calculate"}:
+        tool = tools.python.with_call_id(call_id) if call_id else tools.python
+        raw_code = args.get("code") if isinstance(args, dict) else ""
+        if raw_code is None or raw_code == "":
+            raw_code = (
+                (args.get("script") or args.get("expression") or "")
+                if isinstance(args, dict)
+                else ""
+            )
+        clean_code = _clean_code_fences(
+            raw_code if isinstance(raw_code, str) else str(raw_code or "")
+        )
+        return tool.run(clean_code), False
     if name == "question":
         return _dispatch_question(tools.question, tools.project_dir, project, args)
     raise ValueError(f"Unknown or unsupported tool: {name!r}")
@@ -338,7 +429,7 @@ def _dispatch_edit_file(file_tool, args: dict, call_id: str) -> tuple[object, bo
         ns = entry.get("new_string", "")
         cleaned_edits.append({
             **entry,
-            "old_string": old_str,
+            "old_string": _clean_code_fences(old_str),
             "new_string": _clean_code_fences(
                 ns if isinstance(ns, str) else ("" if ns is None else str(ns))
             ),
@@ -522,6 +613,9 @@ def process_tool_call(
             debug_log(project_dir, call_id, name, error, result)
         if is_cad_build(name):
             cad_error = str(error)
+            cad_fix_required = True
+            preview_id = None
+        elif is_model_mutation(name):
             cad_fix_required = True
             preview_id = None
         err_event: dict[str, object] = {

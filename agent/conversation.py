@@ -13,6 +13,8 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, ClassVar
 
+from agent.io import atomic_write_text
+
 _history_lock: threading.RLock = threading.RLock()
 
 
@@ -120,27 +122,35 @@ class ConversationStore:
                         and item.get("role") in cls._KEPT_ROLES
                     ):
                         history.append(item)
-            cls._set_cached(cache_key, [deepcopy(item) for item in history])
+            cls._set_cached(cache_key, history)
             return [deepcopy(item) for item in history]
 
     @classmethod
     def append(cls, project_dir: Path, message: dict[str, Any]) -> None:
-        """Persist a single message and invalidate the cache.
+        """Persist a single message and update the in-memory cache if present.
 
-        The invalidate, the directory check, and the file write all happen
+        The cache update, directory check, and file write all happen
         inside :func:`shared_history_lock` so a concurrent :meth:`load`
-        cannot refill the cache from a pre-write snapshot and silently
-        overwrite the cache after this method returned — the exact race
-        that used to drop appended lines from every subsequent read.
+        always observes a consistent snapshot without re-parsing the entire
+        JSONL log on every turn.
         """
         with shared_history_lock():
-            cls.invalidate(project_dir)
             log_path = project_dir / "conversation.jsonl"
             log_path.parent.mkdir(parents=True, exist_ok=True)
             with log_path.open("a", encoding="utf-8") as log:
                 log.write(
                     json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n"
                 )
+            if isinstance(message, dict) and message.get("role") in cls._KEPT_ROLES:
+                keys = {str(project_dir)}
+                try:
+                    keys.add(str(project_dir.resolve()))
+                except OSError:
+                    pass
+                for key in keys:
+                    cached = cls._cache.get(key)
+                    if cached is not None:
+                        cached.append(deepcopy(message))
 
     @classmethod
     def append_event(
@@ -156,13 +166,8 @@ class ConversationStore:
         Centralises the ``conversation.jsonl`` writer so the SSE history
         filters (``_load_history`` / ``_KEPT_ROLES``) and the EventBus
         status persistence share one lock and one plain ``open("a")``
-        handle. The previous implementation cached append-mode file
-        descriptors across the whole process, which leaked resources
-        on Windows / POSIX and made cross-thread invalidation brittle.
-
-        The cache invalidate and the file write all run inside
-        :func:`shared_history_lock` to keep the race condition
-        documented on :meth:`invalidate` from reappearing here.
+        handle. Non-role event envelopes do not alter active LLM history
+        (``_KEPT_ROLES``), so the message cache remains warm.
         """
         record = {
             "timestamp": timestamp or cls._now_iso(),
@@ -170,7 +175,6 @@ class ConversationStore:
             "data": data,
         }
         with shared_history_lock():
-            cls.invalidate(project_dir)
             log_path = project_dir / "conversation.jsonl"
             log_path.parent.mkdir(parents=True, exist_ok=True)
             with log_path.open("a", encoding="utf-8") as log:
@@ -185,11 +189,15 @@ class ConversationStore:
         return datetime.now(timezone.utc).isoformat()
 
     @classmethod
-    def rewind_to_last_user_message(cls, project_dir: Path) -> dict[str, Any] | None:
-        """Prune conversation.jsonl back to the last user turn, discarding any
-        uncompleted trailing assistant/tool/continuation messages.
+    def rewind_to_user_message(
+        cls, project_dir: Path, user_index: int = -1
+    ) -> dict[str, Any] | None:
+        """Prune conversation.jsonl back to the user turn at ``user_index``
+        (0-based index among non-synthetic user messages; -1 denotes the latest).
 
-        Returns the last user message dict, or None if no user turn is found.
+        Discards any trailing assistant/tool/continuation messages after that
+        user turn. Returns the targeted user message dict, or None if no matching
+        user turn is found.
         """
         with shared_history_lock():
             cls.invalidate(project_dir)
@@ -197,8 +205,7 @@ class ConversationStore:
             if not log_path.exists():
                 return None
             lines = log_path.read_text(encoding="utf-8").splitlines()
-            last_user_idx = -1
-            last_user_item: dict[str, Any] | None = None
+            user_turns: list[tuple[int, dict[str, Any]]] = []
             for idx, line in enumerate(lines):
                 if not line.strip():
                     continue
@@ -206,16 +213,28 @@ class ConversationStore:
                     item = json.loads(line)
                     if isinstance(item, dict):
                         if item.get("role") == "user" and not item.get("synthetic"):
-                            last_user_idx = idx
-                            last_user_item = item
+                            user_turns.append((idx, item))
                 except json.JSONDecodeError:
                     continue
-            if last_user_idx == -1 or last_user_item is None:
+            if not user_turns:
                 return None
-            kept_lines = lines[: last_user_idx + 1]
-            log_path.write_text("\n".join(kept_lines) + "\n", encoding="utf-8")
+            if -len(user_turns) <= user_index < len(user_turns):
+                target_idx, target_item = user_turns[user_index]
+            else:
+                target_idx, target_item = user_turns[-1]
+            kept_lines = lines[: target_idx + 1]
+            atomic_write_text(log_path, "\n".join(kept_lines) + "\n")
             cls.invalidate(project_dir)
-            return deepcopy(last_user_item)
+            return deepcopy(target_item)
+
+    @classmethod
+    def rewind_to_last_user_message(cls, project_dir: Path) -> dict[str, Any] | None:
+        """Prune conversation.jsonl back to the last user turn, discarding any
+        uncompleted trailing assistant/tool/continuation messages.
+
+        Returns the last user message dict, or None if no user turn is found.
+        """
+        return cls.rewind_to_user_message(project_dir, user_index=-1)
 
     @classmethod
     def clear(cls, project_dir: Path) -> bool:

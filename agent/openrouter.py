@@ -10,7 +10,7 @@ import hashlib
 import os
 from typing import Any
 
-from agent.llm_base import ChatCompletionsClient, post_with_cancel
+from agent.llm_base import ChatCompletionsClient, is_continuation_messages, post_with_cancel
 from agent.settings import Settings
 
 
@@ -44,7 +44,12 @@ class OpenRouterClient(ChatCompletionsClient):
             headers["X-Session-ID"] = hashlib.sha256(self.session_id.encode()).hexdigest()[:64]
         return headers
 
-    def _apply_provider_payload(self, payload: dict[str, Any]) -> None:
+    def _is_continuation(self, messages: list[dict[str, Any]] | None) -> bool:
+        return is_continuation_messages(messages)
+
+    def _apply_provider_payload(
+        self, payload: dict[str, Any], messages: list[dict[str, Any]] | None = None
+    ) -> None:
         if self.session_id:
             payload["session_id"] = hashlib.sha256(self.session_id.encode()).hexdigest()[:64]
         # Reserved-for-future trace hook: the structured ``cad_review`` evaluator
@@ -83,17 +88,29 @@ class OpenRouterClient(ChatCompletionsClient):
                 # Anthropic-compatible endpoints.
                 self._mark_first_system_message(payload)
                 self._mark_last_eligible_message(payload)
-        if self.settings.openrouter_reasoning_effort:
-            reasoning_dict: dict[str, Any] = {
-                "effort": self.settings.openrouter_reasoning_effort,
-            }
-            if self.settings.openrouter_reasoning_max_tokens:
-                reasoning_dict["max_tokens"] = self.settings.openrouter_reasoning_max_tokens
-            payload["reasoning"] = reasoning_dict
-        elif self.settings.openrouter_reasoning_max_tokens:
-            payload["reasoning"] = {
-                "max_tokens": self.settings.openrouter_reasoning_max_tokens,
-            }
+
+        is_continuation = self._is_continuation(messages)
+        effort = (
+            self.settings.openrouter_reasoning_effort.lower().strip()
+            if self.settings.openrouter_reasoning_effort
+            else None
+        )
+        max_tokens_cfg = self.settings.openrouter_reasoning_max_tokens
+
+        # OpenRouter strictly requires choosing ONLY ONE of "effort" or "max_tokens".
+        # Sending both simultaneously results in a 400 Bad Request error.
+        if effort in ("none", "off", "0"):
+            payload["reasoning"] = {"effort": "none"}
+        elif effort:
+            if is_continuation:
+                payload["reasoning"] = {"effort": "low"}
+            else:
+                payload["reasoning"] = {"effort": effort}
+        elif is_continuation:
+            payload["reasoning"] = {"max_tokens": 512}
+        elif max_tokens_cfg is not None and max_tokens_cfg > 0:
+            payload["reasoning"] = {"max_tokens": max(256, int(max_tokens_cfg))}
+
         if provider_order:
             if self.settings.openrouter_force_provider:
                 # Legacy single-provider pinning: stick to one upstream and
@@ -203,7 +220,7 @@ class OpenRouterClient(ChatCompletionsClient):
             # parameters". Using ``max_tokens`` keeps the budget applied while
             # staying compatible with every supported provider.
             payload["max_tokens"] = self.settings.llm_max_completion_tokens
-        self._apply_provider_payload(payload)
+        self._apply_provider_payload(payload, messages)
         self._apply_gemini_cache_breakpoint(payload)
         return payload
 
