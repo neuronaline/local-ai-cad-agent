@@ -229,6 +229,8 @@ def convert_messages_to_interactions(
                     {
                         "type": "model_output",
                         "content": [{"type": "text", "text": content}],
+                        "thought_signature": turn_sig,
+                        "signature": turn_sig,
                     }
                 )
 

@@ -45,26 +45,28 @@ def _is_empty_or_none(val: object) -> bool:
 
 def _pick_intended_value(key: str, existing: object, candidate: object) -> object:
     """Resolve conflicting values for duplicate keys emitted by streaming LLMs."""
-    # If one value represents absence of content, pick the other non-empty value.
+    if candidate is None:
+        return existing
+    if existing is None:
+        return candidate
+
+    # For new_string in edit_file, an empty string ("") or shorter string is a valid
+    # intentional deletion/replacement and must not be discarded in favor of an earlier value.
+    if key == "new_string":
+        return candidate
+
     if _is_empty_or_none(candidate) and not _is_empty_or_none(existing):
         return existing
     if _is_empty_or_none(existing) and not _is_empty_or_none(candidate):
         return candidate
 
-    # Both values are non-empty. For string payloads, prefer the substantial
-    # payload (longest non-empty string) to prevent token leaks from truncating code.
-    if isinstance(existing, str) and isinstance(candidate, str):
-        return candidate if len(candidate) > len(existing) else existing
-
-    # For collection payloads (e.g. edits list, views list, questions list),
-    # prefer the more complete collection when a streaming model re-emits a key.
-    if (isinstance(existing, list) and isinstance(candidate, list)) or (
-        isinstance(existing, dict) and isinstance(candidate, dict)
-    ):
+    # For full-file or code payloads, prefer the substantial payload to prevent
+    # streaming token leaks (e.g. {"content": "<full model>", "content": "FEMALE"})
+    # from overwriting the body.
+    if key in {"content", "code"} and isinstance(existing, str) and isinstance(candidate, str):
         return candidate if len(candidate) >= len(existing) else existing
 
-    # For all other keys (or equal values), preserve the first emitted value.
-    return existing
+    return candidate
 
 
 def _deduplicate_tool_keys(pairs: list) -> dict:
@@ -100,29 +102,31 @@ def _clean_code_fences(code: str) -> str:
     """Strip markdown code block fences if an LLM wraps code in ```scad ... ```.
 
     When ``code`` is not wrapped in markdown fences, the original string is
-    returned verbatim so leading indentation and trailing newlines in
-    ``edit_file`` snippets are preserved.
+    returned verbatim so leading indentation, whitespace-only replacements,
+    and trailing newlines in ``edit_file`` snippets are preserved.
     """
     if not isinstance(code, str) or not code:
         return ""
     text = code.strip()
-    if not text:
-        return ""
-    if text.startswith("```") and text.endswith("```") and len(text) >= 6 and "\n" not in text:
+    if not text or not text.startswith("```"):
+        return code
+    if text.endswith("```") and len(text) >= 6 and "\n" not in text:
         inner = text[3:-3].strip()
         m = re.match(r"^[a-zA-Z0-9_-]+\s+(.*)$", inner)
         return m.group(1) if m else inner
-    match = re.search(r"```(?:[a-zA-Z0-9_-]+)?[ \t]*\r?\n(.*?)\r?\n```", text, re.DOTALL)
+    match = re.match(
+        r"^```(?:[a-zA-Z0-9_-]+)?[ \t]*\r?\n(.*?)\r?\n```$",
+        text,
+        re.DOTALL,
+    )
     if match:
         return match.group(1)
-    if text.startswith("```"):
-        lines = text.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        return "\n".join(lines)
-    return code
+    lines = text.splitlines()
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines)
 
 
 def _strip_json_trailing_commas(text: str) -> str:
@@ -203,12 +207,12 @@ def is_model_mutation(name: str) -> bool:
 
 def is_cad_build(name: str) -> bool:
     """True for the canonical CAD build tool call."""
-    return name in {"cad_build", "cad_build_and_verify"}
+    return name == "cad_build"
 
 
 def is_python_calculation(name: str) -> bool:
     """True for stateless Python math/engineering calculation tool calls."""
-    return name in {"python", "run_python", "calculate"}
+    return name == "python"
 
 
 def _can_join_wave(wave: list[dict], candidate_name: str) -> bool:
@@ -243,16 +247,13 @@ def _can_join_wave(wave: list[dict], candidate_name: str) -> bool:
     if is_model_mutation(candidate_name):
         return all(is_python_calculation(w) for w in wave_names)
 
-    if any(is_model_mutation(w) for w in wave_names):
+    if any(is_model_mutation(w) or is_cad_build(w) for w in wave_names):
         return False
 
-    # cad_build can run alongside Python calculations or read_file, but not another
-    # cad_build or get_view_images (which reads the review artifacts cad_build writes).
+    # cad_build can run alongside stateless Python calculations, but not alongside
+    # another cad_build, model mutations, read_file, or get_view_images.
     if is_cad_build(candidate_name):
-        return all(is_python_calculation(w) or w == "read_file" for w in wave_names)
-
-    if candidate_name == "get_view_images":
-        return not any(is_cad_build(w) for w in wave_names)
+        return all(is_python_calculation(w) for w in wave_names)
 
     return True
 
@@ -309,7 +310,9 @@ def dispatch(
             crop = _validate_crop(crop)
 
         views: list[str] | None = None
-        if isinstance(raw_views, str):
+        if raw_views is None:
+            views = ["all"] if crop else ["isometric", "front", "top"]
+        elif isinstance(raw_views, str):
             cleaned = raw_views.strip()
             views = [cleaned] if cleaned else None
         elif isinstance(raw_views, (list, tuple)):
@@ -334,7 +337,7 @@ def dispatch(
                 if crop:
                     view_req["crop"] = crop
                 img_payload = tools.image.with_call_id(call_id).get_view_images(view_req)
-                if isinstance(img_payload, dict):
+                if isinstance(img_payload, dict) and "images" in img_payload:
                     raw_build["images"] = img_payload.get("images", [])
                     raw_build["review_sha256"] = img_payload.get("review_sha256")
             except Exception as error:  # noqa: BLE001 - Non-blocking view resolution fallback.
@@ -367,9 +370,7 @@ def dispatch(
         tool = (
             tools.file.with_call_id(call_id) if call_id else tools.file
         )
-        content = args.get("content")
-        if content is None:
-            content = args.get("code", "")
+        content = args.get("content", "")
         clean_content = _clean_code_fences(
             content if isinstance(content, str) else str(content or "")
         )
@@ -385,15 +386,9 @@ def dispatch(
     if name == "get_view_images":
         image = tools.image.with_call_id(call_id) if call_id else tools.image
         return image.get_view_images(args), False
-    if name in {"python", "run_python", "calculate"}:
+    if name == "python":
         tool = tools.python.with_call_id(call_id) if call_id else tools.python
-        raw_code = args.get("code") if isinstance(args, dict) else ""
-        if raw_code is None or raw_code == "":
-            raw_code = (
-                (args.get("script") or args.get("expression") or "")
-                if isinstance(args, dict)
-                else ""
-            )
+        raw_code = args.get("code", "") if isinstance(args, dict) else ""
         clean_code = _clean_code_fences(
             raw_code if isinstance(raw_code, str) else str(raw_code or "")
         )
@@ -689,7 +684,6 @@ def cancel_remaining_tool_calls(
 _MULTIMODAL_BUILDERS: dict[str, Callable[..., dict | None]] = {
     "get_view_images": build_view_image_multimodal_content,
     "cad_build": build_view_image_multimodal_content,
-    "cad_build_and_verify": build_view_image_multimodal_content,
 }
 
 

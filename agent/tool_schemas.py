@@ -32,6 +32,46 @@ def _tool(
     }
 
 
+_VIEW_NAMES = [
+    "all",
+    "isometric",
+    "top",
+    "bottom",
+    "front",
+    "back",
+    "left",
+    "right",
+    "isometric_negative",
+]
+
+
+def _views_property(
+    description: str, *, default: list[str] | None = None
+) -> dict[str, Any]:
+    prop: dict[str, Any] = {
+        "type": "array",
+        "maxItems": 8,
+        "items": {
+            "type": "string",
+            "enum": list(_VIEW_NAMES),
+        },
+        "description": description,
+    }
+    if default is not None:
+        prop["default"] = list(default)
+    return prop
+
+
+def _crop_property(description: str) -> dict[str, Any]:
+    return {
+        "type": "array",
+        "minItems": 4,
+        "maxItems": 4,
+        "items": {"type": "number"},
+        "description": description,
+    }
+
+
 TOOL_SCHEMAS = [
     _tool(
         "read_file",
@@ -67,14 +107,6 @@ TOOL_SCHEMAS = [
         "edit_file",
         TOOL_DESCRIPTIONS["edit_file"]["description"],
         {
-            "old_string": {
-                "type": "string",
-                "description": TOOL_DESCRIPTIONS["edit_file"]["old_string"],
-            },
-            "new_string": {
-                "type": "string",
-                "description": TOOL_DESCRIPTIONS["edit_file"]["new_string"],
-            },
             "edits": {
                 "type": "array",
                 "minItems": 1,
@@ -96,44 +128,23 @@ TOOL_SCHEMAS = [
                 "description": TOOL_DESCRIPTIONS["edit_file"]["edits"],
             },
         },
-        [],
+        ["edits"],
     ),
     _tool(
         "cad_build",
         TOOL_DESCRIPTIONS["cad_build"]["description"],
         {
-            "views": {
-                "type": "array",
-                "maxItems": 8,
-                "items": {
-                    "type": "string",
-                    "enum": [
-                        "all",
-                        "isometric",
-                        "top",
-                        "bottom",
-                        "front",
-                        "back",
-                        "left",
-                        "right",
-                        "isometric_negative",
-                    ],
-                },
-                "description": TOOL_DESCRIPTIONS["cad_build"]["views"],
-            },
+            "views": _views_property(
+                TOOL_DESCRIPTIONS["cad_build"]["views"],
+                default=["isometric", "front", "top"],
+            ),
             "resolution": {
                 "type": "integer",
                 "enum": [512, 1024],
                 "default": 512,
                 "description": TOOL_DESCRIPTIONS["cad_build"]["resolution"],
             },
-            "crop": {
-                "type": "array",
-                "minItems": 4,
-                "maxItems": 4,
-                "items": {"type": "number"},
-                "description": TOOL_DESCRIPTIONS["cad_build"]["crop"],
-            },
+            "crop": _crop_property(TOOL_DESCRIPTIONS["cad_build"]["crop"]),
         },
         [],
     ),
@@ -141,32 +152,8 @@ TOOL_SCHEMAS = [
         "get_view_images",
         TOOL_DESCRIPTIONS["get_view_images"]["description"],
         {
-            "views": {
-                "type": "array",
-                "maxItems": 8,
-                "items": {
-                    "type": "string",
-                    "enum": [
-                        "all",
-                        "isometric",
-                        "top",
-                        "bottom",
-                        "front",
-                        "back",
-                        "left",
-                        "right",
-                        "isometric_negative",
-                    ],
-                },
-                "description": TOOL_DESCRIPTIONS["get_view_images"]["views"],
-            },
-            "crop": {
-                "type": "array",
-                "minItems": 4,
-                "maxItems": 4,
-                "items": {"type": "number"},
-                "description": TOOL_DESCRIPTIONS["get_view_images"]["crop"],
-            },
+            "views": _views_property(TOOL_DESCRIPTIONS["get_view_images"]["views"]),
+            "crop": _crop_property(TOOL_DESCRIPTIONS["get_view_images"]["crop"]),
         },
         [],
     ),

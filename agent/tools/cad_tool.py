@@ -1,6 +1,7 @@
 """Build and render the project's CAD model inside the bubblewrap sandbox."""
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import shutil
@@ -283,7 +284,7 @@ class CadTool:
             try:
                 cached = json.loads(cached_metrics_path.read_text(encoding="utf-8"))
                 metrics = cached.get("metrics")
-                if isinstance(metrics, dict):
+                if isinstance(metrics, dict) and "components" in metrics:
                     self._enforce_basic_geometry(metrics)
                     self._atomic_copy(cached_stl, self.project_dir / "preview.stl")
                     self._atomic_copy(cached_metrics_path, self.project_dir / ".cad_metrics.json")
@@ -305,6 +306,8 @@ class CadTool:
                         "review_views_dir": None,
                         "review_sheet_path": None,
                         "cached": True,
+                        "model_code": model_code,
+                        "raw_metrics_doc": cached,
                     }
             except (OSError, json.JSONDecodeError, ValueError):
                 pass  # Fall back to normal sandbox execution on cache read issue
@@ -436,23 +439,18 @@ class CadTool:
                 "review_manifest": review_manifest,
                 "review_views_dir": staging_views_dir,
                 "review_sheet_path": staging_sheet_path,
+                "model_code": model_code,
+                "raw_metrics_doc": cached,
             }
 
     def _stage_review_artifacts(
         self, workspace: Path
     ) -> tuple[str, str]:
-        """Copy multi-view review artifacts out of the bubblewrap workspace.
+        """Move multi-view review artifacts out of the bubblewrap workspace.
 
         Returns paths to a per-call staging ``views/`` directory and
         contact sheet PNG. ``promote_review`` reads from these paths
         and verifies each view's SHA against the manifest entry.
-
-        The earlier implementation reused a single
-        ``<project>/.review-staging`` directory — a real race when
-        two ``cad_build`` runs overlapped. ``mkdtemp`` per
-        call removes the shared global state; the directory survives
-        bubblewrap teardown so ``promote_review`` can verify and
-        promote the PNGs.
         """
         staging_parent = self.project_dir / ".cad-agent"
         staging_parent.mkdir(parents=True, exist_ok=True)
@@ -477,14 +475,10 @@ class CadTool:
             shutil.rmtree(staging_root, ignore_errors=True)
             raise RuntimeError("Review contact sheet was not produced by the sandbox.")
         views_target = staging_root / "views"
-        try:
-            shutil.copytree(source_views, views_target)
-        except Exception:
-            shutil.rmtree(staging_root, ignore_errors=True)
-            raise
         sheet_target = staging_root / "review-sheet.png"
         try:
-            shutil.copyfile(source_sheet, sheet_target)
+            shutil.move(str(source_views), str(views_target))
+            shutil.move(str(source_sheet), str(sheet_target))
         except Exception:
             shutil.rmtree(staging_root, ignore_errors=True)
             raise
@@ -760,16 +754,6 @@ class CadTool:
             frames.append(final)
         return "\n".join(dict.fromkeys(frames))[-2000:]
 
-    def run(self) -> dict[str, Any]:
-        """Build once and return the geometry metrics.
-
-        Always uses :attr:`RenderMode.NONE` — the cheapest path that
-        skips every visual artifact. Callers that need PNGs or the
-        multi-view manifest should use :meth:`build`.
-        """
-        payload = self._execute(mode=RenderMode.NONE)
-        return dict(payload.get("metrics") or {})
-
     @staticmethod
     def _summarize_payload(
         metrics: dict[str, Any] | None,
@@ -863,6 +847,7 @@ class CadTool:
             result["preview_sha256"] = preview_sha
         if payload.get("cached"):
             result["cached"] = True
+        promoted_manifest: dict[str, Any] | None = None
         if mode.produces_manifest:
             review_manifest = payload.get("review_manifest")
             review_path: str | None = None
@@ -882,21 +867,7 @@ class CadTool:
                         )
                         review_path = promoted.get("artifact_dir")
                         if isinstance(promoted, dict) and promoted.get("view_count") != review_manifest.get("view_count"):
-                            for m_path in (
-                                self.project_dir / ".cad_metrics.json",
-                                (self.project_dir / ".cad-agent" / "cache" / model_sha / ".cad_metrics.json") if model_sha else None,
-                            ):
-                                if m_path is not None and m_path.is_file():
-                                    try:
-                                        m_data = json.loads(m_path.read_text(encoding="utf-8"))
-                                        if isinstance(m_data, dict):
-                                            m_data["review_manifest"] = promoted
-                                            atomic_write_bytes(
-                                                m_path,
-                                                json.dumps(m_data).encode("utf-8"),
-                                            )
-                                    except (OSError, json.JSONDecodeError):
-                                        pass
+                            promoted_manifest = promoted
             finally:
                 for staged_path_str in (staging_views_dir, staging_sheet_path):
                     if staged_path_str:
@@ -920,26 +891,29 @@ class CadTool:
         )
         if self._call_id:
             verifier = verifier.with_call_id(self._call_id)
-        verification = verifier.verify(precomputed_metrics=metrics if isinstance(metrics, dict) else None)
+        precomputed_code = payload.get("model_code")
+        verification = verifier.verify(
+            precomputed_metrics=metrics if isinstance(metrics, dict) else None,
+            model_code=precomputed_code if isinstance(precomputed_code, str) else None,
+        )
         result["verification"] = verification
 
-        # Persist verification in working copy and cache .cad_metrics.json
+        # Persist verification (and any merged review_manifest) in working copy and cache .cad_metrics.json in one pass
         model_sha = result.get("model_sha256")
-        for m_path in (
-            self.project_dir / ".cad_metrics.json",
-            (self.project_dir / ".cad-agent" / "cache" / model_sha / ".cad_metrics.json") if model_sha else None,
-        ):
-            if m_path is not None and m_path.is_file():
-                try:
-                    m_data = json.loads(m_path.read_text(encoding="utf-8"))
-                    if isinstance(m_data, dict):
-                        m_data["verification"] = verification
-                        atomic_write_bytes(
-                            m_path,
-                            json.dumps(m_data).encode("utf-8"),
-                        )
-                except (OSError, json.JSONDecodeError):
-                    pass
+        base_doc = payload.get("raw_metrics_doc")
+        if isinstance(base_doc, dict):
+            updated_doc = dict(base_doc)
+            if promoted_manifest is not None:
+                updated_doc["review_manifest"] = promoted_manifest
+            updated_doc["verification"] = verification
+            encoded_doc = json.dumps(updated_doc).encode("utf-8")
+            for m_path in (
+                self.project_dir / ".cad_metrics.json",
+                (self.project_dir / ".cad-agent" / "cache" / model_sha / ".cad_metrics.json") if model_sha else None,
+            ):
+                if m_path is not None and m_path.parent.is_dir():
+                    with contextlib.suppress(OSError):
+                        atomic_write_bytes(m_path, encoded_doc)
 
         result["summary"] = self._summarize_payload(
             metrics,
@@ -948,15 +922,6 @@ class CadTool:
             verification,
         )
         return result
-
-    def build_and_verify(
-        self,
-        mode: RenderMode = RenderMode.FULL_REVIEW,
-        requested_views: list[str] | None = None,
-        resolution: int = 512,
-    ) -> dict[str, Any]:
-        """Legacy alias for :meth:`build`."""
-        return self.build(mode=mode, requested_views=requested_views, resolution=resolution)
 
     def stop(self) -> None:
         with self._lock:

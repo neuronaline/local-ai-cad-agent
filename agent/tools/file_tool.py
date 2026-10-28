@@ -142,13 +142,17 @@ class OpenScadPreflight:
 
         for fn_m in re.finditer(r"\$fn\s*=\s*([0-9]+)", clean_code):
             fn_val = int(fn_m.group(1))
+            line_num = clean_code[: fn_m.start()].count("\n") + 1
             if fn_val > 256:
-                line_num = clean_code[: fn_m.start()].count("\n") + 1
                 self.blocked_errors.append(
                     f"Excessive facet resolution: $fn = {fn_val} at line {line_num} exceeds the "
                     "maximum safe limit (256) and will stall OpenSCAD compilation. Use $fn <= 64 (or <= 36 for threads)."
                 )
                 return
+            if fn_val > 100:
+                self.warnings.append(
+                    f"PRE-FLIGHT WARNING: $fn = {fn_val} (> 100) at line {line_num} causes slow rendering. Prefer $fn <= 64."
+                )
 
         for sl_m in re.finditer(r"\bslices\s*=\s*([0-9]+)", clean_code):
             sl_val = int(sl_m.group(1))
@@ -160,7 +164,17 @@ class OpenScadPreflight:
                 )
                 return
 
-        # 5. Check for UPPER_CASE parameter definition
+        # 5. Block 3D primitives directly inside 2D extrusions
+        extrusion_errors = self.check_extrusion_children(clean_code)
+        if extrusion_errors:
+            line_num, ext_name, prim_name = extrusion_errors[0]
+            self.blocked_errors.append(
+                f"Invalid OpenSCAD CSG: 3D primitive '{prim_name}()' used inside {ext_name}() at line {line_num}. "
+                f"{ext_name}() only accepts 2D shapes (circle, square, polygon) as children."
+            )
+            return
+
+        # 6. Check for UPPER_CASE parameter definition
         has_params = bool(re.search(r"^[ \t]*[A-Z][A-Z0-9_]*[ \t]*=", clean_code, re.MULTILINE))
         if not has_params:
             self.warnings.append(
@@ -168,18 +182,11 @@ class OpenScadPreflight:
                 "Define numeric parameters at top (e.g. WIDTH = 50;)."
             )
 
-        # 6. Check radian conversion in OpenSCAD degree-based trig functions
+        # 7. Check radian conversion in OpenSCAD degree-based trig functions
         for line_num, trig_fn in self.check_radian_trig(clean_code):
             self.warnings.append(
                 f"PRE-FLIGHT WARNING: Degree-to-radian conversion in trig function at line {line_num} ('{trig_fn}()'). "
                 "OpenSCAD sin(), cos(), and tan() expect degrees directly, not radians."
-            )
-
-        # 7. Check 3D primitives directly inside 2D extrusions
-        for line_num, ext_name, prim_name in self.check_extrusion_children(clean_code):
-            self.warnings.append(
-                f"PRE-FLIGHT WARNING: 3D primitive '{prim_name}()' used inside {ext_name}() at line {line_num}. "
-                f"{ext_name}() requires 2D shapes (circle, square, polygon) as children."
             )
 
     @staticmethod
@@ -465,14 +472,8 @@ class FileTool:
     def write_file(
         self,
         filename: str = MODEL_FILENAME,
-        content: str | None = None,
+        content: str = "",
     ) -> str:
-        if content is None:
-            if filename == MODEL_FILENAME:
-                content = ""
-            else:
-                content = filename
-                filename = MODEL_FILENAME
         path = self._path(filename)
         with _file_lock(path):
             return self._write_model(content, "write_file")

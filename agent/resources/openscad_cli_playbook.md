@@ -107,7 +107,6 @@ module countersunk_hole(h, d_shaft, d_head, h_head) {
 // NEVER seal the top of a bottle body under the neck or cut the body cavity past Z = body_h.
 // Union outer shell (body + conical shoulder + neck), then subtract ONE continuous inner union.
 module hollowed_bottle(body_d, body_h, shoulder_h, neck_d, neck_h, wall, bottom_t) {
-    total_h = body_h + shoulder_h + neck_h;
     neck_id = neck_d - 2 * wall;
     difference() {
         union() {
@@ -128,20 +127,24 @@ module hollowed_bottle(body_d, body_h, shoulder_h, neck_d, neck_h, wall, bottom_
     }
 }
 
-// CGAL-Safe Helical Screw Thread (Fast compile: keep $fn <= 36 and slices <= turns * 18)
-// Use eccentric circle extrusion for smooth, self-supporting 3D-printable threads.
-// Radial clearance: 0.35 mm for PETG, 0.25 mm for PLA.
-module helical_thread(major_d, pitch, length, depth = 1.2) {
+// CGAL-Safe Helical Screw Thread (Male & Female Mating Pattern)
+// Keep depth <= 0.30 * pitch (e.g. pitch = 3.0, depth = 0.8) so flank overhang stays < 40 deg.
+// Radial clearance: 0.35 mm for PETG, 0.25 mm for PLA (female_major_d = male_major_d + 2 * clearance).
+// - For MALE neck: union helical_thread(NECK_D, PITCH, NECK_H, DEPTH) on top of shoulder (d2 = NECK_D),
+//   then subtract inner bore cylinder(d = NECK_D - 2 * DEPTH - 2 * WALL).
+// - For FEMALE cap (printed flat top-down at Z = 0): subtract helical_thread(NECK_D + 2 * CLEARANCE,
+//   PITCH, CAP_H - CAP_TOP_T + EPS, DEPTH) directly from the cap cylinder starting at Z = CAP_TOP_T.
+module helical_thread(major_d, pitch, length, depth = 0.8) {
     turns = length / pitch;
     core_r = major_d / 2 - depth / 2;
     offset_r = depth / 2;
     linear_extrude(
         height = length,
         twist = -360 * turns,
-        slices = max(12, round(turns * 18)),
+        slices = max(16, round(turns * 24)),
         convexity = 10
     )
-        translate([ offset_r, 0, 0 ])
+        translate([offset_r, 0, 0])
             circle(r = core_r, $fn = 36);
 }
 
@@ -156,6 +159,23 @@ module circular_hole_grid(hole_d, pitch, max_radius, plate_t) {
             translate([px, py, -EPS])
                 cylinder(h = plate_t + 2 * EPS, d = hole_d);
     }
+}
+
+// Self-Supporting 45-Deg Dovetail Prism (Sliding-Lid Box & Lid Pattern)
+// Wide base at Z = 0, 45-deg inward-sloping sides (dr == dz == h) tapering to top_w = bot_w - 2 * h at Z = h.
+// Lid: single trapezoidal slab `dovetail_prism(groove_bot_w - 2 * clearance, lid_t, lid_len)` flat on Z = 0.
+// Box groove: set `side_wall = back_wall + lid_t`, hollow `inner_w = box_w - 2 * side_wall` to top, then subtract
+// `dovetail_prism(box_w - 2 * back_wall, lid_t + EPS, box_l + 2 * EPS)` at `Z = box_z - lid_t`.
+module dovetail_prism(bot_w, h, length) {
+    top_w = bot_w - 2 * h;
+    rotate([90, 0, 0])
+        linear_extrude(height = length, center = true, convexity = 4)
+            polygon(points = [
+                [-bot_w / 2, 0],
+                [+bot_w / 2, 0],
+                [+top_w / 2, h],
+                [-top_w / 2, h]
+            ]);
 }
 
 // Multi-variant & Plate Layout Pattern (Customizer)
@@ -174,4 +194,22 @@ module plate_layout() {
 }
 plate_layout();
 ```
+
+---
+
+## 6. Critical FDM Printability & Orientation Rules
+
+1. **Perforated Caps, Shaker Lids & Enclosures (Zero Elevated Perforated Bridges):**
+   * **NEVER** orient a cap or lid with a flat perforated ceiling elevated at `Z > 0` (circular/slotted hole perimeters inside a mid-air horizontal bridge have nothing to anchor to and collapse in the slicer).
+   * **NEVER** flip a convex domed cap upside-down onto its dome apex (`bed_contact_area = 0 mm²`).
+   * **Canonical Cap Rule:** Orient caps and lids **flat outer top face down on `Z = 0`**, with the internal cavity/threads opening upward (`+Z`) and dispensing/ventilation holes cut through the `Z = 0..CAP_TOP_T` base plate.
+2. **Groove, Track & Pocket Back-Wall Thickness:**
+   * When cutting sliding dovetail rails, O-ring grooves, or hex nut pockets into a wall, always verify that the **remaining outer wall behind the deepest point of the cutout** is at least `>= 2 * nozzle_dia` (e.g. `(BASKET_X - TRACK_BOT_W) / 2 >= 1.5 mm` for a `0.6 mm` nozzle; never leave `< 1.0 mm` walls that slicers drop).
+   * Ensure both the upper and lower slopes of horizontal dovetail/sliding tracks satisfy `dr <= dz` (`<= 45 deg` overhang from vertical).
+3. **No Intra-Solid Mid-Air Islands (Local Z-Minima):**
+   * Every internal feature, boss, conical funnel, or thread start at `Z > 0` must grow continuously from a lower wall (`<= 45 deg` bottom chamfer/ramp). Countersink cones or cutouts must never sever an internal ring from its lower support wall.
+4. **Sliding Lids, Dovetail Rails & Perforated Basket Slots (Zero 90-Deg Overhang Ledges):**
+   * **NEVER** cut rectangular L-channels/T-slots (`cube()`) at the top of a box or add stepped horizontal lips at `Z > 0` on a sliding lid—flat horizontal roofs at `Z > 0` create massive `>60 deg` overhangs (`SEVERE_OVERHANG`).
+   * Always use the `dovetail_prism(bot_w, h, length)` pattern: wide base at the bottom of the groove (`Z = box_z - lid_t`, supported from below by the narrower `inner_w` cavity wall so the floor faces `+Z`) tapering inward at `45 deg` (`dr = dz`) to `Z = box_z`, paired with a flat-base `45 deg` trapezoidal lid resting on `Z = 0`.
+   * For perforated baskets/containers, use **narrow vertical wall slots** (horizontal width `<= 2.0 mm`) that stop `>= 3 mm` below the top rail floor; never cut wide horizontal slots (`width > 3.5 mm`) with flat roofs.
 

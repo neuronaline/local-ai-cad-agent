@@ -12,6 +12,7 @@ Produces:
 
 from __future__ import annotations
 
+from collections import deque
 import hashlib
 import json
 import math
@@ -88,230 +89,6 @@ def _declared_parameters(model_code: str) -> list[dict[str, Any]]:
             except ValueError:
                 continue
     return parameters
-
-
-def _analyze_connected_components(
-    vertices: np.ndarray, triangles: np.ndarray
-) -> dict[str, Any]:
-    """Analyze connected triangle components and return structured spatial/topological metrics."""
-    if len(triangles) == 0:
-        return {
-            "disconnected_count": 0,
-            "solids_min_z": [],
-            "floating_solid_count": 0,
-            "floating_solids": [],
-            "solid_count": 0,
-            "micro_debris_count": 0,
-            "trapped_cavity_count": 0,
-            "trapped_cavities": [],
-            "min_part_gap_mm": None,
-            "overlapping_part_count": 0,
-        }
-    edges_to_tris: dict[tuple[int, int], list[int]] = {}
-    for idx, (v0, v1, v2) in enumerate(triangles):
-        for e in (
-            (min(int(v0), int(v1)), max(int(v0), int(v1))),
-            (min(int(v1), int(v2)), max(int(v1), int(v2))),
-            (min(int(v2), int(v0)), max(int(v2), int(v0))),
-        ):
-            edges_to_tris.setdefault(e, []).append(idx)
-
-    parent = list(range(len(triangles)))
-
-    def find(i: int) -> int:
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]
-            i = parent[i]
-        return i
-
-    def union(i: int, j: int) -> None:
-        root_i, root_j = find(i), find(j)
-        if root_i != root_j:
-            parent[root_i] = root_j
-
-    for tri_list in edges_to_tris.values():
-        if len(tri_list) > 1:
-            first = tri_list[0]
-            for other in tri_list[1:]:
-                union(first, other)
-
-    comp_tris: dict[int, list[int]] = {}
-    for i in range(len(triangles)):
-        comp_tris.setdefault(find(i), []).append(i)
-
-    if len(vertices) == 0:
-        disconnected_count = max(0, len(comp_tris) - 1)
-        return {
-            "disconnected_count": disconnected_count,
-            "solids_min_z": [],
-            "floating_solid_count": 0,
-            "floating_solids": [],
-            "solid_count": max(1, disconnected_count + 1),
-            "micro_debris_count": 0,
-            "trapped_cavity_count": 0,
-            "trapped_cavities": [],
-            "min_part_gap_mm": None,
-            "overlapping_part_count": 0,
-        }
-
-    raw_components: list[dict[str, Any]] = []
-    micro_debris_count = 0
-
-    for tri_indices in comp_tris.values():
-        c_tri_arr = triangles[tri_indices]
-        c_vert_indices = np.unique(c_tri_arr)
-        c_verts = vertices[c_vert_indices]
-
-        min_pt = np.min(c_verts, axis=0)
-        max_pt = np.max(c_verts, axis=0)
-        dx = float(max_pt[0] - min_pt[0])
-        dy = float(max_pt[1] - min_pt[1])
-        dz = float(max_pt[2] - min_pt[2])
-        cx = float((min_pt[0] + max_pt[0]) / 2.0)
-        cy = float((min_pt[1] + max_pt[1]) / 2.0)
-        cz = float((min_pt[2] + max_pt[2]) / 2.0)
-
-        ref_pt = 0.5 * (min_pt + max_pt)
-        cv0 = vertices[c_tri_arr[:, 0]] - ref_pt
-        cv1 = vertices[c_tri_arr[:, 1]] - ref_pt
-        cv2 = vertices[c_tri_arr[:, 2]] - ref_pt
-        c_vol = float(np.sum(np.cross(cv0, cv1) * cv2) / 6.0)
-
-        # Microscopic CSG debris: detached slivers with <0.01 mm³ volume and <=8 triangles
-        if abs(c_vol) < 0.01 and len(tri_indices) <= 8:
-            micro_debris_count += 1
-            continue
-
-        raw_components.append({
-            "min_z": float(min_pt[2]),
-            "max_z": float(max_pt[2]),
-            "min_x": float(min_pt[0]),
-            "max_x": float(max_pt[0]),
-            "min_y": float(min_pt[1]),
-            "max_y": float(max_pt[1]),
-            "dx": dx,
-            "dy": dy,
-            "dz": dz,
-            "cx": cx,
-            "cy": cy,
-            "cz": cz,
-            "volume": abs(c_vol),
-            "raw_volume": c_vol,
-        })
-
-    solid_components: list[dict[str, Any]] = []
-    trapped_cavities: list[dict[str, Any]] = []
-
-    # Identify positive solid bodies
-    positive_solids = [c for c in raw_components if c["raw_volume"] > 0.1]
-
-    for c in raw_components:
-        # A component is a trapped internal cavity if it has negative signed volume
-        # (inward normals) AND is geometrically enclosed within a positive solid shell.
-        # If the entire mesh has inverted normals, raw_volume < 0 across all solids,
-        # so these must be treated as solid components (handled by INVERTED_NORMALS).
-        if c["raw_volume"] < -0.1 and positive_solids:
-            is_enclosed = any(
-                p["min_x"] <= c["min_x"] and c["max_x"] <= p["max_x"]
-                and p["min_y"] <= c["min_y"] and c["max_y"] <= p["max_y"]
-                and p["min_z"] <= c["min_z"] and c["max_z"] <= p["max_z"]
-                for p in positive_solids
-            )
-            if is_enclosed:
-                trapped_cavities.append({
-                    "min_z": round(c["min_z"], 3),
-                    "max_z": round(c["max_z"], 3),
-                    "volume_mm3": round(c["volume"], 3),
-                    "bbox_mm": [round(c["dx"], 3), round(c["dy"], 3), round(c["dz"], 3)],
-                })
-                continue
-
-        solid_components.append(c)
-
-    if not solid_components and comp_tris:
-        first_indices = next(iter(comp_tris.values()))
-        c_verts = vertices[np.unique(triangles[first_indices])]
-        min_pt = np.min(c_verts, axis=0)
-        max_pt = np.max(c_verts, axis=0)
-        solid_components.append({
-            "min_z": float(min_pt[2]),
-            "max_z": float(max_pt[2]),
-            "min_x": float(min_pt[0]),
-            "max_x": float(max_pt[0]),
-            "min_y": float(min_pt[1]),
-            "max_y": float(max_pt[1]),
-            "dx": float(max_pt[0] - min_pt[0]),
-            "dy": float(max_pt[1] - min_pt[1]),
-            "dz": float(max_pt[2] - min_pt[2]),
-            "cx": float((min_pt[0] + max_pt[0]) / 2.0),
-            "cy": float((min_pt[1] + max_pt[1]) / 2.0),
-            "cz": float((min_pt[2] + max_pt[2]) / 2.0),
-            "volume": 0.0,
-            "raw_volume": 0.0,
-        })
-
-    solid_components.sort(key=lambda c: c["min_z"])
-    solid_count = len(solid_components)
-    disconnected_count = max(0, solid_count - 1)
-    solids_min_z = [round(c["min_z"], 3) for c in solid_components]
-
-    base_z = solids_min_z[0] if solids_min_z else 0.0
-    floating_solids: list[dict[str, Any]] = []
-    if solid_count > 1:
-        for c in solid_components:
-            if c["min_z"] > base_z + 0.08:
-                floating_solids.append({
-                    "min_z": round(c["min_z"], 3),
-                    "max_z": round(c["max_z"], 3),
-                    "bbox_mm": [round(c["dx"], 3), round(c["dy"], 3), round(c["dz"], 3)],
-                    "center_xy": [round(c["cx"], 3), round(c["cy"], 3)],
-                    "volume_mm3": round(c["volume"], 3),
-                })
-    floating_solid_count = len(floating_solids)
-
-    grounded = [c for c in solid_components if c["min_z"] <= base_z + 0.08]
-    overlapping_part_count = 0
-    min_part_gap_mm: float | None = None
-    if len(grounded) >= 2:
-        for i in range(len(grounded)):
-            for j in range(i + 1, len(grounded)):
-                a = grounded[i]
-                b = grounded[j]
-                overlap_x = (a["min_x"] < b["max_x"]) and (b["min_x"] < a["max_x"])
-                overlap_y = (a["min_y"] < b["max_y"]) and (b["min_y"] < a["max_y"])
-                if overlap_x and overlap_y:
-                    overlapping_part_count += 1
-                    gap = 0.0
-                else:
-                    dx_gap = max(0.0, max(a["min_x"] - b["max_x"], b["min_x"] - a["max_x"]))
-                    dy_gap = max(0.0, max(a["min_y"] - b["max_y"], b["min_y"] - a["max_y"]))
-                    gap = math.hypot(dx_gap, dy_gap)
-                if min_part_gap_mm is None or gap < min_part_gap_mm:
-                    min_part_gap_mm = gap
-
-    if min_part_gap_mm is not None:
-        min_part_gap_mm = round(min_part_gap_mm, 3)
-
-    return {
-        "disconnected_count": disconnected_count,
-        "solids_min_z": solids_min_z,
-        "floating_solid_count": floating_solid_count,
-        "floating_solids": floating_solids,
-        "solid_count": solid_count,
-        "micro_debris_count": micro_debris_count,
-        "trapped_cavity_count": len(trapped_cavities),
-        "trapped_cavities": trapped_cavities,
-        "min_part_gap_mm": min_part_gap_mm,
-        "overlapping_part_count": overlapping_part_count,
-    }
-
-
-def _count_disconnected_solids(triangles: np.ndarray) -> int:
-    """Return number of disconnected mesh components beyond the first."""
-    analysis = _analyze_connected_components(
-        np.empty((0, 3), dtype=np.float64), triangles
-    )
-    return analysis["disconnected_count"]
 
 
 def _compute_static_stability(
@@ -405,6 +182,719 @@ def _compute_static_stability(
     return False, round(-min_seg_dist, 3), bounds
 
 
+def _analyze_connected_components(
+    vertices: np.ndarray, triangles: np.ndarray
+) -> dict[str, Any]:
+    """Analyze connected triangle components and return structured spatial/topological metrics."""
+    if len(triangles) == 0:
+        return {
+            "disconnected_count": 0,
+            "solids_min_z": [],
+            "floating_solid_count": 0,
+            "floating_solids": [],
+            "solid_count": 0,
+            "micro_debris_count": 0,
+            "trapped_cavity_count": 0,
+            "trapped_cavities": [],
+            "min_part_gap_mm": None,
+            "overlapping_part_count": 0,
+            "components": [],
+        }
+    edges_to_tris: dict[tuple[int, int], list[int]] = {}
+    for idx, (v0, v1, v2) in enumerate(triangles):
+        for e in (
+            (min(int(v0), int(v1)), max(int(v0), int(v1))),
+            (min(int(v1), int(v2)), max(int(v1), int(v2))),
+            (min(int(v2), int(v0)), max(int(v2), int(v0))),
+        ):
+            edges_to_tris.setdefault(e, []).append(idx)
+
+    parent = list(range(len(triangles)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        root_i, root_j = find(i), find(j)
+        if root_i != root_j:
+            parent[root_i] = root_j
+
+    for tri_list in edges_to_tris.values():
+        if len(tri_list) > 1:
+            first = tri_list[0]
+            for other in tri_list[1:]:
+                union(first, other)
+
+    comp_tris: dict[int, list[int]] = {}
+    for i in range(len(triangles)):
+        comp_tris.setdefault(find(i), []).append(i)
+
+    if len(vertices) == 0:
+        disconnected_count = max(0, len(comp_tris) - 1)
+        return {
+            "disconnected_count": disconnected_count,
+            "solids_min_z": [],
+            "floating_solid_count": 0,
+            "floating_solids": [],
+            "solid_count": max(1, disconnected_count + 1),
+            "micro_debris_count": 0,
+            "trapped_cavity_count": 0,
+            "trapped_cavities": [],
+            "min_part_gap_mm": None,
+            "overlapping_part_count": 0,
+            "components": [],
+        }
+
+    raw_components: list[dict[str, Any]] = []
+    micro_debris_count = 0
+
+    for tri_indices in comp_tris.values():
+        c_tri_arr = triangles[tri_indices]
+        c_vert_indices = np.unique(c_tri_arr)
+        c_verts = vertices[c_vert_indices]
+
+        min_pt = np.min(c_verts, axis=0)
+        max_pt = np.max(c_verts, axis=0)
+        dx = float(max_pt[0] - min_pt[0])
+        dy = float(max_pt[1] - min_pt[1])
+        dz = float(max_pt[2] - min_pt[2])
+        cx = float((min_pt[0] + max_pt[0]) / 2.0)
+        cy = float((min_pt[1] + max_pt[1]) / 2.0)
+        cz = float((min_pt[2] + max_pt[2]) / 2.0)
+
+        ref_pt = 0.5 * (min_pt + max_pt)
+        v0_c = vertices[c_tri_arr[:, 0]]
+        v1_c = vertices[c_tri_arr[:, 1]]
+        v2_c = vertices[c_tri_arr[:, 2]]
+        cv0 = v0_c - ref_pt
+        cv1 = v1_c - ref_pt
+        cv2 = v2_c - ref_pt
+        tet_vols_c = np.sum(np.cross(cv0, cv1) * cv2, axis=1) / 6.0
+        c_vol = float(np.sum(tet_vols_c))
+
+        # Microscopic CSG debris: detached slivers with <0.01 mm³ volume and <=8 triangles
+        if abs(c_vol) < 0.01 and len(tri_indices) <= 8:
+            micro_debris_count += 1
+            continue
+
+        if abs(c_vol) > 1e-9:
+            tet_centroids_c = (cv0 + cv1 + cv2) * 0.25
+            com_c = ref_pt + np.sum(tet_vols_c[:, None] * tet_centroids_c, axis=0) / c_vol
+        else:
+            com_c = ref_pt
+
+        raw_components.append({
+            "tri_indices": tri_indices,
+            "vert_indices": c_vert_indices,
+            "min_z": float(min_pt[2]),
+            "max_z": float(max_pt[2]),
+            "min_x": float(min_pt[0]),
+            "max_x": float(max_pt[0]),
+            "min_y": float(min_pt[1]),
+            "max_y": float(max_pt[1]),
+            "dx": dx,
+            "dy": dy,
+            "dz": dz,
+            "cx": cx,
+            "cy": cy,
+            "cz": cz,
+            "volume": abs(c_vol),
+            "raw_volume": c_vol,
+            "com_vec": com_c,
+        })
+
+    solid_components: list[dict[str, Any]] = []
+    trapped_cavities: list[dict[str, Any]] = []
+
+    # Identify positive solid bodies
+    positive_solids = [c for c in raw_components if c["raw_volume"] > 0.1]
+
+    for c in raw_components:
+        # A component is a trapped internal cavity if it has negative signed volume
+        # (inward normals) AND is geometrically enclosed within a positive solid shell.
+        # If the entire mesh has inverted normals, raw_volume < 0 across all solids,
+        # so these must be treated as solid components (handled by INVERTED_NORMALS).
+        if c["raw_volume"] < -0.1 and positive_solids:
+            is_enclosed = any(
+                p["min_x"] <= c["min_x"] and c["max_x"] <= p["max_x"]
+                and p["min_y"] <= c["min_y"] and c["max_y"] <= p["max_y"]
+                and p["min_z"] <= c["min_z"] and c["max_z"] <= p["max_z"]
+                for p in positive_solids
+            )
+            if is_enclosed:
+                trapped_cavities.append({
+                    "min_z": round(c["min_z"], 3),
+                    "max_z": round(c["max_z"], 3),
+                    "volume_mm3": round(c["volume"], 3),
+                    "bbox_mm": [round(c["dx"], 3), round(c["dy"], 3), round(c["dz"], 3)],
+                })
+                continue
+
+        solid_components.append(c)
+
+    if not solid_components and comp_tris:
+        first_indices = next(iter(comp_tris.values()))
+        c_vert_indices = np.unique(triangles[first_indices])
+        c_verts = vertices[c_vert_indices]
+        min_pt = np.min(c_verts, axis=0)
+        max_pt = np.max(c_verts, axis=0)
+        ref_pt = 0.5 * (min_pt + max_pt)
+        solid_components.append({
+            "tri_indices": first_indices,
+            "vert_indices": c_vert_indices,
+            "min_z": float(min_pt[2]),
+            "max_z": float(max_pt[2]),
+            "min_x": float(min_pt[0]),
+            "max_x": float(max_pt[0]),
+            "min_y": float(min_pt[1]),
+            "max_y": float(max_pt[1]),
+            "dx": float(max_pt[0] - min_pt[0]),
+            "dy": float(max_pt[1] - min_pt[1]),
+            "dz": float(max_pt[2] - min_pt[2]),
+            "cx": float((min_pt[0] + max_pt[0]) / 2.0),
+            "cy": float((min_pt[1] + max_pt[1]) / 2.0),
+            "cz": float((min_pt[2] + max_pt[2]) / 2.0),
+            "volume": 0.0,
+            "raw_volume": 0.0,
+            "com_vec": ref_pt,
+        })
+
+    solid_components.sort(key=lambda c: (round(c["min_z"], 2), round(c["min_x"], 2)))
+    solid_count = len(solid_components)
+    disconnected_count = max(0, solid_count - 1)
+    solids_min_z = [round(c["min_z"], 3) for c in solid_components]
+
+    base_z = min(solids_min_z) if solids_min_z else 0.0
+    floating_solids: list[dict[str, Any]] = []
+    if solid_count > 1:
+        for c in solid_components:
+            if c["min_z"] > base_z + 0.08:
+                floating_solids.append({
+                    "min_z": round(c["min_z"], 3),
+                    "max_z": round(c["max_z"], 3),
+                    "bbox_mm": [round(c["dx"], 3), round(c["dy"], 3), round(c["dz"], 3)],
+                    "center_xy": [round(c["cx"], 3), round(c["cy"], 3)],
+                    "volume_mm3": round(c["volume"], 3),
+                })
+    floating_solid_count = len(floating_solids)
+
+    grounded = [c for c in solid_components if c["min_z"] <= base_z + 0.08]
+    overlapping_part_count = 0
+    min_part_gap_mm: float | None = None
+    if len(grounded) >= 2:
+        for i in range(len(grounded)):
+            for j in range(i + 1, len(grounded)):
+                a = grounded[i]
+                b = grounded[j]
+                overlap_x = (a["min_x"] < b["max_x"]) and (b["min_x"] < a["max_x"])
+                overlap_y = (a["min_y"] < b["max_y"]) and (b["min_y"] < a["max_y"])
+                if overlap_x and overlap_y:
+                    overlapping_part_count += 1
+                    gap = 0.0
+                else:
+                    dx_gap = max(0.0, max(a["min_x"] - b["max_x"], b["min_x"] - a["max_x"]))
+                    dy_gap = max(0.0, max(a["min_y"] - b["max_y"], b["min_y"] - a["max_y"]))
+                    gap = math.hypot(dx_gap, dy_gap)
+                if min_part_gap_mm is None or gap < min_part_gap_mm:
+                    min_part_gap_mm = gap
+
+    if min_part_gap_mm is not None:
+        min_part_gap_mm = round(min_part_gap_mm, 3)
+
+    # Compute per-component printability and stability metrics
+    component_summaries: list[dict[str, Any]] = []
+    for comp_idx, c in enumerate(solid_components, start=1):
+        c_tri_arr = triangles[c["tri_indices"]]
+        v0_c = vertices[c_tri_arr[:, 0]]
+        v1_c = vertices[c_tri_arr[:, 1]]
+        v2_c = vertices[c_tri_arr[:, 2]]
+        cross_c = np.cross(v1_c - v0_c, v2_c - v0_c)
+        norms_c = np.linalg.norm(cross_c, axis=1)
+        areas_c = 0.5 * norms_c
+        surf_c = float(np.sum(areas_c))
+        safe_norms_c = np.where(norms_c > 1e-12, norms_c, 1.0)
+        nz_c = cross_c[:, 2] / safe_norms_c
+        max_z_c = np.maximum.reduce([v0_c[:, 2], v1_c[:, 2], v2_c[:, 2]])
+        min_z_c = np.minimum.reduce([v0_c[:, 2], v1_c[:, 2], v2_c[:, 2]])
+
+        bed_mask_c = (
+            (max_z_c <= base_z + 0.05)
+            & ((max_z_c - min_z_c) <= 0.002)
+            & (nz_c <= -0.998)
+        )
+        bed_area_c = float(np.sum(areas_c[bed_mask_c]))
+        fp_area_c = max(c["dx"] * c["dy"], 1e-6)
+        bed_ratio_c = float(min(1.0, bed_area_c / fp_area_c))
+
+        elev_c = max_z_c > (c["min_z"] + 0.40)
+        ov45_c = float(np.sum(areas_c[elev_c & (nz_c < -0.70710678)]))
+        ov60_c = float(np.sum(areas_c[elev_c & (nz_c < -0.86602540)]))
+
+        c_verts = vertices[c["vert_indices"]]
+        grounded_xy_c = c_verts[c_verts[:, 2] <= base_z + 0.05, :2]
+        com_c = c["com_vec"]
+        stable_c, margin_c, supp_bounds_c = _compute_static_stability(
+            com_c[:2], grounded_xy_c
+        )
+
+        component_summaries.append({
+            "index": comp_idx,
+            "bbox_mm": [round(c["dx"], 3), round(c["dy"], 3), round(c["dz"], 3)],
+            "bounds_mm": {
+                "min_x": round(c["min_x"], 3),
+                "max_x": round(c["max_x"], 3),
+                "min_y": round(c["min_y"], 3),
+                "max_y": round(c["max_y"], 3),
+                "min_z": round(c["min_z"], 3),
+                "max_z": round(c["max_z"], 3),
+            },
+            "center_xy": [round(c["cx"], 3), round(c["cy"], 3)],
+            "volume_mm3": round(c["volume"], 3),
+            "surface_area_mm2": round(surf_c, 2),
+            "bed_contact_area_mm2": round(bed_area_c, 2),
+            "bed_contact_ratio": round(bed_ratio_c, 4),
+            "overhang_area_45deg_mm2": round(ov45_c, 2),
+            "overhang_area_60deg_mm2": round(ov60_c, 2),
+            "center_of_mass_mm": [
+                round(float(com_c[0]), 3),
+                round(float(com_c[1]), 3),
+                round(float(com_c[2]), 3),
+            ],
+            "is_statically_stable": stable_c,
+            "stability_margin_mm": margin_c,
+            "support_footprint_bounds_mm": supp_bounds_c,
+        })
+
+    return {
+        "disconnected_count": disconnected_count,
+        "solids_min_z": solids_min_z,
+        "floating_solid_count": floating_solid_count,
+        "floating_solids": floating_solids,
+        "solid_count": solid_count,
+        "micro_debris_count": micro_debris_count,
+        "trapped_cavity_count": len(trapped_cavities),
+        "trapped_cavities": trapped_cavities,
+        "min_part_gap_mm": min_part_gap_mm,
+        "overlapping_part_count": overlapping_part_count,
+        "components": component_summaries,
+    }
+
+
+def _count_disconnected_solids(triangles: np.ndarray) -> int:
+    """Return number of disconnected mesh components beyond the first."""
+    analysis = _analyze_connected_components(
+        np.empty((0, 3), dtype=np.float64), triangles
+    )
+    return analysis["disconnected_count"]
+
+
+def _analyze_overhang_and_floating_features(
+    vertices: np.ndarray,
+    non_deg_triangles: np.ndarray,
+    tri_areas: np.ndarray,
+    nz: np.ndarray,
+    max_z_tri: np.ndarray,
+    base_z: float,
+) -> dict[str, Any]:
+    """Detect intra-solid hanging Z-minima islands, perforated horizontal ceilings, and severe overhang patches."""
+    if len(vertices) == 0 or len(non_deg_triangles) == 0:
+        return {
+            "unsupported_floating_features": [],
+            "perforated_ceilings": [],
+            "severe_overhang_patches": [],
+        }
+
+    z = vertices[:, 2]
+    edge_to_tris: dict[tuple[int, int], list[int]] = {}
+    adj: dict[int, list[int]] = {}
+    vert_tris: dict[int, list[int]] = {}
+    for idx, (a, b, c) in enumerate(non_deg_triangles):
+        ia, ib, ic = int(a), int(b), int(c)
+        vert_tris.setdefault(ia, []).append(idx)
+        vert_tris.setdefault(ib, []).append(idx)
+        vert_tris.setdefault(ic, []).append(idx)
+        for u, v in ((ia, ib), (ib, ic), (ic, ia)):
+            e = (u, v) if u < v else (v, u)
+            if e not in edge_to_tris:
+                edge_to_tris[e] = [idx]
+                adj.setdefault(u, []).append(v)
+                adj.setdefault(v, []).append(u)
+            else:
+                edge_to_tris[e].append(idx)
+
+    # 1. Morse-theory upward monotone Z-support BFS to detect hanging intra-solid local Z-minima
+    unsupported_floating_features: list[dict[str, Any]] = []
+    comp_min_z_vert = np.full(len(vertices), base_z, dtype=np.float64)
+    comp_visited: set[int] = set()
+    for sv in adj:
+        if sv in comp_visited:
+            continue
+        comp: list[int] = []
+        q = deque([sv])
+        comp_visited.add(sv)
+        while q:
+            u = q.popleft()
+            comp.append(u)
+            for nb in adj[u]:
+                if nb not in comp_visited:
+                    comp_visited.add(nb)
+                    q.append(nb)
+        c_min_z = float(np.min(z[comp]))
+        comp_min_z_vert[comp] = c_min_z
+        # Seed from component base (z <= c_min_z + 0.25) and upward-facing internal cavity floors (nz > 0.85)
+        supported: set[int] = {
+            u
+            for u in comp
+            if z[u] <= c_min_z + 0.25
+            or any(nz[t] > 0.85 for t in vert_tris.get(u, ()))
+        }
+        uq = deque(supported)
+        while uq:
+            u = uq.popleft()
+            zu = z[u]
+            for nb in adj[u]:
+                if nb not in supported and z[nb] >= zu - 0.05:
+                    supported.add(nb)
+                    uq.append(nb)
+
+        unsupported = [u for u in comp if u not in supported]
+        if unsupported:
+            un_set = set(unsupported)
+            un_vis: set[int] = set()
+            for u0 in unsupported:
+                if u0 in un_vis:
+                    continue
+                sub: list[int] = []
+                sq = deque([u0])
+                un_vis.add(u0)
+                while sq:
+                    cur = sq.popleft()
+                    sub.append(cur)
+                    for nb in adj[cur]:
+                        if nb in un_set and nb not in un_vis:
+                            un_vis.add(nb)
+                            sq.append(nb)
+                pts = vertices[sub]
+                sub_min_z = float(np.min(pts[:, 2]))
+                if sub_min_z <= c_min_z + 0.40 or len(sub) < 3:
+                    continue
+                bottom_verts = [u for u in sub if z[u] <= sub_min_z + 0.20]
+                b_tris: set[int] = set()
+                for bv in bottom_verts:
+                    b_tris.update(vert_tris.get(bv, ()))
+                mean_nz = float(np.mean([nz[t] for t in b_tris])) if b_tris else 0.0
+                if mean_nz < -0.10:
+                    unsupported_floating_features.append({
+                        "kind": "hanging_z_minimum",
+                        "min_z_mm": round(sub_min_z, 2),
+                        "max_z_mm": round(float(np.max(pts[:, 2])), 2),
+                        "center_xy": [
+                            round(float(np.mean(pts[:, 0])), 2),
+                            round(float(np.mean(pts[:, 1])), 2),
+                        ],
+                        "vertex_count": len(sub),
+                    })
+
+    # 2. Contiguous steep downward overhang patches (nz < -0.8660254, elevated > c_min_z + 0.60)
+    tri_comp_min_z = comp_min_z_vert[non_deg_triangles[:, 0]]
+    steep_mask = (nz < -0.86602540) & (max_z_tri > tri_comp_min_z + 0.60)
+    steep_indices = np.where(steep_mask)[0]
+    steep_set = {int(i) for i in steep_indices}
+
+    visited_tris: set[int] = set()
+    perforated_ceilings: list[dict[str, Any]] = []
+    severe_overhang_patches: list[dict[str, Any]] = []
+
+    for start_idx in steep_indices:
+        s_idx = int(start_idx)
+        if s_idx in visited_tris:
+            continue
+        t_queue = [s_idx]
+        visited_tris.add(s_idx)
+        patch_tris: list[int] = []
+        while t_queue:
+            curr = t_queue.pop()
+            patch_tris.append(curr)
+            ia, ib, ic = (
+                int(non_deg_triangles[curr, 0]),
+                int(non_deg_triangles[curr, 1]),
+                int(non_deg_triangles[curr, 2]),
+            )
+            for u, v in ((ia, ib), (ib, ic), (ic, ia)):
+                e = (u, v) if u < v else (v, u)
+                for nb in edge_to_tris.get(e, ()):
+                    if nb in steep_set and nb not in visited_tris:
+                        visited_tris.add(nb)
+                        t_queue.append(nb)
+
+        p_arr = np.asarray(patch_tris, dtype=np.int64)
+        p_area = float(np.sum(tri_areas[p_arr]))
+        if p_area < 15.0:
+            continue
+
+        p_verts = vertices[np.unique(non_deg_triangles[p_arr])]
+        p_min = np.min(p_verts, axis=0)
+        p_max = np.max(p_verts, axis=0)
+        span_xy = float(min(p_max[0] - p_min[0], p_max[1] - p_min[1]))
+        z_mean = float(np.mean(p_verts[:, 2]))
+        center_xy = [
+            round(float(0.5 * (p_min[0] + p_max[0])), 2),
+            round(float(0.5 * (p_min[1] + p_max[1])), 2),
+        ]
+
+        patch_set = set(patch_tris)
+        b_adj: dict[int, list[int]] = {}
+        vert_up: dict[int, int] = {}
+        vert_down: dict[int, int] = {}
+        for t_idx in patch_tris:
+            ia, ib, ic = (
+                int(non_deg_triangles[t_idx, 0]),
+                int(non_deg_triangles[t_idx, 1]),
+                int(non_deg_triangles[t_idx, 2]),
+            )
+            for u, v in ((ia, ib), (ib, ic), (ic, ia)):
+                e = (u, v) if u < v else (v, u)
+                outside_nbs = [nb for nb in edge_to_tris.get(e, ()) if nb not in patch_set]
+                if outside_nbs:
+                    b_adj.setdefault(u, []).append(v)
+                    b_adj.setdefault(v, []).append(u)
+                    ez = 0.5 * (z[u] + z[v])
+                    for nb in outside_nbs:
+                        for w in non_deg_triangles[nb]:
+                            iw = int(w)
+                            if iw != u and iw != v:
+                                oz = float(z[iw])
+                                if oz > ez + 0.03:
+                                    vert_up[u] = vert_up.get(u, 0) + 1
+                                    vert_up[v] = vert_up.get(v, 0) + 1
+                                elif oz < ez - 0.03:
+                                    vert_down[u] = vert_down.get(u, 0) + 1
+                                    vert_down[v] = vert_down.get(v, 0) + 1
+
+        # Count boundary loops and upward-turning inner hole loops
+        b_visited: set[int] = set()
+        loop_count = 0
+        upward_loops = 0
+        for bv in b_adj:
+            if bv in b_visited:
+                continue
+            loop_count += 1
+            bq = [bv]
+            b_visited.add(bv)
+            loop_verts: list[int] = []
+            while bq:
+                cur_v = bq.pop()
+                loop_verts.append(cur_v)
+                for nxt_v in b_adj.get(cur_v, ()):
+                    if nxt_v not in b_visited:
+                        b_visited.add(nxt_v)
+                        bq.append(nxt_v)
+            l_up = sum(vert_up.get(v, 0) for v in loop_verts) // 2
+            l_down = sum(vert_down.get(v, 0) for v in loop_verts) // 2
+            if l_up > l_down and l_up >= 3:
+                upward_loops += 1
+
+        patch_info = {
+            "area_mm2": round(p_area, 2),
+            "z_mm": round(z_mean, 2),
+            "span_xy_mm": round(span_xy, 2),
+            "center_xy": center_xy,
+            "bounds_xy_mm": [
+                round(float(p_min[0]), 2),
+                round(float(p_min[1]), 2),
+                round(float(p_max[0]), 2),
+                round(float(p_max[1]), 2),
+            ],
+            "loop_count": loop_count,
+            "upward_loops": upward_loops,
+        }
+
+        if loop_count >= 2 and upward_loops >= 1 and span_xy >= 5.0:
+            perforated_ceilings.append(patch_info)
+        elif p_area >= 25.0 and (span_xy >= 2.5 or upward_loops >= 1):
+            severe_overhang_patches.append(patch_info)
+
+    perforated_ceilings.sort(key=lambda p: p["area_mm2"], reverse=True)
+    severe_overhang_patches.sort(key=lambda p: p["area_mm2"], reverse=True)
+
+    return {
+        "unsupported_floating_features": unsupported_floating_features,
+        "perforated_ceilings": perforated_ceilings,
+        "severe_overhang_patches": severe_overhang_patches,
+    }
+
+
+def _measure_min_local_wall_thickness(
+    vertices: np.ndarray,
+    non_deg_triangles: np.ndarray,
+    norms: np.ndarray,
+    tri_cross: np.ndarray,
+) -> tuple[float | None, dict[str, Any] | None]:
+    """Measure local minimum opposing wall thickness via 2D Z-slice inward raycasting."""
+    if len(vertices) == 0 or len(non_deg_triangles) == 0:
+        return None, None
+
+    safe_norms = np.where(norms > 1e-12, norms, 1.0)
+    unit_n = tri_cross / safe_norms[:, None]
+
+    # Keep walls within ~51 deg of vertical (|nz| <= 0.78)
+    wall_mask = np.abs(unit_n[:, 2]) <= 0.78
+    if not np.any(wall_mask):
+        return None, None
+
+    w_tris = non_deg_triangles[wall_mask]
+    v0 = vertices[w_tris[:, 0]]
+    v1 = vertices[w_tris[:, 1]]
+    v2 = vertices[w_tris[:, 2]]
+    unit_n = unit_n[wall_mask]
+
+    min_z_tri = np.minimum.reduce([v0[:, 2], v1[:, 2], v2[:, 2]])
+    max_z_tri = np.maximum.reduce([v0[:, 2], v1[:, 2], v2[:, 2]])
+    z_min, z_max = float(np.min(min_z_tri)), float(np.max(max_z_tri))
+    dz = z_max - z_min
+    if dz < 0.8:
+        return None, None
+
+    uniform_z = np.linspace(z_min + 0.3, z_max - 0.3, 14)
+    z_verts = np.stack([v0[:, 2], v1[:, 2], v2[:, 2]], axis=1)
+    horiz_z: list[np.ndarray] = []
+    for a, b in ((0, 1), (1, 2), (2, 0)):
+        hz_mask = np.abs(z_verts[:, a] - z_verts[:, b]) < 1e-3
+        if np.any(hz_mask):
+            horiz_z.append(z_verts[hz_mask, a])
+    if horiz_z:
+        hz_all = np.unique(np.round(np.concatenate(horiz_z), 2))
+        hz_all = hz_all[(hz_all > z_min + 0.3) & (hz_all < z_max - 0.3)]
+        if len(hz_all) > 16:
+            hz_all = hz_all[np.linspace(0, len(hz_all) - 1, 16).astype(int)]
+        z_levels = np.unique(
+            np.round(np.concatenate([uniform_z, hz_all - 0.04, hz_all + 0.04]), 3)
+        )
+    else:
+        z_levels = uniform_z
+    z_levels = z_levels[(z_levels > z_min + 0.2) & (z_levels < z_max - 0.2)]
+
+    best_min_t: float | None = None
+    best_loc: dict[str, Any] | None = None
+    idx_a = [0, 1, 2]
+    idx_b = [1, 2, 0]
+
+    for zs in z_levels:
+        span_mask = (min_z_tri < zs) & (max_z_tri > zs)
+        if not np.any(span_mask):
+            continue
+        sv0, sv1, sv2 = v0[span_mask], v1[span_mask], v2[span_mask]
+        sn3 = unit_n[span_mask]
+        sn = sn3[:, :2]
+        sn_norm = np.linalg.norm(sn, axis=1, keepdims=True)
+        sn = sn / np.where(sn_norm > 1e-9, sn_norm, 1.0)
+
+        verts_3 = np.stack([sv0, sv1, sv2], axis=1)
+        z_diff = verts_3[:, :, 2] - zs
+        za = z_diff[:, idx_a]
+        zb = z_diff[:, idx_b]
+        cross_mask = (za < 0) != (zb < 0)
+
+        denom = za - zb
+        t_edge = za / np.where(np.abs(denom) > 1e-12, denom, 1.0)
+        pts_edge = verts_3[:, idx_a, :2] + t_edge[:, :, None] * (
+            verts_3[:, idx_b, :2] - verts_3[:, idx_a, :2]
+        )
+        seg_pts = pts_edge[cross_mask].reshape(len(verts_3), 2, 2)
+        A = seg_pts[:, 0, :]
+        B = seg_pts[:, 1, :]
+        seg_vec = B - A
+        seg_len = np.linalg.norm(seg_vec, axis=1)
+        keep = seg_len >= 0.45
+        if np.sum(keep) < 2:
+            continue
+        A, B, seg_vec, seg_len, sn, sn3 = (
+            A[keep],
+            B[keep],
+            seg_vec[keep],
+            seg_len[keep],
+            sn[keep],
+            sn3[keep],
+        )
+
+        # Bound pairwise matrix size on dense slices
+        if len(A) > 800:
+            q_idx = np.linspace(0, len(A) - 1, 800).astype(int)
+            len_scale = float(len(A)) / 800.0
+        else:
+            q_idx = np.arange(len(A))
+            len_scale = 1.0
+
+        mid_q = 0.5 * (A[q_idx] + B[q_idx])
+        sn_q = sn[q_idx]
+        sn3_q = sn3[q_idx]
+        len_q = seg_len[q_idx] * len_scale
+        inward_d = -sn_q
+
+        dx = inward_d[:, 0:1]
+        dy = inward_d[:, 1:2]
+        vx = seg_vec[None, :, 0]
+        vy = seg_vec[None, :, 1]
+        det = dx * vy - dy * vx
+        parallel = np.abs(det) < 1e-9
+        safe_det = np.where(parallel, 1.0, det)
+
+        rx = A[None, :, 0] - mid_q[:, 0:1]
+        ry = A[None, :, 1] - mid_q[:, 1:2]
+
+        t = (rx * vy - ry * vx) / safe_det
+        u = (rx * dy - ry * dx) / safe_det
+
+        valid_hit = (~parallel) & (t > 0.03) & (u >= -1e-4) & (u <= 1.0001)
+        t_masked = np.where(valid_hit, t, np.inf)
+        min_idx = np.argmin(t_masked, axis=1)
+        min_t = t_masked[np.arange(len(q_idx)), min_idx]
+
+        hit_sn = sn[min_idx]
+        hit_sn3 = sn3[min_idx]
+        dot_2d = np.sum(sn_q * hit_sn, axis=1)
+        dot_3d = np.sum(sn3_q * hit_sn3, axis=1)
+        hit_len = seg_len[min_idx]
+
+        opposing = (
+            (min_t < 5.0)
+            & (dot_2d <= -0.85)
+            & (dot_3d <= -0.65)
+            & (hit_len >= 0.45)
+        )
+        if not np.any(opposing):
+            continue
+
+        opp_t = min_t[opposing]
+        opp_len = len_q[opposing]
+        opp_mid = mid_q[opposing]
+        order = np.argsort(opp_t)
+        opp_t = opp_t[order]
+        opp_len = opp_len[order]
+        opp_mid = opp_mid[order]
+        for k in range(len(opp_t)):
+            t_cand = float(opp_t[k])
+            near_mask = (np.abs(opp_t - t_cand) <= 0.15) & (
+                np.linalg.norm(opp_mid - opp_mid[k], axis=1) <= 8.0
+            )
+            if float(np.sum(opp_len[near_mask])) >= 3.0:
+                if best_min_t is None or t_cand < best_min_t:
+                    best_min_t = round(t_cand, 3)
+                    best_loc = {
+                        "z_mm": round(float(zs), 2),
+                        "xy_mm": [
+                            round(float(opp_mid[k, 0]), 2),
+                            round(float(opp_mid[k, 1]), 2),
+                        ],
+                    }
+                break
+
+    return best_min_t, best_loc
+
+
 def mesh_metrics(vertices: np.ndarray, triangles: np.ndarray) -> dict[str, Any]:
     """Calculate exact bounding box, volume, solid count, and manifold validity."""
     if len(vertices) == 0 or len(triangles) == 0:
@@ -492,22 +982,26 @@ def mesh_metrics(vertices: np.ndarray, triangles: np.ndarray) -> dict[str, Any]:
     trapped_cavities = comp_analysis["trapped_cavities"]
     min_part_gap_mm = comp_analysis["min_part_gap_mm"]
     overlapping_part_count = comp_analysis["overlapping_part_count"]
+    components = comp_analysis.get("components", [])
 
     is_valid = volume > 0 and dim_x > 0 and dim_y > 0 and dim_z > 0
 
     # Printability telemetry (surface area, bed contact, overhangs, stability)
-    e1 = v1 - v0
-    e2 = v2 - v0
-    tri_cross = np.cross(e1, e2)
-    norms = np.linalg.norm(tri_cross, axis=1)
+    tri_cross = raw_cross[valid_mask]
+    norms = norms_all[valid_mask]
     tri_areas = 0.5 * norms
     surface_area = float(np.sum(tri_areas))
 
     safe_norms = np.where(norms > 1e-12, norms, 1.0)
     nz = tri_cross[:, 2] / safe_norms
     max_z_tri = np.maximum.reduce([v0[:, 2], v1[:, 2], v2[:, 2]])
+    min_z_tri_all = np.minimum.reduce([v0[:, 2], v1[:, 2], v2[:, 2]])
 
-    bed_mask = (max_z_tri <= min_pt[2] + 0.20) & (nz <= -0.95)
+    bed_mask = (
+        (max_z_tri <= min_pt[2] + 0.05)
+        & ((max_z_tri - min_z_tri_all) <= 0.002)
+        & (nz <= -0.998)
+    )
     bed_contact_area = float(np.sum(tri_areas[bed_mask]))
     footprint_area = max(dim_x * dim_y, 1e-6)
     bed_contact_ratio = float(min(1.0, bed_contact_area / footprint_area))
@@ -524,12 +1018,40 @@ def mesh_metrics(vertices: np.ndarray, triangles: np.ndarray) -> dict[str, Any]:
 
     active_vert_indices = np.unique(non_deg_triangles)
     active_verts = vertices[active_vert_indices]
-    grounded_xy = active_verts[active_verts[:, 2] <= min_pt[2] + 0.20, :2]
+    grounded_xy = active_verts[active_verts[:, 2] <= min_pt[2] + 0.05, :2]
     is_statically_stable, stability_margin_mm, support_footprint_bounds_mm = (
         _compute_static_stability(com_vec[:2], grounded_xy)
     )
 
-    needs_support = bool(overhang_area_45 >= 15.0 or overhang_ratio >= 0.03)
+    grounded_comps = [
+        c
+        for c in components
+        if (c.get("bounds_mm") or {}).get("min_z", 0.0) <= float(min_pt[2]) + 0.08
+    ]
+    if len(grounded_comps) >= 2:
+        if any(not c.get("is_statically_stable", True) for c in grounded_comps):
+            is_statically_stable = False
+        stability_margin_mm = min(
+            float(c.get("stability_margin_mm", 0.0)) for c in grounded_comps
+        )
+
+    overhang_features = _analyze_overhang_and_floating_features(
+        vertices, non_deg_triangles, tri_areas, nz, max_z_tri, float(min_pt[2])
+    )
+    unsupported_floating_features = overhang_features["unsupported_floating_features"]
+    perforated_ceilings = overhang_features["perforated_ceilings"]
+    severe_overhang_patches = overhang_features["severe_overhang_patches"]
+
+    min_wall_thickness_mm, local_wall_info = _measure_min_local_wall_thickness(
+        vertices, non_deg_triangles, norms, tri_cross
+    )
+
+    needs_support = bool(
+        overhang_area_45 >= 15.0
+        or overhang_ratio >= 0.03
+        or bool(unsupported_floating_features)
+        or bool(perforated_ceilings)
+    )
     needs_brim = bool(
         slenderness_ratio >= 2.5
         or not is_statically_stable
@@ -537,7 +1059,7 @@ def mesh_metrics(vertices: np.ndarray, triangles: np.ndarray) -> dict[str, Any]:
         or (bed_contact_ratio < 0.08 and dim_z >= 10.0)
     )
 
-    printability = {
+    printability: dict[str, Any] = {
         "surface_area_mm2": round(surface_area, 2),
         "bed_contact_area_mm2": round(bed_contact_area, 2),
         "bed_contact_ratio": round(bed_contact_ratio, 4),
@@ -551,6 +1073,11 @@ def mesh_metrics(vertices: np.ndarray, triangles: np.ndarray) -> dict[str, Any]:
         "support_footprint_bounds_mm": support_footprint_bounds_mm,
         "needs_support": needs_support,
         "needs_brim": needs_brim,
+        "min_wall_thickness_mm": min_wall_thickness_mm,
+        "min_wall_location": local_wall_info,
+        "unsupported_floating_features": unsupported_floating_features,
+        "perforated_ceilings": perforated_ceilings,
+        "severe_overhang_patches": severe_overhang_patches,
     }
 
     return {
@@ -572,6 +1099,7 @@ def mesh_metrics(vertices: np.ndarray, triangles: np.ndarray) -> dict[str, Any]:
         "trapped_cavities": trapped_cavities,
         "min_part_gap_mm": min_part_gap_mm,
         "overlapping_part_count": overlapping_part_count,
+        "components": components,
         "boundary_edges": boundary_edges,
         "multi_face_edges": multi_face_edges,
         "inconsistent_winding_edges": inconsistent_winding_edges,

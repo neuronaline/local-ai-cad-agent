@@ -21,8 +21,8 @@ llm:
 # Models configured below appear automatically in the Web UI model picker.
 # Optional provider keys (shown values are defaults where applicable):
 #   all:        base_url, timeout_seconds, reasoning_effort (default for its models)
-#   openrouter: provider_order: [], force_provider: false, reasoning_max_tokens: 2048
-#               (defaults for its models; 2048 bounds reasoning so tool calls never truncate, 0 = unlimited),
+#   openrouter: provider_order: [], force_provider: false, reasoning_max_tokens: 4096
+#               (defaults for its models; 4096 bounds reasoning so tool calls never truncate, 0 = unlimited),
 #               app_title, app_url, session_prefix, enable_anthropic_cache: true, enable_gemini_cache: true
 #   gemini:     store: true, project_id / location (auth_mode: gcloud only)
 
@@ -31,7 +31,7 @@ openrouter:
   # You can bind `providers` (priority routing order), `force_provider`, and
   # `reasoning_effort` directly per model so switching models in the UI
   # automatically switches the OpenRouter sub-providers too:
-  # reasoning_max_tokens: 2048   # Default 2048 aggressively caps thinking tokens so tools never truncate (0 = unlimited)
+  # reasoning_max_tokens: 4096   # Default 4096 caps thinking tokens so complex tool calls never truncate (0 = unlimited)
   models: {}
     # deepseek/deepseek-r1:
     #   reasoning_effort: high       # Takes precedence over reasoning_max_tokens when set

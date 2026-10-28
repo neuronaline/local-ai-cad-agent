@@ -44,6 +44,7 @@ from agent.llm_base import (
     RequestCancelled,
     create_llm_client,
     extract_text_tool_calls,
+    extract_usage_summary,
     provider_label,
     sanitize_assistant_message,
     strip_encrypted_reasoning,
@@ -75,8 +76,8 @@ from agent.tools.question_validator import QuestionValidator
 # same logical error keeps repeating (useful for catching repair loops).
 # Both values flow through :meth:`AgentRunner._build_failure_exhausted` so
 # tests can target the predicate directly without re-rolling the literals.
-_BUILD_FAILURE_TOTAL_MAX = 6
-_BUILD_FAILURE_PER_SIGNATURE_MAX = 3
+_BUILD_FAILURE_TOTAL_MAX = 7
+_BUILD_FAILURE_PER_SIGNATURE_MAX = 4
 _MAX_TOTAL_TRUNCATION_CONTINUATIONS = 8
 
 # Run-scoped artifact directories. ``AgentRunner.start`` takes ownership of
@@ -593,7 +594,7 @@ class AgentRunner:
             state.client.stream_callback = self._build_stream_publisher(state)
             run_settings = state.settings or self.settings
             limit = run_settings.agent_tool_call_limit
-            max_iterations = limit + _MAX_TOTAL_TRUNCATION_CONTINUATIONS + 4
+            max_iterations = limit + _MAX_TOTAL_TRUNCATION_CONTINUATIONS + 8
             tool_turn = 0
             for _ in range(max_iterations):
                 if self._stop_event.is_set():
@@ -839,30 +840,29 @@ class AgentRunner:
                 state.total_truncation_continuations += 1
                 state.last_turn_was_continuation = True
                 usage = getattr(state.client, "last_usage", None)
-                if isinstance(usage, dict):
-                    state.total_prompt_tokens += int(usage.get("prompt_tokens") or 0)
-                    state.total_completion_tokens += int(usage.get("completion_tokens") or 0)
-                    details = usage.get("completion_tokens_details") or {}
-                    state.total_reasoning_tokens += int(details.get("reasoning_tokens") or usage.get("reasoning_tokens") or 0)
-                    ptd = usage.get("prompt_tokens_details") or {}
-                    cached_tokens = ptd.get("cached_tokens") or usage.get("cached_tokens") or 0
-                    state.total_cached_tokens += int(cached_tokens)
-                    cost = usage.get("cost")
-                    if cost is not None:
-                        try:
-                            state.total_cost += float(cost)
-                        except (ValueError, TypeError):
-                            pass
+                self._accumulate_state_usage(state, usage)
                 self._publish_usage(state.project, usage, state=state)
                 content = trunc_err.partial_content.strip() if trunc_err.partial_content else ""
-                truncated_tools = [
-                    (tc.get("function") or {}).get("name") or "tool"
-                    for tc in (trunc_err.partial_tool_calls or [])
-                    if isinstance(tc, dict)
-                ]
+                truncated_tools: list[str] = []
+                partial_arg_snippets: list[str] = []
+                for tc in (trunc_err.partial_tool_calls or []):
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function") or {}
+                    t_name = fn.get("name") or "tool"
+                    truncated_tools.append(t_name)
+                    raw_args = str(fn.get("arguments") or "").strip()
+                    if raw_args:
+                        tail = raw_args[-300:] if len(raw_args) > 300 else raw_args
+                        partial_arg_snippets.append(f"{t_name} tail: ...{tail}")
                 stored_content = content
-                if not stored_content and not trunc_err.reasoning_text and truncated_tools:
-                    stored_content = f"[Truncated tool call: {', '.join(truncated_tools)}]"
+                if not stored_content and truncated_tools:
+                    tail_info = (
+                        f" ({'; '.join(partial_arg_snippets)})"
+                        if partial_arg_snippets
+                        else ""
+                    )
+                    stored_content = f"[Truncated tool call: {', '.join(truncated_tools)}{tail_info}]"
                 partial_msg: dict[str, Any] = {
                     "role": "assistant",
                     "content": stored_content,
@@ -950,21 +950,7 @@ class AgentRunner:
             )
         state.total_turns += 1
         usage = getattr(state.client, "last_usage", None)
-        if isinstance(usage, dict):
-            state.total_prompt_tokens += int(usage.get("prompt_tokens") or 0)
-            state.total_completion_tokens += int(usage.get("completion_tokens") or 0)
-            details = usage.get("completion_tokens_details") or {}
-            reasoning_tokens = details.get("reasoning_tokens") or usage.get("reasoning_tokens") or 0
-            state.total_reasoning_tokens += int(reasoning_tokens)
-            ptd = usage.get("prompt_tokens_details") or {}
-            cached_tokens = ptd.get("cached_tokens") or usage.get("cached_tokens") or 0
-            state.total_cached_tokens += int(cached_tokens)
-            cost = usage.get("cost")
-            if cost is not None:
-                try:
-                    state.total_cost += float(cost)
-                except (ValueError, TypeError):
-                    pass
+        self._accumulate_state_usage(state, usage)
         self._publish_usage(state.project, usage, state=state)
         assistant_message = sanitize_assistant_message(
             response["choices"][0]["message"],
@@ -1181,6 +1167,7 @@ class AgentRunner:
                 if state.cad_nudge_count < 2:
                     state.nudged_cad = True
                     state.cad_nudge_count += 1
+                    state.last_turn_was_continuation = True
                     reminder = _synthetic_user(
                         format_unverified_model_nudge(MODEL_FILENAME)
                     )
@@ -1206,6 +1193,7 @@ class AgentRunner:
             if state.verification_nudge_count < 2:
                 state.nudged_final_verification = True
                 state.verification_nudge_count += 1
+                state.last_turn_was_continuation = True
                 reminder = _synthetic_user(NUDGE_CAD_FIX_REQUIRED)
                 state.messages.append(reminder)
                 self._append_message(state.project_dir, reminder)
@@ -1320,18 +1308,26 @@ class AgentRunner:
 
             for (
                 call,
-                res_preview_id,
-                res_cad_error,
-                res_cad_fix_required,
-                waiting,
+                _res_preview_id,
+                _res_cad_error,
+                _res_cad_fix_required,
+                _waiting,
                 deferred_msgs,
             ) in wave_outcomes:
                 if deferred_msgs is not None:
                     for msg in deferred_msgs:
                         state.messages.append(msg)
                         self._append_message(state.project_dir, msg)
-                call_id = call.get("id", "")
-                processed_call_ids.add(call_id)
+                processed_call_ids.add(call.get("id", ""))
+
+            for (
+                call,
+                res_preview_id,
+                res_cad_error,
+                res_cad_fix_required,
+                waiting,
+                _deferred_msgs,
+            ) in wave_outcomes:
                 tool_name = call.get("function", {}).get("name", "")
                 if (
                     len(wave) == 1
@@ -1770,6 +1766,7 @@ class AgentRunner:
             self._project_state_message(
                 project_dir,
                 history,
+                is_retry=is_retry,
                 user_printer=eff_settings.user_printer,
                 user_nozzle=eff_settings.user_nozzle,
                 user_filament=eff_settings.user_filament,
@@ -1783,6 +1780,7 @@ class AgentRunner:
         project_dir: Path,
         history: list[dict] | None = None,
         *,
+        is_retry: bool = False,
         user_printer: str = "",
         user_nozzle: str = "",
         user_filament: str = "",
@@ -1794,7 +1792,9 @@ class AgentRunner:
         See :data:`agent.prompt._OPERATIONAL_RULES` for the instruction the
         model receives.
         """
-        existed, code = cls._initial_model_state(project_dir, history)
+        existed, code = cls._initial_model_state(
+            project_dir, history, is_retry=is_retry
+        )
         content = format_project_state(
             existed,
             MODEL_FILENAME,
@@ -1818,7 +1818,11 @@ class AgentRunner:
 
     @classmethod
     def _initial_model_state(
-        cls, project_dir: Path, history: list[dict] | None = None
+        cls,
+        project_dir: Path,
+        history: list[dict] | None = None,
+        *,
+        is_retry: bool = False,
     ) -> tuple[bool, str]:
         """Determine whether model.scad existed and its content at the start of this conversation.
 
@@ -1833,7 +1837,7 @@ class AgentRunner:
                 if isinstance(data, dict) and "existed" in data:
                     existed = bool(data["existed"])
                     content = str(data.get("content", ""))
-                    if not history or len(history) <= 1:
+                    if not is_retry and (not history or len(history) <= 1):
                         model_file = project_dir / MODEL_FILENAME
                         real_exists = model_file.is_file()
                         current_content = (
@@ -1858,6 +1862,7 @@ class AgentRunner:
         model_file = project_dir / MODEL_FILENAME
         existed = False
         content = ""
+        has_mutation = False
         if history and len(history) > 1:
             first_file_tool = None
             for m in history:
@@ -1866,16 +1871,22 @@ class AgentRunner:
                     for tc in tool_calls:
                         if isinstance(tc, dict):
                             fn_name = tc.get("function", {}).get("name")
-                            if fn_name in {"write_file", "edit_file", "read_file"}:
+                            if fn_name in {"write_file", "edit_file"}:
+                                has_mutation = True
+                            if first_file_tool is None and fn_name in {
+                                "write_file",
+                                "edit_file",
+                                "read_file",
+                            }:
                                 first_file_tool = fn_name
-                                break
-                    if first_file_tool is not None:
-                        break
-            existed = first_file_tool in {"edit_file", "read_file"}
+            if first_file_tool is not None:
+                existed = first_file_tool in {"edit_file", "read_file"}
+            else:
+                existed = model_file.is_file()
         else:
             existed = model_file.is_file()
 
-        if existed and model_file.is_file():
+        if existed and not has_mutation and model_file.is_file():
             try:
                 if model_file.stat().st_size <= 100_000:
                     content = model_file.read_text("utf-8", errors="replace")
@@ -2011,6 +2022,16 @@ class AgentRunner:
         (project_dir / ".agent_initial_state.json").unlink(missing_ok=True)
         return ConversationStore.clear(project_dir)
 
+    @staticmethod
+    def _accumulate_state_usage(state: _RunState, usage: dict | None) -> None:
+        summary = extract_usage_summary(usage)
+        state.total_prompt_tokens += summary["prompt_tokens"]
+        state.total_completion_tokens += summary["completion_tokens"]
+        state.total_reasoning_tokens += summary["reasoning_tokens"]
+        state.total_cached_tokens += summary["cached_tokens"]
+        if summary["cost"] is not None:
+            state.total_cost += summary["cost"]
+
     def _publish_usage(
         self,
         project: str,
@@ -2019,37 +2040,21 @@ class AgentRunner:
     ) -> None:
         if not usage:
             return
-        details = usage.get("prompt_tokens_details")
-        cached_tokens = int(
-            (details.get("cached_tokens", 0) if isinstance(details, dict) else 0)
-            or usage.get("cached_tokens")
-            or 0
-        )
-        cache_write_tokens = int(
-            details.get("cache_write_tokens", 0) if isinstance(details, dict) else 0
-        )
-        prompt_tokens = usage.get("prompt_tokens")
-        completion_tokens = usage.get("completion_tokens")
-        p_val = int(prompt_tokens) if prompt_tokens is not None else 0
-        c_val = int(completion_tokens) if completion_tokens is not None else 0
-        cache_hit_rate = round((cached_tokens / p_val) * 100.0, 1) if p_val > 0 else 0.0
-        cost = usage.get("cost")
-        cost_val: float | None = None
-        if cost is not None:
-            try:
-                cost_val = float(cost)
-            except (ValueError, TypeError):
-                cost_val = None
+        summary = extract_usage_summary(usage)
+        cached_tokens = summary["cached_tokens"]
+        p_val = summary["prompt_tokens"]
+        c_val = summary["completion_tokens"]
+        cost_val = summary["cost"]
         total_cost = round(state.total_cost, 6) if state and state.total_cost > 0 else cost_val
         self.publish(
             "agent_usage",
             {
                 "project": project,
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
+                "prompt_tokens": usage.get("prompt_tokens"),
+                "completion_tokens": usage.get("completion_tokens"),
                 "cached_tokens": cached_tokens,
-                "cache_write_tokens": cache_write_tokens,
-                "cache_hit_rate": cache_hit_rate,
+                "cache_write_tokens": summary["cache_write_tokens"],
+                "cache_hit_rate": summary["cache_hit_rate"],
                 "cost": cost_val,
                 "total_cost": total_cost,
                 "total_prompt_tokens": state.total_prompt_tokens if state else p_val,

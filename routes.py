@@ -1442,7 +1442,7 @@ def restore_revision(project_name: str, revision_id: str):
             user_filament=settings.user_filament,
         )
         try:
-            build = cad.build_and_verify(mode=RenderMode.NONE)
+            build = cad.build(mode=RenderMode.NONE)
             metrics = build.get("metrics") or {}
             verification = build.get("verification") or {}
             (project_dir / "render.png").unlink(missing_ok=True)
@@ -1527,7 +1527,7 @@ def build_project(project_name: str):
             user_filament=settings.user_filament,
         )
         try:
-            build = cad.build_and_verify(mode=RenderMode.NONE)
+            build = cad.build(mode=RenderMode.NONE)
             metrics = build.get("metrics") or {}
             verification = build.get("verification") or {}
             (project_dir / "render.png").unlink(missing_ok=True)

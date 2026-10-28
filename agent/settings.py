@@ -88,7 +88,7 @@ class ModelOption:
             "reasoning_effort": self.reasoning_effort,
         }
 
-DEFAULT_OPENROUTER_REASONING_MAX_TOKENS = 2048
+DEFAULT_OPENROUTER_REASONING_MAX_TOKENS = 4096
 
 
 @dataclass(frozen=True)

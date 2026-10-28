@@ -62,11 +62,8 @@ def compact_for_context(tool: str, result: str) -> str:
     """Compact verbose tool envelopes for LLM context while keeping essential metrics."""
     if tool not in {
         "cad_build",
-        "cad_build_and_verify",
         "get_view_images",
         "python",
-        "run_python",
-        "calculate",
     }:
         return result
     try:
@@ -94,7 +91,7 @@ def compact_for_context(tool: str, result: str) -> str:
     if not isinstance(data, dict):
         return result
 
-    if tool in {"python", "run_python", "calculate"}:
+    if tool == "python":
         if not data.get("stdout"):
             return json.dumps(
                 {"ok": True, "tool": tool, "data": {"result": data.get("result")}},
@@ -142,6 +139,19 @@ def compact_for_context(tool: str, result: str) -> str:
         compact_data["trapped_cavity_count"] = metrics.get("trapped_cavity_count")
         if metrics.get("trapped_cavities"):
             compact_data["trapped_cavities"] = metrics.get("trapped_cavities")
+    if (metrics.get("solid_count") or 1) > 1 and isinstance(metrics.get("components"), list):
+        compact_data["components"] = [
+            {
+                "index": c.get("index"),
+                "bbox_mm": c.get("bbox_mm"),
+                "center_xy": c.get("center_xy"),
+                "bed_contact_area_mm2": c.get("bed_contact_area_mm2"),
+                "overhang_area_60deg_mm2": c.get("overhang_area_60deg_mm2"),
+                "is_statically_stable": c.get("is_statically_stable"),
+            }
+            for c in metrics["components"][:6]
+            if isinstance(c, dict)
+        ]
     printability = metrics.get("printability")
     if isinstance(printability, dict) and printability:
         compact_printability: dict[str, Any] = {
@@ -157,9 +167,15 @@ def compact_for_context(tool: str, result: str) -> str:
             "support_footprint_bounds_mm",
             "slenderness_ratio",
             "needs_brim",
+            "min_wall_thickness_mm",
+            "min_wall_location",
+            "unsupported_floating_features",
+            "perforated_ceilings",
+            "severe_overhang_patches",
         ):
-            if printability.get(opt_key) is not None:
-                compact_printability[opt_key] = printability.get(opt_key)
+            val = printability.get(opt_key)
+            if val is not None and val != [] and val != {}:
+                compact_printability[opt_key] = val
         compact_data["printability"] = compact_printability
     verif = data.get("verification")
     if isinstance(verif, dict) and verif:
@@ -304,7 +320,7 @@ def _classify(tool: str, error: Exception, message: str) -> tuple[str, str, bool
             False,
             TOOL_HINTS["REVISION_INTEGRITY"],
         )
-    if tool in {"python", "run_python", "calculate"}:
+    if tool == "python":
         if "timed out" in lower or "timeout" in lower:
             return (
                 "PYTHON_TIMEOUT",
@@ -325,11 +341,11 @@ def _classify(tool: str, error: Exception, message: str) -> tuple[str, str, bool
     ):
         return (
             "MODEL_MISSING",
-            "build" if tool in {"cad_build", "cad_build_and_verify"} else "validation",
+            "build" if tool == "cad_build" else "validation",
             True,
             TOOL_HINTS["MODEL_MISSING"].format(filename="model.scad"),
         )
-    if tool in {"cad_build", "cad_build_and_verify"}:
+    if tool == "cad_build":
         if "cgal" in lower or "assertion violation" in lower:
             return (
                 "CAD_BUILD_FAILED",

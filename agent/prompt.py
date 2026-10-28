@@ -22,9 +22,11 @@ Satisfy explicit user dimensions (authoritative) and functional requirements fir
 Infer unstated dimensions from standard hardware and mechanical practices (fastener clearances,
 wall thicknesses, mating tolerances). Always include essential functional and mechanical
 features implied by the object's real-world purpose (e.g. mating screw threads or snap/bayonet
-joints on caps and jars, >= 45 deg conical transition shoulders on necked vessels so internal
-cavities are continuous and self-supporting without flat internal roofs, lead-in chamfers, and
-mating clearances). Avoid unrequested purely decorative ornaments, but never omit functional
+joints on caps and jars, >= 45 deg conical transition shoulders on necked vessels, lead-in
+chamfers, and mating clearances). Design every part for support-free FDM 3D printing: every
+component must rest squarely on a flat Z = 0 base face, caps/lids must rest flat outer-face-down
+at Z = 0 with cavities opening upward (+Z), and remaining walls behind grooves/bores must be
+>= 2 extrusion perimeters. Avoid unrequested decorative ornaments, but never omit functional
 mechanics. When a reference image is provided, use it for shape and proportion while keeping
 stated dimensions exact."""
 
@@ -53,35 +55,21 @@ _HARDWARE_AND_MATERIAL_RULES = """\
 
 _OPERATIONAL_RULES = """\
 - Edit only the active project's model.scad.
-- Aggressive reasoning economy (CRITICAL for reasoning models):
-  * Strictly budget your internal thinking/reasoning. Never generate lengthy monologues, explore speculative alternatives, or overthink obvious geometry.
-  * Offload coordinate arithmetic, Z-stacks, clearances, overhang angles, and physical stability checks from internal thinking tokens to the ``python`` tool, and immediately emit the required tool calls.
-  * Reserve your output token budget for the OpenSCAD code and tool arguments rather than thinking.
-- Mandatory Python engineering, geometry & physics verification:
-  * Do not rely on mental arithmetic. Almost always verify geometry, mechanical tolerances, and physical stability with ``python`` (using ``np``, ``sp``, and ``math``):
-    1. **Mode A — Parallel Verify + Write (Default for Standard & Parametric Models):** Emit ``python`` and ``write_file`` (or ``edit_file``) **in parallel in the same turn**. In the ``python`` script, define the model's parameters and programmatically ``assert`` + ``print`` key invariants:
-       - *Z-Stack & Cutter Continuity:* Every vertical stage meets without gaps (``z_next == z_prev``) and subtractive cutters overshoot target faces by ``EPS``.
-       - *Wall & Hole Clearances:* Minimum wall thickness across bores, radial/linear cuts, and centered arrays (``-(N - 1) * PITCH / 2``) satisfies nozzle perimeter multiples and material clearances.
-       - *Overhang & Transition Slopes:* Conical shoulders, chamfers, and unsupported transitions satisfy ``math.degrees(math.atan2(dr, dz)) <= 45``.
-       - *Center of Mass & Static Stability:* For asymmetric, cantilevered, or tall freestanding parts, verify that the composite XY Center of Mass lies well inside the Z=0 base support footprint and the slenderness ratio is stable.
-       - *Multi-Part Plate Layout:* Bounding boxes do not overlap, maintain >= 10 mm clearance, and fit inside the printer build volume.
-    2. **Mode B — Compute-First then Write (For Unknowns & Symbolic Constraints):** When coordinates require solving non-trivial equations first (e.g. ``SymPy`` tangent intersections, gear involutes/pitch radii, custom thread profiles, linkage kinematics, or multi-constraint layouts), call ``python`` first (multiple independent ``python`` calls may be emitted in parallel), inspect the exact numeric output, and then emit ``write_file`` or ``edit_file``.
-- Multi-variant & multi-part models: When multiple components or variants are requested,
-  declare a top-level Customizer selector (e.g. ``PART_TYPE = "ALL";``) and arrange parts
-  side-by-side with >= 10 mm clearance following the Playbook's ``plate_layout`` pattern, with
-  every independent part resting flat on the build plate (``min_z = 0``).
+- Reasoning economy:
+  * Budget internal thinking concisely; never generate lengthy monologues or overthink obvious geometry.
+  * Offload non-trivial coordinate arithmetic, Z-stacks, clearances, overhang angles, and stability checks to the ``python`` tool (`np`, `sp`, `math`) rather than mental arithmetic.
+- Python engineering & geometry verification:
+  1. **Compute-First (`python` then `write_file`/`edit_file`):** For multi-part assemblies, mating threads/rails, or symbolic coordinate solving, call ``python`` first, inspect the solved output, then write or edit `model.scad`.
+  2. **Parallel Verify + Write (`python` + `write_file`/`edit_file`):** For single-part models or localized edits where dimensions are straightforward, you may emit ``python`` and ``write_file``/``edit_file`` in parallel in the same turn to assert Z-stack continuity (`min_z == 0`), wall clearances (`>= 2 * nozzle_dia`), overhang slopes (`<= 45 deg`), and Center of Mass stability.
+- Multi-variant & multi-part models: Declare a top-level Customizer selector (e.g. ``PART_TYPE = "ALL";``) and arrange parts side-by-side with `>= 10 mm` gap on `Z = 0` following the Playbook's ``plate_layout`` pattern.
 - Tool workflow:
-  * Create new models by emitting ``python`` (geometric/physical invariant verification) + ``write_file`` in parallel, or call ``python`` first when symbolic/open-form coordinate solving is needed before writing code. For complex or multi-part assemblies, scaffold iteratively: write and build the core geometry and layout first, then add secondary features with ``edit_file``.
-  * Modify existing code incrementally with ``edit_file`` (paired in parallel with ``python`` when modifying dimensions, coordinates, or clearances). When multiple edits have accumulated across turns, call ``read_file`` to inspect the current file directly.
-  * Independent tool calls (e.g. multiple ``python`` scripts, ``python`` + ``write_file``/``edit_file``, or ``python`` + ``read_file`` + ``get_view_images``) execute concurrently in parallel—batch them in the same turn whenever possible.
-  * Build, inspect metrics, and verify geometry in one step with ``cad_build(views=['isometric', 'front', 'top'])``. On build or verification failure, fix model.scad and rebuild.
-  * When the user reports a visual or spatial defect (e.g. a floating part, missing/off-center hole, sealed opening, or misaligned feature), call ``get_view_images(views=['front', 'top', 'isometric'])`` (or ``views=['all']``) to inspect the rendered geometry before editing model.scad.
-  * Inspect additional camera angles without rebuilding via ``get_view_images(views=[...], crop=[ymin, xmin, ymax, xmax])``, or rebuild at high detail with ``cad_build(views=[...], resolution=1024, crop=[ymin, xmin, ymax, xmax])``.
+  * Use ``write_file`` for initial creation or full rewrites, and ``edit_file`` (`edits=[{old_string, new_string}]`) for targeted updates. Call ``read_file`` after multiple edits have diverged from the initial snapshot.
+  * Batch independent tool calls in the same turn whenever possible.
+  * Compile and visually verify geometry in one step with ``cad_build(views=['isometric', 'front', 'top'])``. On build or verification failure, fix `model.scad` and rebuild.
+  * When a visual or spatial defect is reported, call ``get_view_images(views=['front', 'top', 'isometric'])`` (or ``views=['all']``) to inspect rendered views before editing.
   * Clarify blocking physical contradictions with a single batched ``question``.
-- Verification requirement: A task is ready only after model.scad compiles and passes
-  ``cad_build`` without critical verification issues.
-- Response style: Keep final answers concise and factual (1-3 sentences or clear bullet points),
-  stating what was created, confirmed dimensions, and any notable assumptions."""
+- Verification requirement: A task is ready only after `model.scad` compiles and passes ``cad_build`` without critical verification issues.
+- Response style: Keep final answers concise and factual (1-3 sentences or bullet points) stating what was created, confirmed dimensions, and key assumptions."""
 
 # Ordered list of (section_tag, body) pairs. Adding or reordering a section is a
 # one-line change here; the render loop below produces the final prompt.
@@ -218,22 +206,19 @@ PROJECT_STATE_EXISTS_WITH_CONTENT_TEMPLATE = (
     "{content}\n"
     "```\n"
     "Inspect it directly; call read_file only after multiple edits have diverged the file from this initial snapshot. "
-    "Keep reasoning concise and offload dimensional, clearance, or coordinate math to python (emitted in parallel with edit_file, or first for complex equations). "
-    "If the user reports a visual or spatial defect, call get_view_images(views=['front', 'top', 'isometric']) (can be batched in parallel with python) to inspect the rendered views alongside the code before editing.\n"
+    "If the user reports a visual or spatial defect, call get_view_images(views=['front', 'top', 'isometric']) before editing.\n"
     "</project_state>"
 )
 
 PROJECT_STATE_EXISTS_TEMPLATE = (
     "<project_state>\n"
-    "{filename} exists. Read it before making a targeted edit, and verify dimensional or spatial changes with python (in parallel with edit_file or prior to it).\n"
+    "{filename} exists. Call read_file before making targeted edits.\n"
     "</project_state>"
 )
 
 PROJECT_STATE_MISSING_TEMPLATE = (
     "<project_state>\n"
-    "{filename} does not exist. Keep internal reasoning to an aggressively concise structural outline and offload math to python: "
-    "either emit python (asserting Z-stack continuity, wall/hole clearances, overhang angles <= 45 deg, and Center of Mass stability) + write_file in parallel in this turn, "
-    "or call python first if symbolic/non-trivial coordinate equations must be solved before writing {filename} (do not call read_file, edit_file, or cad_build first).\n"
+    "{filename} does not exist. Create it with write_file (calling python first if coordinate/tolerance equations must be solved, or in parallel to verify geometric invariants). Do not call read_file, edit_file, or cad_build before write_file.\n"
     "</project_state>"
 )
 
@@ -368,22 +353,22 @@ TOOL_DESCRIPTIONS = {
     },
     "edit_file": {
         "description": (
-            "Search and replace exact code in model.scad. Provide old_string and new_string "
-            "for a single replacement, or edits for multiple atomic replacements."
+            "Search and replace exact code in model.scad using an atomic list of "
+            "{old_string, new_string} replacements."
         ),
         "old_string": "Exact text in model.scad to replace.",
         "new_string": "Replacement text (empty string to delete).",
-        "edits": "Batch list of {old_string, new_string} replacements applied atomically.",
+        "edits": "Non-empty list of {old_string, new_string} replacements applied atomically.",
     },
     "cad_build": {
         "description": (
             "Compile model.scad into 3D preview (STL), render views, and verify geometry "
             "(dimensions, volume, solid count, manifoldness, $fn, EPS rules). "
-            "Pass views=['isometric', 'front', 'top'] for standard one-step build and visual verification."
+            "Defaults to returning ['isometric', 'front', 'top'] view images."
         ),
         "views": (
-            "Views to return as images in this turn (e.g. ['isometric'], ['all']). "
-            "If omitted, returns only geometric metrics."
+            "Views to return as images in this turn (defaults to ['isometric', 'front', 'top']; "
+            "pass ['all'] for 8-view contact sheet or [] for metrics only)."
         ),
         "resolution": "Render resolution: 512 (default) or 1024 for fine detail.",
         "crop": "Normalized crop box [ymin, xmin, ymax, xmax] (0.0 to 1.0) to zoom into a sub-region.",

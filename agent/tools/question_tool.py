@@ -9,32 +9,15 @@ SINGLE_CHOICE_TYPES = frozenset({"select", "multiselect"})
 
 
 def normalize_questions(args: dict) -> list[dict]:
-    """Validate and extract the questions list from args, supporting flat and nested formats."""
+    """Validate and extract the questions list from args."""
+    if not isinstance(args, dict) or "questions" not in args:
+        raise ValueError("question tool requires a 'questions' list.")
     questions = args.get("questions")
-    if "questions" in args:
-        if isinstance(questions, dict):
-            return [questions]
-        if not isinstance(questions, list):
-            raise ValueError("'questions' must be a list.")
-        return questions
-    input_type = args.get("input_type")
-    if not input_type:
-        raw_opts = args.get("options")
-        input_type = "select" if isinstance(raw_opts, list) and len(raw_opts) >= 2 else "text"
-    options = args.get("options") if input_type in {"select", "multiselect"} else []
-    question_text = args.get("question", "")
-    if not isinstance(question_text, str) or not question_text.strip():
-        raise ValueError(
-            "question descriptor is malformed: 'question' missing or empty."
-        )
-    return [
-        {
-            "id": "q1",
-            "question": question_text,
-            "input_type": input_type,
-            "options": options if isinstance(options, list) else [],
-        }
-    ]
+    if isinstance(questions, dict):
+        return [questions]
+    if not isinstance(questions, list):
+        raise ValueError("'questions' must be a list.")
+    return questions
 
 
 class QuestionTool:

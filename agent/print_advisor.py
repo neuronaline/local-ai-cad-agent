@@ -13,6 +13,7 @@ import re
 import threading
 from typing import Any
 
+from agent.llm_base import extract_usage_summary
 from agent.revisions import compute_model_sha256
 from agent.settings import with_reasoning_effort
 from agent.tools.cad_scripts.renderer import load_stl
@@ -1117,37 +1118,21 @@ def _publish_advisor_usage(
 ) -> None:
     if not callable(publish) or not isinstance(usage, dict) or not usage:
         return
-    details = usage.get("prompt_tokens_details")
-    cached_tokens = int(
-        (details.get("cached_tokens", 0) if isinstance(details, dict) else 0)
-        or usage.get("cached_tokens")
-        or 0
-    )
-    cache_write_tokens = int(
-        details.get("cache_write_tokens", 0) if isinstance(details, dict) else 0
-    )
-    prompt_tokens = usage.get("prompt_tokens")
-    completion_tokens = usage.get("completion_tokens")
-    p_val = int(prompt_tokens) if prompt_tokens is not None else 0
-    c_val = int(completion_tokens) if completion_tokens is not None else 0
-    cache_hit_rate = round((cached_tokens / p_val) * 100.0, 1) if p_val > 0 else 0.0
-    cost = usage.get("cost")
-    cost_val: float | None = None
-    if cost is not None:
-        try:
-            cost_val = float(cost)
-        except (ValueError, TypeError):
-            cost_val = None
+    summary = extract_usage_summary(usage)
+    p_val = summary["prompt_tokens"]
+    c_val = summary["completion_tokens"]
+    cached_tokens = summary["cached_tokens"]
+    cost_val = summary["cost"]
     try:
         publish(
             "agent_usage",
             {
                 "project": project_name,
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
+                "prompt_tokens": usage.get("prompt_tokens"),
+                "completion_tokens": usage.get("completion_tokens"),
                 "cached_tokens": cached_tokens,
-                "cache_write_tokens": cache_write_tokens,
-                "cache_hit_rate": cache_hit_rate,
+                "cache_write_tokens": summary["cache_write_tokens"],
+                "cache_hit_rate": summary["cache_hit_rate"],
                 "cost": cost_val,
                 "total_cost": cost_val,
                 "total_prompt_tokens": p_val,
@@ -1361,8 +1346,13 @@ def generate_ai_print_profile(
                     nozzle_diameter_mm=nozzle_dia,
                     user_printer=user_printer,
                 )
-                final_advice = _format_heuristic_advice_markdown(
-                    ai_profile, user_printer, user_nozzle
+                ai_advice = json_block.get("advice_markdown")
+                final_advice = (
+                    ai_advice.strip()
+                    if isinstance(ai_advice, str) and ai_advice.strip()
+                    else _format_heuristic_advice_markdown(
+                        ai_profile, user_printer, user_nozzle
+                    )
                 )
                 try:
                     cache_path.parent.mkdir(parents=True, exist_ok=True)

@@ -395,7 +395,6 @@ def _coerce_requests(requests: object) -> list[dict[str, object]]:
         global_crop = _validate_crop(requests.get("crop"))
 
         items: list[dict[str, object]] = []
-        # 1. Handle "views" list/string
         if "views" in requests:
             raw_views = requests["views"]
             if raw_views is None or raw_views == [] or raw_views == "":
@@ -407,22 +406,6 @@ def _coerce_requests(requests: object) -> list[dict[str, object]]:
                 items = _coerce_list(raw_views, "views")
             else:
                 raise ValueError("'views' must be a list of view names or a single view name.")
-        # 2. Handle "images" list (legacy schema compatibility)
-        elif "images" in requests:
-            raw_images = requests["images"]
-            if raw_images is None or raw_images == [] or raw_images == "":
-                items = [{"view": "all"}]
-            elif not isinstance(raw_images, list):
-                raise ValueError("'images' must be a list of view requests.")
-            else:
-                items = _coerce_list(raw_images, "images")
-        # 3. Handle single "view" key
-        elif "view" in requests:
-            raw_view = requests["view"]
-            if not isinstance(raw_view, str) or not raw_view.strip():
-                raise ValueError("'view' must be a non-empty string.")
-            items = [{"view": raw_view.strip()}]
-        # 4. Handle crop-only request (defaults to contact sheet "all")
         elif global_crop:
             items = [{"view": "all"}]
         else:

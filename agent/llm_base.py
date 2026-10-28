@@ -194,11 +194,18 @@ def extract_text_tool_calls(
             flags=re.DOTALL,
         ).strip()
 
-    # 2. Tool call tags: <tool_call> ... </tool_call>
-    if "<tool_call>" in cleaned or "<tool_call " in cleaned:
+    # 2. Tool call tags: <tool_call> ... </tool_call> or <function_call> ... </function_call>
+    if (
+        "<tool_call>" in cleaned
+        or "<tool_call " in cleaned
+        or "<function_call>" in cleaned
+        or "<function_call " in cleaned
+    ):
         tc_matches = list(
             re.finditer(
-                r"<tool_call[^>]*>(.*?)(?:</tool_call>|\Z)", cleaned, re.DOTALL
+                r"<(?:tool_call|function_call)[^>]*>(.*?)(?:</(?:tool_call|function_call)>|\Z)",
+                cleaned,
+                re.DOTALL,
             )
         )
         for tcm in tc_matches:
@@ -206,7 +213,7 @@ def extract_text_tool_calls(
             try:
                 data = json.loads(raw)
                 if isinstance(data, dict) and "name" in data:
-                    call_args = data.get("arguments", {})
+                    call_args = data.get("arguments", data.get("args", {}))
                     extracted_calls.append(
                         {
                             "id": f"call_tc_{len(extracted_calls)}",
@@ -224,7 +231,10 @@ def extract_text_tool_calls(
             except Exception:
                 pass
         cleaned = re.sub(
-            r"<tool_call[^>]*>.*?(?:</tool_call>|\Z)", "", cleaned, flags=re.DOTALL
+            r"<(?:tool_call|function_call)[^>]*>.*?(?:</(?:tool_call|function_call)>|\Z)",
+            "",
+            cleaned,
+            flags=re.DOTALL,
         ).strip()
 
     # 3. Mistral / Command R style: [TOOL_CALLS] ... [/TOOL_CALLS]
@@ -263,7 +273,9 @@ def extract_text_tool_calls(
         ).strip()
 
     # Clean up any leftover stray closing tags
-    cleaned = re.sub(r"</?(?:function|parameter|tool_call)[^>]*>", "", cleaned).strip()
+    cleaned = re.sub(
+        r"</?(?:function|function_call|parameter|tool_call)[^>]*>", "", cleaned
+    ).strip()
 
     return cleaned, extracted_calls
 
@@ -557,7 +569,63 @@ def sanitize_messages(
     return normalize_messages(relocated)
 
 
-def relocate_tool_images(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+MAX_HISTORICAL_IMAGE_BATCHES = 3
+
+
+def extract_usage_summary(usage: dict[str, Any] | None) -> dict[str, Any]:
+    """Extract normalized token counts, cache hit rate, and cost from a provider usage dict."""
+    if not isinstance(usage, dict) or not usage:
+        return {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "reasoning_tokens": 0,
+            "cached_tokens": 0,
+            "cache_write_tokens": 0,
+            "cache_hit_rate": 0.0,
+            "cost": None,
+        }
+    ptd = usage.get("prompt_tokens_details")
+    ptd = ptd if isinstance(ptd, dict) else {}
+    ctd = usage.get("completion_tokens_details")
+    ctd = ctd if isinstance(ctd, dict) else {}
+
+    prompt_tokens = int(usage.get("prompt_tokens") or 0)
+    completion_tokens = int(usage.get("completion_tokens") or 0)
+    reasoning_tokens = int(
+        ctd.get("reasoning_tokens") or usage.get("reasoning_tokens") or 0
+    )
+    cached_tokens = int(
+        ptd.get("cached_tokens") or usage.get("cached_tokens") or 0
+    )
+    cache_write_tokens = int(ptd.get("cache_write_tokens") or 0)
+    cache_hit_rate = (
+        round((cached_tokens / prompt_tokens) * 100.0, 1)
+        if prompt_tokens > 0
+        else 0.0
+    )
+    raw_cost = usage.get("cost")
+    cost_val: float | None = None
+    if raw_cost is not None:
+        try:
+            cost_val = float(raw_cost)
+        except (ValueError, TypeError):
+            cost_val = None
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "cached_tokens": cached_tokens,
+        "cache_write_tokens": cache_write_tokens,
+        "cache_hit_rate": cache_hit_rate,
+        "cost": cost_val,
+    }
+
+
+def relocate_tool_images(
+    messages: list[dict[str, Any]],
+    *,
+    max_image_batches: int = MAX_HISTORICAL_IMAGE_BATCHES,
+) -> list[dict[str, Any]]:
     """Move ``image_url`` parts out of ``tool`` messages into user messages.
 
     The OpenAI Chat Completions spec (and the providers that implement it,
@@ -571,19 +639,19 @@ def relocate_tool_images(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
       supported.`` when the trailing tool message contains image parts.
 
     Tool-role messages produced by tools like ``get_view_images`` may attach
-    rendered PNGs to the message so the agent can inspect geometry in-band. Keep each
-    completed tool batch's visual evidence in the subsequent conversation: dropping it
-    after one turn changes the prompt prefix and causes avoidable cache misses (and
-    misleading input-token drops). Images are emitted only after the complete
-    tool-result batch so multi-tool assistant responses retain the required
-    contiguous tool-result protocol.
+    rendered PNGs to the message so the agent can inspect geometry in-band.
+    Up to ``max_image_batches`` most recent tool-image batches retain their full
+    inline base64 PNG payloads (preserving prompt caching across normal multi-turn
+    builds while bounding context bloat in extended repair loops).
     """
     relocated: list[dict[str, Any]] = []
     batch_images: list[dict[str, Any]] = []
+    emitted_batch_indices: list[int] = []
 
     def flush_batch_images() -> None:
         if not batch_images:
             return
+        emitted_batch_indices.append(len(relocated))
         relocated.append(
             {
                 "role": "user",
@@ -632,6 +700,16 @@ def relocate_tool_images(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
         relocated.append(tool_copy)
         batch_images.extend(deepcopy(part) for part in image_parts)
     flush_batch_images()
+
+    if max_image_batches > 0 and len(emitted_batch_indices) > max_image_batches:
+        for stale_idx in emitted_batch_indices[:-max_image_batches]:
+            relocated[stale_idx] = {
+                "role": "user",
+                "content": (
+                    f"{TOOL_IMAGE_PROMPT} "
+                    "[Earlier rendered view images omitted to preserve context window.]"
+                ),
+            }
     return relocated
 
 
@@ -1168,6 +1246,7 @@ def parse_chat_stream(
                             "<tool_call ",
                             "[TOOL_CALLS]",
                             "<function_call>",
+                            "<function_call ",
                         )
                         found_tool_pos = -1
                         for tt in tool_tags:
@@ -1191,16 +1270,17 @@ def parse_chat_stream(
                                 if stream_callback:
                                     stream_callback({"type": "content", "delta": before})
                             in_tool_tag = True
-                            tool_tag_buffer += text
-                            text = ""
-                            break
+                            continue
 
                         matched_prefix = False
                         for candidate in (
                             "<think>",
                             "<function=",
                             "<tool_call>",
+                            "<tool_call ",
                             "[TOOL_CALLS]",
+                            "<function_call>",
+                            "<function_call ",
                         ):
                             for k in range(min(len(text), len(candidate) - 1), 0, -1):
                                 if text.endswith(candidate[:k]):
@@ -1245,7 +1325,6 @@ def parse_chat_stream(
                                 stream_callback({"type": "reasoning", "delta": text})
                         break
                     else:  # in_tool_tag
-                        tool_tag_buffer += text
                         closing_tags = (
                             "</function>",
                             "</tool_call>",
@@ -1255,13 +1334,15 @@ def parse_chat_stream(
                         closed = False
                         for ct in closing_tags:
                             if ct in text:
-                                _, _, rem = text.partition(ct)
+                                tag_part, _, rem = text.partition(ct)
+                                tool_tag_buffer += tag_part + ct
                                 in_tool_tag = False
                                 text = rem
                                 closed = True
                                 break
                         if closed:
                             continue
+                        tool_tag_buffer += text
                         break
             reasoning = (
                 delta.get("reasoning")

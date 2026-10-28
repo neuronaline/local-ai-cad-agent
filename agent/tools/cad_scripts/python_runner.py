@@ -74,7 +74,6 @@ FORBIDDEN_NAMES = frozenset({
     "compile",
     "input",
     "breakpoint",
-    "getattr",
     "setattr",
     "delattr",
     "globals",
@@ -173,14 +172,25 @@ def _safe_import(
 
 
 _HIDDEN_BUILTINS = frozenset({
-    "type",
-    "dir",
-    "hasattr",
     "help",
     "credits",
     "license",
     "copyright",
 })
+
+
+def _safe_getattr(obj: Any, name: str, *default: Any) -> Any:
+    """Safe getattr that blocks access to dunder and restricted attributes."""
+    if not isinstance(name, str) or name in DANGEROUS_ATTRIBUTES or name.startswith("__"):
+        raise AttributeError(f"Access to restricted attribute '{name}' is not permitted.")
+    return getattr(obj, name, *default)
+
+
+def _safe_hasattr(obj: Any, name: str) -> bool:
+    """Safe hasattr that blocks probing of dunder and restricted attributes."""
+    if not isinstance(name, str) or name in DANGEROUS_ATTRIBUTES or name.startswith("__"):
+        return False
+    return hasattr(obj, name)
 
 
 def _build_safe_builtins() -> dict[str, Any]:
@@ -191,6 +201,8 @@ def _build_safe_builtins() -> dict[str, Any]:
         and k not in _HIDDEN_BUILTINS
         and not (k.startswith("__") and k.endswith("__"))
     }
+    safe["getattr"] = _safe_getattr
+    safe["hasattr"] = _safe_hasattr
     safe["__import__"] = _safe_import
     safe["__build_class__"] = builtins.__build_class__
     safe["__name__"] = "__main__"

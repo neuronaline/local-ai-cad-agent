@@ -193,26 +193,28 @@ class CadVerifier:
         self,
         *,
         precomputed_metrics: dict[str, Any] | None = None,
+        model_code: str | None = None,
     ) -> dict[str, Any]:
         """Run complete deterministic verification on model.scad and preview.stl."""
         self._check_cancelled()
         self._publish_status("verifying", "Running deterministic CAD verification…")
 
-        model_path = self.project_dir / MODEL_FILENAME
-        if not model_path.is_file():
-            finding = Finding(
-                category="CRITICAL",
-                code="MODEL_MISSING",
-                message=f"{MODEL_FILENAME} does not exist.",
-                impact="Cannot verify a missing model file.",
-            )
-            return self._build_envelope(
-                findings=[finding],
-                code_integrity={"exists": False},
-                mesh_integrity={"exists": False},
-            )
+        if model_code is None:
+            model_path = self.project_dir / MODEL_FILENAME
+            if not model_path.is_file():
+                finding = Finding(
+                    category="CRITICAL",
+                    code="MODEL_MISSING",
+                    message=f"{MODEL_FILENAME} does not exist.",
+                    impact="Cannot verify a missing model file.",
+                )
+                return self._build_envelope(
+                    findings=[finding],
+                    code_integrity={"exists": False},
+                    mesh_integrity={"exists": False},
+                )
+            model_code = model_path.read_text(encoding="utf-8", errors="replace")
 
-        model_code = model_path.read_text(encoding="utf-8", errors="replace")
         code_findings, code_meta = self._verify_code(model_code)
         self._check_cancelled()
 
@@ -250,6 +252,43 @@ class CadVerifier:
         all_findings = code_findings + build_findings + mesh_findings
         return self._build_envelope(all_findings, code_meta, mesh_meta)
 
+    @staticmethod
+    def _extract_lexical_scopes(clean_code: str) -> list[tuple[int, str]]:
+        """Partition OpenSCAD code into independent lexical scopes (top-level and per-module).
+
+        Returns a list of ``(base_offset, scope_text)`` pairs where nested ``module`` bodies
+        are blanked out (preserving newlines and character offsets) inside the outer scope so
+        variables in later independent modules never trigger false-positive cross-module
+        shadowing alerts.
+        """
+        scopes: list[tuple[int, str]] = []
+        top_chars = list(clean_code)
+        for mod_m in re.finditer(r"\bmodule\s+[A-Za-z_][A-Za-z0-9_]*\s*\(", clean_code):
+            p_end = OpenScadPreflight._consume_balanced_parens(clean_code, mod_m.end())
+            if p_end is None:
+                continue
+            idx = p_end
+            while idx < len(clean_code) and clean_code[idx].isspace():
+                idx += 1
+            if idx >= len(clean_code) or clean_code[idx] != "{":
+                continue
+            b_start = idx
+            b_depth = 1
+            b_end = b_start + 1
+            while b_end < len(clean_code) and b_depth > 0:
+                if clean_code[b_end] == "{":
+                    b_depth += 1
+                elif clean_code[b_end] == "}":
+                    b_depth -= 1
+                b_end += 1
+            if b_depth == 0:
+                scopes.append((b_start + 1, clean_code[b_start + 1 : b_end - 1]))
+                for k in range(mod_m.start(), b_end):
+                    if top_chars[k] != "\n":
+                        top_chars[k] = " "
+        scopes.insert(0, (0, "".join(top_chars)))
+        return scopes
+
     def _verify_code(self, code: str) -> tuple[list[Finding], dict[str, Any]]:
         findings: list[Finding] = []
 
@@ -283,8 +322,6 @@ class CadVerifier:
             syntax_error = True
 
         for line_num, line in enumerate(clean_code.splitlines(), start=1):
-            stripped = line.strip()
-
             # 3. Minkowski ban
             if re.search(r"\bminkowski\s*\(", line):
                 findings.append(
@@ -296,6 +333,18 @@ class CadVerifier:
                         impact="Causes severe OpenSCAD compiler freezing and timeouts. Use hull() or 2D offset() instead.",
                     )
                 )
+
+        # 5. 3D primitives directly inside 2D extrusions
+        for line_num, ext_name, prim_name in OpenScadPreflight.check_extrusion_children(clean_code):
+            findings.append(
+                Finding(
+                    category="CRITICAL",
+                    code="3D_PRIMITIVE_IN_2D_EXTRUSION",
+                    message=f"3D primitive '{prim_name}()' used inside {ext_name}() at line {line_num}.",
+                    line=line_num,
+                    impact=f"{ext_name}() only accepts 2D child shapes (circle, square, polygon). 3D shapes cause empty geometry or CGAL evaluation failure.",
+                )
+            )
 
         # Active scene modifiers
         # In OpenSCAD, '!', '*', and '%' modifiers prefix a module or primitive instantiation at statement
@@ -361,65 +410,57 @@ class CadVerifier:
                 )
             )
 
-        # 5. 3D primitives directly inside 2D extrusions
-        for line_num, ext_name, prim_name in OpenScadPreflight.check_extrusion_children(clean_code):
-            findings.append(
-                Finding(
-                    category="CRITICAL",
-                    code="3D_PRIMITIVE_IN_2D_EXTRUSION",
-                    message=f"3D primitive '{prim_name}()' used inside {ext_name}() at line {line_num}.",
-                    line=line_num,
-                    impact=f"{ext_name}() only accepts 2D child shapes (circle, square, polygon). 3D shapes cause empty geometry or CGAL evaluation failure.",
-                )
-            )
+        # 6. Lexical Scope Block Reassignment Detection (per enclosing scope)
+        for base_offset, scope_code in self._extract_lexical_scopes(clean_code):
+            scope_vars: set[str] = set()
+            brace_depth = 0
+            paren_depth = 0
+            for line in scope_code.splitlines():
+                open_c = line.count("{")
+                close_c = line.count("}")
+                open_p = line.count("(")
+                close_p = line.count(")")
+                if brace_depth == 0 and paren_depth == 0:
+                    for assign_m in re.finditer(
+                        r"(?:^|[;])\s*([A-Za-z0-9_]+)\s*=(?!=)", line
+                    ):
+                        var = assign_m.group(1)
+                        if not var.startswith("$") and var != "EPS":
+                            scope_vars.add(var)
+                brace_depth = max(0, brace_depth + open_c - close_c)
+                paren_depth = max(0, paren_depth + open_p - close_p)
 
-        # 6. Lexical Scope Block Reassignment Detection
-        top_level_vars: set[str] = set()
-        brace_depth = 0
-        top_paren_depth = 0
-        for line in clean_code.splitlines():
-            open_c = line.count("{")
-            close_c = line.count("}")
-            open_p = line.count("(")
-            close_p = line.count(")")
-            if brace_depth == 0 and top_paren_depth == 0:
-                assign_m = re.match(r"^[ \t]*([A-Za-z0-9_]+)[ \t]*=(?!=)", line)
-                if assign_m:
-                    var = assign_m.group(1)
-                    if not var.startswith("$") and var != "EPS":
-                        top_level_vars.add(var)
-            brace_depth = max(0, brace_depth + open_c - close_c)
-            top_paren_depth = max(0, top_paren_depth + open_p - close_p)
+            if not scope_vars:
+                continue
 
-        if top_level_vars:
-            for block_m in re.finditer(r"\b(if|for)\s*\(", clean_code):
+            for block_m in re.finditer(r"\b(if|for)\s*\(", scope_code):
                 block_kind = block_m.group(1)
-                paren_depth = 1
+                p_depth = 1
                 p_idx = block_m.end()
-                while p_idx < len(clean_code) and paren_depth > 0:
-                    if clean_code[p_idx] == "(":
-                        paren_depth += 1
-                    elif clean_code[p_idx] == ")":
-                        paren_depth -= 1
+                while p_idx < len(scope_code) and p_depth > 0:
+                    if scope_code[p_idx] == "(":
+                        p_depth += 1
+                    elif scope_code[p_idx] == ")":
+                        p_depth -= 1
                     p_idx += 1
-                if paren_depth != 0:
+                if p_depth != 0:
                     continue
-                while p_idx < len(clean_code) and clean_code[p_idx].isspace():
+                while p_idx < len(scope_code) and scope_code[p_idx].isspace():
                     p_idx += 1
-                if p_idx >= len(clean_code) or clean_code[p_idx] != "{":
+                if p_idx >= len(scope_code) or scope_code[p_idx] != "{":
                     continue
                 start_idx = p_idx
                 b_depth = 1
                 cur_idx = start_idx + 1
-                while cur_idx < len(clean_code) and b_depth > 0:
-                    if clean_code[cur_idx] == "{":
+                while cur_idx < len(scope_code) and b_depth > 0:
+                    if scope_code[cur_idx] == "{":
                         b_depth += 1
-                    elif clean_code[cur_idx] == "}":
+                    elif scope_code[cur_idx] == "}":
                         b_depth -= 1
                     cur_idx += 1
-                inner_content = clean_code[start_idx + 1 : cur_idx - 1]
-                after_block = clean_code[cur_idx:]
-                for var in top_level_vars:
+                inner_content = scope_code[start_idx + 1 : cur_idx - 1]
+                after_block = scope_code[cur_idx:]
+                for var in scope_vars:
                     var_pat = rf"\b{re.escape(var)}\b"
                     for reassign_m in re.finditer(
                         rf"(?:^|[;{{}}])\s*({re.escape(var)})\s*=(?!=)",
@@ -435,7 +476,7 @@ class CadVerifier:
                         used_after_block = bool(re.search(var_pat, after_block))
                         if used_later_in_block and not used_in_rhs and not used_after_block:
                             continue
-                        abs_pos = start_idx + 1 + reassign_m.start(1)
+                        abs_pos = base_offset + start_idx + 1 + reassign_m.start(1)
                         line_num = clean_code[:abs_pos].count("\n") + 1
                         findings.append(
                             Finding(
@@ -550,7 +591,7 @@ class CadVerifier:
             if wall_val < nozzle_dia:
                 findings.append(
                     Finding(
-                        category="WARNING",
+                        category="CRITICAL",
                         code="THIN_WALL_PARAMETER",
                         message=f"Declared wall thickness parameter {wall_name} = {wall_val:.2f} mm is thinner than nozzle diameter ({nozzle_dia:.2f} mm).",
                         impact="Slicers will drop walls thinner than a single extrusion perimeter.",
@@ -606,6 +647,7 @@ class CadVerifier:
             and "dimensions_mm" in precomputed_metrics
             and "volume_mm3" in precomputed_metrics
             and "boundary_edges" in precomputed_metrics
+            and "components" in precomputed_metrics
         ):
             cached_metrics = precomputed_metrics
 
@@ -623,7 +665,12 @@ class CadVerifier:
                             is_valid_cache = False
                     if is_valid_cache:
                         m = cached_data["metrics"]
-                        if "dimensions_mm" in m and "volume_mm3" in m and "boundary_edges" in m:
+                        if (
+                            "dimensions_mm" in m
+                            and "volume_mm3" in m
+                            and "boundary_edges" in m
+                            and "components" in m
+                        ):
                             cached_metrics = m
             except (OSError, json.JSONDecodeError, UnicodeDecodeError):
                 pass
@@ -693,6 +740,24 @@ class CadVerifier:
                         message=f"OpenSCAD reported undefined symbol: {msg}",
                         line=lineno,
                         impact="OpenSCAD ignored the undefined symbol/module, resulting in missing or corrupt geometry.",
+                    )
+                )
+            elif any(
+                kw in msg_lower
+                for kw in (
+                    "not a valid 2-manifold",
+                    "self-intersect",
+                    "cgal",
+                    "degenerate",
+                )
+            ):
+                findings.append(
+                    Finding(
+                        category="CRITICAL",
+                        code="COMPILER_GEOMETRY_WARNING",
+                        message=f"OpenSCAD compiler manifold/CSG error: {msg}",
+                        line=lineno,
+                        impact="OpenSCAD reported non-manifold or invalid CSG topology during evaluation.",
                     )
                 )
             else:
@@ -767,7 +832,7 @@ class CadVerifier:
             if min_dim < nozzle_dia:
                 findings.append(
                     Finding(
-                        category="WARNING",
+                        category="CRITICAL",
                         code="THIN_BOUNDING_DIMENSION",
                         message=f"Model has a thin dimension under nozzle diameter {nozzle_dia:.2f} mm ({min_dim:.3f} mm).",
                         impact=f"Features below nozzle diameter ({nozzle_dia:.2f} mm) cannot be extruded by standard slicers.",
@@ -858,6 +923,7 @@ class CadVerifier:
         solids_min_z = cached_metrics.get("solids_min_z") or []
         printability = cached_metrics.get("printability") or {}
         floating_solids = cached_metrics.get("floating_solids") or []
+        components = cached_metrics.get("components") or []
 
         if solid_count > 1:
             if floating_solid_count > 0:
@@ -906,10 +972,10 @@ class CadVerifier:
                 if overlapping_part_count > 0:
                     findings.append(
                         Finding(
-                            category="WARNING",
+                            category="CRITICAL",
                             code="OVERLAPPING_PARTS",
                             message=f"Model has {overlapping_part_count} pair(s) of grounded parts with overlapping XY footprints.",
-                            impact="Adjacent parts in plate layout will fuse together during 3D printing. Increase layout spacing between parts.",
+                            impact="Adjacent parts in plate layout will fuse together during 3D printing. Increase layout spacing between parts (PART_GAP >= 10 mm).",
                         )
                     )
                 elif min_part_gap_mm is not None and min_part_gap_mm < 2.0:
@@ -944,88 +1010,205 @@ class CadVerifier:
                     )
                 )
 
-        # 5. Printability & Severe Overhang Check
+        # 5. Printability, Per-Component Stability, Ceiling & Wall Thickness Checks
         if isinstance(printability, dict) and printability:
-            bed_area = float(printability.get("bed_contact_area_mm2", 0.0) or 0.0)
             overhang_60 = float(printability.get("overhang_area_60deg_mm2", 0.0) or 0.0)
-            overhang_ratio = float(printability.get("overhang_ratio", 0.0) or 0.0)
             surf_area = float(printability.get("surface_area_mm2", 0.0) or 0.0)
+            base_z = min(solids_min_z) if solids_min_z else 0.0
 
-            if volume > 100.0 and bed_area < 1.0:
+            grounded_comps = [
+                c
+                for c in components
+                if isinstance(c, dict)
+                and float((c.get("bounds_mm") or {}).get("min_z", 0.0)) <= base_z + 0.08
+            ]
+
+            # 5a. Per-component Bed Contact & CoM Static Stability
+            for c in grounded_comps:
+                c_idx = c.get("index", 1)
+                c_vol = float(c.get("volume_mm3", 0.0) or 0.0)
+                c_bed = float(c.get("bed_contact_area_mm2", 0.0) or 0.0)
+                c_ratio = float(c.get("bed_contact_ratio", 0.0) or 0.0)
+                c_bbox = c.get("bbox_mm") or [0.0, 0.0, 0.0]
+                c_dz = float(c_bbox[2]) if len(c_bbox) >= 3 else 0.0
+                c_xy = c.get("center_xy") or [0.0, 0.0]
+                part_label = (
+                    f"Component #{c_idx} at XY=({c_xy[0]:.1f}, {c_xy[1]:.1f}) mm"
+                    if len(grounded_comps) > 1
+                    else "Model"
+                )
+
+                if c_vol > 25.0 and (
+                    c_bed < 3.0
+                    or (c_dz >= 5.0 and c_ratio < 0.015 and c_bed < 15.0)
+                ):
+                    findings.append(
+                        Finding(
+                            category="CRITICAL",
+                            code="LOW_BED_CONTACT",
+                            message=(
+                                f"{part_label} has insufficient build plate contact area "
+                                f"({c_bed:.2f} mm², {c_ratio * 100:.1f}% of footprint)."
+                            ),
+                            impact=(
+                                "Part rests on a point, dome, or knife-edge at Z = 0 and will detach during the first layer. "
+                                "Ensure every component has a flat horizontal base face resting squarely on Z = 0."
+                            ),
+                        )
+                    )
+                elif c_dz >= 5.0 and c_bed >= 1.0:
+                    c_stable = c.get("is_statically_stable", True)
+                    c_margin = float(c.get("stability_margin_mm", 0.0) or 0.0)
+                    if c_stable is False and c_margin < -0.5:
+                        com_mm = c.get("center_of_mass_mm")
+                        support_bounds = c.get("support_footprint_bounds_mm")
+                        com_str = (
+                            f"({com_mm[0]:.1f}, {com_mm[1]:.1f}, {com_mm[2]:.1f}) mm"
+                            if isinstance(com_mm, list) and len(com_mm) == 3
+                            else "outside base"
+                        )
+                        bounds_str = (
+                            f"X=[{support_bounds['min_x']:.1f}, {support_bounds['max_x']:.1f}], "
+                            f"Y=[{support_bounds['min_y']:.1f}, {support_bounds['max_y']:.1f}] mm"
+                            if isinstance(support_bounds, dict)
+                            else "Z=0 contact polygon"
+                        )
+                        findings.append(
+                            Finding(
+                                category="CRITICAL",
+                                code="UNSTABLE_CENTER_OF_MASS",
+                                message=(
+                                    f"{part_label} Center of Mass {com_str} projects {abs(c_margin):.2f} mm outside "
+                                    f"its convex Z=0 base support footprint ({bounds_str})."
+                                ),
+                                impact=(
+                                    "Freestanding part is statically unstable and will tip over under gravity. "
+                                    "Widen the Z=0 base footprint, add a support foot under the overhang, or re-orient the part."
+                                ),
+                            )
+                        )
+
+            # 5b. Intra-solid mid-air floating islands (local Z-minima)
+            unsupported_floating = printability.get("unsupported_floating_features") or []
+            if unsupported_floating:
+                feat_descs = [
+                    f"Z=[{u.get('min_z_mm')}..{u.get('max_z_mm')}] mm at XY=({(u.get('center_xy') or [0, 0])[0]}, {(u.get('center_xy') or [0, 0])[1]}) mm"
+                    for u in unsupported_floating[:3]
+                ]
                 findings.append(
                     Finding(
-                        category="WARNING",
-                        code="LOW_BED_CONTACT",
-                        message=f"Model has near-zero build plate contact area ({bed_area:.2f} mm²).",
-                        impact="Part will not adhere to the print bed without supports; orient flat base at Z = 0.",
+                        category="CRITICAL",
+                        code="UNSUPPORTED_FLOATING_FEATURE",
+                        message=(
+                            f"Model has {len(unsupported_floating)} intra-solid feature(s) starting in mid-air with zero support from the layer below "
+                            f"({'; '.join(feat_descs)})."
+                        ),
+                        impact=(
+                            "Even though connected to the body at a higher layer, these local Z-minima (such as severed internal cones, "
+                            "un-ramped internal ledges, or hanging bosses) print in thin air and collapse in the slicer. "
+                            "Add a >= 45 deg bottom support taper/chamfer down to a supporting wall or Z = 0."
+                        ),
                     )
                 )
 
+            # 5c. Perforated unsupported horizontal ceilings
+            perforated_ceilings = printability.get("perforated_ceilings") or []
+            if perforated_ceilings:
+                ceil_descs = [
+                    f"Z={p.get('z_mm')} mm, area={p.get('area_mm2')} mm², span={p.get('span_xy_mm')} mm, holes={p.get('upward_loops')} at XY=({(p.get('center_xy') or [0, 0])[0]}, {(p.get('center_xy') or [0, 0])[1]}) mm"
+                    for p in perforated_ceilings[:3]
+                ]
+                findings.append(
+                    Finding(
+                        category="CRITICAL",
+                        code="PERFORATED_UNSUPPORTED_CEILING",
+                        message=(
+                            f"Model contains {len(perforated_ceilings)} elevated horizontal ceiling(s) pierced by unsupported mid-air holes "
+                            f"({'; '.join(ceil_descs)})."
+                        ),
+                        impact=(
+                            "Circular or slotted hole perimeters inside an elevated horizontal bridge have nothing to anchor to and collapse into spaghetti during FDM printing. "
+                            "Orient perforated caps/lids flat outer-face-down on Z = 0 (with cavity/skirt opening upward +Z), or use a continuous >= 45 deg conical interior funnel."
+                        ),
+                    )
+                )
+
+            # 5d. Severe unchamfered overhangs (>60 deg)
+            severe_patches = printability.get("severe_overhang_patches") or []
+            severe_patch_area = sum(
+                float(p.get("area_mm2", 0.0) or 0.0) for p in severe_patches
+            )
+            max_patch_area = max(
+                (float(p.get("area_mm2", 0.0) or 0.0) for p in severe_patches),
+                default=0.0,
+            )
+            if severe_patches and (
+                severe_patch_area >= 50.0
+                or max_patch_area >= 35.0
+                or overhang_60 >= 120.0
+            ):
+                p_strs = [
+                    f"Z={p.get('z_mm')} mm ({p.get('area_mm2')} mm², span={p.get('span_xy_mm')} mm, XY_bounds={p.get('bounds_xy_mm')})"
+                    for p in severe_patches[:3]
+                ]
+                patch_detail = f" Major overhang zones: {'; '.join(p_strs)}."
+                findings.append(
+                    Finding(
+                        category="CRITICAL",
+                        code="SEVERE_OVERHANG",
+                        message=(
+                            f"Model has {overhang_60:.1f} mm² of steep (>60 deg) unsupported overhang area.{patch_detail}"
+                        ),
+                        impact=(
+                            "Horizontal internal roofs, rectangular rail ledges (cube() grooves), stepped lid lips at Z > 0, or wide flat-topped wall slots will sag or collapse during FDM printing. "
+                            "Replace 90-deg steps/grooves with 45-deg self-supporting tapers (e.g. Playbook dovetail_prism where dr == dz), keep sliding lids flat-bottomed on Z = 0 without raised overhanging lips, and keep wall slots narrow (<= 2.0 mm width)."
+                        ),
+                    )
+                )
+
+            # 5e. Global & 2D Z-slice local wall thickness checks
             if surf_area > 0 and volume > 0 and not any(d <= 0.0001 for d in (dim_x, dim_y, dim_z)):
                 effective_t = 2.0 * volume / surf_area
-                if effective_t < 0.35 * nozzle_dia:
+                if effective_t < 0.45 * nozzle_dia:
                     findings.append(
                         Finding(
-                            category="WARNING",
+                            category="CRITICAL",
                             code="THIN_WALL_SHELL",
                             message=f"Calculated average mesh wall thickness ({effective_t:.2f} mm) is critically thin for a {nozzle_dia:.2f} mm nozzle.",
                             impact="Thin shells risk slicing holes and brittle prints.",
                         )
                     )
-            footprint_xy = max(dim_x * dim_y, 1.0)
-            if overhang_60 >= 150.0 and (
-                overhang_ratio >= 0.06 or overhang_60 >= 0.15 * footprint_xy
-            ):
-                findings.append(
-                    Finding(
-                        category="WARNING",
-                        code="SEVERE_OVERHANG",
-                        message=(
-                            f"Model has {overhang_60:.1f} mm² of steep (>60 deg) unsupported overhang area."
-                        ),
-                        impact=(
-                            "Horizontal internal roofs or unchamfered transitions will sag during FDM printing; "
-                            "use >= 45 deg conical shoulders or orient caps upside-down."
-                        ),
-                    )
-                )
 
-            if (
-                solid_count == 1
-                and floating_solid_count == 0
-                and dim_z >= 5.0
-                and bed_area >= 1.0
-            ):
-                is_stable = printability.get("is_statically_stable", True)
-                stability_margin = float(
-                    printability.get("stability_margin_mm", 0.0) or 0.0
-                )
-                if is_stable is False and stability_margin < -0.5:
-                    com_mm = printability.get("center_of_mass_mm")
-                    support_bounds = printability.get("support_footprint_bounds_mm")
-                    com_str = (
-                        f"({com_mm[0]:.1f}, {com_mm[1]:.1f}, {com_mm[2]:.1f}) mm"
-                        if isinstance(com_mm, list) and len(com_mm) == 3
-                        else "outside base"
+            min_wall_t = printability.get("min_wall_thickness_mm")
+            min_wall_loc = printability.get("min_wall_location") or {}
+            if isinstance(min_wall_t, (int, float)):
+                loc_z = min_wall_loc.get("z_mm", 0.0)
+                loc_xy = min_wall_loc.get("xy_mm") or [0.0, 0.0]
+                if min_wall_t < nozzle_dia * 0.95:
+                    findings.append(
+                        Finding(
+                            category="CRITICAL",
+                            code="THIN_LOCAL_WALL",
+                            message=(
+                                f"Local wall thickness drops to {min_wall_t:.2f} mm at Z = {loc_z} mm, "
+                                f"XY = ({loc_xy[0]}, {loc_xy[1]}) mm, which is thinner than nozzle diameter ({nozzle_dia:.2f} mm)."
+                            ),
+                            impact=(
+                                "Slicers drop walls thinner than a single extrusion width, creating open holes or severed walls "
+                                "(commonly behind dovetail grooves, bores, or deep cutouts). Reduce cutout depth or increase outer wall dimensions so all walls are >= 2 perimeters."
+                            ),
+                        )
                     )
-                    bounds_str = (
-                        f"X=[{support_bounds['min_x']:.1f}, {support_bounds['max_x']:.1f}], "
-                        f"Y=[{support_bounds['min_y']:.1f}, {support_bounds['max_y']:.1f}] mm"
-                        if isinstance(support_bounds, dict)
-                        else "Z=0 contact polygon"
-                    )
+                elif min_wall_t < nozzle_dia * 1.65:
                     findings.append(
                         Finding(
                             category="WARNING",
-                            code="UNSTABLE_CENTER_OF_MASS",
+                            code="SINGLE_PERIMETER_LOCAL_WALL",
                             message=(
-                                f"Center of Mass {com_str} projects {abs(stability_margin):.2f} mm outside "
-                                f"the convex Z=0 base support footprint ({bounds_str})."
+                                f"Local wall thickness is only {min_wall_t:.2f} mm at Z = {loc_z} mm, "
+                                f"XY = ({loc_xy[0]}, {loc_xy[1]}) mm (< 2 perimeters for a {nozzle_dia:.2f} mm nozzle)."
                             ),
-                            impact=(
-                                "Freestanding part is statically unstable and will tip over under gravity. "
-                                "Widen the Z=0 base footprint, add a support foot under the overhang, or re-orient the part."
-                            ),
+                            impact="Thin local walls behind grooves or pockets are fragile; aim for >= 2 perimeters.",
                         )
                     )
 
