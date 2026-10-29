@@ -78,6 +78,8 @@ _PRUSA_INFILL_MAP: dict[str, str] = {
     "3dhoneycomb": "3dhoneycomb",
     "crosshatch": "gyroid",
     "rectilinear": "rectilinear",
+    "zig-zag": "rectilinear",
+    "zigzag": "rectilinear",
     "concentric": "concentric",
     "lightning": "lightning",
 }
@@ -86,6 +88,49 @@ _PRUSA_SURFACE_MAP: dict[str, str] = {
     "monotonic": "monotonic",
     "concentric": "concentric",
     "rectilinear": "rectilinear",
+}
+_PRUSA_SEAM_MAP: dict[str, str] = {
+    "aligned": "aligned",
+    "back": "rear",
+    "rear": "rear",
+    "random": "random",
+    "nearest": "nearest",
+}
+
+_BAMBU_INFILL_MAP: dict[str, str] = {
+    "gyroid": "gyroid",
+    "grid": "grid",
+    "cubic": "cubic",
+    "adaptivecubic": "adaptivecubic",
+    "honeycomb": "honeycomb",
+    "3dhoneycomb": "3dhoneycomb",
+    "crosshatch": "crosshatch",
+    "rectilinear": "zig-zag",
+    "zig-zag": "zig-zag",
+    "zigzag": "zig-zag",
+    "concentric": "concentric",
+    "lightning": "lightning",
+}
+_BAMBU_SURFACE_MAP: dict[str, str] = {
+    "monotonicline": "monotonicline",
+    "monotonic": "monotonic",
+    "concentric": "concentric",
+    "rectilinear": "rectilinear",
+}
+_BAMBU_SEAM_MAP: dict[str, str] = {
+    "aligned": "aligned",
+    "back": "back",
+    "rear": "back",
+    "random": "random",
+    "nearest": "nearest",
+}
+_BAMBU_IRONING_MAP: dict[str, str] = {
+    "no iron": "no ironing",
+    "no ironing": "no ironing",
+    "none": "no ironing",
+    "top": "top",
+    "topmost": "topmost",
+    "solid": "solid",
 }
 _BAMBU_WALL_SEQUENCE_MAP: dict[str, str] = {
     "inner/outer": "inner wall/outer wall",
@@ -119,8 +164,17 @@ def build_prusa_slicer_config(profile: dict[str, Any]) -> str:
     bot_pat = _PRUSA_SURFACE_MAP.get(
         str(profile.get("bottom_surface_pattern", "monotonic")), "monotonic"
     )
-    ironing_type = str(profile.get("ironing_type", "no iron"))
-    ironing_on = 0 if ironing_type == "no iron" else 1
+    raw_ironing = str(profile.get("ironing_type", "no iron")).strip().lower()
+    ironing_on = 0 if raw_ironing in ("no iron", "no ironing", "none", "off", "0", "") else 1
+    if raw_ironing == "topmost":
+        prusa_ironing_type = "topmost"
+    elif raw_ironing in ("top", "alltop"):
+        prusa_ironing_type = "top"
+    elif raw_ironing == "solid":
+        prusa_ironing_type = "solid"
+    else:
+        prusa_ironing_type = "top"
+    seam_pos = _PRUSA_SEAM_MAP.get(str(profile.get("seam_position", "aligned")), "aligned")
     wall_seq = str(profile.get("wall_sequence", "inner/outer"))
 
     settings = {
@@ -149,20 +203,20 @@ def build_prusa_slicer_config(profile: dict[str, Any]) -> str:
         "support_material_extrusion_width": profile.get(
             "support_line_width_mm", round(nozzle_dia * 0.95, 2)
         ),
-        "perimeters": profile["wall_loops"],
-        "top_solid_layers": profile["top_shell_layers"],
-        "bottom_solid_layers": profile["bottom_shell_layers"],
+        "perimeters": profile.get("wall_loops", 3),
+        "top_solid_layers": profile.get("top_shell_layers", 4),
+        "bottom_solid_layers": profile.get("bottom_shell_layers", 4),
         "perimeter_generator": profile.get("wall_generator", "arachne"),
         "thin_walls": 1 if profile.get("detect_thin_wall", True) else 0,
-        "seam_position": profile.get("seam_position", "aligned"),
+        "seam_position": seam_pos,
         "external_perimeters_first": 1 if wall_seq == "outer/inner" else 0,
         "elefant_foot_compensation": profile.get("elefant_foot_compensation_mm", 0.10),
         "xy_size_compensation": profile.get("xy_contour_compensation_mm", 0.0),
         "ironing": ironing_on,
-        "ironing_type": "top" if ironing_type == "topmost" else ("alltop" if ironing_on else "top"),
+        "ironing_type": prusa_ironing_type,
         "ironing_flowrate": f"{profile.get('ironing_flow_percent', 15)}%",
         "ironing_speed": profile.get("ironing_speed_mms", 30),
-        "fill_density": f"{profile['infill_density_percent']}%",
+        "fill_density": f"{profile.get('infill_density_percent', 20)}%",
         "fill_pattern": infill_pat,
         "top_fill_pattern": top_pat,
         "bottom_fill_pattern": bot_pat,
@@ -170,8 +224,8 @@ def build_prusa_slicer_config(profile: dict[str, Any]) -> str:
         "support_material": support,
         # Without ``support_material_auto`` PrusaSlicer only honours painted supports.
         "support_material_auto": support,
-        "support_material_style": "organic" if profile["support_type"] == "tree" else "grid",
-        "support_material_threshold": profile["support_threshold_angle"],
+        "support_material_style": "organic" if profile.get("support_type", "normal") == "tree" else "grid",
+        "support_material_threshold": profile.get("support_threshold_angle", 45),
         "support_material_buildplate_only": (
             1 if profile.get("support_on_build_plate_only", False) else 0
         ),
@@ -254,14 +308,14 @@ def build_bambu_orca_config(profile: dict[str, Any]) -> str:
         "support_line_width": str(
             profile.get("support_line_width_mm", round(nozzle_dia * 0.95, 2))
         ),
-        "wall_loops": str(profile["wall_loops"]),
+        "wall_loops": str(profile.get("wall_loops", 3)),
         "top_shell_layers": str(top_layers),
         "bottom_shell_layers": str(bot_layers),
         "top_shell_thickness": str(round(max(0.6, top_layers * lh), 2)),
         "bottom_shell_thickness": str(round(max(0.6, bot_layers * lh), 2)),
         "wall_generator": str(profile.get("wall_generator", "arachne")),
         "detect_thin_wall": "1" if profile.get("detect_thin_wall", True) else "0",
-        "seam_position": str(profile.get("seam_position", "aligned")),
+        "seam_position": _BAMBU_SEAM_MAP.get(str(profile.get("seam_position", "aligned")), "aligned"),
         "wall_sequence": _BAMBU_WALL_SEQUENCE_MAP.get(
             str(profile.get("wall_sequence", "inner/outer")),
             "inner wall/outer wall",
@@ -271,17 +325,26 @@ def build_bambu_orca_config(profile: dict[str, Any]) -> str:
         "xy_hole_compensation": str(profile.get("xy_hole_compensation_mm", 0.0)),
         "xy_contour_compensation": str(profile.get("xy_contour_compensation_mm", 0.0)),
         "precise_z_height": "1" if profile.get("precise_z_height", True) else "0",
-        "ironing_type": str(profile.get("ironing_type", "no iron")),
+        "ironing_type": _BAMBU_IRONING_MAP.get(
+            str(profile.get("ironing_type", "no iron")).strip().lower(), "no ironing"
+        ),
         "ironing_flow": f"{profile.get('ironing_flow_percent', 15)}%",
         "ironing_speed": str(profile.get("ironing_speed_mms", 30)),
-        "sparse_infill_density": f"{profile['infill_density_percent']}%",
-        "sparse_infill_pattern": str(profile["infill_pattern"]),
-        "top_surface_pattern": str(profile.get("top_surface_pattern", "monotonicline")),
-        "bottom_surface_pattern": str(profile.get("bottom_surface_pattern", "monotonic")),
+        "sparse_infill_density": f"{profile.get('infill_density_percent', 20)}%",
+        "sparse_infill_pattern": _BAMBU_INFILL_MAP.get(
+            str(profile.get("infill_pattern", "gyroid")),
+            str(profile.get("infill_pattern", "gyroid")),
+        ),
+        "top_surface_pattern": _BAMBU_SURFACE_MAP.get(
+            str(profile.get("top_surface_pattern", "monotonicline")), "monotonicline"
+        ),
+        "bottom_surface_pattern": _BAMBU_SURFACE_MAP.get(
+            str(profile.get("bottom_surface_pattern", "monotonic")), "monotonic"
+        ),
         "infill_wall_overlap": f"{profile.get('infill_wall_overlap_percent', 15)}%",
-        "enable_support": "1" if profile["support_enabled"] else "0",
-        "support_type": "tree(auto)" if profile["support_type"] == "tree" else "normal(auto)",
-        "support_threshold_angle": str(profile["support_threshold_angle"]),
+        "enable_support": "1" if profile.get("support_enabled", False) else "0",
+        "support_type": "tree(auto)" if profile.get("support_type", "normal") == "tree" else "normal(auto)",
+        "support_threshold_angle": str(profile.get("support_threshold_angle", 45)),
         "support_on_build_plate_only": (
             "1" if profile.get("support_on_build_plate_only", False) else "0"
         ),
@@ -420,31 +483,55 @@ def _prepare_3mf_objects_and_layout(
     )
     if len(obj_matches) != 1:
         if len(obj_matches) > 1:
-            existing_meta: list[dict[str, Any]] = []
-            for idx, om in enumerate(obj_matches, start=1):
-                tag_head = om.group(0).split(">", 1)[0]
-                id_m = re.search(r'\bid="(\d+)"', tag_head)
-                name_m = re.search(r'\bname="([^"]*)"', tag_head)
-                oid = int(id_m.group(1)) if id_m else idx
-                oname = (
-                    xml_unescape(name_m.group(1))
-                    if name_m
-                    else f"{project_name or 'part'}_{oid}"
+            all_xs: list[float] = []
+            all_ys: list[float] = []
+            all_zs: list[float] = []
+            for om in obj_matches:
+                for vm in re.finditer(
+                    r'<vertex\b[^>]*?\bx="([^"]+)"[^>]*?\by="([^"]+)"[^>]*?\bz="([^"]+)"',
+                    om.group(0),
+                ):
+                    try:
+                        all_xs.append(float(vm.group(1)))
+                        all_ys.append(float(vm.group(2)))
+                        all_zs.append(float(vm.group(3)))
+                    except ValueError:
+                        pass
+            if all_xs and all_ys and all_zs:
+                assembly_cx = (min(all_xs) + max(all_xs)) * 0.5
+                assembly_cy = (min(all_ys) + max(all_ys)) * 0.5
+                assembly_min_z = min(all_zs)
+                plate_cx = bed_x_mm * 0.5
+                plate_cy = bed_y_mm * 0.5
+                shift_x = plate_cx - assembly_cx
+                shift_y = plate_cy - assembly_cy
+                shift_z = -assembly_min_z
+
+                existing_meta: list[dict[str, Any]] = []
+                new_build_items: list[str] = []
+                for idx, om in enumerate(obj_matches, start=1):
+                    tag_head = om.group(0).split(">", 1)[0]
+                    id_m = re.search(r'\bid="(\d+)"', tag_head)
+                    name_m = re.search(r'\bname="([^"]*)"', tag_head)
+                    oid = int(id_m.group(1)) if id_m else idx
+                    oname = (
+                        xml_unescape(name_m.group(1))
+                        if name_m
+                        else f"{project_name or 'part'}_{oid}"
+                    )
+                    t_str = f"1 0 0 0 1 0 0 0 1 {_fmt_coord(shift_x)} {_fmt_coord(shift_y)} {_fmt_coord(shift_z)}"
+                    existing_meta.append({"id": oid, "name": oname, "transform": t_str})
+                    new_build_items.append(f'\t\t<item objectid="{oid}" transform="{t_str}" printable="1" />')
+
+                xml = re.sub(
+                    r"<build\b[^>]*>.*?</build>",
+                    "<build>\n" + "\n".join(new_build_items) + "\n\t</build>",
+                    xml,
+                    count=1,
+                    flags=re.DOTALL,
                 )
-                item_tag_m = re.search(rf'<item\b[^>]*?\bobjectid="{oid}"[^>]*/>', xml)
-                tm_m = (
-                    re.search(r'\btransform="([^"]+)"', item_tag_m.group(0))
-                    if item_tag_m
-                    else None
-                )
-                t_str = (
-                    tm_m.group(1)
-                    if tm_m
-                    else f"1 0 0 0 1 0 0 0 1 {_fmt_coord(bed_x_mm * 0.5)} {_fmt_coord(bed_y_mm * 0.5)} 0"
-                )
-                existing_meta.append({"id": oid, "name": oname, "transform": t_str})
-            return content, existing_meta
-        return content, default_meta
+                return xml.encode("utf-8"), existing_meta
+            return content, default_meta
 
     obj_block = obj_matches[0].group(0)
     vert_tags = re.findall(r"<vertex\b[^>]*/\s*>", obj_block)

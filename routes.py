@@ -1062,23 +1062,22 @@ def get_print_profile(project_name: str):
     bus = current_app.config.get("EVENT_BUS")
     publish = bus.publish if bus is not None else None
     use_ai = bool(payload.get("use_ai", False))
-    with _project_lock(project_name):
-        project_dir = _resolve_project_or_404(project_name)
-        if not isinstance(project_dir, Path):
-            return project_dir
-        try:
-            result = recommend_print_profile(
-                project_dir,
-                priority=str(payload.get("priority", "auto")),
-                material_override=str(payload.get("material", "auto")),
-                settings=settings,
-                use_ai=use_ai,
-                publish=publish,
-            )
-        except FileNotFoundError as error:
-            return jsonify({"error": str(error)}), 404
-        except (ValueError, OSError) as error:
-            return jsonify({"error": str(error)}), 500
+    project_dir = _resolve_project_or_404(project_name)
+    if not isinstance(project_dir, Path):
+        return project_dir
+    try:
+        result = recommend_print_profile(
+            project_dir,
+            priority=str(payload.get("priority", "auto")),
+            material_override=str(payload.get("material", "auto")),
+            settings=settings,
+            use_ai=use_ai,
+            publish=publish,
+        )
+    except FileNotFoundError as error:
+        return jsonify({"error": str(error)}), 404
+    except (ValueError, OSError) as error:
+        return jsonify({"error": str(error)}), 500
     return jsonify(result)
 
 
@@ -1093,44 +1092,49 @@ def export_model(project_name: str):
     settings: Settings = current_app.config["SETTINGS"]
     bus = current_app.config.get("EVENT_BUS")
     publish = bus.publish if bus is not None else None
-    with _project_lock(project_name):
-        project_dir = _resolve_project_or_404(project_name)
-        if not isinstance(project_dir, Path):
-            return project_dir
 
-        print_profile: dict[str, Any] | None = None
-        if fmt == "3mf":
-            from agent.print_advisor import parse_nozzle_spec
+    project_dir = _resolve_project_or_404(project_name)
+    if not isinstance(project_dir, Path):
+        return project_dir
 
-            req_json = (request.get_json(silent=True) or {}) if request.method == "POST" else {}
-            raw_profile = req_json.get("profile")
-            nozzle_info = parse_nozzle_spec(settings.user_nozzle)
-            if isinstance(raw_profile, dict):
-                print_profile = sanitize_print_profile(
-                    raw_profile,
-                    nozzle_diameter_mm=nozzle_info["diameter_mm"],
-                    user_printer=settings.user_printer,
-                )
-            elif req_json.get("embed_settings", True) is not False:
+    print_profile: dict[str, Any] | None = None
+    if fmt == "3mf":
+        from agent.print_advisor import parse_nozzle_spec
+
+        req_json = (request.get_json(silent=True) or {}) if request.method == "POST" else {}
+        raw_profile = req_json.get("profile")
+        nozzle_info = parse_nozzle_spec(settings.user_nozzle)
+        if isinstance(raw_profile, dict):
+            print_profile = sanitize_print_profile(
+                raw_profile,
+                nozzle_diameter_mm=nozzle_info["diameter_mm"],
+                user_printer=settings.user_printer,
+            )
+        elif req_json.get("embed_settings", True):
+            has_build_state = (
+                (project_dir / "preview.stl").is_file()
+                or (project_dir / ".cad_metrics.json").is_file()
+            )
+            if has_build_state:
                 use_ai_flag = bool(req_json.get("auto_ai", True))
-                has_build_state = (
-                    (project_dir / "preview.stl").is_file()
-                    or (project_dir / ".cad_metrics.json").is_file()
-                )
-                if has_build_state or bool(req_json.get("auto_ai", False)):
-                    try:
-                        result = recommend_print_profile(
-                            project_dir,
-                            settings=settings,
-                            use_ai=use_ai_flag,
-                            publish=publish,
-                        )
-                        print_profile = result.get("profile")
-                    except FileNotFoundError as error:
-                        return jsonify({"error": str(error)}), 404
-                    except (ValueError, OSError) as error:
-                        return jsonify({"error": str(error)}), 500
+                try:
+                    result = recommend_print_profile(
+                        project_dir,
+                        settings=settings,
+                        use_ai=use_ai_flag,
+                        publish=publish,
+                    )
+                    print_profile = result.get("profile")
+                except FileNotFoundError:
+                    # Model not built yet; continue with clean 3MF export without embedded settings
+                    print_profile = None
+                except (ValueError, OSError) as error:
+                    current_app.logger.warning("Failed to generate print profile for 3MF export: %s", error)
+                    print_profile = None
 
+    with _project_lock(project_name):
+        if not project_dir.is_dir():
+            return jsonify({"error": "Project not found."}), 404
         try:
             exported_path = export_project_model(project_dir, fmt, print_profile=print_profile)
         except FileNotFoundError as error:
@@ -1140,15 +1144,15 @@ def export_model(project_name: str):
         except (RuntimeError, OSError) as error:
             return jsonify({"error": str(error)}), 500
 
-        mimetype = EXPORT_MIME_TYPES.get(fmt, "application/octet-stream")
-        download_name = f"{project_name}.{fmt}"
-        return send_file(
-            exported_path,
-            mimetype=mimetype,
-            as_attachment=True,
-            download_name=download_name,
-            max_age=0,
-        )
+    mimetype = EXPORT_MIME_TYPES.get(fmt, "application/octet-stream")
+    download_name = f"{project_name}.{fmt}"
+    return send_file(
+        exported_path,
+        mimetype=mimetype,
+        as_attachment=True,
+        download_name=download_name,
+        max_age=0,
+    )
 
 
 # ---------------------------------------------------------------------------

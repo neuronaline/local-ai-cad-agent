@@ -16,8 +16,6 @@ from typing import Any
 from agent.llm_base import extract_usage_summary
 from agent.revisions import compute_model_sha256
 from agent.settings import with_reasoning_effort
-from agent.tools.cad_scripts.renderer import load_stl
-from agent.tools.cad_scripts.runner import mesh_metrics
 
 _LOG = logging.getLogger(__name__)
 
@@ -31,6 +29,8 @@ ALLOWED_INFILL_PATTERNS: tuple[str, ...] = (
     "3dhoneycomb",
     "crosshatch",
     "rectilinear",
+    "zig-zag",
+    "zigzag",
     "concentric",
     "lightning",
 )
@@ -49,13 +49,13 @@ ALLOWED_BRIM_TYPES: tuple[str, ...] = (
     "auto_brim",
 )
 ALLOWED_WALL_GENERATORS: tuple[str, ...] = ("arachne", "classic")
-ALLOWED_SEAM_POSITIONS: tuple[str, ...] = ("aligned", "back", "random", "nearest")
+ALLOWED_SEAM_POSITIONS: tuple[str, ...] = ("aligned", "back", "rear", "random", "nearest")
 ALLOWED_WALL_SEQUENCES: tuple[str, ...] = (
     "inner/outer",
     "outer/inner",
     "inner/outer/inner",
 )
-ALLOWED_IRONING_TYPES: tuple[str, ...] = ("no iron", "top", "topmost")
+ALLOWED_IRONING_TYPES: tuple[str, ...] = ("no iron", "no ironing", "top", "topmost")
 ALLOWED_PRIORITIES: tuple[str, ...] = ("auto", "strength", "quality", "speed")
 
 _DEFAULTS: dict[str, Any] = {
@@ -183,11 +183,74 @@ _FLAT_TOP_WORDS = (
     "faceplate", "nameplate", "tile", "tag",
 )
 
-_HIGH_SPEED_PRINTER_KEYWORDS = (
-    "bambu", "x1", "x1c", "x1e", "p1p", "p1s", "a1", "h2d", "k1", "k2", "voron",
-    "ratrig", "vzbot", "mk4", "core one", "prusa xl", "flsun", "v400", "s1",
-    "qidi", "ankermake", "adventurer 5", "centauri", "sovol sv08",
+_HIGH_SPEED_PRINTER_PATTERNS = (
+    r"\bbambu\b",
+    r"\bx1[ce]?\b",
+    r"\bp1[ps]\b",
+    r"\ba1(\s*mini)?\b",
+    r"\bh2d\b",
+    r"\bk1(\s*max)?\b",
+    r"\bk2(\s*plus)?\b",
+    r"\bvoron\b",
+    r"\bratrig\b",
+    r"\bvzbot\b",
+    r"\bmk4\b",
+    r"\bcore\s*one\b",
+    r"\bprusa\s*xl\b",
+    r"\bflsun\b",
+    r"\bv400\b",
+    r"\bqidi\b",
+    r"\bankermake\b",
+    r"\badventurer\s*5\b",
+    r"\bcentauri\b",
+    r"\bsv08\b",
 )
+
+_MATERIAL_BOUNDS: dict[str, dict[str, tuple[float, float]]] = {
+    "PLA": {
+        "nozzle_temp": (180.0, 245.0),
+        "bed_temp": (40.0, 75.0),
+        "max_volumetric": (2.0, 28.0),
+    },
+    "PETG": {
+        "nozzle_temp": (215.0, 265.0),
+        "bed_temp": (60.0, 95.0),
+        "max_volumetric": (2.0, 20.0),
+    },
+    "ASA": {
+        "nozzle_temp": (230.0, 280.0),
+        "bed_temp": (80.0, 115.0),
+        "max_volumetric": (2.0, 24.0),
+    },
+    "ABS": {
+        "nozzle_temp": (225.0, 275.0),
+        "bed_temp": (80.0, 115.0),
+        "max_volumetric": (2.0, 24.0),
+    },
+    "TPU": {
+        "nozzle_temp": (200.0, 245.0),
+        "bed_temp": (25.0, 65.0),
+        "max_volumetric": (1.0, 8.0),
+    },
+}
+
+
+def normalize_material(raw_material: str | None, default: str = "PLA") -> str:
+    """Normalize user-entered filament strings (e.g. 'PLA+', 'PETG HF', 'TPU 95A', 'ABS-GF') to standard base material."""
+    text = (raw_material or "").strip().upper()
+    if not text or text == "AUTO":
+        return default
+    if "TPU" in text or "FLEX" in text:
+        return "TPU"
+    if "PETG" in text or "PET-G" in text or text == "PET" or text.startswith("PET-") or "PET " in text:
+        return "PETG"
+    if "ASA" in text:
+        return "ASA"
+    if "ABS" in text:
+        return "ABS"
+    if "PLA" in text:
+        return "PLA"
+    return default
 
 
 def _number(
@@ -286,7 +349,11 @@ def parse_printer_spec(printer_str: str | None) -> dict[str, Any]:
     """Infer kinematics speed tier and build plate dimensions (mm) from printer string."""
     text = (printer_str or "").strip()
     lower = text.lower()
-    is_high_speed = any(kw in lower for kw in _HIGH_SPEED_PRINTER_KEYWORDS)
+    # Sidewinder X1/Genius and Ender-3 S1 are standard bedslingers, not high-speed CoreXY
+    is_slow_override = any(tok in lower for tok in ("sidewinder", "ender 3 s1", "ender-3 s1"))
+    is_high_speed = not is_slow_override and any(
+        re.search(pat, lower) for pat in _HIGH_SPEED_PRINTER_PATTERNS
+    )
     speed_tier = "high_speed" if is_high_speed else "standard"
 
     bed_x, bed_y = 256.0, 256.0
@@ -295,6 +362,8 @@ def parse_printer_spec(printer_str: str | None) -> dict[str, Any]:
         bx, by = float(dim_match.group(1)), float(dim_match.group(2))
         if 100.0 <= bx <= 600.0 and 100.0 <= by <= 600.0:
             bed_x, bed_y = bx, by
+    elif "ender 2" in lower or "ender-2" in lower:
+        bed_x, bed_y = 165.0, 165.0
     elif "a1 mini" in lower or "prusa mini" in lower or "kp3s" in lower:
         bed_x, bed_y = 180.0, 180.0
     elif "voron 0" in lower or "v0" in lower:
@@ -303,10 +372,14 @@ def parse_printer_spec(printer_str: str | None) -> dict[str, Any]:
         bed_x, bed_y = 250.0, 210.0
     elif "prusa xl" in lower:
         bed_x, bed_y = 360.0, 360.0
-    elif "350" in lower and ("voron" in lower or "sv08" in lower):
+    elif "ender 5 plus" in lower or "ender-5 plus" in lower or "sv08" in lower or ("350" in lower and "voron" in lower):
         bed_x, bed_y = 350.0, 350.0
-    elif "300" in lower or "k1 max" in lower or "k2 plus" in lower:
+    elif "sidewinder" in lower or "k1 max" in lower or "k2 plus" in lower or "300" in lower:
         bed_x, bed_y = 300.0, 300.0
+    elif "max" in lower and ("neptune" in lower or "kobra" in lower):
+        bed_x, bed_y = 420.0, 420.0
+    elif "plus" in lower and ("neptune" in lower or "kobra" in lower):
+        bed_x, bed_y = 320.0, 320.0
     elif any(k in lower for k in ("ender", "k1", "kobra", "neptune", "sovol", "vyper", "artillery")):
         bed_x, bed_y = 220.0, 220.0
 
@@ -454,6 +527,7 @@ def sanitize_print_profile(
     *,
     nozzle_diameter_mm: float = 0.4,
     user_printer: str = "",
+    fallback_profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Clamp and validate a (possibly untrusted) print profile into safe slicer bounds.
 
@@ -462,8 +536,19 @@ def sanitize_print_profile(
     """
     if not isinstance(raw, dict):
         raw = {}
-    material = _choice(raw, "material", ALLOWED_MATERIALS)
-    nozzle_dia = max(0.15, min(1.2, float(raw.get("nozzle_diameter_mm") or nozzle_diameter_mm or 0.4)))
+    fb = fallback_profile or _DEFAULTS
+    raw_mat = raw.get("material", fb.get("material", "PLA"))
+    material = normalize_material(str(raw_mat), fb.get("material", "PLA"))
+    if material not in ALLOWED_MATERIALS:
+        material = "PLA"
+
+    raw_dia = raw.get("nozzle_diameter_mm")
+    try:
+        parsed_dia = float(raw_dia) if raw_dia is not None else float(nozzle_diameter_mm or 0.4)
+    except (ValueError, TypeError):
+        parsed_dia = parse_nozzle_spec(str(raw_dia))["diameter_mm"] if raw_dia else float(nozzle_diameter_mm or 0.4)
+    nozzle_dia = max(0.15, min(1.2, parsed_dia))
+
     target_printer = _text(raw, "target_printer", 80) or _text({"p": user_printer}, "p", 80)
     printer_spec = parse_printer_spec(target_printer)
 
@@ -472,15 +557,29 @@ def sanitize_print_profile(
     min_first = round(max(0.10, nozzle_dia * 0.25), 2)
     max_first = round(min(0.60, nozzle_dia * 0.75), 2)
 
-    layer_height = round(_number(raw, "layer_height_mm", min_layer, max_layer, round(nozzle_dia * 0.50, 2)), 2)
+    layer_height = round(
+        _number(raw, "layer_height_mm", min_layer, max_layer, fb.get("layer_height_mm", round(nozzle_dia * 0.50, 2))),
+        2,
+    )
     first_layer = round(
-        _number(raw, "first_layer_height_mm", min_first, max_first, round(min(0.40, max(0.20, nozzle_dia * 0.50)), 2)),
+        _number(
+            raw,
+            "first_layer_height_mm",
+            min_first,
+            max_first,
+            fb.get("first_layer_height_mm", round(min(0.40, max(0.20, nozzle_dia * 0.50)), 2)),
+        ),
         2,
     )
 
     mat_defaults = _material_thermal_and_flow_defaults(
         material, nozzle_dia, printer_spec["speed_tier"], layer_height
     )
+    mat_fb = fb if fb.get("material") == material else mat_defaults
+    bounds = _MATERIAL_BOUNDS.get(material, _MATERIAL_BOUNDS["PLA"])
+    nozzle_min, nozzle_max = bounds["nozzle_temp"]
+    bed_min, bed_max = bounds["bed_temp"]
+    vol_min, vol_max = bounds["max_volumetric"]
 
     min_lw = round(max(0.12, nozzle_dia * 0.85), 2)
     max_lw = round(min(1.80, nozzle_dia * 1.60), 2)
@@ -490,162 +589,162 @@ def sanitize_print_profile(
     def_top_lw = round(nozzle_dia * 1.00, 2)
     def_sup_lw = round(nozzle_dia * 0.95, 2)
 
-    brim_enabled = _bool(raw, "brim_enabled", False)
+    brim_enabled = _bool(raw, "brim_enabled", fb.get("brim_enabled", False))
     raw_brim_type = _choice(
         raw,
         "brim_type",
         ALLOWED_BRIM_TYPES,
-        "outer_only" if brim_enabled else "no_brim",
+        fb.get("brim_type", "outer_only" if brim_enabled else "no_brim"),
     )
     if not brim_enabled:
         brim_type = "no_brim"
         brim_width = 0
     else:
         brim_type = "outer_only" if raw_brim_type == "no_brim" else raw_brim_type
-        brim_width = round(_number(raw, "brim_width_mm", 4, 15, 6))
+        brim_width = round(_number(raw, "brim_width_mm", 4, 15, fb.get("brim_width_mm", 6)))
 
-    support_enabled = _bool(raw, "support_enabled", False)
+    support_enabled = _bool(raw, "support_enabled", fb.get("support_enabled", False))
 
     sanitized: dict[str, Any] = {
         "material": material,
         "nozzle_diameter_mm": round(nozzle_dia, 2),
         "layer_height_mm": layer_height,
         "first_layer_height_mm": first_layer,
-        "line_width_mm": round(_number(raw, "line_width_mm", min_lw, max_lw, def_lw), 2),
+        "line_width_mm": round(_number(raw, "line_width_mm", min_lw, max_lw, fb.get("line_width_mm", def_lw)), 2),
         "initial_layer_line_width_mm": round(
-            _number(raw, "initial_layer_line_width_mm", min_lw, max_lw, def_init_lw), 2
+            _number(raw, "initial_layer_line_width_mm", min_lw, max_lw, fb.get("initial_layer_line_width_mm", def_init_lw)), 2
         ),
         "outer_wall_line_width_mm": round(
-            _number(raw, "outer_wall_line_width_mm", min_lw, max_lw, def_lw), 2
+            _number(raw, "outer_wall_line_width_mm", min_lw, max_lw, fb.get("outer_wall_line_width_mm", def_lw)), 2
         ),
         "inner_wall_line_width_mm": round(
-            _number(raw, "inner_wall_line_width_mm", min_lw, max_lw, def_inner_lw), 2
+            _number(raw, "inner_wall_line_width_mm", min_lw, max_lw, fb.get("inner_wall_line_width_mm", def_inner_lw)), 2
         ),
         "top_surface_line_width_mm": round(
-            _number(raw, "top_surface_line_width_mm", min_lw, max_lw, def_top_lw), 2
+            _number(raw, "top_surface_line_width_mm", min_lw, max_lw, fb.get("top_surface_line_width_mm", def_top_lw)), 2
         ),
         "sparse_infill_line_width_mm": round(
-            _number(raw, "sparse_infill_line_width_mm", min_lw, max_lw, def_inner_lw), 2
+            _number(raw, "sparse_infill_line_width_mm", min_lw, max_lw, fb.get("sparse_infill_line_width_mm", def_inner_lw)), 2
         ),
         "internal_solid_infill_line_width_mm": round(
-            _number(raw, "internal_solid_infill_line_width_mm", min_lw, max_lw, def_lw), 2
+            _number(raw, "internal_solid_infill_line_width_mm", min_lw, max_lw, fb.get("internal_solid_infill_line_width_mm", def_lw)), 2
         ),
         "support_line_width_mm": round(
-            _number(raw, "support_line_width_mm", min_lw, max_lw, def_sup_lw), 2
+            _number(raw, "support_line_width_mm", min_lw, max_lw, fb.get("support_line_width_mm", def_sup_lw)), 2
         ),
-        "wall_loops": round(_number(raw, "wall_loops", 2, 8)),
-        "top_shell_layers": round(_number(raw, "top_shell_layers", 2, 10)),
-        "bottom_shell_layers": round(_number(raw, "bottom_shell_layers", 2, 10)),
-        "wall_generator": _choice(raw, "wall_generator", ALLOWED_WALL_GENERATORS),
-        "detect_thin_wall": _bool(raw, "detect_thin_wall", True),
-        "seam_position": _choice(raw, "seam_position", ALLOWED_SEAM_POSITIONS),
-        "wall_sequence": _choice(raw, "wall_sequence", ALLOWED_WALL_SEQUENCES),
-        "only_one_wall_top": _bool(raw, "only_one_wall_top", False),
+        "wall_loops": round(_number(raw, "wall_loops", 2, 8, fb.get("wall_loops", 3))),
+        "top_shell_layers": round(_number(raw, "top_shell_layers", 2, 10, fb.get("top_shell_layers", 4))),
+        "bottom_shell_layers": round(_number(raw, "bottom_shell_layers", 2, 10, fb.get("bottom_shell_layers", 4))),
+        "wall_generator": _choice(raw, "wall_generator", ALLOWED_WALL_GENERATORS, fb.get("wall_generator", "arachne")),
+        "detect_thin_wall": _bool(raw, "detect_thin_wall", fb.get("detect_thin_wall", True)),
+        "seam_position": _choice(raw, "seam_position", ALLOWED_SEAM_POSITIONS, fb.get("seam_position", "aligned")),
+        "wall_sequence": _choice(raw, "wall_sequence", ALLOWED_WALL_SEQUENCES, fb.get("wall_sequence", "inner/outer")),
+        "only_one_wall_top": _bool(raw, "only_one_wall_top", fb.get("only_one_wall_top", False)),
         "elefant_foot_compensation_mm": round(
-            _number(raw, "elefant_foot_compensation_mm", 0.0, 0.30, 0.10), 2
+            _number(raw, "elefant_foot_compensation_mm", 0.0, 0.30, fb.get("elefant_foot_compensation_mm", 0.10)), 2
         ),
         "xy_hole_compensation_mm": round(
-            _number(raw, "xy_hole_compensation_mm", -0.20, 0.30, 0.0), 2
+            _number(raw, "xy_hole_compensation_mm", -0.20, 0.30, fb.get("xy_hole_compensation_mm", 0.0)), 2
         ),
         "xy_contour_compensation_mm": round(
-            _number(raw, "xy_contour_compensation_mm", -0.20, 0.20, 0.0), 2
+            _number(raw, "xy_contour_compensation_mm", -0.20, 0.20, fb.get("xy_contour_compensation_mm", 0.0)), 2
         ),
-        "precise_z_height": _bool(raw, "precise_z_height", True),
-        "ironing_type": _choice(raw, "ironing_type", ALLOWED_IRONING_TYPES),
-        "ironing_flow_percent": round(_number(raw, "ironing_flow_percent", 5, 30, 15)),
-        "ironing_speed_mms": round(_number(raw, "ironing_speed_mms", 15, 60, 30)),
-        "infill_density_percent": round(_number(raw, "infill_density_percent", 0, 100) / 5) * 5,
-        "infill_pattern": _choice(raw, "infill_pattern", ALLOWED_INFILL_PATTERNS),
-        "top_surface_pattern": _choice(raw, "top_surface_pattern", ALLOWED_SURFACE_PATTERNS),
+        "precise_z_height": _bool(raw, "precise_z_height", fb.get("precise_z_height", True)),
+        "ironing_type": _choice(raw, "ironing_type", ALLOWED_IRONING_TYPES, fb.get("ironing_type", "no iron")),
+        "ironing_flow_percent": round(_number(raw, "ironing_flow_percent", 5, 30, fb.get("ironing_flow_percent", 15))),
+        "ironing_speed_mms": round(_number(raw, "ironing_speed_mms", 15, 60, fb.get("ironing_speed_mms", 30))),
+        "infill_density_percent": round(_number(raw, "infill_density_percent", 0, 100, fb.get("infill_density_percent", 20)) / 5) * 5,
+        "infill_pattern": _choice(raw, "infill_pattern", ALLOWED_INFILL_PATTERNS, fb.get("infill_pattern", "gyroid")),
+        "top_surface_pattern": _choice(raw, "top_surface_pattern", ALLOWED_SURFACE_PATTERNS, fb.get("top_surface_pattern", "monotonicline")),
         "bottom_surface_pattern": _choice(
-            raw, "bottom_surface_pattern", ALLOWED_SURFACE_PATTERNS, "monotonic"
+            raw, "bottom_surface_pattern", ALLOWED_SURFACE_PATTERNS, fb.get("bottom_surface_pattern", "monotonic")
         ),
         "infill_wall_overlap_percent": round(
-            _number(raw, "infill_wall_overlap_percent", 10, 35, 25 if material == "TPU" else 15)
+            _number(raw, "infill_wall_overlap_percent", 10, 35, fb.get("infill_wall_overlap_percent", 25 if material == "TPU" else 15))
         ),
         "support_enabled": support_enabled,
-        "support_type": _choice(raw, "support_type", ALLOWED_SUPPORT_TYPES),
-        "support_threshold_angle": round(_number(raw, "support_threshold_angle", 25, 60, 45)),
-        "support_on_build_plate_only": _bool(raw, "support_on_build_plate_only", False),
+        "support_type": _choice(raw, "support_type", ALLOWED_SUPPORT_TYPES, fb.get("support_type", "normal")),
+        "support_threshold_angle": round(_number(raw, "support_threshold_angle", 25, 60, fb.get("support_threshold_angle", 45))),
+        "support_on_build_plate_only": _bool(raw, "support_on_build_plate_only", fb.get("support_on_build_plate_only", False)),
         "support_top_z_distance_mm": round(
-            _number(raw, "support_top_z_distance_mm", 0.10, 0.40, mat_defaults["support_top_z_distance_mm"]),
+            _number(raw, "support_top_z_distance_mm", 0.10, 0.40, fb.get("support_top_z_distance_mm", mat_defaults["support_top_z_distance_mm"])),
             2,
         ),
         "support_bottom_z_distance_mm": round(
-            _number(raw, "support_bottom_z_distance_mm", 0.10, 0.40, mat_defaults["support_bottom_z_distance_mm"]),
+            _number(raw, "support_bottom_z_distance_mm", 0.10, 0.40, fb.get("support_bottom_z_distance_mm", mat_defaults["support_bottom_z_distance_mm"])),
             2,
         ),
         "support_interface_top_layers": round(
-            _number(raw, "support_interface_top_layers", 0, 5, 2)
+            _number(raw, "support_interface_top_layers", 0, 5, fb.get("support_interface_top_layers", 2))
         ),
-        "bridge_flow": round(_number(raw, "bridge_flow", 0.80, 1.15, 0.95), 2),
-        "thick_bridges": _bool(raw, "thick_bridges", False),
+        "bridge_flow": round(_number(raw, "bridge_flow", 0.80, 1.15, fb.get("bridge_flow", 0.95)), 2),
+        "thick_bridges": _bool(raw, "thick_bridges", fb.get("thick_bridges", False)),
         "brim_enabled": brim_enabled,
         "brim_type": brim_type,
         "brim_width_mm": brim_width,
         "nozzle_temp_initial_c": round(
-            _number(raw, "nozzle_temp_initial_c", 180, 300, mat_defaults["nozzle_temp_initial_c"])
+            _number(raw, "nozzle_temp_initial_c", nozzle_min, nozzle_max, mat_fb.get("nozzle_temp_initial_c", mat_defaults["nozzle_temp_initial_c"]))
         ),
         "nozzle_temp_c": round(
-            _number(raw, "nozzle_temp_c", 180, 300, mat_defaults["nozzle_temp_c"])
+            _number(raw, "nozzle_temp_c", nozzle_min, nozzle_max, mat_fb.get("nozzle_temp_c", mat_defaults["nozzle_temp_c"]))
         ),
         "bed_temp_initial_c": round(
-            _number(raw, "bed_temp_initial_c", 0, 120, mat_defaults["bed_temp_initial_c"])
+            _number(raw, "bed_temp_initial_c", bed_min, bed_max, mat_fb.get("bed_temp_initial_c", mat_defaults["bed_temp_initial_c"]))
         ),
         "bed_temp_c": round(
-            _number(raw, "bed_temp_c", 0, 120, mat_defaults["bed_temp_c"])
+            _number(raw, "bed_temp_c", bed_min, bed_max, mat_fb.get("bed_temp_c", mat_defaults["bed_temp_c"]))
         ),
         "fan_min_percent": round(
-            _number(raw, "fan_min_percent", 0, 100, mat_defaults["fan_min_percent"])
+            _number(raw, "fan_min_percent", 0, 100, mat_fb.get("fan_min_percent", mat_defaults["fan_min_percent"]))
         ),
         "fan_max_percent": round(
-            _number(raw, "fan_max_percent", 0, 100, mat_defaults["fan_max_percent"])
+            _number(raw, "fan_max_percent", 0, 100, mat_fb.get("fan_max_percent", mat_defaults["fan_max_percent"]))
         ),
         "overhang_fan_percent": round(
-            _number(raw, "overhang_fan_percent", 0, 100, mat_defaults["overhang_fan_percent"])
+            _number(raw, "overhang_fan_percent", 0, 100, mat_fb.get("overhang_fan_percent", mat_defaults["overhang_fan_percent"]))
         ),
         "slow_down_for_layer_cooling": _bool(
-            raw, "slow_down_for_layer_cooling", mat_defaults["slow_down_for_layer_cooling"]
+            raw, "slow_down_for_layer_cooling", mat_fb.get("slow_down_for_layer_cooling", mat_defaults["slow_down_for_layer_cooling"])
         ),
         "max_volumetric_speed_mm3s": round(
-            _number(raw, "max_volumetric_speed_mm3s", 1.5, 35.0, mat_defaults["max_volumetric_speed_mm3s"]),
+            _number(raw, "max_volumetric_speed_mm3s", vol_min, vol_max, mat_fb.get("max_volumetric_speed_mm3s", mat_defaults["max_volumetric_speed_mm3s"])),
             1,
         ),
         "initial_layer_speed_mms": round(
-            _number(raw, "initial_layer_speed_mms", 15, 100, mat_defaults["initial_layer_speed_mms"])
+            _number(raw, "initial_layer_speed_mms", 15, 100, mat_fb.get("initial_layer_speed_mms", mat_defaults["initial_layer_speed_mms"]))
         ),
         "initial_layer_infill_speed_mms": round(
-            _number(raw, "initial_layer_infill_speed_mms", 20, 150, mat_defaults["initial_layer_infill_speed_mms"])
+            _number(raw, "initial_layer_infill_speed_mms", 20, 150, mat_fb.get("initial_layer_infill_speed_mms", mat_defaults["initial_layer_infill_speed_mms"]))
         ),
         "outer_wall_speed_mms": round(
-            _number(raw, "outer_wall_speed_mms", 20, 250, mat_defaults["outer_wall_speed_mms"])
+            _number(raw, "outer_wall_speed_mms", 20, 250, mat_fb.get("outer_wall_speed_mms", mat_defaults["outer_wall_speed_mms"]))
         ),
         "inner_wall_speed_mms": round(
-            _number(raw, "inner_wall_speed_mms", 25, 350, mat_defaults["inner_wall_speed_mms"])
+            _number(raw, "inner_wall_speed_mms", 25, 350, mat_fb.get("inner_wall_speed_mms", mat_defaults["inner_wall_speed_mms"]))
         ),
         "sparse_infill_speed_mms": round(
-            _number(raw, "sparse_infill_speed_mms", 25, 400, mat_defaults["sparse_infill_speed_mms"])
+            _number(raw, "sparse_infill_speed_mms", 25, 400, mat_fb.get("sparse_infill_speed_mms", mat_defaults["sparse_infill_speed_mms"]))
         ),
         "internal_solid_infill_speed_mms": round(
-            _number(raw, "internal_solid_infill_speed_mms", 25, 350, mat_defaults["internal_solid_infill_speed_mms"])
+            _number(raw, "internal_solid_infill_speed_mms", 25, 350, mat_fb.get("internal_solid_infill_speed_mms", mat_defaults["internal_solid_infill_speed_mms"]))
         ),
         "top_surface_speed_mms": round(
-            _number(raw, "top_surface_speed_mms", 20, 200, mat_defaults["top_surface_speed_mms"])
+            _number(raw, "top_surface_speed_mms", 20, 200, mat_fb.get("top_surface_speed_mms", mat_defaults["top_surface_speed_mms"]))
         ),
         "bridge_speed_mms": round(
-            _number(raw, "bridge_speed_mms", 15, 80, mat_defaults["bridge_speed_mms"])
+            _number(raw, "bridge_speed_mms", 15, 80, mat_fb.get("bridge_speed_mms", mat_defaults["bridge_speed_mms"]))
         ),
         "support_speed_mms": round(
-            _number(raw, "support_speed_mms", 25, 220, mat_defaults["support_speed_mms"])
+            _number(raw, "support_speed_mms", 25, 220, mat_fb.get("support_speed_mms", mat_defaults["support_speed_mms"]))
         ),
         "travel_speed_mms": round(
-            _number(raw, "travel_speed_mms", 80, 600, mat_defaults["travel_speed_mms"])
+            _number(raw, "travel_speed_mms", 80, 600, mat_fb.get("travel_speed_mms", mat_defaults["travel_speed_mms"]))
         ),
-        "slow_down_overhangs": _bool(raw, "slow_down_overhangs", True),
-        "bed_x_mm": round(_number(raw, "bed_x_mm", 100.0, 600.0, printer_spec["bed_x_mm"]), 1),
-        "bed_y_mm": round(_number(raw, "bed_y_mm", 100.0, 600.0, printer_spec["bed_y_mm"]), 1),
-        "part_category": _text(raw, "part_category", 60) or _DEFAULTS["part_category"],
-        "rationale": _text(raw, "rationale", 500),
+        "slow_down_overhangs": _bool(raw, "slow_down_overhangs", fb.get("slow_down_overhangs", True)),
+        "bed_x_mm": round(_number(raw, "bed_x_mm", 100.0, 600.0, fb.get("bed_x_mm", printer_spec["bed_x_mm"])), 1),
+        "bed_y_mm": round(_number(raw, "bed_y_mm", 100.0, 600.0, fb.get("bed_y_mm", printer_spec["bed_y_mm"])), 1),
+        "part_category": _text(raw, "part_category", 60) or fb.get("part_category", _DEFAULTS["part_category"]),
+        "rationale": _text(raw, "rationale", 500) or fb.get("rationale", ""),
     }
     if sanitized["fan_min_percent"] > sanitized["fan_max_percent"]:
         sanitized["fan_min_percent"] = sanitized["fan_max_percent"]
@@ -778,20 +877,24 @@ def build_heuristic_print_profile(
     is_mechanical = _has_any_word(combined_text, _MECHANICAL_WORDS)
     is_detail = _has_any_word(combined_text, _DETAIL_WORDS)
     is_enclosure = _has_any_word(combined_text, _ENCLOSURE_WORDS)
-    is_flexible = _has_any_word(combined_text, _FLEXIBLE_WORDS)
     features = _analyze_scad_features(code_snippet, user_context)
 
-    requested_material = material_override.strip().upper()
-    if requested_material in ALLOWED_MATERIALS:
-        material = requested_material
-    elif is_flexible:
+    norm_override = normalize_material(material_override, "")
+    norm_default = normalize_material(default_material, "PLA")
+    wants_tpu = _has_any_word(user_text, ("tpu", "flex", "flexible filament"))
+    wants_petg = _has_any_word(user_text, ("petg", "weatherproof", "outdoor", "uv"))
+    wants_abs = _has_any_word(user_text, ("abs", "asa"))
+
+    if norm_override in ALLOWED_MATERIALS:
+        material = norm_override
+    elif wants_tpu:
         material = "TPU"
-    elif _has_any_word(user_text, _PETG_WORDS) or _has_any_word(code_text, ("petg", "weatherproof")):
+    elif wants_petg:
         material = "PETG"
-    elif default_material.strip().upper() in ALLOWED_MATERIALS:
-        material = default_material.strip().upper()
+    elif wants_abs:
+        material = "ABS" if "abs" in user_text else "ASA"
     else:
-        material = "PLA"
+        material = norm_default
 
     dims = metrics.get("dimensions_mm") or {}
     extents = [float(dims.get(axis, 0.0)) for axis in ("x", "y", "z")]
@@ -970,7 +1073,21 @@ def build_heuristic_print_profile(
         ),
     ]
 
-    is_abrasive = _has_any_word(combined_text, ("cf", "carbon", "gf", "glass", "glow", "wood", "metal"))
+    dx = float(dims.get("x", 0.0))
+    dy = float(dims.get("y", 0.0))
+    bx = float(printer_spec["bed_x_mm"])
+    by = float(printer_spec["bed_y_mm"])
+    exceeds_bed = (dx > bx or dy > by) and (dx > by or dy > bx)
+    if exceeds_bed:
+        reasons.append(
+            f"WARNING: Model footprint ({dx:.1f} × {dy:.1f} mm) exceeds printer build plate ({bx:.0f} × {by:.0f} mm)."
+        )
+
+    is_abrasive = (
+        _has_any_word(combined_text, ("cf", "carbon", "gf", "glass", "glow", "wood", "metal"))
+        or any(tok in (default_material or "").lower() for tok in ("cf", "carbon", "gf", "glass", "glow", "wood", "metal"))
+        or any(tok in (material_override or "").lower() for tok in ("cf", "carbon", "gf", "glass", "glow", "wood", "metal"))
+    )
     if is_abrasive and nozzle_mat in ("Stainless Steel", "Brass"):
         reasons.append(
             f"Caution: Abrasive filament detected with {nozzle_mat} nozzle; a hardened steel nozzle is strongly advised."
@@ -1054,6 +1171,9 @@ def _load_metrics(project_dir: Path) -> dict[str, Any]:
                 and "printability" in metrics
             ):
                 return metrics
+    from agent.tools.cad_scripts.renderer import load_stl
+    from agent.tools.cad_scripts.runner import mesh_metrics
+
     vertices, triangles = load_stl(preview_stl)
     return mesh_metrics(vertices, triangles)
 
@@ -1063,6 +1183,21 @@ def _read_scad(project_dir: Path, limit: int = 4000) -> str:
         return (project_dir / "model.scad").read_text(encoding="utf-8")[:limit]
     except (OSError, UnicodeDecodeError):
         return ""
+
+
+def _clean_user_message_text(text: str) -> str:
+    """Strip synthetic prefixes and auto-generated /print templates from user message text."""
+    trimmed = text.strip()
+    if not trimmed:
+        return ""
+    if "Please analyze the current CAD model and provide a comprehensive 3D printing and slicing recommendation" in trimmed:
+        match = re.search(r"### User Requirements & Specific Notes:\s*(.*?)(?:\s*###|\Z)", trimmed, re.DOTALL)
+        if match:
+            extracted = match.group(1).strip()
+            if extracted and extracted != "Standard production print.":
+                return extracted
+        return ""
+    return trimmed
 
 
 def _read_recent_user_context(project_dir: Path, max_messages: int = 5) -> str:
@@ -1077,17 +1212,22 @@ def _read_recent_user_context(project_dir: Path, max_messages: int = 5) -> str:
                     continue
                 if not isinstance(msg, dict) or msg.get("role") != "user":
                     continue
+                if msg.get("synthetic"):
+                    continue
                 content = msg.get("content")
                 if isinstance(content, str) and content.strip():
-                    user_texts.append(content.strip())
+                    cleaned = _clean_user_message_text(content)
+                    if cleaned:
+                        user_texts.append(cleaned)
                 elif isinstance(content, list):
                     parts = [
-                        str(part.get("text")).strip()
+                        _clean_user_message_text(str(part.get("text")).strip())
                         for part in content
                         if isinstance(part, dict)
                         and isinstance(part.get("text"), str)
                         and str(part.get("text")).strip()
                     ]
+                    parts = [p for p in parts if p]
                     if parts:
                         user_texts.append(" ".join(parts))
     except OSError:
@@ -1096,16 +1236,14 @@ def _read_recent_user_context(project_dir: Path, max_messages: int = 5) -> str:
 
 
 def _prepare_advisor_settings(settings: Any) -> Any:
-    """Return lightweight settings for the AI print advisor (capped effort and token budget)."""
+    """Return lightweight settings for the AI print advisor (none/low effort and token budget)."""
     advisor_settings = settings
     try:
         effort = getattr(advisor_settings, "reasoning_effort", None)
         if effort in ("medium", "high", "xhigh", "max"):
-            advisor_settings = with_reasoning_effort(advisor_settings, "low")
+            advisor_settings = with_reasoning_effort(advisor_settings, "none")
         if is_dataclass(advisor_settings) and hasattr(advisor_settings, "llm_max_completion_tokens"):
-            cur_max = getattr(advisor_settings, "llm_max_completion_tokens", None)
-            capped_max = min(int(cur_max), 2048) if isinstance(cur_max, int) and cur_max > 0 else 2048
-            advisor_settings = replace(advisor_settings, llm_max_completion_tokens=capped_max)
+            advisor_settings = replace(advisor_settings, llm_max_completion_tokens=4096)
     except Exception:  # noqa: BLE001
         return settings
     return advisor_settings
@@ -1134,10 +1272,11 @@ def _publish_advisor_usage(
                 "cache_write_tokens": summary["cache_write_tokens"],
                 "cache_hit_rate": summary["cache_hit_rate"],
                 "cost": cost_val,
-                "total_cost": cost_val,
+                "total_cost": None,
                 "total_prompt_tokens": p_val,
                 "total_completion_tokens": c_val,
                 "total_cached_tokens": cached_tokens,
+                "advisor_call": True,
             },
         )
     except Exception:  # noqa: BLE001
@@ -1189,10 +1328,14 @@ def generate_ai_print_profile(
             model_sha = hashlib.sha256((project_dir / "preview.stl").read_bytes()).hexdigest()
         except OSError:
             model_sha = ""
+    active_provider = getattr(settings, "llm_provider", "") or ""
+    active_model = getattr(settings, f"{active_provider}_model", "") or getattr(settings, "model", "") or ""
     cache_key = hashlib.sha256(
         json.dumps(
             {
-                "schema_v": 2,
+                "schema_v": 3,
+                "provider": active_provider,
+                "model": active_model,
                 "model_sha256": model_sha,
                 "printer": user_printer,
                 "nozzle": user_nozzle,
@@ -1218,12 +1361,17 @@ def generate_ai_print_profile(
                     {**baseline, **cached_entry["profile"]},
                     nozzle_diameter_mm=nozzle_dia,
                     user_printer=user_printer,
+                    fallback_profile=baseline,
+                )
+                cached_advice = (
+                    str(cached_entry.get("advice_markdown") or "").strip()
+                    or _format_heuristic_advice_markdown(
+                        cached_profile, user_printer, user_nozzle
+                    )
                 )
                 return {
                     "profile": cached_profile,
-                    "advice_markdown": _format_heuristic_advice_markdown(
-                        cached_profile, user_printer, user_nozzle
-                    ),
+                    "advice_markdown": cached_advice,
                     "printability": p,
                     "dimensions_mm": dims,
                     "volume_mm3": vol,
@@ -1308,6 +1456,7 @@ def generate_ai_print_profile(
         f"### OpenSCAD Code:\n```scad\n{code_text[:2000]}\n```\n"
     )
 
+    ai_error: str | None = None
     try:
         from agent.llm_base import create_llm_client
 
@@ -1338,13 +1487,24 @@ def generate_ai_print_profile(
         if isinstance(content, str) and content.strip():
             json_block = _extract_json_block(content)
             if json_block and isinstance(json_block, dict):
-                merged_raw = {**baseline, **json_block}
+                ai_mat_raw = json_block.get("material")
+                ai_mat = normalize_material(str(ai_mat_raw), baseline["material"]) if ai_mat_raw else baseline["material"]
+                if ai_mat != baseline["material"]:
+                    new_mat_defaults = _material_thermal_and_flow_defaults(
+                        ai_mat, nozzle_dia, printer_spec["speed_tier"], baseline["layer_height_mm"]
+                    )
+                    effective_baseline = {**baseline, **new_mat_defaults, "material": ai_mat}
+                else:
+                    effective_baseline = baseline
+
+                merged_raw = {**effective_baseline, **json_block}
                 if user_printer:
                     merged_raw["target_printer"] = user_printer
                 ai_profile = sanitize_print_profile(
                     merged_raw,
                     nozzle_diameter_mm=nozzle_dia,
                     user_printer=user_printer,
+                    fallback_profile=effective_baseline,
                 )
                 ai_advice = json_block.get("advice_markdown")
                 final_advice = (
@@ -1361,6 +1521,7 @@ def generate_ai_print_profile(
                             {
                                 "cache_key": cache_key,
                                 "profile": ai_profile,
+                                "advice_markdown": final_advice,
                             },
                             indent=2,
                         ),
@@ -1382,13 +1543,17 @@ def generate_ai_print_profile(
                     "source": "ai",
                     "cached": False,
                 }
+            ai_error = "AI response did not contain a valid JSON print profile."
+        else:
+            ai_error = "AI response was empty."
     except Exception as exc:  # noqa: BLE001
         if stop_event is not None and stop_event.is_set():
             raise
         _LOG.warning("AI 3MF profile generation failed; falling back to heuristic: %s", exc)
+        ai_error = str(exc)
 
     advice_md = _format_heuristic_advice_markdown(baseline, user_printer, user_nozzle)
-    return {
+    fallback_result: dict[str, Any] = {
         "profile": baseline,
         "advice_markdown": advice_md,
         "printability": p,
@@ -1402,6 +1567,10 @@ def generate_ai_print_profile(
         "source": "heuristic",
         "cached": False,
     }
+    if ai_error:
+        fallback_result["fallback"] = True
+        fallback_result["ai_error"] = ai_error
+    return fallback_result
 
 
 def recommend_print_profile(

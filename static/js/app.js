@@ -668,7 +668,10 @@ function updateUsagePill(data = {}) {
   const completion = Number(data.completion_tokens);
   const cached = Number(data.cached_tokens || 0);
   const cost = data.cost != null && Number.isFinite(Number(data.cost)) ? Number(data.cost) : null;
-  const totalCost = data.total_cost != null && Number.isFinite(Number(data.total_cost)) ? Number(data.total_cost) : null;
+  let totalCost = data.total_cost != null && Number.isFinite(Number(data.total_cost)) ? Number(data.total_cost) : null;
+  if (totalCost == null && lastUsage?.totalCost != null) {
+    totalCost = lastUsage.totalCost + (cost || 0);
+  }
   const hitRate = data.cache_hit_rate != null && Number.isFinite(Number(data.cache_hit_rate))
     ? Number(data.cache_hit_rate)
     : (prompt > 0 ? (cached / prompt) * 100 : 0);
@@ -1761,13 +1764,17 @@ downloadModelBtn?.addEventListener('click', async () => {
     `;
   }
 
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 150000);
+
   try {
     const exportUrl = `/api/projects/${encodeURIComponent(currentProject)}/export?format=${encodeURIComponent(format)}`;
     const options = is3mf
-      ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ auto_ai: true }) }
-      : { method: 'GET' };
+      ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ auto_ai: true }), signal: controller.signal }
+      : { method: 'GET', signal: controller.signal };
 
     const res = await fetch(exportUrl, options);
+    clearTimeout(timeoutId);
     if (!res.ok) {
       const err = await res.json().catch(() => ({ error: 'Export failed' }));
       throw new Error(err.error || res.statusText);
@@ -1775,7 +1782,9 @@ downloadModelBtn?.addEventListener('click', async () => {
     const blob = await res.blob();
     triggerBlobDownload(blob, `${currentProject}.${format}`);
   } catch (error) {
-    addMessage(`${is3mf ? '3MF ' : ''}Export failed: ${error.message}`, 'error');
+    clearTimeout(timeoutId);
+    const msg = error.name === 'AbortError' ? 'Export timed out after 150 seconds.' : error.message;
+    addMessage(`${is3mf ? '3MF ' : ''}Export failed: ${msg}`, 'error');
   } finally {
     downloadModelBtn.disabled = !previewProject;
     if (is3mf) {
