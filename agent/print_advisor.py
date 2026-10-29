@@ -1295,9 +1295,10 @@ def generate_ai_print_profile(
 ) -> dict[str, Any]:
     """Query the active LLM to configure a complete 3MF slicer profile."""
     metrics = _load_metrics(project_dir)
-    user_printer = getattr(settings, "user_printer", "") or ""
-    user_nozzle = getattr(settings, "user_nozzle", "") or ""
-    user_filament = getattr(settings, "user_filament", "PLA") or "PLA"
+    user_printer = (getattr(settings, "user_printer", "") or "").strip()
+    user_nozzle = (getattr(settings, "user_nozzle", "") or "").strip()
+    user_filament = (getattr(settings, "user_filament", "PLA") or "PLA").strip()
+    user_additional_info = " ".join(str(getattr(settings, "user_additional_info", "") or "").split()).strip()
     nozzle_spec = parse_nozzle_spec(user_nozzle)
     nozzle_dia = nozzle_spec["diameter_mm"]
 
@@ -1333,13 +1334,14 @@ def generate_ai_print_profile(
     cache_key = hashlib.sha256(
         json.dumps(
             {
-                "schema_v": 3,
+                "schema_v": 4,
                 "provider": active_provider,
                 "model": active_model,
                 "model_sha256": model_sha,
                 "printer": user_printer,
                 "nozzle": user_nozzle,
                 "filament": user_filament,
+                "additional_info": user_additional_info,
                 "priority": priority,
                 "material_override": material_override,
                 "extra_context": extra_context,
@@ -1379,6 +1381,7 @@ def generate_ai_print_profile(
                         "printer": user_printer,
                         "nozzle": user_nozzle,
                         "filament": user_filament,
+                        "additional_info": user_additional_info,
                     },
                     "source": "ai",
                     "cached": True,
@@ -1437,11 +1440,18 @@ def generate_ai_print_profile(
         "}"
     )
 
+    hw_lines = [
+        f"- 3D Printer: {user_printer or 'Standard FDM'} (Bed: {baseline['bed_x_mm']:.0f}×{baseline['bed_y_mm']:.0f} mm)",
+        f"- Nozzle: {user_nozzle or '0.4 mm'}",
+        f"- Default Filament: {user_filament}",
+    ]
+    if user_additional_info:
+        hw_lines.append(f"- Additional Instructions: {user_additional_info}")
+    hw_section = "\n".join(hw_lines)
+
     user_prompt = (
-        f"### Target Hardware:\n"
-        f"- 3D Printer: {user_printer or 'Standard FDM'} (Bed: {baseline['bed_x_mm']:.0f}×{baseline['bed_y_mm']:.0f} mm)\n"
-        f"- Nozzle: {user_nozzle or '0.4 mm'}\n"
-        f"- Default Filament: {user_filament}\n\n"
+        f"### Target Hardware & Setup:\n"
+        f"{hw_section}\n\n"
         f"### Exact Model Telemetry:\n"
         f"- Dimensions: {dims.get('x', 0):.1f} × {dims.get('y', 0):.1f} × {dims.get('z', 0):.1f} mm\n"
         f"- Volume: {vol:.1f} mm³ | Surface Area: {float(p.get('surface_area_mm2', 0)):.1f} mm²\n"
@@ -1539,6 +1549,7 @@ def generate_ai_print_profile(
                         "printer": user_printer,
                         "nozzle": user_nozzle,
                         "filament": user_filament,
+                        "additional_info": user_additional_info,
                     },
                     "source": "ai",
                     "cached": False,
@@ -1563,6 +1574,7 @@ def generate_ai_print_profile(
             "printer": user_printer,
             "nozzle": user_nozzle,
             "filament": user_filament,
+            "additional_info": user_additional_info,
         },
         "source": "heuristic",
         "cached": False,
@@ -1600,9 +1612,14 @@ def recommend_print_profile(
         )
 
     metrics = _load_metrics(project_dir)
-    user_printer = getattr(settings, "user_printer", "") if settings else ""
-    user_nozzle = getattr(settings, "user_nozzle", "") if settings else ""
-    user_filament = getattr(settings, "user_filament", "PLA") if settings else "PLA"
+    user_printer = (getattr(settings, "user_printer", "") or "").strip() if settings else ""
+    user_nozzle = (getattr(settings, "user_nozzle", "") or "").strip() if settings else ""
+    user_filament = (getattr(settings, "user_filament", "PLA") or "PLA").strip() if settings else "PLA"
+    user_additional_info = (
+        " ".join(str(getattr(settings, "user_additional_info", "") or "").split()).strip()
+        if settings
+        else ""
+    )
 
     profile = build_heuristic_print_profile(
         metrics,
@@ -1626,6 +1643,7 @@ def recommend_print_profile(
             "printer": user_printer,
             "nozzle": user_nozzle,
             "filament": user_filament,
+            "additional_info": user_additional_info,
         },
         "source": "heuristic",
         "cached": False,
@@ -1651,12 +1669,20 @@ def format_print_command_prompt(
 
     hw_lines = []
     if settings:
-        if getattr(settings, "user_printer", ""):
-            hw_lines.append(f"- Target 3D Printer: {settings.user_printer}")
-        if getattr(settings, "user_nozzle", ""):
-            hw_lines.append(f"- Nozzle: {settings.user_nozzle}")
-        if getattr(settings, "user_filament", ""):
-            hw_lines.append(f"- Default Filament: {settings.user_filament}")
+        printer = str(getattr(settings, "user_printer", "") or "").strip()
+        nozzle = str(getattr(settings, "user_nozzle", "") or "").strip()
+        filament = str(getattr(settings, "user_filament", "") or "").strip()
+        additional_info = " ".join(
+            str(getattr(settings, "user_additional_info", "") or "").split()
+        ).strip()
+        if printer:
+            hw_lines.append(f"- Target 3D Printer: {printer}")
+        if nozzle:
+            hw_lines.append(f"- Nozzle: {nozzle}")
+        if filament:
+            hw_lines.append(f"- Default Filament: {filament}")
+        if additional_info:
+            hw_lines.append(f"- Additional Instructions: {additional_info}")
     hw_block = ("### User Hardware Setup:\n" + "\n".join(hw_lines) + "\n\n") if hw_lines else ""
 
     return (

@@ -98,3 +98,4 @@ user:
   printer: ""                   # 3D printer / device model (e.g. Bambu Lab A1, Prusa MK4, Ender 3)
   nozzle: "0.4 mm"              # Nozzle type & diameter (e.g. Stainless Steel 0.6 mm, Hardened Steel 0.4 mm, Brass 0.4 mm)
   filament: PLA                 # Favorite filament material (PLA, PETG, ABS, ASA, TPU, etc.)
+  additional_info: ""           # Extra instructions / setup notes (e.g. textured PEI sheet, enclosed chamber, custom tolerances)

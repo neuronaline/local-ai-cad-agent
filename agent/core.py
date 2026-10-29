@@ -1770,6 +1770,7 @@ class AgentRunner:
                 user_printer=eff_settings.user_printer,
                 user_nozzle=eff_settings.user_nozzle,
                 user_filament=eff_settings.user_filament,
+                user_additional_info=eff_settings.user_additional_info,
             ),
             *history,
         ]
@@ -1784,6 +1785,7 @@ class AgentRunner:
         user_printer: str = "",
         user_nozzle: str = "",
         user_filament: str = "",
+        user_additional_info: str = "",
     ) -> dict[str, str]:
         """Provide initial workspace state after the cacheable system prefix.
 
@@ -1802,6 +1804,7 @@ class AgentRunner:
             user_printer=user_printer,
             user_nozzle=user_nozzle,
             user_filament=user_filament,
+            user_additional_info=user_additional_info,
         )
         # Gemini normalizes all system messages into an immutable instruction.
         # Keeping workspace state in a later user message lets its

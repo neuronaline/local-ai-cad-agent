@@ -175,6 +175,7 @@ class Settings:
     user_printer: str = ""
     user_nozzle: str = ""
     user_filament: str = "PLA"
+    user_additional_info: str = ""
     # ── Configured model catalog ──
     available_models: tuple[ModelOption, ...] = ()
 
@@ -498,7 +499,11 @@ def load_settings(project_root: Path | None = None) -> Settings:
     viewer = config.get("viewer") or {}
     viewer_grid = viewer.get("grid") or {} if isinstance(viewer, dict) else {}
     user_cfg = config.get("user") or {}
-    _reject_unknown(user_cfg, {"printer", "nozzle", "filament"}, "user")
+    _reject_unknown(
+        user_cfg,
+        {"printer", "nozzle", "filament", "additional_info"},
+        "user",
+    )
     _reject_unknown(
         ollama,
         {"base_url", "model", "models", "timeout_seconds", "reasoning_effort", "think"},
@@ -739,6 +744,7 @@ def load_settings(project_root: Path | None = None) -> Settings:
         user_printer=str(user_cfg.get("printer") or "").strip(),
         user_nozzle=str(user_cfg.get("nozzle") or "").strip(),
         user_filament=str(user_cfg.get("filament") or "PLA").strip() or "PLA",
+        user_additional_info=str(user_cfg.get("additional_info") or "").strip(),
         available_models=tuple(catalog),
     )
     # Activate each provider's default model (its effort/routing override the

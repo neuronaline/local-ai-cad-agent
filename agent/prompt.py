@@ -51,7 +51,8 @@ _HARDWARE_AND_MATERIAL_RULES = """\
   * ABS / ASA: account for thermal shrinkage; use radial clearance 0.25-0.35 mm, min wall 1.6-2.0 mm, and filleted internal corners to prevent warping/delamination.
   * TPU / Flex: use 0.10-0.20 mm press-fit clearance and >= 2.0 mm walls unless designing a thin living hinge or gasket.
 - Nozzle-aware wall & feature sizing: scale minimum wall thicknesses and fine features to multiples of the nozzle diameter / line width when specified in <user_preferences> (e.g. for a 0.6 mm nozzle with ~0.62-0.65 mm line width, design load-bearing walls >= 1.8 mm (3 perimeters) or thin walls >= 1.25 mm (2 perimeters), avoid thin features < 0.65 mm, and account for coarser Z layer steps of 0.20-0.36 mm on vertical clearances and shallow slopes).
-- Printer build volume: keep single parts and plate_layout arrangements within the target printer's build envelope when specified."""
+- Printer build volume: keep single parts and plate_layout arrangements within the target printer's build envelope when specified.
+- Additional user instructions: follow any custom instructions, tolerances, or printer setup details specified under <user_preferences>."""
 
 _OPERATIONAL_RULES = """\
 - Edit only the active project's model.scad.
@@ -239,6 +240,7 @@ def format_project_state(
     user_printer: str = "",
     user_nozzle: str = "",
     user_filament: str = "",
+    user_additional_info: str = "",
 ) -> str:
     """Format the workspace state message appended after the cacheable system prefix."""
     if not exists:
@@ -253,7 +255,8 @@ def format_project_state(
     printer_clean = clean_preference_string(user_printer)
     nozzle_clean = clean_preference_string(user_nozzle)
     filament_clean = clean_preference_string(user_filament)
-    if printer_clean or nozzle_clean or filament_clean:
+    additional_clean = clean_preference_string(user_additional_info, max_len=1000)
+    if printer_clean or nozzle_clean or filament_clean or additional_clean:
         pref_lines = ["<user_preferences>"]
         if printer_clean:
             pref_lines.append(f"Target 3D Printer: {printer_clean}")
@@ -261,6 +264,8 @@ def format_project_state(
             pref_lines.append(f"Nozzle Configuration: {nozzle_clean}")
         if filament_clean:
             pref_lines.append(f"Default Filament Material: {filament_clean}")
+        if additional_clean:
+            pref_lines.append(f"Additional Instructions: {additional_clean}")
         pref_lines.append(
             "Apply the matching printer build volume, nozzle line-width/wall multiples, and material clearances "
             "from <hardware_and_material_rules> unless the user's message explicitly requests a different material or configuration."
