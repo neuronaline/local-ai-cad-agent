@@ -5,9 +5,12 @@ for Google Cloud Vertex AI without external vendor SDK dependencies.
 """
 from __future__ import annotations
 
+import datetime
 import logging
 import os
+from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
 import threading
 import time
@@ -15,8 +18,76 @@ import time
 _LOG = logging.getLogger(__name__)
 
 # Token validity: GCP access tokens are typically valid for 3600 seconds (1 hour).
-# Cache for 50 minutes (3000 seconds) to ensure safety against edge-of-expiry requests.
-_TOKEN_CACHE_TTL_SECONDS = 3000.0
+# Default fallback TTL if database inspection is unavailable.
+_DEFAULT_TOKEN_CACHE_TTL_SECONDS = 300.0
+# Refresh before Google token expiry window to prevent in-flight token expiry.
+_EXPIRY_SAFETY_BUFFER_SECONDS = 90.0
+
+
+def _get_gcloud_config_dir() -> Path:
+    config_env = os.environ.get("CLOUDSDK_CONFIG")
+    if config_env and os.path.isdir(config_env):
+        return Path(config_env)
+    return Path.home() / ".config" / "gcloud"
+
+
+def _purge_access_tokens_db(account_id: str | None = None) -> None:
+    """Purge cached access tokens from gcloud's local SQLite store.
+
+    This ensures subsequent `gcloud auth print-access-token` calls
+    contact Google OAuth servers rather than returning stale tokens.
+    """
+    try:
+        db_path = _get_gcloud_config_dir() / "access_tokens.db"
+        if not db_path.is_file():
+            return
+        with sqlite3.connect(str(db_path), timeout=2.0) as conn:
+            cur = conn.cursor()
+            if account_id:
+                cur.execute("DELETE FROM access_tokens WHERE account_id = ?", (account_id,))
+            else:
+                cur.execute("DELETE FROM access_tokens")
+            conn.commit()
+    except Exception as err:
+        _LOG.debug("Failed to purge access_tokens.db: %s", err)
+
+
+def _get_db_token_remaining_seconds(target_token: str | None = None) -> float | None:
+    """Return remaining lifetime seconds for a token according to gcloud's SQLite cache."""
+    try:
+        db_path = _get_gcloud_config_dir() / "access_tokens.db"
+        if not db_path.is_file():
+            return None
+        with sqlite3.connect(str(db_path), timeout=2.0) as conn:
+            cur = conn.cursor()
+            if target_token:
+                row = cur.execute(
+                    "SELECT token_expiry FROM access_tokens WHERE access_token = ?",
+                    (target_token,),
+                ).fetchone()
+            else:
+                row = cur.execute(
+                    "SELECT token_expiry FROM access_tokens ORDER BY token_expiry DESC LIMIT 1"
+                ).fetchone()
+            if not row or not row[0]:
+                return None
+            expiry_val = row[0]
+            if isinstance(expiry_val, str):
+                try:
+                    expiry_dt = datetime.datetime.fromisoformat(expiry_val)
+                except ValueError:
+                    expiry_dt = datetime.datetime.strptime(
+                        expiry_val.split(".")[0], "%Y-%m-%d %H:%M:%S"
+                    )
+            elif isinstance(expiry_val, datetime.datetime):
+                expiry_dt = expiry_val
+            else:
+                return None
+            now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+            return (expiry_dt - now_utc).total_seconds()
+    except Exception as err:
+        _LOG.debug("Failed to inspect token expiry in access_tokens.db: %s", err)
+        return None
 
 
 class GCloudAuthManager:
@@ -30,10 +101,16 @@ class GCloudAuthManager:
         self._cached_location: str | None = None
 
     def invalidate_token(self) -> None:
-        """Clear cached access token, forcing subsequent requests to fetch a fresh token."""
+        """Clear cached access token in memory and on disk.
+
+        Purging `access_tokens.db` forces `gcloud auth print-access-token`
+        to request a brand-new token from Google OAuth servers instead of
+        re-reading stale credentials.
+        """
         with self._lock:
             self._cached_token = None
             self._token_expiry_monotonic = 0.0
+            _purge_access_tokens_db()
 
     def get_access_token(self, *, force_refresh: bool = False) -> str:
         """Retrieve a valid Google Cloud OAuth2 access token.
@@ -49,6 +126,12 @@ class GCloudAuthManager:
                 and now < self._token_expiry_monotonic
             ):
                 return self._cached_token
+
+            # If forced, or if cached SQLite token on disk is within the safety buffer, purge it
+            # so gcloud is guaranteed to fetch a fresh token from Google OAuth servers.
+            db_remaining = _get_db_token_remaining_seconds(self._cached_token)
+            if force_refresh or (db_remaining is not None and db_remaining <= _EXPIRY_SAFETY_BUFFER_SECONDS):
+                _purge_access_tokens_db()
 
             gcloud_bin = shutil.which("gcloud")
             if not gcloud_bin:
@@ -96,8 +179,14 @@ class GCloudAuthManager:
                     "Please run 'gcloud auth login' in your terminal."
                 )
 
+            remaining = _get_db_token_remaining_seconds(token)
+            ttl = (
+                max(15.0, remaining - _EXPIRY_SAFETY_BUFFER_SECONDS)
+                if remaining is not None
+                else _DEFAULT_TOKEN_CACHE_TTL_SECONDS
+            )
             self._cached_token = token
-            self._token_expiry_monotonic = time.monotonic() + _TOKEN_CACHE_TTL_SECONDS
+            self._token_expiry_monotonic = time.monotonic() + ttl
             return token
 
     def get_project(self, configured_project: str | None = None) -> str:

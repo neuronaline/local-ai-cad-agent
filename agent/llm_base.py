@@ -1837,6 +1837,10 @@ class BaseLLMClient:
                             raise RuntimeError(
                                 f"{self._provider_label} {response.status_code}: {body_preview}"
                             )
+                        if response.status_code == 401:
+                            raise RuntimeError(
+                                f"{self._provider_label} 401 Unauthorized: Authentication failed or credentials expired. Please check your credentials."
+                            )
                     response.raise_for_status()
                     duration_ms = round((time.perf_counter() - call_start) * 1000, 2)
                     if log_payload:

@@ -12,7 +12,14 @@ import logging
 from typing import Any
 
 from agent.gcloud_auth import gcloud_auth
-from agent.llm_base import ChatCompletionsClient, is_continuation_messages, post_with_cancel
+from agent.llm_base import (
+    ChatCompletionsClient,
+    RequestCancelled,
+    _response_text,
+    is_continuation_messages,
+    post_with_cancel,
+    sleep_with_cancel,
+)
 from agent.settings import Settings
 
 _LOG = logging.getLogger(__name__)
@@ -133,7 +140,7 @@ class VertexClient(ChatCompletionsClient):
         if eff != "none":
             if not is_gemini_2:
                 level_map = {
-                    "minimal": "MINIMAL" if "flash" in model_lower else "LOW",
+                    "minimal": "LOW",
                     "low": "LOW",
                     "medium": "MEDIUM",
                     "high": "HIGH",
@@ -141,8 +148,6 @@ class VertexClient(ChatCompletionsClient):
                     "max": "HIGH",
                 }
                 level = level_map.get(eff, "LOW")
-                if "gemini-4" in model_lower and level == "MINIMAL":
-                    level = "LOW"
                 thinking_config["thinking_level"] = level
             else:
                 budget_map = {
@@ -156,11 +161,7 @@ class VertexClient(ChatCompletionsClient):
                 thinking_config["thinking_budget"] = budget_map.get(eff, 2048)
         elif eff == "none":
             if not is_gemini_2:
-                thinking_config["thinking_level"] = (
-                    "MINIMAL"
-                    if ("flash" in model_lower and "gemini-4" not in model_lower)
-                    else "LOW"
-                )
+                thinking_config["thinking_level"] = "LOW"
             elif "pro" not in model_lower:
                 thinking_config["thinking_budget"] = 0
         payload["extra_body"] = {"google": {"thinking_config": thinking_config}}
@@ -196,8 +197,16 @@ class VertexClient(ChatCompletionsClient):
                 response.close()
             except Exception:
                 pass
+            response = None
             gcloud_auth.invalidate_token()
-            if not (self.stop_event and self.stop_event.is_set()):
+            for auth_attempt in range(1, 3):
+                if self.stop_event and self.stop_event.is_set():
+                    raise RequestCancelled("LLM request cancelled.")
+                # Brief backoff for token issuance and Google Cloud edge API gateway propagation
+                backoff = 0.5 * auth_attempt
+                sleep_with_cancel(backoff, self.stop_event)
+                if self.stop_event and self.stop_event.is_set():
+                    raise RequestCancelled("LLM request cancelled.")
                 try:
                     fresh_token = gcloud_auth.get_access_token(force_refresh=True)
                     active_headers = {**headers, "Authorization": f"Bearer {fresh_token}"}
@@ -208,10 +217,33 @@ class VertexClient(ChatCompletionsClient):
                         timeout_seconds=timeout,
                         stop_event=self.stop_event,
                     )
-                    if getattr(response, "status_code", None) == 401:
-                        gcloud_auth.invalidate_token()
-                except Exception:
+                    if getattr(response, "status_code", None) != 401:
+                        break
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
                     gcloud_auth.invalidate_token()
+                except RequestCancelled:
+                    raise
+                except Exception as err:
+                    gcloud_auth.invalidate_token()
+                    _LOG.debug("Auth recovery attempt %d failed: %s", auth_attempt, err)
+                    if auth_attempt == 2 and response is None:
+                        raise
+
+            if getattr(response, "status_code", None) == 401:
+                body = _response_text(response)[:500]
+                try:
+                    response.close()
+                except Exception:
+                    pass
+                project = self._resolved_project()
+                err_detail = f": {body}" if body else ""
+                raise RuntimeError(
+                    f"Vertex AI authentication failed (401 Unauthorized) for project '{project}'{err_detail}. "
+                    "Please verify your credentials using 'gcloud auth login' and check project permissions."
+                )
 
         # Many Gemini 3+ preview/frontier models on Vertex AI are provisioned exclusively
         # on the 'global' endpoint. If a regional endpoint returns 404 NOT_FOUND,
