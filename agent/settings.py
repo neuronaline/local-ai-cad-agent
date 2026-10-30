@@ -149,7 +149,7 @@ class Settings:
     vertex_reasoning_effort: str | None = None
     # ── end provider selection ──
     show_info_messages: bool = True
-    agent_tool_call_limit: int = 25
+    agent_tool_call_limit: int = 12
     revision_retention_count: int = 0  # 0 = unlimited, >0 = keep at most N revisions
     agent_debug_log_tool_errors: bool = False
     # When True, every agent run writes a redacted, append-only JSONL
@@ -725,7 +725,7 @@ def load_settings(project_root: Path | None = None) -> Settings:
         vertex_timeout_seconds=_validate_timeout_seconds(vertex.get("timeout_seconds"), "vertex.timeout_seconds"),
         vertex_reasoning_effort=provider_defaults["vertex"].reasoning_effort,
         show_info_messages=_strict_bool(ui.get("show_info_messages", True), "ui.show_info_messages"),
-        agent_tool_call_limit=_positive_int(agent.get("tool_call_limit", 25), "agent.tool_call_limit"),
+        agent_tool_call_limit=_positive_int(agent.get("tool_call_limit", 12), "agent.tool_call_limit"),
         revision_retention_count=_non_negative_int(agent.get("revision_retention_count", 0), "agent.revision_retention_count"),
         agent_debug_log_tool_errors=agent_debug_log_tool_errors,
         agent_log_tool_activity=agent_log_tool_activity,

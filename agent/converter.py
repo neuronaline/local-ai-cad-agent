@@ -65,9 +65,11 @@ def stl_to_obj(stl_path: Path) -> str:
 PRUSA_CONFIG_ENTRY = "Metadata/Slic3r_PE.config"
 BAMBU_CONFIG_ENTRY = "Metadata/project_settings.config"
 MODEL_SETTINGS_ENTRY = "Metadata/model_settings.config"
+SLICE_INFO_ENTRY = "Metadata/slice_info.config"
 PROFILE_ENTRY = "Metadata/cad_agent_print_profile.json"
 THUMBNAIL_ENTRY = "Metadata/thumbnail.png"
 _THUMBNAIL_REL_TYPE = "http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail"
+_BAMBU_STUDIO_VERSION = "02.08.02.61"
 
 _PRUSA_INFILL_MAP: dict[str, str] = {
     "gyroid": "gyroid",
@@ -79,7 +81,6 @@ _PRUSA_INFILL_MAP: dict[str, str] = {
     "crosshatch": "gyroid",
     "rectilinear": "rectilinear",
     "zig-zag": "rectilinear",
-    "zigzag": "rectilinear",
     "concentric": "concentric",
     "lightning": "lightning",
 }
@@ -88,11 +89,11 @@ _PRUSA_SURFACE_MAP: dict[str, str] = {
     "monotonic": "monotonic",
     "concentric": "concentric",
     "rectilinear": "rectilinear",
+    "zig-zag": "rectilinear",
 }
 _PRUSA_SEAM_MAP: dict[str, str] = {
     "aligned": "aligned",
     "back": "rear",
-    "rear": "rear",
     "random": "random",
     "nearest": "nearest",
 }
@@ -107,7 +108,6 @@ _BAMBU_INFILL_MAP: dict[str, str] = {
     "crosshatch": "crosshatch",
     "rectilinear": "zig-zag",
     "zig-zag": "zig-zag",
-    "zigzag": "zig-zag",
     "concentric": "concentric",
     "lightning": "lightning",
 }
@@ -115,31 +115,35 @@ _BAMBU_SURFACE_MAP: dict[str, str] = {
     "monotonicline": "monotonicline",
     "monotonic": "monotonic",
     "concentric": "concentric",
-    "rectilinear": "rectilinear",
+    "rectilinear": "zig-zag",
+    "zig-zag": "zig-zag",
 }
 _BAMBU_SEAM_MAP: dict[str, str] = {
     "aligned": "aligned",
     "back": "back",
-    "rear": "back",
     "random": "random",
     "nearest": "nearest",
 }
 _BAMBU_IRONING_MAP: dict[str, str] = {
     "no iron": "no ironing",
-    "no ironing": "no ironing",
-    "none": "no ironing",
     "top": "top",
     "topmost": "topmost",
-    "solid": "solid",
 }
 _BAMBU_WALL_SEQUENCE_MAP: dict[str, str] = {
     "inner/outer": "inner wall/outer wall",
     "outer/inner": "outer wall/inner wall",
     "inner/outer/inner": "inner-outer-inner wall",
-    "inner wall/outer wall": "inner wall/outer wall",
-    "outer wall/inner wall": "outer wall/inner wall",
-    "inner-outer-inner wall": "inner-outer-inner wall",
 }
+
+
+def _num_str(val: Any) -> str:
+    try:
+        fval = float(val)
+        if abs(fval) < 1e-9:
+            return "0"
+        return f"{round(fval, 4):g}"
+    except (TypeError, ValueError):
+        return str(val)
 
 
 def build_prusa_slicer_config(profile: dict[str, Any]) -> str:
@@ -154,7 +158,12 @@ def build_prusa_slicer_config(profile: dict[str, Any]) -> str:
     brim_enabled = bool(profile.get("brim_enabled"))
     brim_width = profile.get("brim_width_mm", 6) if brim_enabled else 0
     support = 1 if profile.get("support_enabled") else 0
-    material = str(profile.get("material", "PLA"))
+    material = str(profile.get("material", "PLA")).upper()
+    bx = int(round(float(profile.get("bed_x_mm", 256.0))))
+    by = int(round(float(profile.get("bed_y_mm", 256.0))))
+    bz = int(round(float(profile.get("bed_z_mm", min(bx, by)))))
+    def_lw = profile.get("line_width_mm", round(nozzle_dia * 1.05, 2))
+
     infill_pat = _PRUSA_INFILL_MAP.get(
         str(profile.get("infill_pattern", "gyroid")), "gyroid"
     )
@@ -166,43 +175,24 @@ def build_prusa_slicer_config(profile: dict[str, Any]) -> str:
     )
     raw_ironing = str(profile.get("ironing_type", "no iron")).strip().lower()
     ironing_on = 0 if raw_ironing in ("no iron", "no ironing", "none", "off", "0", "") else 1
-    if raw_ironing == "topmost":
-        prusa_ironing_type = "topmost"
-    elif raw_ironing in ("top", "alltop"):
-        prusa_ironing_type = "top"
-    elif raw_ironing == "solid":
-        prusa_ironing_type = "solid"
-    else:
-        prusa_ironing_type = "top"
+    prusa_ironing_type = "topmost" if raw_ironing == "topmost" else "top"
     seam_pos = _PRUSA_SEAM_MAP.get(str(profile.get("seam_position", "aligned")), "aligned")
     wall_seq = str(profile.get("wall_sequence", "inner/outer"))
 
     settings = {
-        "nozzle_diameter": nozzle_dia,
-        "layer_height": lh,
-        "first_layer_height": first_lh,
-        "extrusion_width": profile.get("line_width_mm", round(nozzle_dia * 1.05, 2)),
-        "first_layer_extrusion_width": profile.get(
-            "initial_layer_line_width_mm", round(nozzle_dia * 1.25, 2)
-        ),
-        "external_perimeter_extrusion_width": profile.get(
-            "outer_wall_line_width_mm", round(nozzle_dia * 1.05, 2)
-        ),
-        "perimeter_extrusion_width": profile.get(
-            "inner_wall_line_width_mm", round(nozzle_dia * 1.12, 2)
-        ),
-        "top_infill_extrusion_width": profile.get(
-            "top_surface_line_width_mm", round(nozzle_dia * 1.00, 2)
-        ),
-        "infill_extrusion_width": profile.get(
-            "sparse_infill_line_width_mm", round(nozzle_dia * 1.12, 2)
-        ),
-        "solid_infill_extrusion_width": profile.get(
-            "internal_solid_infill_line_width_mm", round(nozzle_dia * 1.05, 2)
-        ),
-        "support_material_extrusion_width": profile.get(
-            "support_line_width_mm", round(nozzle_dia * 0.95, 2)
-        ),
+        "nozzle_diameter": _num_str(nozzle_dia),
+        "min_layer_height": _num_str(round(max(0.04, nozzle_dia * 0.20), 2)),
+        "max_layer_height": _num_str(round(min(0.80, nozzle_dia * 0.70), 2)),
+        "layer_height": _num_str(lh),
+        "first_layer_height": _num_str(first_lh),
+        "extrusion_width": _num_str(def_lw),
+        "first_layer_extrusion_width": _num_str(profile.get("initial_layer_line_width_mm", def_lw)),
+        "external_perimeter_extrusion_width": _num_str(profile.get("outer_wall_line_width_mm", def_lw)),
+        "perimeter_extrusion_width": _num_str(profile.get("inner_wall_line_width_mm", def_lw)),
+        "top_infill_extrusion_width": _num_str(profile.get("top_surface_line_width_mm", def_lw)),
+        "infill_extrusion_width": _num_str(profile.get("sparse_infill_line_width_mm", def_lw)),
+        "solid_infill_extrusion_width": _num_str(profile.get("internal_solid_infill_line_width_mm", def_lw)),
+        "support_material_extrusion_width": _num_str(profile.get("support_line_width_mm", def_lw)),
         "perimeters": profile.get("wall_loops", 3),
         "top_solid_layers": profile.get("top_shell_layers", 4),
         "bottom_solid_layers": profile.get("bottom_shell_layers", 4),
@@ -210,8 +200,8 @@ def build_prusa_slicer_config(profile: dict[str, Any]) -> str:
         "thin_walls": 1 if profile.get("detect_thin_wall", True) else 0,
         "seam_position": seam_pos,
         "external_perimeters_first": 1 if wall_seq == "outer/inner" else 0,
-        "elefant_foot_compensation": profile.get("elefant_foot_compensation_mm", 0.10),
-        "xy_size_compensation": profile.get("xy_contour_compensation_mm", 0.0),
+        "elefant_foot_compensation": _num_str(profile.get("elefant_foot_compensation_mm", 0.10)),
+        "xy_size_compensation": _num_str(profile.get("xy_contour_compensation_mm", 0.0)),
         "ironing": ironing_on,
         "ironing_type": prusa_ironing_type,
         "ironing_flowrate": f"{profile.get('ironing_flow_percent', 15)}%",
@@ -222,21 +212,20 @@ def build_prusa_slicer_config(profile: dict[str, Any]) -> str:
         "bottom_fill_pattern": bot_pat,
         "infill_overlap": f"{profile.get('infill_wall_overlap_percent', 15)}%",
         "support_material": support,
-        # Without ``support_material_auto`` PrusaSlicer only honours painted supports.
         "support_material_auto": support,
         "support_material_style": "organic" if profile.get("support_type", "normal") == "tree" else "grid",
         "support_material_threshold": profile.get("support_threshold_angle", 45),
         "support_material_buildplate_only": (
             1 if profile.get("support_on_build_plate_only", False) else 0
         ),
-        "support_material_contact_distance": profile.get("support_top_z_distance_mm", 0.20),
-        "support_material_bottom_contact_distance": profile.get(
-            "support_bottom_z_distance_mm", 0.20
+        "support_material_contact_distance": _num_str(profile.get("support_top_z_distance_mm", 0.20)),
+        "support_material_bottom_contact_distance": _num_str(
+            profile.get("support_bottom_z_distance_mm", 0.20)
         ),
         "support_material_interface_layers": profile.get("support_interface_top_layers", 2),
-        "bridge_flow_ratio": profile.get("bridge_flow", 0.95),
+        "bridge_flow_ratio": _num_str(profile.get("bridge_flow", 0.95)),
         "thick_bridges": 1 if profile.get("thick_bridges", False) else 0,
-        "brim_width": brim_width,
+        "brim_width": _num_str(brim_width),
         "skirts": 0 if brim_enabled else 1,
         "filament_type": material,
         "first_layer_temperature": profile.get("nozzle_temp_initial_c", 220),
@@ -247,8 +236,9 @@ def build_prusa_slicer_config(profile: dict[str, Any]) -> str:
         "max_fan_speed": profile.get("fan_max_percent", 100),
         "bridge_fan_speed": profile.get("overhang_fan_percent", 100),
         "cooling": 1 if profile.get("slow_down_for_layer_cooling", True) else 0,
-        "max_volumetric_speed": profile.get("max_volumetric_speed_mm3s", 16.0),
+        "max_volumetric_speed": _num_str(profile.get("max_volumetric_speed_mm3s", 16.0)),
         "first_layer_speed": profile.get("initial_layer_speed_mms", 50),
+        "first_layer_infill_speed": profile.get("initial_layer_infill_speed_mms", 80),
         "external_perimeter_speed": profile.get("outer_wall_speed_mms", 120),
         "perimeter_speed": profile.get("inner_wall_speed_mms", 180),
         "infill_speed": profile.get("sparse_infill_speed_mms", 200),
@@ -258,15 +248,45 @@ def build_prusa_slicer_config(profile: dict[str, Any]) -> str:
         "support_material_speed": profile.get("support_speed_mms", 120),
         "travel_speed": profile.get("travel_speed_mms", 350),
         "enable_dynamic_overhang_speeds": 1 if profile.get("slow_down_overhangs", True) else 0,
+        "default_acceleration": profile.get("default_acceleration_mms2", 6000),
+        "external_perimeter_acceleration": profile.get("outer_wall_acceleration_mms2", 3000),
+        "perimeter_acceleration": profile.get("inner_wall_acceleration_mms2", 6000),
+        "top_solid_infill_acceleration": profile.get("top_surface_acceleration_mms2", 2000),
+        "first_layer_acceleration": profile.get("initial_layer_acceleration_mms2", 500),
+        "travel_acceleration": profile.get("travel_acceleration_mms2", 10000),
+        "retract_length": _num_str(profile.get("retraction_length_mm", 0.8)),
+        "retract_speed": profile.get("retraction_speed_mms", 30),
+        "retract_lift": _num_str(profile.get("z_hop_mm", 0.4)),
+        "filament_density": _num_str(profile.get("filament_density_g_cm3", 1.24)),
+        "filament_diameter": "1.75",
+        "filament_cost": _num_str(profile.get("filament_cost_per_kg", 20.0)),
+        "extrusion_multiplier": _num_str(profile.get("filament_flow_ratio", 0.98)),
+        "printer_model": str(profile.get("printer_model") or ""),
+        "bed_shape": f"0x0,{bx}x0,{bx}x{by},0x{by}",
+        "max_print_height": bz,
     }
     lines = ["; generated by Local AI CAD Agent"]
     lines += [f"; {key} = {value}" for key, value in settings.items()]
     return "\n".join(lines) + "\n"
 
 
+def build_bambu_slice_info_config() -> str:
+    """Generate ``Metadata/slice_info.config`` for Bambu Studio 2.x compatibility."""
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        "<config>\n"
+        "  <header>\n"
+        '    <header_item key="X-BBL-Client-Type" value="slicer"/>\n'
+        f'    <header_item key="X-BBL-Client-Version" value="{_BAMBU_STUDIO_VERSION}"/>\n'
+        "  </header>\n"
+        "</config>\n"
+    )
+
+
 def build_bambu_orca_config(profile: dict[str, Any]) -> str:
-    """Generate a Bambu Studio / OrcaSlicer ``project_settings.config`` (JSON, string values)."""
+    """Translate an LLM-generated print profile 1:1 into Bambu Studio / OrcaSlicer ``project_settings.config``."""
     nozzle_dia = float(profile.get("nozzle_diameter_mm", 0.4))
+    nozzle_str = _num_str(nozzle_dia)
     lh = float(profile.get("layer_height_mm", 0.20))
     first_lh = float(profile.get("first_layer_height_mm", 0.20))
     top_layers = int(profile.get("top_shell_layers", 4))
@@ -276,43 +296,78 @@ def build_bambu_orca_config(profile: dict[str, Any]) -> str:
     if not brim_enabled:
         brim_type = "no_brim"
     brim_width = profile.get("brim_width_mm", 6) if brim_enabled else 0
-    material = str(profile.get("material", "PLA"))
-    nozzle_temp_init = str(profile.get("nozzle_temp_initial_c", 220))
-    nozzle_temp = str(profile.get("nozzle_temp_c", 215))
-    bed_temp_init = str(profile.get("bed_temp_initial_c", 60))
-    bed_temp = str(profile.get("bed_temp_c", 60))
+    material = str(profile.get("material", "PLA")).upper()
+    nozzle_temp_init = int(round(float(profile.get("nozzle_temp_initial_c", 220))))
+    nozzle_temp = int(round(float(profile.get("nozzle_temp_c", 215))))
+    bed_temp_init = str(int(round(float(profile.get("bed_temp_initial_c", 60)))))
+    bed_temp = str(int(round(float(profile.get("bed_temp_c", 60)))))
+    bx = int(round(float(profile.get("bed_x_mm", 256.0))))
+    by = int(round(float(profile.get("bed_y_mm", 256.0))))
+    bz = int(round(float(profile.get("bed_z_mm", min(bx, by)))))
+
+    printer_model = str(profile.get("printer_model") or "Bambu Lab A1")
+    printer_tag = re.sub(r"^Bambu Lab\s+", "BBL ", printer_model, flags=re.IGNORECASE)
+    nozzle_suffix = "" if abs(nozzle_dia - 0.4) < 1e-3 else f" {nozzle_str} nozzle"
+    printer_structure = str(profile.get("printer_structure") or "i3")
+    printer_settings_id = str(profile.get("bambu_printer_settings_id") or f"{printer_model} {nozzle_str} nozzle")
+    print_settings_id = str(profile.get("bambu_print_settings_id") or f"{lh:.2f}mm Standard @{printer_tag}{nozzle_suffix}")
+    filament_settings_id = str(profile.get("bambu_filament_settings_id") or f"Generic {material} @{printer_tag}")
+    filament_id = str(profile.get("filament_id") or "GFL99")
+    filament_density = _num_str(profile.get("filament_density_g_cm3", 1.24))
+    filament_cost = _num_str(profile.get("filament_cost_per_kg", 20.0))
+    filament_flow = _num_str(profile.get("filament_flow_ratio", 0.98))
+
+    def_lw = _num_str(profile.get("line_width_mm", round(nozzle_dia * 1.05, 2)))
+    init_lw = _num_str(profile.get("initial_layer_line_width_mm", def_lw))
+    outer_lw = _num_str(profile.get("outer_wall_line_width_mm", def_lw))
+    inner_lw = _num_str(profile.get("inner_wall_line_width_mm", def_lw))
+    top_lw = _num_str(profile.get("top_surface_line_width_mm", def_lw))
+    sparse_lw = _num_str(profile.get("sparse_infill_line_width_mm", def_lw))
+    solid_lw = _num_str(profile.get("internal_solid_infill_line_width_mm", def_lw))
+    sup_lw = _num_str(profile.get("support_line_width_mm", def_lw))
+    one_wall_top = bool(profile.get("only_one_wall_top", False))
 
     config: dict[str, Any] = {
-        "nozzle_diameter": [str(nozzle_dia)],
-        "layer_height": str(lh),
-        "initial_layer_print_height": str(first_lh),
-        "line_width": str(profile.get("line_width_mm", round(nozzle_dia * 1.05, 2))),
-        "initial_layer_line_width": str(
-            profile.get("initial_layer_line_width_mm", round(nozzle_dia * 1.25, 2))
-        ),
-        "outer_wall_line_width": str(
-            profile.get("outer_wall_line_width_mm", round(nozzle_dia * 1.05, 2))
-        ),
-        "inner_wall_line_width": str(
-            profile.get("inner_wall_line_width_mm", round(nozzle_dia * 1.12, 2))
-        ),
-        "top_surface_line_width": str(
-            profile.get("top_surface_line_width_mm", round(nozzle_dia * 1.00, 2))
-        ),
-        "sparse_infill_line_width": str(
-            profile.get("sparse_infill_line_width_mm", round(nozzle_dia * 1.12, 2))
-        ),
-        "internal_solid_infill_line_width": str(
-            profile.get("internal_solid_infill_line_width_mm", round(nozzle_dia * 1.05, 2))
-        ),
-        "support_line_width": str(
-            profile.get("support_line_width_mm", round(nozzle_dia * 0.95, 2))
-        ),
+        "from": "project",
+        "version": _BAMBU_STUDIO_VERSION,
+        "printer_model": printer_model,
+        "printer_variant": nozzle_str,
+        "printer_structure": printer_structure,
+        "printer_technology": "FFF",
+        "printer_settings_id": printer_settings_id,
+        "print_settings_id": print_settings_id,
+        "filament_settings_id": [filament_settings_id],
+        "filament_ids": [filament_id],
+        "filament_vendor": ["Generic"],
+        "filament_type": [material],
+        "filament_density": [filament_density],
+        "filament_cost": [filament_cost],
+        "filament_diameter": ["1.75"],
+        "filament_flow_ratio": [filament_flow],
+        "filament_colour": ["#00AE42"],
+        "printable_area": ["0x0", f"{bx}x0", f"{bx}x{by}", f"0x{by}"],
+        "printable_height": str(bz),
+        "curr_bed_type": "Textured PEI Plate",
+        "nozzle_diameter": [nozzle_str],
+        "min_layer_height": [_num_str(round(max(0.04, nozzle_dia * 0.20), 2))],
+        "max_layer_height": [_num_str(round(min(0.80, nozzle_dia * 0.70), 2))],
+        "layer_height": _num_str(lh),
+        "initial_layer_print_height": _num_str(first_lh),
+        "line_width": def_lw,
+        "initial_layer_line_width": init_lw,
+        "outer_wall_line_width": outer_lw,
+        "inner_wall_line_width": inner_lw,
+        "top_surface_line_width": top_lw,
+        "sparse_infill_line_width": sparse_lw,
+        "internal_solid_infill_line_width": solid_lw,
+        "support_line_width": sup_lw,
+        "skin_infill_line_width": sparse_lw,
+        "skeleton_infill_line_width": sparse_lw,
         "wall_loops": str(profile.get("wall_loops", 3)),
         "top_shell_layers": str(top_layers),
         "bottom_shell_layers": str(bot_layers),
-        "top_shell_thickness": str(round(max(0.6, top_layers * lh), 2)),
-        "bottom_shell_thickness": str(round(max(0.6, bot_layers * lh), 2)),
+        "top_shell_thickness": _num_str(round(top_layers * lh, 2)),
+        "bottom_shell_thickness": _num_str(round(bot_layers * lh, 2)),
         "wall_generator": str(profile.get("wall_generator", "arachne")),
         "detect_thin_wall": "1" if profile.get("detect_thin_wall", True) else "0",
         "seam_position": _BAMBU_SEAM_MAP.get(str(profile.get("seam_position", "aligned")), "aligned"),
@@ -320,10 +375,10 @@ def build_bambu_orca_config(profile: dict[str, Any]) -> str:
             str(profile.get("wall_sequence", "inner/outer")),
             "inner wall/outer wall",
         ),
-        "only_one_wall_top": "1" if profile.get("only_one_wall_top", False) else "0",
-        "elefant_foot_compensation": str(profile.get("elefant_foot_compensation_mm", 0.10)),
-        "xy_hole_compensation": str(profile.get("xy_hole_compensation_mm", 0.0)),
-        "xy_contour_compensation": str(profile.get("xy_contour_compensation_mm", 0.0)),
+        "top_one_wall_type": "all top" if one_wall_top else "not apply",
+        "elefant_foot_compensation": _num_str(profile.get("elefant_foot_compensation_mm", 0.10)),
+        "xy_hole_compensation": _num_str(profile.get("xy_hole_compensation_mm", 0.0)),
+        "xy_contour_compensation": _num_str(profile.get("xy_contour_compensation_mm", 0.0)),
         "precise_z_height": "1" if profile.get("precise_z_height", True) else "0",
         "ironing_type": _BAMBU_IRONING_MAP.get(
             str(profile.get("ironing_type", "no iron")).strip().lower(), "no ironing"
@@ -333,7 +388,7 @@ def build_bambu_orca_config(profile: dict[str, Any]) -> str:
         "sparse_infill_density": f"{profile.get('infill_density_percent', 20)}%",
         "sparse_infill_pattern": _BAMBU_INFILL_MAP.get(
             str(profile.get("infill_pattern", "gyroid")),
-            str(profile.get("infill_pattern", "gyroid")),
+            "gyroid",
         ),
         "top_surface_pattern": _BAMBU_SURFACE_MAP.get(
             str(profile.get("top_surface_pattern", "monotonicline")), "monotonicline"
@@ -348,17 +403,22 @@ def build_bambu_orca_config(profile: dict[str, Any]) -> str:
         "support_on_build_plate_only": (
             "1" if profile.get("support_on_build_plate_only", False) else "0"
         ),
-        "support_top_z_distance": str(profile.get("support_top_z_distance_mm", 0.20)),
-        "support_bottom_z_distance": str(profile.get("support_bottom_z_distance_mm", 0.20)),
+        "support_top_z_distance": _num_str(profile.get("support_top_z_distance_mm", 0.20)),
+        "support_bottom_z_distance": _num_str(profile.get("support_bottom_z_distance_mm", 0.20)),
         "support_interface_top_layers": str(profile.get("support_interface_top_layers", 2)),
-        "bridge_flow": str(profile.get("bridge_flow", 0.95)),
+        "bridge_flow": _num_str(profile.get("bridge_flow", 0.95)),
         "thick_bridges": "1" if profile.get("thick_bridges", False) else "0",
         "brim_type": brim_type,
-        "brim_width": str(brim_width),
+        "brim_width": _num_str(brim_width),
         "skirt_loops": "0" if brim_enabled else "1",
-        "filament_type": [material],
-        "nozzle_temperature_initial_layer": [nozzle_temp_init],
-        "nozzle_temperature": [nozzle_temp],
+        "nozzle_temperature_initial_layer": [str(nozzle_temp_init)],
+        "nozzle_temperature": [str(nozzle_temp)],
+        "nozzle_temperature_range_low": [
+            str(max(170, min(nozzle_temp_init, nozzle_temp) - 20))
+        ],
+        "nozzle_temperature_range_high": [
+            str(min(320, max(nozzle_temp_init, nozzle_temp) + 20))
+        ],
         "hot_plate_temp_initial_layer": [bed_temp_init],
         "hot_plate_temp": [bed_temp],
         "textured_plate_temp_initial_layer": [bed_temp_init],
@@ -374,7 +434,7 @@ def build_bambu_orca_config(profile: dict[str, Any]) -> str:
             "1" if profile.get("slow_down_for_layer_cooling", True) else "0"
         ],
         "filament_max_volumetric_speed": [
-            str(profile.get("max_volumetric_speed_mm3s", 16.0))
+            _num_str(profile.get("max_volumetric_speed_mm3s", 16.0))
         ],
         "initial_layer_speed": str(profile.get("initial_layer_speed_mms", 50)),
         "initial_layer_infill_speed": str(profile.get("initial_layer_infill_speed_mms", 80)),
@@ -389,6 +449,16 @@ def build_bambu_orca_config(profile: dict[str, Any]) -> str:
         "support_speed": str(profile.get("support_speed_mms", 120)),
         "travel_speed": str(profile.get("travel_speed_mms", 350)),
         "enable_overhang_speed": "1" if profile.get("slow_down_overhangs", True) else "0",
+        "default_acceleration": str(profile.get("default_acceleration_mms2", 6000)),
+        "outer_wall_acceleration": str(profile.get("outer_wall_acceleration_mms2", 3000)),
+        "inner_wall_acceleration": str(profile.get("inner_wall_acceleration_mms2", 6000)),
+        "top_surface_acceleration": str(profile.get("top_surface_acceleration_mms2", 2000)),
+        "initial_layer_acceleration": str(profile.get("initial_layer_acceleration_mms2", 500)),
+        "travel_acceleration": str(profile.get("travel_acceleration_mms2", 10000)),
+        "retraction_length": [_num_str(profile.get("retraction_length_mm", 0.8))],
+        "retraction_speed": [str(profile.get("retraction_speed_mms", 30))],
+        "deretraction_speed": [str(profile.get("retraction_speed_mms", 30))],
+        "z_hop": [_num_str(profile.get("z_hop_mm", 0.4))],
     }
     return json.dumps(config, indent=2) + "\n"
 
@@ -481,57 +551,58 @@ def _prepare_3mf_objects_and_layout(
     obj_matches = list(
         re.finditer(r"<object\b[^>]*>\s*<mesh>.*?</mesh>\s*</object>", xml, flags=re.DOTALL)
     )
-    if len(obj_matches) != 1:
-        if len(obj_matches) > 1:
-            all_xs: list[float] = []
-            all_ys: list[float] = []
-            all_zs: list[float] = []
-            for om in obj_matches:
-                for vm in re.finditer(
-                    r'<vertex\b[^>]*?\bx="([^"]+)"[^>]*?\by="([^"]+)"[^>]*?\bz="([^"]+)"',
-                    om.group(0),
-                ):
-                    try:
-                        all_xs.append(float(vm.group(1)))
-                        all_ys.append(float(vm.group(2)))
-                        all_zs.append(float(vm.group(3)))
-                    except ValueError:
-                        pass
-            if all_xs and all_ys and all_zs:
-                assembly_cx = (min(all_xs) + max(all_xs)) * 0.5
-                assembly_cy = (min(all_ys) + max(all_ys)) * 0.5
-                assembly_min_z = min(all_zs)
-                plate_cx = bed_x_mm * 0.5
-                plate_cy = bed_y_mm * 0.5
-                shift_x = plate_cx - assembly_cx
-                shift_y = plate_cy - assembly_cy
-                shift_z = -assembly_min_z
+    if not obj_matches:
+        return content, default_meta
+    if len(obj_matches) > 1:
+        all_xs: list[float] = []
+        all_ys: list[float] = []
+        all_zs: list[float] = []
+        for om in obj_matches:
+            for vm in re.finditer(
+                r'<vertex\b[^>]*?\bx="([^"]+)"[^>]*?\by="([^"]+)"[^>]*?\bz="([^"]+)"',
+                om.group(0),
+            ):
+                try:
+                    all_xs.append(float(vm.group(1)))
+                    all_ys.append(float(vm.group(2)))
+                    all_zs.append(float(vm.group(3)))
+                except ValueError:
+                    pass
+        if all_xs and all_ys and all_zs:
+            assembly_cx = (min(all_xs) + max(all_xs)) * 0.5
+            assembly_cy = (min(all_ys) + max(all_ys)) * 0.5
+            assembly_min_z = min(all_zs)
+            plate_cx = bed_x_mm * 0.5
+            plate_cy = bed_y_mm * 0.5
+            shift_x = plate_cx - assembly_cx
+            shift_y = plate_cy - assembly_cy
+            shift_z = -assembly_min_z
 
-                existing_meta: list[dict[str, Any]] = []
-                new_build_items: list[str] = []
-                for idx, om in enumerate(obj_matches, start=1):
-                    tag_head = om.group(0).split(">", 1)[0]
-                    id_m = re.search(r'\bid="(\d+)"', tag_head)
-                    name_m = re.search(r'\bname="([^"]*)"', tag_head)
-                    oid = int(id_m.group(1)) if id_m else idx
-                    oname = (
-                        xml_unescape(name_m.group(1))
-                        if name_m
-                        else f"{project_name or 'part'}_{oid}"
-                    )
-                    t_str = f"1 0 0 0 1 0 0 0 1 {_fmt_coord(shift_x)} {_fmt_coord(shift_y)} {_fmt_coord(shift_z)}"
-                    existing_meta.append({"id": oid, "name": oname, "transform": t_str})
-                    new_build_items.append(f'\t\t<item objectid="{oid}" transform="{t_str}" printable="1" />')
-
-                xml = re.sub(
-                    r"<build\b[^>]*>.*?</build>",
-                    "<build>\n" + "\n".join(new_build_items) + "\n\t</build>",
-                    xml,
-                    count=1,
-                    flags=re.DOTALL,
+            existing_meta: list[dict[str, Any]] = []
+            new_build_items: list[str] = []
+            for idx, om in enumerate(obj_matches, start=1):
+                tag_head = om.group(0).split(">", 1)[0]
+                id_m = re.search(r'\bid="(\d+)"', tag_head)
+                name_m = re.search(r'\bname="([^"]*)"', tag_head)
+                oid = int(id_m.group(1)) if id_m else idx
+                oname = (
+                    xml_unescape(name_m.group(1))
+                    if name_m
+                    else f"{project_name or 'part'}_{oid}"
                 )
-                return xml.encode("utf-8"), existing_meta
-            return content, default_meta
+                t_str = f"1 0 0 0 1 0 0 0 1 {_fmt_coord(shift_x)} {_fmt_coord(shift_y)} {_fmt_coord(shift_z)}"
+                existing_meta.append({"id": oid, "name": oname, "transform": t_str})
+                new_build_items.append(f'\t\t<item objectid="{oid}" transform="{t_str}" printable="1" />')
+
+            xml = re.sub(
+                r"<build\b[^>]*>.*?</build>",
+                "<build>\n" + "\n".join(new_build_items) + "\n\t</build>",
+                xml,
+                count=1,
+                flags=re.DOTALL,
+            )
+            return xml.encode("utf-8"), existing_meta
+        return content, default_meta
 
     obj_block = obj_matches[0].group(0)
     vert_tags = re.findall(r"<vertex\b[^>]*/\s*>", obj_block)
@@ -700,20 +771,6 @@ def _prepare_3mf_objects_and_layout(
     return xml.encode("utf-8"), objects_meta
 
 
-def _split_disconnected_3mf_objects(
-    content: bytes,
-    project_name: str,
-    *,
-    bed_x_mm: float = 256.0,
-    bed_y_mm: float = 256.0,
-) -> bytes:
-    """Split disconnected multi-body objects, ground to Z=0, and center on the build plate."""
-    updated, _ = _prepare_3mf_objects_and_layout(
-        content, project_name, bed_x_mm=bed_x_mm, bed_y_mm=bed_y_mm
-    )
-    return updated
-
-
 def enrich_3mf_archive(
     base_3mf_path: Path,
     output_path: Path,
@@ -738,6 +795,7 @@ def enrich_3mf_archive(
     if profile:
         added[PRUSA_CONFIG_ENTRY] = build_prusa_slicer_config(profile).encode("utf-8")
         added[BAMBU_CONFIG_ENTRY] = build_bambu_orca_config(profile).encode("utf-8")
+        added[SLICE_INFO_ENTRY] = build_bambu_slice_info_config().encode("utf-8")
         added[PROFILE_ENTRY] = (json.dumps(profile, indent=2) + "\n").encode("utf-8")
     if thumbnail:
         added[THUMBNAIL_ENTRY] = thumbnail
@@ -805,8 +863,9 @@ def _with_core_metadata(content: bytes, project_name: str, profile: dict[str, An
         flags=re.DOTALL,
     )
     hardware_parts = []
-    if profile.get("target_printer"):
-        hardware_parts.append(f"Printer: {profile['target_printer']}")
+    printer_name = profile.get("printer_model")
+    if printer_name:
+        hardware_parts.append(f"Printer: {printer_name}")
     if profile.get("nozzle_diameter_mm"):
         hardware_parts.append(f"Nozzle: {profile['nozzle_diameter_mm']} mm")
     hw_info = f" | {' '.join(hardware_parts)}" if hardware_parts else ""
@@ -816,13 +875,13 @@ def _with_core_metadata(content: bytes, project_name: str, profile: dict[str, An
     ).strip(" |")
     meta: dict[str, str] = {
         "Title": project_name,
-        "Application": "BambuStudio-01.09.05.51",
+        "Application": f"BambuStudio-{_BAMBU_STUDIO_VERSION}",
         "BambuStudio:3mfVersion": "1",
         "Designer": "Local AI CAD Agent",
         "Description": description,
     }
-    if profile.get("target_printer"):
-        meta["Printer"] = str(profile["target_printer"])
+    if printer_name:
+        meta["Printer"] = str(printer_name)
     tags = "".join(
         f'\t<metadata name="{name}">{xml_escape(value)}</metadata>\n' for name, value in meta.items()
     )
@@ -995,7 +1054,7 @@ def export_project_model(
 
     thumbnail = _resolve_3mf_thumbnail(project_dir, exports_dir, model_sha256)
     variant = hashlib.sha256(
-        json.dumps(print_profile, sort_keys=True).encode("utf-8") + (thumbnail or b"")
+        b"3mf_v4:" + json.dumps(print_profile, sort_keys=True).encode("utf-8") + (thumbnail or b"")
     ).hexdigest()[:16]
     enriched_file = exports_dir / f"{model_sha256}_{variant}.3mf"
     if not _cached(enriched_file):

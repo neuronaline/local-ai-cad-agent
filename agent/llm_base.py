@@ -1579,6 +1579,39 @@ def api_key_env(provider: str) -> str:
     raise ValueError(f"Unknown LLM provider: {provider!r}")
 
 
+_RETRY_REASONING_BUDGET = 1024
+_HEAVY_REASONING_LEVELS = {"medium", "high", "xhigh", "max"}
+
+
+def _clamp_payload_reasoning_on_retry(payload: dict[str, Any]) -> None:
+    """Lower (never raise) the reasoning effort in ``payload`` before a timeout retry.
+
+    A deep reasoning request on a long history can stall past the read
+    timeout before its first token; retrying it unchanged usually stalls
+    again. Covers OpenRouter (``reasoning``), Vertex (``extra_body.google``)
+    and Gemini (``generation_config``) payload shapes. Disabled or already
+    light settings (``none``, ``minimal``, ``low``, budget ``0``/``-1``) are
+    left untouched.
+    """
+    reasoning = payload.get("reasoning")
+    configs: list[dict[str, Any]] = []
+    if isinstance(reasoning, dict):
+        configs.append(reasoning)
+    google = (payload.get("extra_body") or {}).get("google")
+    for container in (google, payload.get("generation_config")):
+        if isinstance(container, dict) and isinstance(container.get("thinking_config"), dict):
+            configs.append(container["thinking_config"])
+    for cfg in configs:
+        for key in ("effort", "thinking_level"):
+            level = cfg.get(key)
+            if isinstance(level, str) and level.lower() in _HEAVY_REASONING_LEVELS:
+                cfg[key] = "LOW" if level.isupper() else "low"
+        for key in ("max_tokens", "thinking_budget"):
+            budget = cfg.get(key)
+            if isinstance(budget, int) and budget > _RETRY_REASONING_BUDGET:
+                cfg[key] = _RETRY_REASONING_BUDGET
+
+
 class BaseLLMClient:
     """Shared interface and execution engine for all LLM provider adapters."""
 
@@ -1727,14 +1760,53 @@ class BaseLLMClient:
                         run_id=self.run_id,
                     )
                 raise
-            except Exception:
+            except Exception as error:
                 general_attempt += 1
                 is_last_attempt = general_attempt >= max_general_attempts
                 if is_last_attempt:
                     raise
                 attempt += 1
+                _LOG.warning(
+                    "Retrying %s request (attempt %d/%d, model=%s) after error (%s): %s",
+                    self._provider_label,
+                    general_attempt,
+                    max_general_attempts,
+                    payload.get("model"),
+                    type(error).__name__,
+                    error,
+                )
+                if isinstance(error, httpx.TimeoutException):
+                    _clamp_payload_reasoning_on_retry(payload)
+                if self.stream_callback:
+                    try:
+                        self.stream_callback(
+                            {
+                                "type": "status",
+                                "message": (
+                                    f"Request failed ({type(error).__name__}); retrying "
+                                    f"(attempt {general_attempt}/{max_general_attempts})..."
+                                ),
+                            }
+                        )
+                    except Exception:
+                        pass
+                if log_payload:
+                    self.activity_logger.log(
+                        "llm_retry",
+                        {
+                            "attempt": attempt,
+                            "model": payload.get("model"),
+                            "error": f"{type(error).__name__}: {error}",
+                        },
+                        run_id=self.run_id,
+                    )
                 delay = float(2 ** (general_attempt - 1))
                 sleep_with_cancel(delay, self.stop_event)
+                if self.stream_callback:
+                    try:
+                        self.stream_callback({"type": "status", "message": "Thinking..."})
+                    except Exception:
+                        pass
                 continue
             else:
                 image_rejection = _is_image_rejection(response)
@@ -1824,6 +1896,8 @@ class BaseLLMClient:
                             is_last_attempt = general_attempt >= max_general_attempts
                             if is_last_attempt:
                                 raise
+                            if isinstance(error, httpx.TimeoutException):
+                                _clamp_payload_reasoning_on_retry(payload)
                             _LOG.warning(
                                 "Retrying %s stream (attempt %d/%d, model=%s) after transport error (%s): %s",
                                 self._provider_label,

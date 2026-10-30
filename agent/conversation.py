@@ -142,15 +142,55 @@ class ConversationStore:
                     json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n"
                 )
             if isinstance(message, dict) and message.get("role") in cls._KEPT_ROLES:
-                keys = {str(project_dir)}
+                for cached in cls._cached_histories(project_dir):
+                    cached.append(deepcopy(message))
+
+    @classmethod
+    def _cached_histories(cls, project_dir: Path) -> list[list[dict[str, Any]]]:
+        """Return the cached histories keyed by ``project_dir`` (raw and resolved)."""
+        keys = {str(project_dir)}
+        try:
+            keys.add(str(project_dir.resolve()))
+        except OSError:
+            pass
+        return [cls._cache[key] for key in keys if cls._cache.get(key) is not None]
+
+    @classmethod
+    def replace_tool_result(cls, project_dir: Path, message: dict[str, Any]) -> bool:
+        """Rewrite the newest ``role: tool`` record whose ``tool_call_id`` matches ``message``.
+
+        Used to attach prefix-safe tail metadata (``step_budget``) to a tool
+        result that has been persisted but not yet sent to the LLM, keeping
+        ``conversation.jsonl`` and the in-memory cache identical.
+        """
+        call_id = message.get("tool_call_id")
+
+        def matches(item: Any) -> bool:
+            return (
+                isinstance(item, dict)
+                and item.get("role") == "tool"
+                and item.get("tool_call_id") == call_id
+            )
+
+        with shared_history_lock():
+            for cached in cls._cached_histories(project_dir):
+                idx = next((i for i in range(len(cached) - 1, -1, -1) if matches(cached[i])), None)
+                if idx is not None:
+                    cached[idx] = deepcopy(message)
+            log_path = project_dir / "conversation.jsonl"
+            if not log_path.exists():
+                return False
+            lines = log_path.read_text(encoding="utf-8").splitlines()
+            for idx in range(len(lines) - 1, -1, -1):
                 try:
-                    keys.add(str(project_dir.resolve()))
-                except OSError:
-                    pass
-                for key in keys:
-                    cached = cls._cache.get(key)
-                    if cached is not None:
-                        cached.append(deepcopy(message))
+                    item = json.loads(lines[idx])
+                except json.JSONDecodeError:
+                    continue
+                if matches(item):
+                    lines[idx] = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
+                    atomic_write_text(log_path, "\n".join(lines) + "\n")
+                    return True
+            return False
 
     @classmethod
     def append_event(

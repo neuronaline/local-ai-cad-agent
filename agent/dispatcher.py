@@ -661,6 +661,7 @@ def cancel_remaining_tool_calls(
     messages: list[dict],
     *,
     append_message: Callable[[Path, dict], None],
+    reason: str | None = None,
 ) -> None:
     """Persist cancelled tool-result entries for unprocessed calls."""
     for tc in tool_calls:
@@ -668,7 +669,7 @@ def cancel_remaining_tool_calls(
         if cid and cid not in processed_call_ids:
             tool_name = tc.get("function", {}).get("name", "unknown_tool")
             cancelled = tool_failure(
-                tool_name, RuntimeError("Tool call cancelled (question or stop).")
+                tool_name, RuntimeError(reason or "Tool call cancelled (question or stop).")
             )
             entry = {"role": "tool", "tool_call_id": cid, "content": cancelled}
             messages.append(entry)

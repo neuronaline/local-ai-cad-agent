@@ -71,7 +71,7 @@ openai:
 
 # ── 3. Agent, Server & Viewport ──────────────────────────────────────────────
 agent:
-  tool_call_limit: 25
+  tool_call_limit: 12
   revision_retention_count: 0   # 0 keeps all model revisions
   # off | errors (<project>/debug-errors.jsonl) | debug (rolling activity.jsonl)
   # | dataset (untrimmed trajectories/<run_id>.jsonl)

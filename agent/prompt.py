@@ -60,8 +60,9 @@ _OPERATIONAL_RULES = """\
   * Budget internal thinking concisely; never generate lengthy monologues or overthink obvious geometry.
   * Offload non-trivial coordinate arithmetic, Z-stacks, clearances, overhang angles, and stability checks to the ``python`` tool (`np`, `sp`, `math`) rather than mental arithmetic.
 - Python engineering & geometry verification:
-  1. **Compute-First (`python` then `write_file`/`edit_file`):** For multi-part assemblies, mating threads/rails, or symbolic coordinate solving, call ``python`` first, inspect the solved output, then write or edit `model.scad`.
+  1. **Compute-First (`python` then `write_file`/`edit_file`):** For multi-part assemblies, mating threads/rails, or symbolic coordinate solving, consolidate the upfront math into one ``python`` script (two turns at most), inspect the solved output, then immediately write or edit `model.scad`. Never chain 3+ consecutive `python`-only turns without modifying `model.scad`.
   2. **Parallel Verify + Write (`python` + `write_file`/`edit_file`):** For single-part models or localized edits where dimensions are straightforward, you may emit ``python`` and ``write_file``/``edit_file`` in parallel in the same turn to assert Z-stack continuity (`min_z == 0`), wall clearances (`>= 2 * nozzle_dia`), overhang slopes (`<= 45 deg`), and Center of Mass stability.
+- Step budget discipline: The newest tool result of each turn carries a `step_budget` object (`step`, `limit`, `remaining` turns). All tool calls emitted in one turn cost **1 step** total, so batch compatible calls together (`read_file` + `python`, `get_view_images` + `python`, `write_file`/`edit_file` + `python`, or `write_file`/`edit_file` + `cad_build`) and pace your workflow so `model.scad` is built and verified well before `remaining` reaches 0.
 - Multi-variant & multi-part models: Declare a top-level Customizer selector (e.g. ``PART_TYPE = "ALL";``) and arrange parts side-by-side with `>= 10 mm` gap on `Z = 0` following the Playbook's ``plate_layout`` pattern.
 - Tool workflow:
   * Use ``write_file`` for initial creation or full rewrites, and ``edit_file`` (`edits=[{old_string, new_string}]`) for targeted updates. Call ``read_file`` after multiple edits have diverged from the initial snapshot.
@@ -301,6 +302,25 @@ def format_budget_warning_nudge(remaining: int, filename: str = "model.scad") ->
     """Format synthetic reminder when approaching the tool-call limit."""
     remaining_text = "1 turn" if remaining == 1 else f"{remaining} turns"
     return NUDGE_BUDGET_WARNING_TEMPLATE.format(remaining_text=remaining_text, filename=filename)
+
+
+NUDGE_CALCULATION_LIMIT_TEMPLATE = (
+    "You have run {consecutive} consecutive calculation/inspection turns without updating {filename} "
+    "({remaining_text} remaining). Stop calling python, read_file, or get_view_images repeatedly. "
+    "Consolidate your findings and call write_file or edit_file NOW (or provide your final response if no code changes are needed)."
+)
+
+
+def format_calculation_limit_nudge(
+    consecutive: int, remaining: int, filename: str = "model.scad"
+) -> str:
+    """Format synthetic reminder when consecutive read-only/calculation turns stall progress."""
+    remaining_text = "1 turn" if remaining == 1 else f"{remaining} turns"
+    return NUDGE_CALCULATION_LIMIT_TEMPLATE.format(
+        consecutive=consecutive,
+        remaining_text=remaining_text,
+        filename=filename,
+    )
 
 
 # Multimodal Visual Inspection Prompt (wrapped around relocated tool images)

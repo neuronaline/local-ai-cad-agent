@@ -2451,16 +2451,20 @@ function appendStreamingDelta(runId, delta, messageId = null) {
 function handleStreamingToolDelta(runId, data) {
   const card = getActiveCard(runId) || getOrCreateRunCard(runId);
   const toolName = data?.name || data?.tool || (data?.function && data.function.name) || '';
-  const callId = data?.id || `${ data?.index ?? 0 }`;
-  if (card._streamedToolCallId !== callId) {
-    card._streamedToolCallId = callId;
-    card._streamedToolArgs = '';
+  // Key by stream slot index: it is present on every delta, whereas some
+  // providers only attach the call id once it is known.
+  const slot = `${ data?.index ?? data?.id ?? 0 }`;
+  if (!card._streamedToolCalls) card._streamedToolCalls = new Map();
+  let entry = card._streamedToolCalls.get(slot);
+  if (!entry) {
+    entry = { name: toolName, args: '' };
+    card._streamedToolCalls.set(slot, entry);
+  } else if (toolName && !entry.name) {
+    entry.name = toolName;
   }
-  if (typeof data?.arguments_delta === 'string' && data.arguments_delta) {
-    card._streamedToolArgs = (card._streamedToolArgs || '') + data.arguments_delta;
-  }
-  let label = toolName ? activityLabel(toolName) : 'Calling tool';
-  const args = card._streamedToolArgs || '';
+  if (typeof data?.arguments_delta === 'string') entry.args += data.arguments_delta;
+  let label = entry.name ? activityLabel(entry.name) : 'Calling tool';
+  const args = entry.args;
   if (args.length > 40) {
     const lineCount = (args.match(/\\n|\n/g) || []).length;
     if (lineCount > 0) {
@@ -2469,7 +2473,19 @@ function handleStreamingToolDelta(runId, data) {
       label = `${label} (${(args.length / 1024).toFixed(1)} KB)`;
     }
   }
+  const totalParallel = card._streamedToolCalls.size;
+  if (totalParallel > 1) {
+    label = `${label} [${totalParallel} parallel]`;
+  }
   setCardState(card, 'working', label);
+  if (activityItems.has('agent-run')) {
+    addToolMessage({
+      call_id: 'agent-run',
+      tool: 'agent',
+      status: 'running',
+      result: label,
+    });
+  }
 }
 
 function finalizeRunCard(runId, finalText, reasoning) {
@@ -2673,14 +2689,21 @@ function connectStream() {
         card.dataset.raw = '';
         card.dataset.reasoning = '';
         card._rawMessage = '';
-        card._streamedToolCallId = '';
-        card._streamedToolArgs = '';
+        card._streamedToolCalls = null;
         delete card.dataset.lastContentTurnId;
         delete card.dataset.lastReasoningTurnId;
         const thought = card.querySelector('.thought-disclosure');
         if (thought) thought.remove();
         renderAgentContent(card, '');
         setCardState(card, 'thinking', 'Retrying response...');
+      }
+      if (activityItems.has('agent-run')) {
+        addToolMessage({
+          call_id: 'agent-run',
+          tool: 'agent',
+          status: 'started',
+          result: 'Retrying response...',
+        });
       }
     },
     agent_reasoning_delta: data => {
@@ -2717,6 +2740,7 @@ function connectStream() {
         }
       }
       if (card) {
+        card._streamedToolCalls = null;
         const combined = stripEncryptedReasoning(card.dataset.reasoning || data.reasoning || '');
         if (combined) {
           card.dataset.reasoning = combined;

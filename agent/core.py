@@ -52,6 +52,7 @@ from agent.llm_base import (
 from agent.prompt import (
     NUDGE_CAD_FIX_REQUIRED,
     format_budget_warning_nudge,
+    format_calculation_limit_nudge,
     format_project_state,
     format_unverified_model_nudge,
     get_system_prompt,
@@ -149,6 +150,57 @@ def _synthetic_user(content: str) -> dict[str, object]:
     return {"role": "user", "content": content, "synthetic": True}
 
 
+def _trailing_tool_batch(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return the newest contiguous ``role: tool`` results, newest first.
+
+    Trailing synthetic nudges are skipped so a parallel batch such as
+    ``[cad_build, python]`` is inspected as a whole even after a reminder
+    was appended behind it.
+    """
+    batch: list[dict[str, Any]] = []
+    for msg in reversed(messages):
+        role = msg.get("role")
+        if role == "tool":
+            batch.append(msg)
+        elif batch or not (role == "user" and msg.get("synthetic")):
+            break
+    return batch
+
+
+def _tool_payload(msg: dict[str, Any]) -> dict[str, Any] | None:
+    """Parse the JSON envelope of a tool result (plain or multimodal content)."""
+    content = msg.get("content")
+    text: Any = content
+    if isinstance(content, list):
+        text = next(
+            (
+                part.get("text")
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            ),
+            None,
+        )
+    if not isinstance(text, str) or not text:
+        return None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _set_tool_payload(msg: dict[str, Any], payload: dict[str, Any]) -> None:
+    """Write ``payload`` back into the text slot read by :func:`_tool_payload`."""
+    text = json.dumps(payload, ensure_ascii=False)
+    content = msg.get("content")
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                part["text"] = text
+                return
+    msg["content"] = text
+
+
 def _shared_history_lock() -> threading.Lock:
     """Return the active history lock (configurable by the Flask app)."""
     return shared_history_lock()
@@ -218,6 +270,8 @@ class _RunState:
     truncation_continuations: int = 0
     total_truncation_continuations: int = 0
     budget_warning_sent: bool = False
+    consecutive_readonly_turns: int = 0
+    calculation_warning_sent: bool = False
     last_turn_was_continuation: bool = False
     settings: Settings | None = None
 
@@ -610,7 +664,7 @@ class AgentRunner:
                         tool_turn += 1
                         if tool_turn >= limit:
                             break
-                        self._maybe_nudge_budget_limit(state, tool_turn - 1)
+                        self._report_step_budget(state, tool_turn)
                     continue
                 # Non-CONTINUE is terminal; the helper already published
                 # the diagnostic and finalised ``state.messages``.
@@ -1320,6 +1374,7 @@ class AgentRunner:
                         self._append_message(state.project_dir, msg)
                 processed_call_ids.add(call.get("id", ""))
 
+            mutation_failed_in_wave = False
             for (
                 call,
                 res_preview_id,
@@ -1338,11 +1393,14 @@ class AgentRunner:
                     state.cad_error = res_cad_error
                     state.cad_fix_required = res_cad_fix_required
                 if is_model_mutation(tool_name):
-                    state.model_mutated = True
-                    if state.cad_nudge_count < 2:
-                        state.nudged_cad = False
-                    if state.verification_nudge_count < 2:
-                        state.nudged_final_verification = False
+                    if self._tool_call_succeeded(call.get("id", ""), state.messages):
+                        state.model_mutated = True
+                        if state.cad_nudge_count < 2:
+                            state.nudged_cad = False
+                        if state.verification_nudge_count < 2:
+                            state.nudged_final_verification = False
+                    else:
+                        mutation_failed_in_wave = True
                 elif is_cad_build(tool_name):
                     state.nudged_cad = False
                     # Circuit-breaker for repeated CAD build or verification failures.
@@ -1395,6 +1453,26 @@ class AgentRunner:
                     return self._park_for_question(
                         state, tool_calls, processed_call_ids
                     )
+            if mutation_failed_in_wave and len(processed_call_ids) < len(tool_calls):
+                # Later waves (typically ``cad_build``) would run against a
+                # stale ``model.scad``; skip them so the model fixes the edit.
+                self._cancel_remaining_tool_calls(
+                    state.project_dir,
+                    tool_calls,
+                    processed_call_ids,
+                    state.messages,
+                    reason="Tool call skipped: an earlier write_file/edit_file in this turn failed.",
+                )
+                break
+        # A turn counts once regardless of how many parallel calls it held.
+        if any(
+            is_model_mutation(name) or is_cad_build(name)
+            for name in (c.get("function", {}).get("name", "") for c in tool_calls)
+        ):
+            state.consecutive_readonly_turns = 0
+            state.calculation_warning_sent = False
+        else:
+            state.consecutive_readonly_turns += 1
         return _TurnOutcome.CONTINUE
 
     def _park_for_question(
@@ -1453,24 +1531,53 @@ class AgentRunner:
             state.messages.append(item)
             ConversationStore.append(state.project_dir, item)
 
-    def _maybe_nudge_budget_limit(self, state: _RunState, iteration: int) -> None:
-        """Append a synthetic warning when approaching the tool-call budget.
+    @staticmethod
+    def _tool_call_succeeded(call_id: str, messages: list[dict[str, Any]]) -> bool:
+        """Return False only when the result for ``call_id`` reports ``ok: false``."""
+        for msg in _trailing_tool_batch(messages):
+            if msg.get("tool_call_id") == call_id:
+                payload = _tool_payload(msg)
+                return payload is None or payload.get("ok") is not False
+        return True
 
-        The warning is placed at the prompt tail to preserve the cacheable
-        prefix for upstream LLM provider caching, while nudging the model to
-        stop over-complicating or excessively iterating and finalize.
+    def _report_step_budget(self, state: _RunState, used_steps: int) -> None:
+        """Tell the model its remaining step budget without touching the cached prefix.
+
+        ``step_budget`` is written into the newest tool result of the turn
+        that just finished, before that message is ever sent, and one-shot
+        synthetic nudges are appended behind it when the budget runs low or
+        the model stalls in read-only turns. Messages already sent are never
+        mutated, so the provider prompt-cache prefix stays byte-identical.
+        One turn (including all of its parallel calls) costs one step.
         """
         run_settings = state.settings or self.settings
         limit = run_settings.agent_tool_call_limit
-        remaining = limit - (iteration + 1)
+        remaining = limit - used_steps
+        budget = {"step": used_steps, "limit": limit, "remaining": remaining}
+        for msg in _trailing_tool_batch(state.messages):
+            payload = _tool_payload(msg)
+            if payload is not None:
+                payload["step_budget"] = budget
+                _set_tool_payload(msg, payload)
+                ConversationStore.replace_tool_result(state.project_dir, msg)
+                break
+
+        if state.messages and state.messages[-1].get("role") == "user":
+            return
         warn_threshold = 5 if limit >= 15 else max(1, limit // 3)
         if 1 <= remaining <= warn_threshold and not state.budget_warning_sent:
-            if state.messages and state.messages[-1].get("role") == "user":
-                return
             state.budget_warning_sent = True
-            nudge = _synthetic_user(format_budget_warning_nudge(remaining, MODEL_FILENAME))
-            state.messages.append(nudge)
-            self._append_message(state.project_dir, nudge)
+            text = format_budget_warning_nudge(remaining, MODEL_FILENAME)
+        elif state.consecutive_readonly_turns >= 2 and not state.calculation_warning_sent:
+            state.calculation_warning_sent = True
+            text = format_calculation_limit_nudge(
+                state.consecutive_readonly_turns, remaining, MODEL_FILENAME
+            )
+        else:
+            return
+        nudge = _synthetic_user(text)
+        state.messages.append(nudge)
+        self._append_message(state.project_dir, nudge)
 
     def _handle_tool_limit_reached(self, state: _RunState) -> None:
         """The ``agent.tool_call_limit`` budget was exhausted."""
@@ -1907,18 +2014,14 @@ class AgentRunner:
 
     @staticmethod
     def _last_message_has_tool_image(messages: list[dict]) -> bool:
-        if not messages or messages[-1].get("role") != "tool":
-            return False
-        for msg in reversed(messages):
-            if msg.get("role") != "tool":
-                break
-            content = msg.get("content")
-            if isinstance(content, list) and any(
+        return any(
+            isinstance(msg.get("content"), list)
+            and any(
                 isinstance(part, dict) and part.get("type") == "image_url"
-                for part in content
-            ):
-                return True
-        return False
+                for part in msg["content"]
+            )
+            for msg in _trailing_tool_batch(messages)
+        )
 
     @staticmethod
     def _failure_signature(message: str) -> str:
@@ -1947,31 +2050,19 @@ class AgentRunner:
 
     @classmethod
     def _verification_failure_signature(cls, messages: list[dict]) -> str:
-        """Build a stable signature from critical CAD verification findings in the latest tool result."""
-        if not messages:
-            return cls._failure_signature("verification_failed")
-        last_content = messages[-1].get("content")
-        raw_text = ""
-        if isinstance(last_content, str):
-            raw_text = last_content
-        elif isinstance(last_content, list):
-            for part in last_content:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    raw_text = str(part.get("text") or "")
-                    break
-        try:
-            payload = json.loads(raw_text) if raw_text else {}
-            verif = (payload.get("data") or {}).get("verification") or {}
-            findings = verif.get("findings") or []
+        """Build a stable signature from critical CAD verification findings in the latest tool batch."""
+        for msg in _trailing_tool_batch(messages):
+            payload = _tool_payload(msg) or {}
+            data = payload.get("data")
+            verif = data.get("verification") if isinstance(data, dict) else None
+            findings = verif.get("findings") if isinstance(verif, dict) else None
             codes = sorted(
                 str(f.get("code"))
-                for f in findings
+                for f in (findings if isinstance(findings, list) else [])
                 if isinstance(f, dict) and f.get("category") == "CRITICAL" and f.get("code")
             )
             if codes:
                 return cls._failure_signature("VERIFY_FAIL:" + ",".join(codes))
-        except (TypeError, ValueError, json.JSONDecodeError):
-            pass
         return cls._failure_signature("verification_failed")
 
     @staticmethod
@@ -2109,6 +2200,7 @@ class AgentRunner:
         tool_calls: list[dict],
         processed_call_ids: set[str],
         messages: list[dict],
+        reason: str | None = None,
     ) -> None:
         """Per-call wrapper that injects the runner's append callback into the dispatcher."""
         cancel_remaining_tool_calls(
@@ -2117,6 +2209,7 @@ class AgentRunner:
             processed_call_ids,
             messages,
             append_message=cls._append_message,
+            reason=reason,
         )
 
     @staticmethod
