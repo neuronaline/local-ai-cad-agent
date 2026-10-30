@@ -206,6 +206,14 @@ export class CadViewer {
               throw new Error('The preview has invalid dimensions.');
             }
             this._hideSpinner();
+            const hadPreviousModel = Boolean(this.model && this.modelBounds);
+            let prevDirection = null;
+            let prevDistance = null;
+            if (hadPreviousModel) {
+              const prevCenter = this.modelBounds.center;
+              prevDirection = this.camera.position.clone().sub(prevCenter).normalize();
+              prevDistance = this.camera.position.distanceTo(prevCenter);
+            }
             this.clear();
             this.cadDimensions = size;
             this._refreshGridWarning();
@@ -230,7 +238,11 @@ export class CadViewer {
             this.boxHelper = new THREE.BoxHelper(this.model, 0xb9c9ff);
             this.scene.add(this.model, this.boxHelper);
             this.emptyState.hidden = true;
-            this.fit();
+            if (hadPreviousModel && prevDirection) {
+              this.fit({ preserveCameraAngle: true, prevDirection, prevDistance });
+            } else {
+              this.fit();
+            }
             resolve();
           } catch (error) {
             geometry.dispose();
@@ -251,14 +263,20 @@ export class CadViewer {
     });
   }
 
-  fit() {
+  fit(options = {}) {
     if (!this.model || !this.modelBounds) return;
     const { center, size, largest } = this.modelBounds;
     this.controls.minDistance = Math.max(largest * 0.05, 0.5);
     this.controls.maxDistance = Math.max(largest * 25, 2000);
-    this.camera.position.set(center.x + largest * 1.4, center.y + largest * 1.1, center.z + largest * 1.4);
     this.camera.near = Math.max(largest / 10000, 0.001);
     this.camera.far = Math.max(10000, largest * 8);
+
+    if (options.preserveCameraAngle && options.prevDirection) {
+      const scaleDistance = Math.max(largest * 1.8, Math.min(options.prevDistance || largest * 2.2, largest * 5));
+      this.camera.position.copy(center).addScaledVector(options.prevDirection, scaleDistance);
+    } else {
+      this.camera.position.set(center.x + largest * 1.4, center.y + largest * 1.1, center.z + largest * 1.4);
+    }
     this.camera.updateProjectionMatrix();
     this.controls.target.copy(center);
     this.controls.update();

@@ -584,26 +584,58 @@ def extract_usage_summary(usage: dict[str, Any] | None) -> dict[str, Any]:
             "cache_hit_rate": 0.0,
             "cost": None,
         }
-    ptd = usage.get("prompt_tokens_details")
+    norm = normalize_usage(usage) or usage
+    ptd = norm.get("prompt_tokens_details")
     ptd = ptd if isinstance(ptd, dict) else {}
-    ctd = usage.get("completion_tokens_details")
+    itd = norm.get("input_tokens_details")
+    itd = itd if isinstance(itd, dict) else {}
+    ctd = norm.get("completion_tokens_details")
     ctd = ctd if isinstance(ctd, dict) else {}
 
-    prompt_tokens = int(usage.get("prompt_tokens") or 0)
-    completion_tokens = int(usage.get("completion_tokens") or 0)
+    prompt_tokens = int(
+        norm.get("prompt_tokens")
+        or norm.get("input_tokens")
+        or norm.get("prompt_token_count")
+        or 0
+    )
+    completion_tokens = int(
+        norm.get("completion_tokens")
+        or norm.get("output_tokens")
+        or norm.get("candidates_token_count")
+        or 0
+    )
     reasoning_tokens = int(
-        ctd.get("reasoning_tokens") or usage.get("reasoning_tokens") or 0
+        ctd.get("reasoning_tokens")
+        or norm.get("reasoning_tokens")
+        or norm.get("thoughts_token_count")
+        or 0
     )
     cached_tokens = int(
-        ptd.get("cached_tokens") or usage.get("cached_tokens") or 0
+        ptd.get("cached_tokens")
+        or ptd.get("cache_read_input_tokens")
+        or itd.get("cached_tokens")
+        or itd.get("cache_read_tokens")
+        or norm.get("cached_tokens")
+        or norm.get("cached_content_token_count")
+        or norm.get("cache_read_input_tokens")
+        or 0
     )
-    cache_write_tokens = int(ptd.get("cache_write_tokens") or 0)
+    cache_write_tokens = int(
+        ptd.get("cache_write_tokens")
+        or ptd.get("cache_creation_input_tokens")
+        or itd.get("cache_write_tokens")
+        or norm.get("cache_write_tokens")
+        or norm.get("cache_creation_input_tokens")
+        or 0
+    )
     cache_hit_rate = (
         round((cached_tokens / prompt_tokens) * 100.0, 1)
         if prompt_tokens > 0
         else 0.0
     )
-    raw_cost = usage.get("cost")
+    raw_cost = norm.get("cost")
+    if raw_cost is None:
+        raw_cost = norm.get("total_cost")
     cost_val: float | None = None
     if raw_cost is not None:
         try:
@@ -1078,16 +1110,38 @@ def normalize_usage(usage: dict[str, Any] | None) -> dict[str, Any] | None:
     # 1. Normalize prompt cached tokens
     ptd = normalized.get("prompt_tokens_details")
     ptd_copy = dict(ptd) if isinstance(ptd, dict) else {}
+    itd = normalized.get("input_tokens_details")
+    itd_copy = dict(itd) if isinstance(itd, dict) else {}
+
     cached = (
         ptd_copy.get("cached_tokens")
+        or ptd_copy.get("cache_read_input_tokens")
+        or itd_copy.get("cached_tokens")
+        or itd_copy.get("cache_read_tokens")
         or normalized.get("cached_tokens")
         or normalized.get("cached_content_token_count")
+        or normalized.get("cache_read_input_tokens")
         or (normalized.get("extra_properties") or {}).get("google", {}).get("cached_content_token_count")
         or (normalized.get("extra_properties") or {}).get("google", {}).get("cached_tokens")
+        or (normalized.get("extra_properties") or {}).get("anthropic", {}).get("cache_read_input_tokens")
+        or (normalized.get("extra_properties") or {}).get("openrouter", {}).get("cached_tokens")
         or 0
     )
     if cached:
         ptd_copy["cached_tokens"] = int(cached)
+        normalized["prompt_tokens_details"] = ptd_copy
+
+    cache_write = (
+        ptd_copy.get("cache_write_tokens")
+        or ptd_copy.get("cache_creation_input_tokens")
+        or itd_copy.get("cache_write_tokens")
+        or normalized.get("cache_write_tokens")
+        or normalized.get("cache_creation_input_tokens")
+        or (normalized.get("extra_properties") or {}).get("anthropic", {}).get("cache_creation_input_tokens")
+        or 0
+    )
+    if cache_write:
+        ptd_copy["cache_write_tokens"] = int(cache_write)
         normalized["prompt_tokens_details"] = ptd_copy
 
     # 2. Normalize completion reasoning tokens

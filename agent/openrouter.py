@@ -41,7 +41,9 @@ class OpenRouterClient(ChatCompletionsClient):
         if self.settings.openrouter_app_url:
             headers["HTTP-Referer"] = self.settings.openrouter_app_url
         if self.session_id:
-            headers["X-Session-ID"] = hashlib.sha256(self.session_id.encode()).hexdigest()[:64]
+            session_hash = hashlib.sha256(self.session_id.encode()).hexdigest()[:64]
+            headers["X-Session-ID"] = session_hash
+            headers["x-session-id"] = session_hash
         return headers
 
     def _is_continuation(self, messages: list[dict[str, Any]] | None) -> bool:
@@ -67,27 +69,13 @@ class OpenRouterClient(ChatCompletionsClient):
             self.settings.openrouter_enable_anthropic_cache
             and self.settings.openrouter_model.startswith("anthropic/")
         ):
-            # Treat the request as a direct Anthropic routing only when
-            # every entry — or no entry at all — names Anthropic. A
-            # multi-provider list with one Anthropic entry still routes via
-            # a third-party upstream, so Bedrock/Vertex-style explicit
-            # breakpoints are required.
-            direct_anthropic = (
-                not provider_order
-                or all(slug == "anthropic" for slug in provider_order)
-            )
-            if direct_anthropic:
-                # OpenRouter's automatic breakpoint advances without changing
-                # historical message bytes, but it only routes to Anthropic's
-                # own endpoint.
-                payload["cache_control"] = {"type": "ephemeral"}
-            else:
-                # Bedrock and Vertex reject the top-level automatic control.
-                # Mark both the system prompt and the last eligible conversation turn
-                # so multi-turn tool loops maintain cache continuity across all
-                # Anthropic-compatible endpoints.
-                self._mark_first_system_message(payload)
-                self._mark_last_eligible_message(payload)
+            # OpenRouter top-level cache_control enables automatic breakpoint advancing
+            # across Anthropic, Google Vertex AI, Azure, and Amazon Bedrock endpoints.
+            payload["cache_control"] = {"type": "ephemeral"}
+            # Also explicitly mark the immutable system message and the last eligible
+            # message to ensure breakpoint preservation across any proxy or sub-provider.
+            self._mark_first_system_message(payload)
+            self._mark_last_eligible_message(payload)
 
         is_continuation = self._is_continuation(messages)
         effort = (
@@ -183,14 +171,15 @@ class OpenRouterClient(ChatCompletionsClient):
 
     @staticmethod
     def _mark_last_eligible_message(payload: dict[str, Any]) -> None:
-        """Mark an explicit cache breakpoint on the last eligible user message."""
+        """Mark an explicit cache breakpoint on the last eligible turn message."""
         messages = payload.get("messages", [])
         for message in reversed(messages):
-            if message.get("role") != "user":
+            role = message.get("role")
+            if role not in ("user", "tool", "assistant"):
                 continue
             content = message.get("content")
             marker = {"type": "ephemeral"}
-            if isinstance(content, str):
+            if isinstance(content, str) and content.strip():
                 message["content"] = [
                     {"type": "text", "text": content, "cache_control": marker}
                 ]

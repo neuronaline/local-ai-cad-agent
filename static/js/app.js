@@ -190,6 +190,7 @@ let lastUserSubmission = null;
 let previewProject = '';
 let loadedPreviewRevision = '';
 let previewLoadPromise = null;
+let pendingPreviewRequest = null;
 const activityItems = new Map();
 const ALLOWED_TAGS = new Set([
   'p', 'br', 'b', 'strong', 'i', 'em', 'u', 's', 'del',
@@ -634,8 +635,11 @@ activityPanel?.querySelector('summary')?.addEventListener('click', () => {
   userManuallyToggled = true;
 });
 
+const activeRunningTools = new Set();
+
 function clearActivity() {
   userManuallyToggled = false;
+  activeRunningTools.clear();
   activityItems.clear();
   activityList.replaceChildren();
   activityPanel.hidden = true;
@@ -744,8 +748,8 @@ function updateActivitySummary() {
     : failed.length
       ? `${failed.length} failed ${failed.length === 1 ? 'task' : 'tasks'}`
       : `${items.length} ${items.length === 1 ? 'step' : 'steps'} completed`;
-  if (!userManuallyToggled) {
-    activityPanel.open = Boolean(current);
+  if (!userManuallyToggled && failed.length > 0) {
+    activityPanel.open = true;
   }
   activityPanel.hidden = false;
 }
@@ -770,6 +774,12 @@ function markActivityRecovered() {
 function addToolMessage(data) {
   const callId = data.call_id || generateUUID();
   const status = data.status || 'running';
+  if (status === 'running' || status === 'preparing') {
+    if (callId !== 'agent-run') activeRunningTools.add(callId);
+  } else if (TERMINAL_STATUSES.has(status)) {
+    activeRunningTools.delete(callId);
+  }
+
   if (callId !== 'agent-run' && activityItems.has('agent-run')) {
     const placeholder = activityList.querySelector('[data-call-id="agent-run"]');
     placeholder?.remove();
@@ -1012,29 +1022,34 @@ async function api(url, options = {}) {
 }
 
 async function loadCurrentPreview(previewId) {
-  if (!currentProject || previewLoadPromise) return;
+  if (!currentProject) return;
+  if (previewLoadPromise) {
+    pendingPreviewRequest = { previewId };
+    return previewLoadPromise;
+  }
   previewLoadPromise = (async () => {
     const project = currentProject;
     try {
-      const meta = await api(`/api/projects/${encodeURIComponent(project)}/preview/meta`);
-      if (!meta.displayable) {
-        hideUnapprovedPreview(meta.review_status);
-        return;
-      }
       const url = `/api/projects/${encodeURIComponent(project)}/preview?ts=${Date.now()}`;
       await viewer.load(url);
       previewProject = project;
-      loadedPreviewRevision = meta.revision || loadedPreviewRevision;
-      // The agent turn has already completed by the time we render; failures
-      // here are surfaced as a chat-side error and never block the canonical
-      // ``agent_message`` from being persisted.
       if (downloadModelBtn) downloadModelBtn.disabled = false;
+      api(`/api/projects/${encodeURIComponent(project)}/preview/meta`)
+        .then(meta => {
+          if (meta) loadedPreviewRevision = meta.revision || loadedPreviewRevision;
+        })
+        .catch(() => {});
     } catch (error) {
       if (error.message?.includes('superseded')) return;
       if (downloadModelBtn) downloadModelBtn.disabled = true;
       addMessage(`Preview failed: ${error.message}`, 'error');
     } finally {
       previewLoadPromise = null;
+      if (pendingPreviewRequest) {
+        const next = pendingPreviewRequest;
+        pendingPreviewRequest = null;
+        loadCurrentPreview(next.previewId);
+      }
     }
   })();
   return previewLoadPromise;
@@ -2254,11 +2269,17 @@ function showQuestion(question) {
 // SSE event stream & Run-Card State Machine
 let eventSource = null;
 let activeRunCard = null;
+let isUserScrolledUp = false;
+
+feed?.addEventListener('scroll', () => {
+  if (feed) {
+    isUserScrolledUp = (feed.scrollHeight - feed.scrollTop - feed.clientHeight) > 80;
+  }
+}, { passive: true });
 
 function scrollFeedToBottom(force = false) {
   if (!feed) return;
-  const isNearBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight <= 60;
-  if (force || isNearBottom) {
+  if (force || !isUserScrolledUp) {
     feed.scrollTop = feed.scrollHeight;
   }
 }
@@ -2286,6 +2307,9 @@ function getActiveCard(runId = null) {
 function finalizeAllActiveCards() {
   if (activeRunCard) {
     const card = activeRunCard;
+    if (card.dataset.state === 'working') {
+      return;
+    }
     activeRunCard = null;
     if (card.dataset.state !== 'done' && card.dataset.state !== 'error' && card.dataset.state !== 'stopped') {
       setCardState(card, 'done');
@@ -2296,6 +2320,9 @@ function finalizeAllActiveCards() {
   }
   if (feed) {
     feed.querySelectorAll('.message.agent.streaming').forEach(card => {
+      if (card.dataset.state === 'working') {
+        return;
+      }
       if (card.dataset.state !== 'done' && card.dataset.state !== 'error' && card.dataset.state !== 'stopped') {
         setCardState(card, 'done');
       }
@@ -2369,9 +2396,25 @@ function setCardState(card, state, labelText = null) {
 
 let renderRafId = null;
 let pendingRenderCard = null;
+let renderThrottleTimer = null;
+const STREAMING_RENDER_THROTTLE_MS = 80;
 
-function applyCardRender(card) {
+function applyCardRender(card, isFinal = false) {
   if (!card) return;
+  const now = performance.now();
+  const last = card._lastRenderTime || 0;
+  if (!isFinal && now - last < STREAMING_RENDER_THROTTLE_MS) {
+    if (!renderThrottleTimer) {
+      renderThrottleTimer = setTimeout(() => {
+        renderThrottleTimer = null;
+        if (pendingRenderCard) {
+          applyCardRender(pendingRenderCard, false);
+        }
+      }, STREAMING_RENDER_THROTTLE_MS - (now - last));
+    }
+    return;
+  }
+  card._lastRenderTime = now;
   const rawClean = stripToolCallTags(card.dataset.raw || '', { trim: false });
   renderAgentContent(card, rawClean);
   if (card.dataset.reasoning) {
@@ -2395,9 +2438,16 @@ function flushStreamingRender() {
     cancelAnimationFrame(renderRafId);
     renderRafId = null;
   }
+  if (renderThrottleTimer) {
+    clearTimeout(renderThrottleTimer);
+    renderThrottleTimer = null;
+  }
   if (pendingRenderCard) {
-    applyCardRender(pendingRenderCard);
+    const card = pendingRenderCard;
     pendingRenderCard = null;
+    applyCardRender(card, true);
+  } else if (activeRunCard) {
+    applyCardRender(activeRunCard, true);
   }
 }
 
@@ -2407,7 +2457,7 @@ function scheduleStreamingRender(card) {
   renderRafId = requestAnimationFrame(() => {
     renderRafId = null;
     if (pendingRenderCard) {
-      applyCardRender(pendingRenderCard);
+      applyCardRender(pendingRenderCard, false);
       pendingRenderCard = null;
     }
   });
@@ -2478,14 +2528,12 @@ function handleStreamingToolDelta(runId, data) {
     label = `${label} [${totalParallel} parallel]`;
   }
   setCardState(card, 'working', label);
-  if (activityItems.has('agent-run')) {
-    addToolMessage({
-      call_id: 'agent-run',
-      tool: 'agent',
-      status: 'running',
-      result: label,
-    });
-  }
+  addToolMessage({
+    call_id: 'agent-run',
+    tool: entry.name || 'agent',
+    status: 'running',
+    result: label,
+  });
 }
 
 function finalizeRunCard(runId, finalText, reasoning) {
@@ -2790,10 +2838,15 @@ function connectStream() {
       const runId = data.run_id;
       const card = getActiveCard(runId);
       if (card && card.dataset.state !== 'done' && card.dataset.state !== 'error' && card.dataset.state !== 'stopped') {
-        if (data.status === 'completed') {
-          setCardState(card, 'thinking', 'Thinking');
-        } else if (data.status === 'error') {
-          setCardState(card, 'thinking', 'Thinking');
+        if (data.status === 'completed' || data.status === 'error') {
+          if (activeRunningTools.size > 0) {
+            const nextCallId = [...activeRunningTools][0];
+            const nextItem = activityItems.get(nextCallId);
+            const label = nextItem ? activityLabel(nextItem.tool) : 'Working';
+            setCardState(card, 'working', label);
+          } else {
+            setCardState(card, 'thinking', 'Thinking');
+          }
         } else if (data.status === 'rendering_views' || data.status === 'rendering_subset') {
           const label = data.result || 'Rendering review views';
           setCardState(card, 'working', label);
