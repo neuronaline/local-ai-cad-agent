@@ -1320,12 +1320,12 @@ function addInfoMessage(type, data = {}) {
 
 const COMMANDS = [
   {
-    name: '/print',
+    name: '/3mf',
     args: '[notes]',
-    desc: 'Recommend 3D print & slicer settings based on full project context',
+    desc: 'Generate a ready-to-print 3MF with AI-tuned slicer settings',
     iconSvg: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M6 9V2h12v7M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M6 14h12v8H6z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>',
     action: () => {
-      message.value = '/print ';
+      message.value = '/3mf ';
       autoResizeMessage();
       message.focus();
       closeSlashPopup();
@@ -1750,7 +1750,7 @@ document.querySelector('#reset-view')?.addEventListener('click', () => {
     item.setAttribute('aria-pressed', String(isIso));
   });
 });
-// 3MF & Model Export
+// Model Export
 function triggerBlobDownload(blob, filename) {
   const blobUrl = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -1765,31 +1765,11 @@ function triggerBlobDownload(blob, filename) {
 downloadModelBtn?.addEventListener('click', async () => {
   if (!currentProject || downloadModelBtn.disabled) return;
   const format = exportFormatSelect?.value || 'stl';
-  const is3mf = format === '3mf';
-  const originalHtml = downloadModelBtn.innerHTML;
 
   downloadModelBtn.disabled = true;
-  if (is3mf) {
-    downloadModelBtn.classList.add('loading');
-    downloadModelBtn.innerHTML = `
-      <svg class="icon spin-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-        <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2.5" stroke-dasharray="28" stroke-dashoffset="10"/>
-      </svg>
-      <span>AI 3MF Setup…</span>
-    `;
-  }
-
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 150000);
-
   try {
     const exportUrl = `/api/projects/${encodeURIComponent(currentProject)}/export?format=${encodeURIComponent(format)}`;
-    const options = is3mf
-      ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ auto_ai: true }), signal: controller.signal }
-      : { method: 'GET', signal: controller.signal };
-
-    const res = await fetch(exportUrl, options);
-    clearTimeout(timeoutId);
+    const res = await fetch(exportUrl);
     if (!res.ok) {
       const err = await res.json().catch(() => ({ error: 'Export failed' }));
       throw new Error(err.error || res.statusText);
@@ -1797,15 +1777,9 @@ downloadModelBtn?.addEventListener('click', async () => {
     const blob = await res.blob();
     triggerBlobDownload(blob, `${currentProject}.${format}`);
   } catch (error) {
-    clearTimeout(timeoutId);
-    const msg = error.name === 'AbortError' ? 'Export timed out after 150 seconds.' : error.message;
-    addMessage(`${is3mf ? '3MF ' : ''}Export failed: ${msg}`, 'error');
+    addMessage(`Export failed: ${error.message}`, 'error');
   } finally {
     downloadModelBtn.disabled = !previewProject;
-    if (is3mf) {
-      downloadModelBtn.classList.remove('loading');
-      downloadModelBtn.innerHTML = originalHtml;
-    }
   }
 });
 document.querySelectorAll('[data-view]').forEach(button => {
@@ -2939,6 +2913,23 @@ function connectStream() {
         status: 'stopped',
         result: 'Agent task stopped.',
       });
+    },
+    export_ready: async data => {
+      if (data.project !== currentProject) return;
+      if (data.format === '3mf') {
+        try {
+          const res = await fetch(`/api/projects/${encodeURIComponent(currentProject)}/export?format=3mf`);
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({ error: '3MF download failed' }));
+            addMessage(`3MF download failed: ${err.error || res.statusText}`, 'error');
+            return;
+          }
+          const blob = await res.blob();
+          triggerBlobDownload(blob, `${currentProject}.3mf`);
+        } catch (err) {
+          addMessage(`3MF download failed: ${err.message}`, 'error');
+        }
+      }
     },
     conversation_reset: data => {
       if (!data || data.project !== currentProject) return;

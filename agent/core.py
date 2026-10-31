@@ -49,6 +49,14 @@ from agent.llm_base import (
     sanitize_assistant_message,
     strip_encrypted_reasoning,
 )
+from agent.converter import export_project_model
+from agent.print_advisor import (
+    THREE_MF_COMMAND_MARKER,
+    extract_json_block,
+    parse_nozzle_spec,
+    sanitize_print_profile,
+    validate_profile_universal,
+)
 from agent.prompt import (
     NUDGE_CAD_FIX_REQUIRED,
     format_budget_warning_nudge,
@@ -60,6 +68,7 @@ from agent.prompt import (
 from agent.revisions import (
     MODEL_FILENAME,
     RevisionStore,
+    compute_model_sha256,
     model_is_built,
 )
 from agent.settings import Settings, with_model_selection, with_reasoning_effort
@@ -274,6 +283,8 @@ class _RunState:
     calculation_warning_sent: bool = False
     last_turn_was_continuation: bool = False
     settings: Settings | None = None
+    export_3mf: bool = False
+    export_3mf_retries: int = 0
 
 
 def _extract_reasoning(message: dict[str, Any]) -> str:
@@ -760,6 +771,22 @@ class AgentRunner:
                 },
                 run_id=run_id,
             )
+        export_3mf = False
+        if messages:
+            last_user_msg = None
+            for m in reversed(messages):
+                if isinstance(m, dict) and m.get("role") == "user" and not m.get("synthetic"):
+                    last_user_msg = m
+                    break
+            if last_user_msg:
+                c = last_user_msg.get("content")
+                if isinstance(c, str) and c.startswith(THREE_MF_COMMAND_MARKER):
+                    export_3mf = True
+                elif isinstance(c, list):
+                    for part in c:
+                        if isinstance(part, dict) and str(part.get("text", "")).startswith(THREE_MF_COMMAND_MARKER):
+                            export_3mf = True
+                            break
         return _RunState(
             project_dir=project_dir,
             messages=messages,
@@ -771,6 +798,7 @@ class AgentRunner:
             project=project,
             start_perf_time=time.perf_counter(),
             settings=effective_settings,
+            export_3mf=export_3mf,
         )
 
     def _build_stream_publisher(
@@ -1096,16 +1124,35 @@ class AgentRunner:
                 return _TurnOutcome.DRAWING_NOT_CREATED
             if not raw_content:
                 assistant_message["content"] = "Task completed."
-        invalid_final = not tool_calls and self._should_nudge_incomplete_turn(state)
+        invalid_final = not tool_calls and self._should_nudge_incomplete_turn(state, assistant_message)
         self._publish_assistant_turn(state, assistant_message, invalid_final)
         if not tool_calls:
             return self._handle_no_tool_calls(state, assistant_message)
         state.any_tool_used = True
         return self._handle_tool_calls(state, tool_calls)
 
-    @staticmethod
-    def _should_nudge_incomplete_turn(state: _RunState) -> bool:
+    def _should_nudge_incomplete_turn(
+        self, state: _RunState, assistant_message: dict[str, Any] | None = None
+    ) -> bool:
         """Return True when a text-only turn should be intercepted and nudged."""
+        if state.export_3mf:
+            if state.export_3mf_retries >= 1:
+                return False
+            content = (assistant_message.get("content") if assistant_message else "") or ""
+            json_block = extract_json_block(content)
+            if not json_block or not isinstance(json_block, dict):
+                return True
+            eff_settings = state.settings or self.settings
+            user_printer = (getattr(eff_settings, "user_printer", "") or "").strip()
+            user_nozzle = (getattr(eff_settings, "user_nozzle", "") or "").strip()
+            nozzle_dia = parse_nozzle_spec(user_nozzle)["diameter_mm"]
+            profile = sanitize_print_profile(
+                json_block,
+                nozzle_diameter_mm=nozzle_dia,
+                user_printer=user_printer,
+            )
+            val_err = validate_profile_universal(profile, state.project_dir)
+            return bool(val_err)
         if not state.model_mutated:
             return False
         if not state.preview_id:
@@ -1134,13 +1181,18 @@ class AgentRunner:
             state.run_reasonings.append(reasoning)
 
         if invalid_final:
+            status_msg = (
+                "Validating 3MF slicer profile..."
+                if state.export_3mf
+                else "Model verification required before finalizing."
+            )
             self.publish(
                 "agent_status",
                 {
                     "project": state.project,
                     "run_id": state.run_id,
                     "status": "verifying",
-                    "message": "Model verification required before finalizing.",
+                    "message": status_msg,
                 },
             )
             self.publish(
@@ -1205,6 +1257,10 @@ class AgentRunner:
         """
         content = assistant_message.get("content") or "Task completed."
         full_reasoning = "\n\n".join(state.run_reasonings)
+        if state.export_3mf:
+            outcome = self._finalize_3mf_export(state, content, full_reasoning)
+            if outcome is not None:
+                return outcome
         if not state.preview_id:
             if state.cad_error:
                 self.publish(
@@ -1265,6 +1321,107 @@ class AgentRunner:
             )
             self._publish_terminal_failure(state.project, run_id=state.run_id)
             return _TurnOutcome.FINAL_VERIFICATION_MISSING
+        self._complete(state.project, content, reasoning=full_reasoning, run_id=state.run_id)
+        return _TurnOutcome.COMPLETED
+
+    def _finalize_3mf_export(
+        self, state: _RunState, content: str, full_reasoning: str
+    ) -> _TurnOutcome:
+        """Process and validate 3MF slicer profile from the model's text response."""
+        json_block = extract_json_block(content)
+        if not json_block or not isinstance(json_block, dict):
+            if state.export_3mf_retries < 1:
+                state.export_3mf_retries += 1
+                state.last_turn_was_continuation = True
+                reminder = _synthetic_user(
+                    "The response did not contain a valid JSON print profile block. "
+                    "Please reply with ONLY the complete JSON print profile block enclosed in ```json ... ``` as requested."
+                )
+                state.messages.append(reminder)
+                self._append_message(state.project_dir, reminder)
+                return _TurnOutcome.CONTINUE
+            self.publish(
+                "agent_error",
+                {
+                    "project": state.project,
+                    "run_id": state.run_id,
+                    "message": "3MF export failed: No valid JSON print profile found in the model response.",
+                },
+            )
+            self._publish_terminal_failure(state.project, run_id=state.run_id)
+            return _TurnOutcome.DRAWING_NOT_CREATED
+
+        eff_settings = state.settings or self.settings
+        user_printer = (getattr(eff_settings, "user_printer", "") or "").strip()
+        user_nozzle = (getattr(eff_settings, "user_nozzle", "") or "").strip()
+        nozzle_dia = parse_nozzle_spec(user_nozzle)["diameter_mm"]
+
+        profile = sanitize_print_profile(
+            json_block,
+            nozzle_diameter_mm=nozzle_dia,
+            user_printer=user_printer,
+        )
+        val_err = validate_profile_universal(profile, state.project_dir)
+        if val_err:
+            if state.export_3mf_retries < 1:
+                state.export_3mf_retries += 1
+                state.last_turn_was_continuation = True
+                reminder = _synthetic_user(
+                    f"3MF slicer validation failed: {val_err}\n"
+                    "Please fix the offending parameters and output the complete corrected JSON object enclosed in ```json ... ```."
+                )
+                state.messages.append(reminder)
+                self._append_message(state.project_dir, reminder)
+                return _TurnOutcome.CONTINUE
+            self.publish(
+                "agent_error",
+                {
+                    "project": state.project,
+                    "run_id": state.run_id,
+                    "message": f"3MF slicer validation failed: {val_err}",
+                },
+            )
+            self._publish_terminal_failure(state.project, run_id=state.run_id)
+            return _TurnOutcome.DRAWING_NOT_CREATED
+
+        # Save profile to .cad-agent/print_profile.json
+        current_sha = compute_model_sha256(state.project_dir)
+        profile_store = {
+            "model_sha256": current_sha,
+            "profile": profile,
+        }
+        profile_path = state.project_dir / ".cad-agent" / "print_profile.json"
+        profile_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_profile = profile_path.with_suffix(".tmp")
+        try:
+            tmp_profile.write_text(json.dumps(profile_store, indent=2), encoding="utf-8")
+            tmp_profile.replace(profile_path)
+        except OSError as exc:
+            logging.getLogger(__name__).warning("Failed to save 3MF print profile: %s", exc)
+
+        try:
+            export_project_model(state.project_dir, "3mf", print_profile=profile)
+            self.publish(
+                "export_ready",
+                {
+                    "project": state.project,
+                    "run_id": state.run_id,
+                    "format": "3mf",
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).warning("Failed to package 3MF: %s", exc)
+            self.publish(
+                "agent_error",
+                {
+                    "project": state.project,
+                    "run_id": state.run_id,
+                    "message": f"Failed to package 3MF: {exc}",
+                },
+            )
+            self._publish_terminal_failure(state.project, run_id=state.run_id)
+            return _TurnOutcome.DRAWING_NOT_CREATED
+
         self._complete(state.project, content, reasoning=full_reasoning, run_id=state.run_id)
         return _TurnOutcome.COMPLETED
 

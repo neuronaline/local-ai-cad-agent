@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import io
 import json
 import os
 from pathlib import Path
@@ -20,16 +19,12 @@ from agent.sandbox import _BWRAP, command as sandbox_command
 from agent.tools.cad_scripts.renderer import load_stl, render_iso
 from agent.tools.cad_tool import _supports_manifold
 
-SUPPORTED_EXPORT_FORMATS = frozenset({"stl", "scad", "3mf", "obj", "amf", "off", "csg"})
+SUPPORTED_EXPORT_FORMATS = frozenset({"stl", "scad", "3mf"})
 
 EXPORT_MIME_TYPES: dict[str, str] = {
     "stl": "model/stl",
     "scad": "text/x-scad",
     "3mf": "model/3mf",
-    "obj": "model/obj",
-    "amf": "application/x-amf",
-    "off": "text/plain",
-    "csg": "text/plain",
 }
 
 
@@ -46,19 +41,6 @@ def find_openscad() -> str | None:
         if candidate.is_file():
             return str(candidate)
     return None
-
-
-def stl_to_obj(stl_path: Path) -> str:
-    """Convert an STL file (binary or ASCII) into a Wavefront OBJ string."""
-    vertices, triangles = load_stl(stl_path)
-    buf = io.StringIO()
-    buf.write("# OBJ export from Local AI CAD Agent\n")
-    for v in vertices:
-        buf.write(f"v {v[0]:.4f} {v[1]:.4f} {v[2]:.4f}\n")
-    for t in triangles:
-        # OBJ indices are 1-based
-        buf.write(f"f {t[0] + 1} {t[1] + 1} {t[2] + 1}\n")
-    return buf.getvalue()
 
 
 # Archive entries written by :func:`enrich_3mf_archive`.
@@ -1028,29 +1010,21 @@ def export_project_model(
     model_sha256 = compute_model_sha256(project_dir) or hashlib.sha256(model_path.read_bytes()).hexdigest()
 
     preview_path = project_dir / "preview.stl"
-    if fmt in {"stl", "obj"}:
+    if fmt == "stl":
         if not preview_path.is_file():
             raise FileNotFoundError("No preview has been generated.")
         if preview_path.stat().st_size == 0:
             raise ValueError("The generated preview is empty.")
         _ensure_preview_matches_model(project_dir, model_sha256)
-        if fmt == "stl":
-            return preview_path
+        return preview_path
 
     exports_dir = project_dir / ".cad-agent" / "exports"
     exports_dir.mkdir(parents=True, exist_ok=True)
     _prune_stale_exports(exports_dir, model_sha256)
-    base_file = exports_dir / f"{model_sha256}.{fmt}"
+    base_file = exports_dir / f"{model_sha256}.3mf"
 
     if not _cached(base_file):
-        if fmt == "obj":
-            _write_obj(preview_path, base_file, exports_dir, model_sha256)
-        else:
-            # OpenSCAD-backed formats: 3mf, amf, off, csg
-            _run_openscad_export(model_path, base_file, exports_dir, model_sha256, timeout_seconds)
-
-    if fmt != "3mf":
-        return base_file
+        _run_openscad_export(model_path, base_file, exports_dir, model_sha256, timeout_seconds)
 
     thumbnail = _resolve_3mf_thumbnail(project_dir, exports_dir, model_sha256)
     variant = hashlib.sha256(
@@ -1066,24 +1040,6 @@ def export_project_model(
             thumbnail=thumbnail,
         )
     return enriched_file
-
-
-def _write_obj(preview_path: Path, target: Path, exports_dir: Path, model_sha256: str) -> None:
-    obj_content = stl_to_obj(preview_path)
-    with tempfile.NamedTemporaryFile(
-        dir=exports_dir,
-        prefix=f".tmp_{model_sha256}_",
-        suffix=".obj",
-        delete=False,
-        mode="w",
-        encoding="utf-8",
-    ) as tmp:
-        tmp.write(obj_content)
-        temp_file = Path(tmp.name)
-    try:
-        temp_file.replace(target)
-    finally:
-        temp_file.unlink(missing_ok=True)
 
 
 def _run_openscad_export(

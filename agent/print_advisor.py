@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 import functools
-import hashlib
 import json
 import logging
 import math
@@ -13,12 +11,10 @@ import re
 import shutil
 import subprocess
 import tempfile
-import threading
 from typing import Any
 import xml.etree.ElementTree as ET
 import zipfile
 
-from agent.llm_base import extract_usage_summary
 from agent.revisions import compute_model_sha256
 
 _LOG = logging.getLogger(__name__)
@@ -519,7 +515,7 @@ def sanitize_print_profile(
     return sanitized
 
 
-def _extract_json_block(text: str) -> dict[str, Any] | None:
+def extract_json_block(text: str) -> dict[str, Any] | None:
     """Extract and parse the first valid JSON object from a markdown response."""
     decoder = json.JSONDecoder()
     profile_keys = set(_DEFAULTS) | {"advice_markdown"}
@@ -553,28 +549,7 @@ def _extract_json_block(text: str) -> dict[str, Any] | None:
     return fallback_dict
 
 
-def _format_profile_summary_markdown(
-    profile: dict[str, Any],
-    printer: str,
-    nozzle: str,
-) -> str:
-    nozzle_str = f" with {nozzle}" if nozzle else ""
-    printer_str = f" on {printer}" if printer else ""
-    support_str = (
-        f"Enabled ({profile['support_type']} supports, {profile['support_threshold_angle']}° threshold)"
-        if profile["support_enabled"]
-        else "Disabled (none required)"
-    )
-    brim_str = f"Enabled ({profile['brim_width_mm']} mm brim)" if profile["brim_enabled"] else "Disabled (stable base contact)"
-
-    return (
-        f"**Slicer Profile for {profile['material']}{printer_str}{nozzle_str}:**\n\n"
-        f"- **Layer Height:** {profile['layer_height_mm']} mm (First layer: {profile['first_layer_height_mm']} mm)\n"
-        f"- **Perimeters & Shells:** {profile['wall_loops']} wall loops, {profile['top_shell_layers']} top / {profile['bottom_shell_layers']} bottom\n"
-        f"- **Infill:** {profile['infill_density_percent']}% {profile['infill_pattern']}\n"
-        f"- **Supports & Adhesion:** {support_str} | {brim_str}\n\n"
-        f"**Engineering Rationale:**\n{profile['rationale']}"
-    )
+_extract_json_block = extract_json_block
 
 
 def _load_metrics(project_dir: Path) -> dict[str, Any]:
@@ -612,110 +587,6 @@ def _load_metrics(project_dir: Path) -> dict[str, Any]:
 
     vertices, triangles = load_stl(preview_stl)
     return mesh_metrics(vertices, triangles)
-
-
-def _read_scad(project_dir: Path, limit: int = 4000) -> str:
-    try:
-        return (project_dir / "model.scad").read_text(encoding="utf-8")[:limit]
-    except (OSError, UnicodeDecodeError):
-        return ""
-
-
-def _clean_user_message_text(text: str) -> str:
-    """Strip synthetic prefixes and auto-generated /print templates from user message text."""
-    trimmed = text.strip()
-    if not trimmed:
-        return ""
-    if "Please analyze the current CAD model and provide a comprehensive 3D printing and slicing recommendation" in trimmed:
-        match = re.search(r"### User Requirements & Specific Notes:\s*(.*?)(?:\s*###|\Z)", trimmed, re.DOTALL)
-        if match:
-            extracted = match.group(1).strip()
-            if extracted and extracted != "Standard production print.":
-                return extracted
-        return ""
-    return trimmed
-
-
-def _read_recent_user_context(project_dir: Path, max_messages: int = 5) -> str:
-    """Join the most recent plain-text and multimodal user messages to capture design intent."""
-    user_texts: list[str] = []
-    try:
-        with (project_dir / "conversation.jsonl").open(encoding="utf-8") as conversation:
-            for line in conversation:
-                try:
-                    msg = json.loads(line)
-                except ValueError:
-                    continue
-                if not isinstance(msg, dict) or msg.get("role") != "user":
-                    continue
-                if msg.get("synthetic"):
-                    continue
-                content = msg.get("content")
-                if isinstance(content, str) and content.strip():
-                    cleaned = _clean_user_message_text(content)
-                    if cleaned:
-                        user_texts.append(cleaned)
-                elif isinstance(content, list):
-                    parts = [
-                        _clean_user_message_text(str(part.get("text")).strip())
-                        for part in content
-                        if isinstance(part, dict)
-                        and isinstance(part.get("text"), str)
-                        and str(part.get("text")).strip()
-                    ]
-                    parts = [p for p in parts if p]
-                    if parts:
-                        user_texts.append(" ".join(parts))
-    except OSError:
-        return ""
-    return " | ".join(user_texts[-max_messages:])
-
-
-def _publish_advisor_usage(
-    publish: Callable[..., None] | None,
-    project_name: str,
-    usage: dict[str, Any] | None,
-) -> None:
-    if not callable(publish) or not isinstance(usage, dict) or not usage:
-        return
-    summary = extract_usage_summary(usage)
-    p_val = summary["prompt_tokens"]
-    c_val = summary["completion_tokens"]
-    cached_tokens = summary["cached_tokens"]
-    cost_val = summary["cost"]
-    try:
-        publish(
-            "agent_usage",
-            {
-                "project": project_name,
-                "prompt_tokens": usage.get("prompt_tokens"),
-                "completion_tokens": usage.get("completion_tokens"),
-                "cached_tokens": cached_tokens,
-                "cache_write_tokens": summary["cache_write_tokens"],
-                "cache_hit_rate": summary["cache_hit_rate"],
-                "cost": cost_val,
-                "total_cost": None,
-                "total_prompt_tokens": p_val,
-                "total_completion_tokens": c_val,
-                "total_cached_tokens": cached_tokens,
-                "advisor_call": True,
-            },
-        )
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def _extract_llm_content(resp: Any) -> str:
-    if isinstance(resp, dict):
-        choices = resp.get("choices")
-        if isinstance(choices, list) and choices:
-            msg = choices[0].get("message") if isinstance(choices[0], dict) else None
-            if isinstance(msg, dict):
-                content = str(msg.get("content") or "")
-                if content:
-                    return content
-        return str(resp.get("content") or "")
-    return str(getattr(resp, "content", "") or "")
 
 
 _MINIMAL_3MF_MODEL_XML = (
@@ -785,7 +656,7 @@ def _discover_slicer_cli() -> tuple[str, list[str]] | None:
     return None
 
 
-def _validate_profile_universal(
+def validate_profile_universal(
     profile: dict[str, Any], project_dir: Path | None = None
 ) -> str | None:
     """Validate 3MF OPC/XML structure, dual slicer dialects, and headless CLI slicing."""
@@ -939,390 +810,111 @@ def _validate_profile_universal(
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def generate_ai_print_profile(
-    project_dir: Path,
-    settings: Any,
-    *,
-    priority: str = "auto",
-    material_override: str = "auto",
-    extra_context: str = "",
-    stop_event: threading.Event | None = None,
-    publish: Callable[..., None] | None = None,
-) -> dict[str, Any]:
-    """Query the active LLM to generate a complete 3MF slicer profile."""
-    metrics = _load_metrics(project_dir)
-    user_printer = (getattr(settings, "user_printer", "") or "").strip()
-    user_nozzle = (getattr(settings, "user_nozzle", "") or "").strip()
-    user_filament = (getattr(settings, "user_filament", "PLA") or "PLA").strip()
-    user_additional_info = " ".join(str(getattr(settings, "user_additional_info", "") or "").split()).strip()
-    nozzle_spec = parse_nozzle_spec(user_nozzle)
-    nozzle_dia = nozzle_spec["diameter_mm"]
-    priority = (priority or "auto").strip().lower()
-    material_override = (material_override or "auto").strip()
-    target_filament = (
-        material_override
-        if material_override.lower() != "auto"
-        else user_filament
-    )
-
-    recent_user_context = _read_recent_user_context(project_dir)
-    code_text = _read_scad(project_dir)
-    combined_context = f"{recent_user_context} {extra_context}".strip()
-
-    dims = metrics.get("dimensions_mm") or {}
-    p = metrics.get("printability") or {}
-    vol = float(metrics.get("volume_mm3", 0.0))
-    surf = float(p.get("surface_area_mm2", 0.0))
-
-    model_sha = compute_model_sha256(project_dir) or ""
-    if not model_sha:
-        try:
-            model_sha = hashlib.sha256((project_dir / "preview.stl").read_bytes()).hexdigest()
-        except OSError:
-            model_sha = ""
-    active_provider = getattr(settings, "llm_provider", "") or ""
-    active_model = (
-        getattr(settings, "llm_model", "")
-        or getattr(settings, f"{active_provider}_model", "")
-        or getattr(settings, "model", "")
-        or ""
-    )
-    cache_key = hashlib.sha256(
-        json.dumps(
-            {
-                "schema_v": 9,
-                "provider": active_provider,
-                "model": active_model,
-                "model_sha256": model_sha,
-                "printer": user_printer,
-                "nozzle": user_nozzle,
-                "filament": user_filament,
-                "additional_info": user_additional_info,
-                "priority": priority,
-                "material_override": material_override,
-                "extra_context": extra_context,
-                "user_context": recent_user_context,
-            },
-            sort_keys=True,
-        ).encode("utf-8")
-    ).hexdigest()
-    cache_path = project_dir / ".cad-agent" / "print_profile_cache.json"
-    if cache_path.is_file():
-        try:
-            cached_entry = json.loads(cache_path.read_text(encoding="utf-8"))
-            if (
-                isinstance(cached_entry, dict)
-                and cached_entry.get("cache_key") == cache_key
-                and isinstance(cached_entry.get("profile"), dict)
-            ):
-                cached_profile = sanitize_print_profile(
-                    cached_entry["profile"],
-                    nozzle_diameter_mm=nozzle_dia,
-                    user_printer=user_printer,
-                )
-                cached_advice = (
-                    str(cached_entry.get("advice_markdown") or "").strip()
-                    or _format_profile_summary_markdown(
-                        cached_profile, user_printer, user_nozzle
-                    )
-                )
-                return {
-                    "profile": cached_profile,
-                    "advice_markdown": cached_advice,
-                    "printability": p,
-                    "dimensions_mm": dims,
-                    "volume_mm3": vol,
-                    "hardware": {
-                        "printer": user_printer,
-                        "nozzle": user_nozzle,
-                        "filament": user_filament,
-                        "additional_info": user_additional_info,
-                    },
-                    "source": "ai",
-                    "cached": True,
-                }
-        except (OSError, ValueError):
-            pass
-
-    system_prompt = (
-        "You are an expert additive manufacturing (3D printing) slicing engineer.\n"
-        "Your JSON output is translated 1:1 into a 3MF project archive for Bambu Studio, OrcaSlicer, and PrusaSlicer "
-        "with zero post-processing heuristics. Every value you produce is written directly into the slicer configs.\n"
-        "Analyze the user's printer hardware, nozzle, filament, mesh telemetry, and OpenSCAD source code, "
-        "and output ONLY a valid JSON object wrapped in ```json ... ``` with ALL of the following keys:\n"
-        "{\n"
-        '  "printer_model": string (canonical printer model, e.g. "Bambu Lab A1", "Bambu Lab P1S", "Prusa MK4"),\n'
-        '  "printer_structure": "corexy" | "i3" | "delta",\n'
-        '  "bed_x_mm": number (build plate X width in mm),\n'
-        '  "bed_y_mm": number (build plate Y depth in mm),\n'
-        '  "bed_z_mm": number (max printable Z height in mm),\n'
-        '  "nozzle_diameter_mm": number (installed nozzle orifice diameter in mm),\n'
-        '  "bambu_printer_settings_id": string (exact Bambu/Orca machine preset name, e.g. "Bambu Lab A1 0.6 nozzle"),\n'
-        '  "bambu_print_settings_id": string (exact Bambu/Orca process preset name; 0.4 nozzle has no nozzle suffix e.g. "0.20mm Standard @BBL A1", 0.6 nozzle uses "0.18mm Fine @BBL A1 0.6 nozzle" / "0.24mm Optimal @BBL A1 0.6 nozzle" / "0.30mm Standard @BBL A1 0.6 nozzle"),\n'
-        '  "bambu_filament_settings_id": string (exact Bambu/Orca filament preset name without 0.4/0.6/0.8 nozzle suffix, e.g. "Generic PETG @BBL A1" or "Generic PLA"),\n'
-        '  "material": string (e.g. "PLA", "PETG", "ASA", "ABS", "TPU"),\n'
-        '  "filament_density_g_cm3": number (material density in g/cm³, e.g. 1.24 for PLA, 1.27 for PETG, 1.04 for ABS, 1.07 for ASA, 1.22 for TPU),\n'
-        '  "filament_cost_per_kg": number (filament cost per kg, e.g. 20.0),\n'
-        '  "filament_flow_ratio": number (extrusion multiplier, e.g. 0.98 for PLA/TPU, 0.95 for PETG/ABS/ASA),\n'
-        '  "filament_id": string (Bambu filament code, e.g. "GFL99" for PLA, "GFG99" for PETG, "GFB99" for ABS, "GFB98" for ASA, "GFU99" for TPU),\n'
-        '  "layer_height_mm": number,\n'
-        '  "first_layer_height_mm": number,\n'
-        '  "line_width_mm": number (must be >= nozzle_diameter_mm),\n'
-        '  "initial_layer_line_width_mm": number (must be >= nozzle_diameter_mm),\n'
-        '  "outer_wall_line_width_mm": number (must be >= nozzle_diameter_mm),\n'
-        '  "inner_wall_line_width_mm": number (must be >= nozzle_diameter_mm),\n'
-        '  "top_surface_line_width_mm": number (must be >= nozzle_diameter_mm),\n'
-        '  "sparse_infill_line_width_mm": number (must be >= nozzle_diameter_mm),\n'
-        '  "internal_solid_infill_line_width_mm": number (must be >= nozzle_diameter_mm),\n'
-        '  "support_line_width_mm": number (must be >= nozzle_diameter_mm),\n'
-        '  "wall_loops": integer,\n'
-        '  "top_shell_layers": integer,\n'
-        '  "bottom_shell_layers": integer,\n'
-        '  "wall_generator": "arachne" | "classic",\n'
-        '  "detect_thin_wall": boolean,\n'
-        '  "seam_position": "aligned" | "back" | "random" | "nearest",\n'
-        '  "wall_sequence": "inner/outer" | "outer/inner" | "inner/outer/inner",\n'
-        '  "only_one_wall_top": boolean,\n'
-        '  "elefant_foot_compensation_mm": number,\n'
-        '  "xy_hole_compensation_mm": number,\n'
-        '  "xy_contour_compensation_mm": number,\n'
-        '  "precise_z_height": boolean,\n'
-        '  "ironing_type": "no iron" | "top" | "topmost",\n'
-        '  "ironing_flow_percent": integer,\n'
-        '  "ironing_speed_mms": integer,\n'
-        '  "infill_density_percent": integer,\n'
-        '  "infill_pattern": "gyroid" | "grid" | "cubic" | "adaptivecubic" | "honeycomb" | "3dhoneycomb" | "crosshatch" | "rectilinear" | "zig-zag" | "concentric" | "lightning",\n'
-        '  "top_surface_pattern": "monotonicline" | "monotonic" | "concentric" | "rectilinear" | "zig-zag",\n'
-        '  "bottom_surface_pattern": "monotonic" | "monotonicline" | "concentric" | "rectilinear" | "zig-zag",\n'
-        '  "infill_wall_overlap_percent": integer,\n'
-        '  "support_enabled": boolean,\n'
-        '  "support_type": "normal" | "tree",\n'
-        '  "support_threshold_angle": integer,\n'
-        '  "support_on_build_plate_only": boolean,\n'
-        '  "support_top_z_distance_mm": number,\n'
-        '  "support_bottom_z_distance_mm": number,\n'
-        '  "support_interface_top_layers": integer,\n'
-        '  "bridge_flow": number,\n'
-        '  "thick_bridges": boolean,\n'
-        '  "brim_enabled": boolean,\n'
-        '  "brim_type": "no_brim" | "outer_only" | "inner_only" | "outer_and_inner" | "auto_brim",\n'
-        '  "brim_width_mm": integer,\n'
-        '  "nozzle_temp_initial_c": integer,\n'
-        '  "nozzle_temp_c": integer,\n'
-        '  "bed_temp_initial_c": integer,\n'
-        '  "bed_temp_c": integer,\n'
-        '  "fan_min_percent": integer,\n'
-        '  "fan_max_percent": integer,\n'
-        '  "overhang_fan_percent": integer,\n'
-        '  "slow_down_for_layer_cooling": boolean,\n'
-        '  "max_volumetric_speed_mm3s": number,\n'
-        '  "initial_layer_speed_mms": integer,\n'
-        '  "initial_layer_infill_speed_mms": integer,\n'
-        '  "outer_wall_speed_mms": integer,\n'
-        '  "inner_wall_speed_mms": integer,\n'
-        '  "sparse_infill_speed_mms": integer,\n'
-        '  "internal_solid_infill_speed_mms": integer,\n'
-        '  "top_surface_speed_mms": integer,\n'
-        '  "bridge_speed_mms": integer,\n'
-        '  "support_speed_mms": integer,\n'
-        '  "travel_speed_mms": integer,\n'
-        '  "slow_down_overhangs": boolean,\n'
-        '  "default_acceleration_mms2": integer,\n'
-        '  "outer_wall_acceleration_mms2": integer,\n'
-        '  "inner_wall_acceleration_mms2": integer,\n'
-        '  "top_surface_acceleration_mms2": integer,\n'
-        '  "initial_layer_acceleration_mms2": integer,\n'
-        '  "travel_acceleration_mms2": integer,\n'
-        '  "retraction_length_mm": number,\n'
-        '  "retraction_speed_mms": integer,\n'
-        '  "z_hop_mm": number,\n'
-        '  "part_category": string,\n'
-        '  "rationale": string (concise 1-2 sentence technical summary)\n'
-        "}"
-    )
-
-    hw_lines = [
-        f"- 3D Printer: {user_printer or 'Standard FDM'}",
-        f"- Nozzle: {user_nozzle or f'{nozzle_dia:.2f} mm'}",
-        f"- Filament: {target_filament}",
-    ]
-    if priority and priority.lower() != "auto":
-        hw_lines.append(f"- Priority: {priority}")
-    if user_additional_info:
-        hw_lines.append(f"- Additional Instructions: {user_additional_info}")
-    hw_section = "\n".join(hw_lines)
-
-    user_prompt = (
-        f"### Target Hardware & Setup:\n"
-        f"{hw_section}\n\n"
-        f"### Exact Model Telemetry:\n"
-        f"- Bounding Box Dimensions: {dims.get('x', 0):.1f} × {dims.get('y', 0):.1f} × {dims.get('z', 0):.1f} mm\n"
-        f"- Volume: {vol:.1f} mm³ | Surface Area: {surf:.1f} mm²\n"
-        f"- Bed Contact Footprint: {float(p.get('bed_contact_area_mm2', 0)):.1f} mm² ({float(p.get('bed_contact_ratio', 0))*100:.1f}%)\n"
-        f"- Downward Overhang Area (>45°): {float(p.get('overhang_area_45deg_mm2', 0)):.1f} mm² (Overhang ratio: {float(p.get('overhang_ratio', 0))*100:.1f}%)\n"
-        f"- Downward Overhang Area (>60°): {float(p.get('overhang_area_60deg_mm2', 0)):.1f} mm²\n"
-        f"- Slenderness Ratio (Z / min(X,Y)): {float(p.get('slenderness_ratio', 1.0)):.2f}\n"
-        f"- Mesh Printability Flags: needs_support={bool(p.get('needs_support'))}, needs_brim={bool(p.get('needs_brim'))}\n\n"
-        f"### User Context & Intent:\n{combined_context or 'Standard functional CAD part'}\n\n"
-        f"### OpenSCAD Code (`model.scad`):\n```scad\n{code_text}\n```\n"
-    )
-
-    try:
-        from agent.llm_base import create_llm_client
-
-        client = create_llm_client(settings)
-        if stop_event is not None:
-            client.stop_event = stop_event
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-        def _query_llm(max_attempts: int) -> str:
-            try:
-                resp = client.chat(messages, max_attempts=max_attempts)
-            except TypeError:
-                resp = client.chat(messages)
-            _publish_advisor_usage(publish, project_dir.name, getattr(client, "last_usage", None))
-            return _extract_llm_content(resp)
-
-        content = _query_llm(2)
-        if not content.strip():
-            raise RuntimeError("LLM returned an empty response while generating the print profile.")
-
-        json_block = _extract_json_block(content)
-        if not json_block or not isinstance(json_block, dict):
-            raise RuntimeError("LLM response did not contain a valid JSON print profile.")
-
-        raw_profile = dict(json_block)
-        if not raw_profile.get("material"):
-            raw_profile["material"] = target_filament
-
-        ai_profile = sanitize_print_profile(
-            raw_profile,
-            nozzle_diameter_mm=nozzle_dia,
-            user_printer=user_printer,
-        )
-        val_err = _validate_profile_universal(ai_profile, project_dir)
-        if val_err:
-            messages.append({"role": "assistant", "content": content})
-            messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        f"3MF slicer validation failed: {val_err}\n"
-                        "Please fix the offending parameters and output the complete corrected JSON object."
-                    ),
-                }
-            )
-            try:
-                retry_block = _extract_json_block(_query_llm(1))
-                if retry_block and isinstance(retry_block, dict):
-                    raw_retry = {**raw_profile, **retry_block}
-                    json_block = raw_retry
-                    if not raw_retry.get("material"):
-                        raw_retry["material"] = target_filament
-                    ai_profile = sanitize_print_profile(
-                        raw_retry,
-                        nozzle_diameter_mm=nozzle_dia,
-                        user_printer=user_printer,
-                    )
-            except Exception:  # noqa: BLE001
-                if stop_event is not None and stop_event.is_set():
-                    raise
-
-        ai_advice = json_block.get("advice_markdown")
-        final_advice = (
-            ai_advice.strip()
-            if isinstance(ai_advice, str) and ai_advice.strip()
-            else _format_profile_summary_markdown(
-                ai_profile, user_printer, user_nozzle
-            )
-        )
-        try:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                dir=cache_path.parent,
-                prefix=".tmp_profile_",
-                suffix=".json",
-                encoding="utf-8",
-                delete=False,
-            ) as tmp:
-                tmp_path = Path(tmp.name)
-                json.dump(
-                    {
-                        "cache_key": cache_key,
-                        "profile": ai_profile,
-                        "advice_markdown": final_advice,
-                    },
-                    tmp,
-                    indent=2,
-                )
-            try:
-                tmp_path.replace(cache_path)
-            finally:
-                tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return {
-            "profile": ai_profile,
-            "advice_markdown": final_advice,
-            "printability": p,
-            "dimensions_mm": dims,
-            "volume_mm3": vol,
-            "hardware": {
-                "printer": user_printer,
-                "nozzle": user_nozzle,
-                "filament": user_filament,
-                "additional_info": user_additional_info,
-            },
-            "source": "ai",
-            "cached": False,
-        }
-    except Exception as exc:
-        if stop_event is not None and stop_event.is_set():
-            raise
-        _LOG.error("LLM 3MF print profile generation failed: %s", exc)
-        if isinstance(exc, RuntimeError):
-            raise
-        raise RuntimeError(f"Failed to generate AI print profile: {exc}") from exc
+_validate_profile_universal = validate_profile_universal
 
 
-def recommend_print_profile(
-    project_dir: Path,
-    *,
-    priority: str = "auto",
-    material_override: str = "auto",
-    extra_context: str = "",
-    settings: Any | None = None,
-    stop_event: threading.Event | None = None,
-    publish: Callable[..., None] | None = None,
-) -> dict[str, Any]:
-    """Generate an LLM-configured print profile for the project's current build."""
-    if settings is None:
-        from agent.settings import load_settings
+PRINT_PROFILE_JSON_CONTRACT = """{
+  "printer_model": string (canonical printer model, e.g. "Bambu Lab A1", "Bambu Lab P1S", "Prusa MK4"),
+  "printer_structure": "corexy" | "i3" | "delta",
+  "bed_x_mm": number (build plate X width in mm),
+  "bed_y_mm": number (build plate Y depth in mm),
+  "bed_z_mm": number (max printable Z height in mm),
+  "nozzle_diameter_mm": number (installed nozzle orifice diameter in mm),
+  "bambu_printer_settings_id": string (exact Bambu/Orca machine preset name, e.g. "Bambu Lab A1 0.6 nozzle"),
+  "bambu_print_settings_id": string (exact Bambu/Orca process preset name; 0.4 nozzle has no nozzle suffix e.g. "0.20mm Standard @BBL A1", 0.6 nozzle uses "0.18mm Fine @BBL A1 0.6 nozzle" / "0.24mm Optimal @BBL A1 0.6 nozzle" / "0.30mm Standard @BBL A1 0.6 nozzle"),
+  "bambu_filament_settings_id": string (exact Bambu/Orca filament preset name without 0.4/0.6/0.8 nozzle suffix, e.g. "Generic PETG @BBL A1" or "Generic PLA"),
+  "material": string (e.g. "PLA", "PETG", "ASA", "ABS", "TPU"),
+  "filament_density_g_cm3": number (material density in g/cm³, e.g. 1.24 for PLA, 1.27 for PETG, 1.04 for ABS, 1.07 for ASA, 1.22 for TPU),
+  "filament_cost_per_kg": number (filament cost per kg, e.g. 20.0),
+  "filament_flow_ratio": number (extrusion multiplier, e.g. 0.98 for PLA/TPU, 0.95 for PETG/ABS/ASA),
+  "filament_id": string (Bambu filament code, e.g. "GFL99" for PLA, "GFG99" for PETG, "GFB99" for ABS, "GFB98" for ASA, "GFU99" for TPU),
+  "layer_height_mm": number,
+  "first_layer_height_mm": number,
+  "line_width_mm": number (must be >= nozzle_diameter_mm),
+  "initial_layer_line_width_mm": number (must be >= nozzle_diameter_mm),
+  "outer_wall_line_width_mm": number (must be >= nozzle_diameter_mm),
+  "inner_wall_line_width_mm": number (must be >= nozzle_diameter_mm),
+  "top_surface_line_width_mm": number (must be >= nozzle_diameter_mm),
+  "sparse_infill_line_width_mm": number (must be >= nozzle_diameter_mm),
+  "internal_solid_infill_line_width_mm": number (must be >= nozzle_diameter_mm),
+  "support_line_width_mm": number (must be >= nozzle_diameter_mm),
+  "wall_loops": integer,
+  "top_shell_layers": integer,
+  "bottom_shell_layers": integer,
+  "wall_generator": "arachne" | "classic",
+  "detect_thin_wall": boolean,
+  "seam_position": "aligned" | "back" | "random" | "nearest",
+  "wall_sequence": "inner/outer" | "outer/inner" | "inner/outer/inner",
+  "only_one_wall_top": boolean,
+  "elefant_foot_compensation_mm": number,
+  "xy_hole_compensation_mm": number,
+  "xy_contour_compensation_mm": number,
+  "precise_z_height": boolean,
+  "ironing_type": "no iron" | "top" | "topmost",
+  "ironing_flow_percent": integer,
+  "ironing_speed_mms": integer,
+  "infill_density_percent": integer,
+  "infill_pattern": "gyroid" | "grid" | "cubic" | "adaptivecubic" | "honeycomb" | "3dhoneycomb" | "crosshatch" | "rectilinear" | "zig-zag" | "concentric" | "lightning",
+  "top_surface_pattern": "monotonicline" | "monotonic" | "concentric" | "rectilinear" | "zig-zag",
+  "bottom_surface_pattern": "monotonic" | "monotonicline" | "concentric" | "rectilinear" | "zig-zag",
+  "infill_wall_overlap_percent": integer,
+  "support_enabled": boolean,
+  "support_type": "normal" | "tree",
+  "support_threshold_angle": integer,
+  "support_on_build_plate_only": boolean,
+  "support_top_z_distance_mm": number,
+  "support_bottom_z_distance_mm": number,
+  "support_interface_top_layers": integer,
+  "bridge_flow": number,
+  "thick_bridges": boolean,
+  "brim_enabled": boolean,
+  "brim_type": "no_brim" | "outer_only" | "inner_only" | "outer_and_inner" | "auto_brim",
+  "brim_width_mm": integer,
+  "nozzle_temp_initial_c": integer,
+  "nozzle_temp_c": integer,
+  "bed_temp_initial_c": integer,
+  "bed_temp_c": integer,
+  "fan_min_percent": integer,
+  "fan_max_percent": integer,
+  "overhang_fan_percent": integer,
+  "slow_down_for_layer_cooling": boolean,
+  "max_volumetric_speed_mm3s": number,
+  "initial_layer_speed_mms": integer,
+  "initial_layer_infill_speed_mms": integer,
+  "outer_wall_speed_mms": integer,
+  "inner_wall_speed_mms": integer,
+  "sparse_infill_speed_mms": integer,
+  "internal_solid_infill_speed_mms": integer,
+  "top_surface_speed_mms": integer,
+  "bridge_speed_mms": integer,
+  "support_speed_mms": integer,
+  "travel_speed_mms": integer,
+  "slow_down_overhangs": boolean,
+  "default_acceleration_mms2": integer,
+  "outer_wall_acceleration_mms2": integer,
+  "inner_wall_acceleration_mms2": integer,
+  "top_surface_acceleration_mms2": integer,
+  "initial_layer_acceleration_mms2": integer,
+  "travel_acceleration_mms2": integer,
+  "retraction_length_mm": number,
+  "retraction_speed_mms": integer,
+  "z_hop_mm": number,
+  "part_category": string,
+  "rationale": string (concise 1-2 sentence technical summary)
+}"""
 
-        settings = load_settings()
-    return generate_ai_print_profile(
-        project_dir,
-        settings,
-        priority=priority,
-        material_override=material_override,
-        extra_context=extra_context,
-        stop_event=stop_event,
-        publish=publish,
-    )
+THREE_MF_COMMAND_MARKER = "[3MF EXPORT REQUEST]"
 
 
-def format_print_command_prompt(
-    project_dir: Path, extra_notes: str = "", settings: Any | None = None
+def format_3mf_command_prompt(
+    project_dir: Path, notes: str = "", settings: Any | None = None
 ) -> str:
-    """Build the ``/print`` chat prompt from exact mesh telemetry and user hardware setup."""
+    """Build the expanded user-turn prompt for /3mf with exact mesh telemetry and slicer schema."""
     metrics = _load_metrics(project_dir)
     p = metrics.get("printability") or {}
     dims = metrics.get("dimensions_mm") or {}
     vol = float(metrics.get("volume_mm3", 0.0))
-    notes = extra_notes.strip() or "Standard production print."
+    user_notes = notes.strip() or "Standard production print."
 
     hw_lines = []
     if settings:
@@ -1340,26 +932,27 @@ def format_print_command_prompt(
             hw_lines.append(f"- Default Filament: {filament}")
         if additional_info:
             hw_lines.append(f"- Additional Instructions: {additional_info}")
-    hw_block = ("### User Hardware Setup:\n" + "\n".join(hw_lines) + "\n\n") if hw_lines else ""
+    hw_block = ("### Target Hardware & Setup:\n" + "\n".join(hw_lines) + "\n\n") if hw_lines else ""
 
     return (
-        "Please analyze the current CAD model and provide a comprehensive 3D printing and slicing recommendation.\n\n"
+        f"{THREE_MF_COMMAND_MARKER}\n"
+        "Generate a complete 3MF slicer profile and manufacturing recommendation for this CAD model.\n\n"
         f"{hw_block}"
         "### Exact Model Telemetry:\n"
-        f"- Dimensions (Bounding Box): {dims.get('x', 0.0):.1f} × {dims.get('y', 0.0):.1f} × {dims.get('z', 0.0):.1f} mm\n"
-        f"- Volume: {vol:.1f} mm³ | Surface Area: {p.get('surface_area_mm2', 0.0):.1f} mm²\n"
-        f"- Bed Contact Footprint: {p.get('bed_contact_area_mm2', 0.0):.1f} mm² "
-        f"({p.get('bed_contact_ratio', 0.0) * 100:.1f}% of base)\n"
-        f"- Downward Overhang Area (>45°): {p.get('overhang_area_45deg_mm2', 0.0):.1f} mm² "
-        f"({p.get('overhang_ratio', 0.0) * 100:.1f}%)\n"
-        f"- Downward Overhang Area (>60°): {p.get('overhang_area_60deg_mm2', 0.0):.1f} mm²\n"
-        f"- Slenderness / Aspect Ratio (Z / min(X,Y)): {p.get('slenderness_ratio', 1.0):.2f}\n"
-        f"- Automated Telemetry Flags: needs_support={bool(p.get('needs_support'))}, "
-        f"needs_brim={bool(p.get('needs_brim'))}\n\n"
-        f"### User Requirements & Specific Notes:\n{notes}\n\n"
-        "Please provide detailed, professional advice covering:\n"
-        "1. **Slicer Profile Recommendations:** Optimal material, layer heights, line widths, wall counts, infill pattern/density, and temperature/cooling advice for the target printer and nozzle.\n"
-        "2. **Build Plate Orientation:** How to orient the part on the print bed to balance mechanical strength (layer line shear), overhangs, and surface finish.\n"
-        "3. **Support & Adhesion Strategy:** Tree vs. standard supports, critical overhang areas, contact z-distance, and brim requirements.\n"
-        "4. **Manufacturing Warnings & Tolerances:** Warping risks, dimensional tolerances for fitting parts, and post-processing suggestions."
+        f"- Bounding Box Dimensions: {dims.get('x', 0.0):.1f} × {dims.get('y', 0.0):.1f} × {dims.get('z', 0.0):.1f} mm\n"
+        f"- Volume: {vol:.1f} mm³ | Surface Area: {float(p.get('surface_area_mm2', 0.0)):.1f} mm²\n"
+        f"- Bed Contact Footprint: {float(p.get('bed_contact_area_mm2', 0.0)):.1f} mm² "
+        f"({float(p.get('bed_contact_ratio', 0.0)) * 100:.1f}%)\n"
+        f"- Downward Overhang Area (>45°): {float(p.get('overhang_area_45deg_mm2', 0.0)):.1f} mm² "
+        f"({float(p.get('overhang_ratio', 0.0)) * 100:.1f}%)\n"
+        f"- Downward Overhang Area (>60°): {float(p.get('overhang_area_60deg_mm2', 0.0)):.1f} mm²\n"
+        f"- Slenderness Ratio (Z / min(X,Y)): {float(p.get('slenderness_ratio', 1.0)):.2f}\n"
+        f"- Mesh Printability Flags: needs_support={bool(p.get('needs_support'))}, needs_brim={bool(p.get('needs_brim'))}\n\n"
+        f"### User Requirements & Specific Notes:\n{user_notes}\n\n"
+        "### Slicer Configuration Instructions:\n"
+        "Do NOT call cad_build, write_file, or edit_file. Do not modify model.scad.\n"
+        "Using your understanding of the geometry and the conversation above, provide your slicing recommendations.\n"
+        "You MUST include a valid JSON code block enclosed in ```json ... ``` containing ALL required slicer profile keys:\n"
+        f"{PRINT_PROFILE_JSON_CONTRACT}\n\n"
+        "After or within the JSON block, explain your engineering rationale, print orientation, and support strategy."
     )

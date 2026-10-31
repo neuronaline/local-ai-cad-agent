@@ -44,10 +44,8 @@ from agent.core import AgentRunner
 from agent.images import store_images
 from agent.io import utc_now_iso
 from agent.print_advisor import (
-    format_print_command_prompt,
-    parse_nozzle_spec,
-    recommend_print_profile,
-    sanitize_print_profile,
+    THREE_MF_COMMAND_MARKER,
+    format_3mf_command_prompt,
 )
 from agent.prompt import UI_EXAMPLE_PROMPTS
 from agent.review_paths import review_dir
@@ -119,7 +117,7 @@ def _resolve_project_or_404(
 
 
 def _redact_history_event(event: dict[str, Any]) -> dict[str, Any]:
-    """Replace tool inline image data URLs in history responses with a placeholder.
+    """Replace tool inline image data URLs and collapse expanded command prompts in history responses.
 
     User-uploaded reference images are preserved so the UI can display them
     when loading conversation history. Tool-role messages produced by
@@ -127,6 +125,31 @@ def _redact_history_event(event: dict[str, Any]) -> dict[str, Any]:
     with a lightweight placeholder to prevent unnecessary bandwidth consumption.
     """
     role = event.get("role")
+    if role == "user":
+        content = event.get("content")
+        if isinstance(content, str) and content.startswith(THREE_MF_COMMAND_MARKER):
+            m = re.search(r"### User Requirements & Specific Notes:\s*(.*?)(?:\s*###|\Z)", content, re.DOTALL)
+            notes = m.group(1).strip() if m else ""
+            display_cmd = f"/3mf {notes}".strip() if notes and notes != "Standard production print." else "/3mf"
+            copied = dict(event)
+            copied["content"] = display_cmd
+            return copied
+        if isinstance(content, list):
+            copied_parts = None
+            for idx, part in enumerate(content):
+                if isinstance(part, dict) and str(part.get("text", "")).startswith(THREE_MF_COMMAND_MARKER):
+                    text = str(part.get("text", ""))
+                    m = re.search(r"### User Requirements & Specific Notes:\s*(.*?)(?:\s*###|\Z)", text, re.DOTALL)
+                    notes = m.group(1).strip() if m else ""
+                    display_cmd = f"/3mf {notes}".strip() if notes and notes != "Standard production print." else "/3mf"
+                    if copied_parts is None:
+                        copied_parts = list(content)
+                    copied_parts[idx] = {**part, "text": display_cmd}
+            if copied_parts is not None:
+                copied = dict(event)
+                copied["content"] = copied_parts
+                return copied
+        return event
     if role != "tool":
         return event
     content = event.get("content")
@@ -678,13 +701,14 @@ def chat():
             return jsonify({"error": str(error)}), 404
         except (ValueError, OSError) as error:
             return jsonify({"error": str(error)}), 400
-        if message.lower() == "/print" or message.lower().startswith("/print "):
+        if message.lower() == "/3mf" or message.lower().startswith("/3mf "):
             try:
                 settings_obj: Settings = current_app.config["SETTINGS"]
-                message = format_print_command_prompt(
-                    project_dir, message[6:].strip(), settings=settings_obj
+                notes = message[4:].strip()
+                message = format_3mf_command_prompt(
+                    project_dir, notes, settings=settings_obj
                 )
-            except FileNotFoundError as error:
+            except (FileNotFoundError, ValueError, OSError) as error:
                 return jsonify({"error": str(error)}), 400
         # ``AgentRunner.start`` takes transactional ownership of the
         # uploaded inputs by moving them into a run-scoped directory under
@@ -1056,75 +1080,40 @@ def preview_meta(project_name: str):
     })
 
 
-@render_bp.post("/api/projects/<project_name>/print-profile")
-def get_print_profile(project_name: str):
-    payload = request.get_json(silent=True) or {}
-    settings: Settings = current_app.config["SETTINGS"]
-    bus = current_app.config.get("EVENT_BUS")
-    publish = bus.publish if bus is not None else None
-    project_dir = _resolve_project_or_404(project_name)
-    if not isinstance(project_dir, Path):
-        return project_dir
-    try:
-        result = recommend_print_profile(
-            project_dir,
-            priority=str(payload.get("priority", "auto")),
-            material_override=str(payload.get("material", "auto")),
-            settings=settings,
-            publish=publish,
-        )
-    except FileNotFoundError as error:
-        return jsonify({"error": str(error)}), 404
-    except (ValueError, RuntimeError, OSError) as error:
-        return jsonify({"error": str(error)}), 500
-    return jsonify(result)
-
-
-@render_bp.route("/api/projects/<project_name>/export", methods=["GET", "POST"])
+@render_bp.get("/api/projects/<project_name>/export")
 def export_model(project_name: str):
-    """Export the model; 3MF exports automatically embed AI-tuned slicer settings."""
+    """Export the model; 3MF exports require a pre-generated AI slicer profile via /3mf."""
     fmt = (request.args.get("format") or "stl").lower().strip()
     if fmt not in SUPPORTED_EXPORT_FORMATS:
         supported = ", ".join(sorted(SUPPORTED_EXPORT_FORMATS))
         return jsonify({"error": f"Unsupported format '{fmt}'. Supported: {supported}"}), 400
-
-    settings: Settings = current_app.config["SETTINGS"]
-    bus = current_app.config.get("EVENT_BUS")
-    publish = bus.publish if bus is not None else None
 
     project_dir = _resolve_project_or_404(project_name)
     if not isinstance(project_dir, Path):
         return project_dir
 
     print_profile: dict[str, Any] | None = None
-    if fmt == "3mf":
-        req_json = (request.get_json(silent=True) or {}) if request.method == "POST" else {}
-        raw_profile = req_json.get("profile")
-        if isinstance(raw_profile, dict):
-            nozzle_info = parse_nozzle_spec(settings.user_nozzle)
-            print_profile = sanitize_print_profile(
-                raw_profile,
-                nozzle_diameter_mm=nozzle_info["diameter_mm"],
-                user_printer=settings.user_printer,
-            )
-        elif req_json.get("embed_settings", True):
-            try:
-                result = recommend_print_profile(
-                    project_dir,
-                    settings=settings,
-                    publish=publish,
-                )
-                print_profile = result.get("profile")
-            except FileNotFoundError:
-                # Model not built yet; continue with clean 3MF export without embedded settings
-                print_profile = None
-            except (ValueError, RuntimeError, OSError) as error:
-                current_app.logger.warning("Failed to generate print profile for 3MF export: %s", error)
-                print_profile = None
-
     with _project_lock(project_name):
         if not project_dir.is_dir():
             return jsonify({"error": "Project not found."}), 404
+
+        if fmt == "3mf":
+            profile_path = project_dir / ".cad-agent" / "print_profile.json"
+            if not profile_path.is_file():
+                return jsonify({"error": "No 3MF print profile generated for this model. Run /3mf in chat to generate one."}), 409
+            try:
+                profile_data = json.loads(profile_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return jsonify({"error": "Corrupted 3MF print profile. Run /3mf to regenerate."}), 409
+            if not isinstance(profile_data, dict) or not isinstance(profile_data.get("profile"), dict):
+                return jsonify({"error": "Corrupted 3MF print profile. Run /3mf to regenerate."}), 409
+            current_sha = cached_model_sha256(project_dir)
+            if not current_sha:
+                return jsonify({"error": "No model source file found."}), 404
+            if profile_data.get("model_sha256") != current_sha:
+                return jsonify({"error": "The model has changed since the last 3MF profile was generated. Run /3mf to update settings."}), 409
+            print_profile = profile_data.get("profile")
+
         try:
             exported_path = export_project_model(project_dir, fmt, print_profile=print_profile)
         except FileNotFoundError as error:
