@@ -59,9 +59,15 @@ from agent.print_advisor import (
 )
 from agent.prompt import (
     NUDGE_CAD_FIX_REQUIRED,
+    NUDGE_CAD_WARNING_FIX,
+    NUDGE_REASONING_ONLY_PENDING_CAD,
+    NUDGE_REASONING_ONLY_READY,
+    NUDGE_TRUNCATED_REASONING_PENDING_CAD,
+    NUDGE_TRUNCATED_REASONING_READY,
     format_budget_warning_nudge,
     format_calculation_limit_nudge,
     format_project_state,
+    format_truncated_tool_call_nudge,
     format_unverified_model_nudge,
     get_system_prompt,
 )
@@ -247,6 +253,19 @@ class _TurnOutcome(Enum):
     FINAL_VERIFICATION_MISSING = "final_verification_missing"
 
 
+PHYSICAL_WARNING_CODES: set[str] = {
+    "SEVERE_OVERHANG",
+    "MODERATE_OVERHANG",
+    "UNSTABLE_BASE",
+    "WEAK_BED_ADHESION_AREA",
+    "BUILD_VOLUME_EXCEEDED",
+    "INVERTED_NORMALS",
+    "SINGLE_PERIMETER_LOCAL_WALL",
+    "CROWDED_PART_LAYOUT",
+    "MULTI_BODY_SUSPECT",
+}
+
+
 @dataclass
 class _RunState:
     """Mutable per-run state shared between ``_run`` and ``_run_turn``."""
@@ -261,6 +280,8 @@ class _RunState:
     preview_id: str | None = None
     cad_error: str | None = None
     cad_fix_required: bool = True
+    cad_warning_fix_required: bool = False
+    warning_nudge_count: int = 0
     any_tool_used: bool = False
     model_mutated: bool = False
     nudged_cad: bool = False
@@ -954,7 +975,7 @@ class AgentRunner:
                 state.truncation_continuations += 1
                 state.total_truncation_continuations += 1
                 state.last_turn_was_continuation = True
-                usage = getattr(state.client, "last_usage", None)
+                usage = trunc_err.usage or getattr(state.client, "last_usage", None)
                 self._accumulate_state_usage(state, usage)
                 self._publish_usage(state.project, usage, state=state)
                 content = trunc_err.partial_content.strip() if trunc_err.partial_content else ""
@@ -1007,20 +1028,17 @@ class AgentRunner:
                         "continuing": True,
                     },
                 )
+                partial_msg["synthetic"] = True
                 state.messages.append(partial_msg)
-                ConversationStore.append(state.project_dir, {**partial_msg, "synthetic": True})
+                ConversationStore.append(state.project_dir, partial_msg)
+                cad_pending = self._should_nudge_incomplete_turn(state)
                 if truncated_tools:
-                    nudge_text = (
-                        f"CRITICAL: Your previous tool call ({', '.join(truncated_tools)}) was cut off by token limits before arguments finished. "
-                        "Cease all internal reasoning immediately. Do NOT explain, repeat your reasoning, or apologize. "
-                        "Emit the complete tool call NOW with concise, compact arguments "
-                        "(for write_file/edit_file: keep OpenSCAD code compact, omit verbose comments, scaffold core geometry first)."
-                    )
+                    nudge_text = format_truncated_tool_call_nudge(truncated_tools)
                 else:
                     nudge_text = (
-                        "CRITICAL: Output token limit reached. Cease all internal reasoning immediately. "
-                        "Do NOT repeat reasoning or output commentary. Emit your tool call "
-                        "(e.g. write_file, edit_file, cad_build) or final answer directly NOW."
+                        NUDGE_TRUNCATED_REASONING_PENDING_CAD
+                        if cad_pending
+                        else NUDGE_TRUNCATED_REASONING_READY
                     )
                 continuation_nudge = _synthetic_user(nudge_text)
                 state.messages.append(continuation_nudge)
@@ -1109,15 +1127,17 @@ class AgentRunner:
                     ):
                         state.run_reasonings.append(turn_reasoning)
                     assistant_message["content"] = ""
+                    assistant_message["synthetic"] = True
                     self._append_message(
                         state.project_dir,
-                        {**assistant_message, "synthetic": True},
+                        assistant_message,
                     )
                     state.messages.append(assistant_message)
+                    cad_pending = self._should_nudge_incomplete_turn(state)
                     continuation_nudge = _synthetic_user(
-                        "CRITICAL: Reasoning finished but no tool call was emitted. "
-                        "Do NOT reason further or repeat your analysis. "
-                        "Output your tool call (e.g. write_file, cad_build) or final answer directly NOW."
+                        NUDGE_REASONING_ONLY_PENDING_CAD
+                        if cad_pending
+                        else NUDGE_REASONING_ONLY_READY
                     )
                     state.messages.append(continuation_nudge)
                     self._append_message(state.project_dir, continuation_nudge)
@@ -1190,7 +1210,16 @@ class AgentRunner:
             return False
         if not state.preview_id:
             return not state.cad_error and state.cad_nudge_count < 2
-        return state.cad_fix_required and state.verification_nudge_count < 2
+        if state.cad_fix_required and state.verification_nudge_count < 2:
+            return True
+        run_settings = state.settings or self.settings
+        limit = run_settings.agent_tool_call_limit
+        remaining_budget = max(0, limit - state.tool_call_turn)
+        return bool(
+            state.cad_warning_fix_required
+            and state.warning_nudge_count < 1
+            and remaining_budget >= 2
+        )
 
     def _publish_assistant_turn(
         self,
@@ -1246,7 +1275,7 @@ class AgentRunner:
             )
         else:
             published_reasoning = reasoning
-            if not has_tools and state.run_reasonings:
+            if state.run_reasonings:
                 combined_reasoning = "\n\n".join(state.run_reasonings)
                 content_text = (assistant_message.get("content") or "").strip()
                 if combined_reasoning and combined_reasoning.strip() != content_text:
@@ -1264,7 +1293,7 @@ class AgentRunner:
                 },
             )
             self._append_message(state.project_dir, assistant_message)
-            if assistant_message.get("content") and has_tools:
+            if has_tools:
                 state.run_reasonings.clear()
         state.messages.append(assistant_message)
         if state.activity_logger is not None:
@@ -1354,6 +1383,21 @@ class AgentRunner:
             )
             self._publish_terminal_failure(state.project, run_id=state.run_id)
             return _TurnOutcome.FINAL_VERIFICATION_MISSING
+        run_settings = state.settings or self.settings
+        limit = run_settings.agent_tool_call_limit
+        remaining_budget = max(0, limit - state.tool_call_turn)
+        if (
+            state.model_mutated
+            and state.cad_warning_fix_required
+            and state.warning_nudge_count < 1
+            and remaining_budget >= 2
+        ):
+            state.warning_nudge_count += 1
+            state.last_turn_was_continuation = True
+            reminder = _synthetic_user(NUDGE_CAD_WARNING_FIX)
+            state.messages.append(reminder)
+            self._append_message(state.project_dir, reminder)
+            return _TurnOutcome.CONTINUE
         self._complete(state.project, content, reasoning=full_reasoning, run_id=state.run_id)
         return _TurnOutcome.COMPLETED
 
@@ -1614,6 +1658,8 @@ class AgentRunner:
                 if is_model_mutation(tool_name):
                     if self._tool_call_succeeded(call.get("id", ""), state.messages):
                         state.model_mutated = True
+                        state.cad_warning_fix_required = False
+                        state.warning_nudge_count = 0
                         if state.cad_nudge_count < 2:
                             state.nudged_cad = False
                         if state.verification_nudge_count < 2:
@@ -1622,6 +1668,33 @@ class AgentRunner:
                         mutation_failed_in_wave = True
                 elif is_cad_build(tool_name):
                     state.nudged_cad = False
+                    tool_msg = next(
+                        (
+                            m
+                            for m in reversed(state.messages)
+                            if m.get("tool_call_id") == call.get("id")
+                        ),
+                        None,
+                    )
+                    if tool_msg:
+                        payload = _tool_payload(tool_msg)
+                        if isinstance(payload, dict):
+                            verif = payload.get("verification")
+                            if isinstance(verif, dict):
+                                status = verif.get("status")
+                                findings = verif.get("findings") or []
+                                has_physical_warning = (
+                                    status == "WARNING"
+                                    and any(
+                                        isinstance(f, dict)
+                                        and f.get("category") == "WARNING"
+                                        and f.get("code") in PHYSICAL_WARNING_CODES
+                                        for f in findings
+                                    )
+                                )
+                                state.cad_warning_fix_required = has_physical_warning
+                                if not has_physical_warning:
+                                    state.warning_nudge_count = 0
                     # Circuit-breaker for repeated CAD build or verification failures.
                     # Consecutive failure count resets on a clean, verified build,
                     # while per-signature counts persist across the turn to catch

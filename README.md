@@ -22,7 +22,7 @@ A local-first web application for **creating and refining parametric 3D CAD mode
 - **Sandboxed Execution:** Runs OpenSCAD and math scripts inside an isolated Linux Bubblewrap (`bwrap`) container with detached networking, read-only system mounts, and `libseccomp` syscall filtering.
 - **Interactive 3D Viewport & History:** Live Three.js preview, camera presets, wireframe/grid toggles, source diffs, and one-click revision rollbacks.
 - **UI Model Switcher:** Configure multiple providers and models in `config.yaml` and switch models or reasoning effort directly from the Web UI.
-- **Print Advisor & Multi-Format Export:** Hardware-aware print profile recommendations (`/print` & `user` printer config) with export to **3MF** (with embedded slicer settings), **STL**, **OpenSCAD (`.scad`)**, **OBJ**, **AMF**, **OFF**, or **CSG**.
+- **Ready-to-Print 3MF & Multi-Format Export:** Hardware-aware print profile recommendations (`/3mf` & `user:` printer config) with export to **3MF** (with embedded slicer settings for Bambu Studio, OrcaSlicer, and PrusaSlicer), **STL**, and **OpenSCAD (`.scad`)**.
 - **Zero External CDN Dependencies:** All frontend assets are bundled locally in `static/vendor/`.
 
 ## 📋 Requirements
@@ -55,7 +55,7 @@ Set `llm.provider` (e.g. `openrouter` or `gemini:gemini-3.8-flash`) and define y
 | **Gemini** | `gemini` | Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) in `.env`; models under `gemini.models` |
 | **Vertex AI** | `vertex` | Run `gcloud auth application-default login`; models under `vertex.models` |
 
-*(Optional: Set your 3D printer, nozzle, and filament under `user:` in `config.yaml` for tailored `/print` recommendations.)*
+*(Optional: Set your 3D printer, nozzle, and filament under `user:` in `config.yaml` for tailored `/3mf` recommendations and slicer profiles.)*
 
 ### 3. Run
 
@@ -67,7 +67,7 @@ Open **`http://127.0.0.1:8000`**.
 
 > ⚠️ **Security Note:** The server binds to `127.0.0.1` with no built-in authentication. Do not expose it to untrusted networks without an authenticating reverse proxy.
 
-## 🛠️ Agent Tools
+## 🛠️ Agent Tools & Commands
 
 The agent iterates using 7 structured tools:
 
@@ -76,6 +76,11 @@ The agent iterates using 7 structured tools:
 - `get_view_images` — Loads rendered views or the 8-angle contact sheet into visual context.
 - `python` — Runs restricted math and engineering calculations inside the sandbox.
 - `question` — Prompts the user with a structured UI form when critical dimensions are ambiguous.
+
+Slash commands available in chat:
+- `/3mf [notes]` — Exports a ready-to-print 3MF with AI-tuned slicer settings for your hardware profile.
+- `/audit [notes]` — Audits the model for geometric, manifold, and manufacturing defects.
+- `/reset` — Resets conversation memory for the active project.
 
 Projects are stored under `~/CAD-Agent-Projects/<project_name>/` (configurable via `workspace_root` in `config.yaml`).
 

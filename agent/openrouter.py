@@ -14,6 +14,16 @@ from agent.llm_base import ChatCompletionsClient, is_continuation_messages, post
 from agent.settings import Settings
 
 
+_EFFORT_REASONING_BUDGETS: dict[str, int] = {
+    "minimal": 1024,
+    "low": 2048,
+    "medium": 4096,
+    "high": 6144,
+    "xhigh": 8192,
+    "max": 8192,
+}
+
+
 class OpenRouterClient(ChatCompletionsClient):
     # Preserving reasoning blocks is critical for tool use continuity on OpenRouter,
     # specifically for models like Claude and OpenAI reasoning models where multi-turn
@@ -87,15 +97,27 @@ class OpenRouterClient(ChatCompletionsClient):
 
         # OpenRouter strictly requires choosing ONLY ONE of "effort" or "max_tokens".
         # Sending both simultaneously results in a 400 Bad Request error.
-        if effort in ("none", "off", "0"):
+        if is_continuation:
+            if effort in ("none", "off", "0"):
+                payload["reasoning"] = {"effort": "none"}
+            else:
+                # Continuation turns must never consume thousands of reasoning tokens.
+                # Clamp reasoning to a tight 512-token ceiling to emit the pending tool call immediately.
+                payload["reasoning"] = {"max_tokens": 512}
+        elif effort in ("none", "off", "0"):
             payload["reasoning"] = {"effort": "none"}
         elif effort:
-            if is_continuation:
-                payload["reasoning"] = {"effort": "low"}
-            else:
+            if max_tokens_cfg == 0:
+                # Unconstrained thinking explicitly requested (0 = unlimited in config)
                 payload["reasoning"] = {"effort": effort}
-        elif is_continuation:
-            payload["reasoning"] = {"max_tokens": 512}
+            else:
+                budget = _EFFORT_REASONING_BUDGETS.get(effort, 4096)
+                if self.settings.llm_max_completion_tokens:
+                    max_comp = self.settings.llm_max_completion_tokens
+                    reserved_for_output = max(max_comp // 2, 8192) if max_comp >= 16384 else max_comp // 2
+                    max_allowed = max(256, max_comp - reserved_for_output)
+                    budget = min(budget, max_allowed)
+                payload["reasoning"] = {"max_tokens": max(256, budget)}
         elif max_tokens_cfg is not None and max_tokens_cfg > 0:
             payload["reasoning"] = {"max_tokens": max(256, int(max_tokens_cfg))}
 

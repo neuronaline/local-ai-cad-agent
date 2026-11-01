@@ -108,12 +108,14 @@ class CompletionTruncatedError(RuntimeError):
         reasoning_text: str = "",
         partial_tool_calls: list[dict[str, Any]] | None = None,
         provider_label: str = "",
+        usage: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.partial_content = partial_content
         self.reasoning_text = reasoning_text
         self.partial_tool_calls = partial_tool_calls or []
         self.provider_label = provider_label
+        self.usage = usage
 
 
 def _stream_error_detail(error: Any) -> str:
@@ -549,6 +551,25 @@ def sanitize_messages(
 
     cleaned: list[dict[str, Any]] = []
     for idx, message in enumerate(messages):
+        # Filter stale synthetic truncation artifacts from prior completed runs (idx < last_user_idx)
+        if idx < last_user_idx and message.get("synthetic") is True:
+            role = message.get("role")
+            content_str = str(message.get("content") or "").strip().lower()
+            if role == "user":
+                if any(
+                    marker in content_str
+                    for marker in (
+                        "critical: output token limit reached",
+                        "critical: your previous tool call",
+                        "critical: reasoning finished but no tool call",
+                    )
+                ):
+                    continue
+            elif role == "assistant":
+                has_tools = bool(message.get("tool_calls"))
+                if not has_tools and content_str != "task stopped.":
+                    continue
+
         if message.get("role") == "assistant":
             is_aborted_stub = (
                 not message.get("tool_calls")
@@ -1558,7 +1579,8 @@ def parse_chat_stream(
         for idx, call in enumerate(all_extracted_calls):
             tool_calls[idx] = call
 
-    if finish_reason in ("length", "MAX_TOKENS"):
+    finish_norm = str(finish_reason or "").strip().lower()
+    if finish_norm in ("length", "max_tokens"):
         raise CompletionTruncatedError(
             f"{provider_label} completion was truncated (finish_reason={finish_reason!r}); "
             "token limit was reached before completion. Consider increasing 'llm.max_completion_tokens' "
@@ -1567,13 +1589,13 @@ def parse_chat_stream(
             reasoning_text=reasoning_text,
             partial_tool_calls=list(tool_calls.values()) if tool_calls else [],
             provider_label=provider_label,
+            usage=last_usage,
         )
 
     # Some reasoning-first models (Anthropic extended thinking, OpenAI o-series,
     # Gemini thinking) emit reasoning deltas with no text content and finish
     # cleanly. Leave content empty so the runner can nudge continuation rather
     # than treating placeholder text as a completed final answer.
-    finish_norm = str(finish_reason or "").strip().lower()
     if not content and not tool_calls:
         if reasoning_text.strip() and (finish_reason is None or finish_norm in ("stop", "completed", "end_turn")):
             content = ""
@@ -1664,6 +1686,8 @@ def _clamp_payload_reasoning_on_retry(payload: dict[str, Any]) -> None:
             budget = cfg.get(key)
             if isinstance(budget, int) and budget > _RETRY_REASONING_BUDGET:
                 cfg[key] = _RETRY_REASONING_BUDGET
+        if "effort" in cfg and "max_tokens" in cfg:
+            del cfg["effort"]
 
 
 class BaseLLMClient:
@@ -2307,6 +2331,9 @@ class ChatCompletionsClient(BaseLLMClient):
             usage = result.get("usage") if isinstance(result, dict) else None
             self.last_usage = usage if isinstance(usage, dict) else None
             return result
+        except CompletionTruncatedError as trunc_err:
+            self.last_usage = trunc_err.usage if isinstance(trunc_err.usage, dict) else None
+            raise
         finally:
             with self._response_lock:
                 self._active_response = None
@@ -2348,7 +2375,9 @@ class ChatCompletionsClient(BaseLLMClient):
         body = response.json()
         self.last_usage = normalize_usage(body.get("usage")) if isinstance(body.get("usage"), dict) else None
         choices = body.get("choices") if isinstance(body, dict) else None
-        if choices and choices[0].get("finish_reason") in ("length", "MAX_TOKENS"):
+        finish_reason = choices[0].get("finish_reason") if choices else None
+        finish_norm = str(finish_reason or "").strip().lower()
+        if choices and finish_norm in ("length", "max_tokens"):
             msg_partial = choices[0].get("message") if isinstance(choices[0].get("message"), dict) else {}
             raise CompletionTruncatedError(
                 f"{self._provider_label} completion was truncated "
@@ -2359,6 +2388,7 @@ class ChatCompletionsClient(BaseLLMClient):
                 reasoning_text=msg_partial.get("reasoning") or msg_partial.get("reasoning_content") or "",
                 partial_tool_calls=msg_partial.get("tool_calls") or [],
                 provider_label=self._provider_label,
+                usage=self.last_usage,
             )
         if choices and isinstance(choices[0].get("message"), dict):
             msg = choices[0]["message"]

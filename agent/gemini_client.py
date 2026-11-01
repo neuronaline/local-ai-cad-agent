@@ -806,6 +806,7 @@ def parse_interactions_stream(
             reasoning_text=reasoning_text,
             partial_tool_calls=list(tool_calls.values()) if tool_calls else [],
             provider_label=provider_label,
+            usage=last_usage,
         )
 
     if not content and not tool_calls:
@@ -932,6 +933,7 @@ def parse_interactions_response(body: dict[str, Any]) -> dict[str, Any]:
             reasoning_text=reasoning_text,
             partial_tool_calls=tool_calls,
             provider_label="Google AI Studio",
+            usage=usage,
         )
 
     if not content and not tool_calls:
@@ -1106,6 +1108,9 @@ class GoogleInteractionsClient(BaseLLMClient):
             if isinstance(result, dict) and "id" in result:
                 self._last_interaction_id = result["id"]
             return result
+        except CompletionTruncatedError as trunc_err:
+            self.last_usage = trunc_err.usage if isinstance(trunc_err.usage, dict) else None
+            raise
         finally:
             with self._response_lock:
                 self._active_response = None
@@ -1120,7 +1125,11 @@ class GoogleInteractionsClient(BaseLLMClient):
             with contextlib.suppress(Exception):
                 response.read()
         body = response.json()
-        parsed_body = parse_interactions_response(body)
+        try:
+            parsed_body = parse_interactions_response(body)
+        except CompletionTruncatedError as trunc_err:
+            self.last_usage = trunc_err.usage if isinstance(trunc_err.usage, dict) else None
+            raise
         self.last_usage = parsed_body.get("usage")
         if "id" in parsed_body:
             self._last_interaction_id = parsed_body["id"]

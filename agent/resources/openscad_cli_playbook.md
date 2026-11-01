@@ -103,6 +103,24 @@ module countersunk_hole(h, d_shaft, d_head, h_head) {
         cylinder(h = h_head + EPS, d1 = d_shaft, d2 = d_head);
 }
 
+// Self-Supporting Horizontal Bore (Teardrop Profile for Support-Free FDM Printing)
+// Circular bores with d > 3 mm running horizontally (along X or Y) create > 60 deg steep overhangs
+// at their top crown (Z_max). A teardrop profile adds a 45-deg pointed roof that prints cleanly without support.
+// Extrudes along Z with apex pointing along +Y; orient with rotate() so the apex points upward in +Z
+// (e.g. rotate([90, 0, 0]) for a bore along Y, or rotate([90, 0, 90]) for a bore along X).
+module teardrop_hole(d, h) {
+    r = d / 2;
+    linear_extrude(height = h, center = true, convexity = 4)
+        hull() {
+            circle(r = r);
+            polygon(points = [
+                [-r * sin(45), r * cos(45)],
+                [0, r * sqrt(2)],
+                [r * sin(45), r * cos(45)]
+            ]);
+        }
+}
+
 // Hollowed Necked Vessel (Continuous Cavity & Self-Supporting >= 45 deg Shoulder)
 // NEVER seal the top of a bottle body under the neck or cut the body cavity past Z = body_h.
 // Union outer shell (body + conical shoulder + neck), then subtract ONE continuous inner union.
@@ -212,4 +230,8 @@ plate_layout();
    * **NEVER** cut rectangular L-channels/T-slots (`cube()`) at the top of a box or add stepped horizontal lips at `Z > 0` on a sliding lid—flat horizontal roofs at `Z > 0` create massive `>60 deg` overhangs (`SEVERE_OVERHANG`).
    * Always use the `dovetail_prism(bot_w, h, length)` pattern: wide base at the bottom of the groove (`Z = box_z - lid_t`, supported from below by the narrower `inner_w` cavity wall so the floor faces `+Z`) tapering inward at `45 deg` (`dr = dz`) to `Z = box_z`, paired with a flat-base `45 deg` trapezoidal lid resting on `Z = 0`.
    * For perforated baskets/containers, use **narrow vertical wall slots** (horizontal width `<= 2.0 mm`) that stop `>= 3 mm` below the top rail floor; never cut wide horizontal slots (`width > 3.5 mm`) with flat roofs.
+5. **Horizontal Bores, Captive Nut Pockets & Tapered-Body Cutouts:**
+   * **Horizontal Bores (`d > 3 mm`):** Circular holes running horizontally along X or Y create steep `> 60 deg` overhangs at the top ceiling. Always use `teardrop_hole(d, h)` or a 45-deg chamfered roof so the ceiling is self-supporting (`dr <= dz`).
+   * **Captive Nut Pockets at `Z > 0`:** When embedding horizontal hex nut pockets or captive slots above the build plate, bevel or chamfer the upper roof at `<= 45 deg` instead of flat horizontal overhang ceilings.
+   * **Tapered Body Wall Clearance:** When placing bores or pockets inside angled or tapered bodies (wedges, cones, pyramids), calculate outer wall thickness at the narrowest cross-section (not just the base or center): `x_outer(y) - r_pocket >= 2 * nozzle_dia` (e.g. `>= 1.2 mm`). Never allow pockets to pinch thin outer walls below 2 extrusion perimeters.
 

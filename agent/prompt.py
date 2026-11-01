@@ -25,10 +25,13 @@ features implied by the object's real-world purpose (e.g. mating screw threads o
 joints on caps and jars, >= 45 deg conical transition shoulders on necked vessels, lead-in
 chamfers, and mating clearances). Design every part for support-free FDM 3D printing: every
 component must rest squarely on a flat Z = 0 base face, caps/lids must rest flat outer-face-down
-at Z = 0 with cavities opening upward (+Z), and remaining walls behind grooves/bores must be
->= 2 extrusion perimeters. Avoid unrequested decorative ornaments, but never omit functional
-mechanics. When a reference image is provided, use it for shape and proportion while keeping
-stated dimensions exact."""
+at Z = 0 with cavities opening upward (+Z), horizontal holes/bores (d > 3 mm) and internal
+captive pockets at Z > 0 must use self-supporting <= 45 deg teardrop or chamfered roofs (never
+flat horizontal roofs or uncompensated horizontal cylinders that produce steep > 60 deg crown
+overhangs), and remaining walls behind grooves/bores—especially inside tapered or angled bodies—must
+preserve >= 2 extrusion perimeters at the narrowest cross-section. Avoid unrequested decorative ornaments,
+but never omit functional mechanics. When a reference image is provided, use it for shape and
+proportion while keeping stated dimensions exact."""
 
 # Single source of truth for parameter formatting and units.
 # OpenSCAD syntax, EPS cutter conventions, manifold union, and difference rules
@@ -57,8 +60,8 @@ _HARDWARE_AND_MATERIAL_RULES = """\
 _OPERATIONAL_RULES = """\
 - Edit only the active project's model.scad.
 - Reasoning economy:
-  * Budget internal thinking concisely; never generate lengthy monologues or overthink obvious geometry.
-  * Offload non-trivial coordinate arithmetic, Z-stacks, clearances, overhang angles, and stability checks to the ``python`` tool (`np`, `sp`, `math`) rather than mental arithmetic.
+  * Budget internal thinking concisely; keep internal monologues brief and focused strictly on high-level strategy and immediate tool choices.
+  * NEVER derive complex trigonometry, teardrop offsets, rotation matrices, or tapered wall clearances via mental monologues—immediately invoke ``python`` (`np`, `sp`, `math`) standalone or in parallel with `write_file`/`edit_file` to calculate exact coordinates.
 - Python engineering & geometry verification:
   1. **Compute-First (`python` then `write_file`/`edit_file`):** For multi-part assemblies, mating threads/rails, or symbolic coordinate solving, consolidate the upfront math into one ``python`` script (two turns at most), inspect the solved output, then immediately write or edit `model.scad`. Never chain 3+ consecutive `python`-only turns without modifying `model.scad`.
   2. **Parallel Verify + Write (`python` + `write_file`/`edit_file`):** For single-part models or localized edits where dimensions are straightforward, you may emit ``python`` and ``write_file``/``edit_file`` in parallel in the same turn to assert Z-stack continuity (`min_z == 0`), wall clearances (`>= 2 * nozzle_dia`), overhang slopes (`<= 45 deg`), and Center of Mass stability.
@@ -68,9 +71,10 @@ _OPERATIONAL_RULES = """\
   * Use ``write_file`` for initial creation or full rewrites, and ``edit_file`` (`edits=[{old_string, new_string}]`) for targeted updates. Call ``read_file`` after multiple edits have diverged from the initial snapshot.
   * Batch independent tool calls in the same turn whenever possible.
   * Compile and visually verify geometry in one step with ``cad_build(views=['isometric', 'front', 'top'])``. On build or verification failure, fix `model.scad` and rebuild.
+  * When verification findings report specific coordinates (e.g. steep overhangs at `Z = ...`, thin local walls at `XY = ...`, or unstable base), use `python` to solve exact geometry adjustments at those coordinates, apply fixes with `edit_file` or `write_file`, and rebuild automatically.
   * When a visual or spatial defect is reported, call ``get_view_images(views=['front', 'top', 'isometric'])`` (or ``views=['all']``) to inspect rendered views before editing.
   * Clarify blocking physical contradictions with a single batched ``question``.
-- Verification requirement: A task is ready only after `model.scad` compiles and passes ``cad_build`` without critical verification issues.
+- Verification requirement: A task is ready only after `model.scad` compiles and passes ``cad_build`` with zero critical issues and—while step budget remains (remaining >= 2)—zero unresolved physical printability WARNINGs (e.g. SEVERE_OVERHANG, SINGLE_PERIMETER_LOCAL_WALL, UNSTABLE_BASE).
 - Response style: Keep final answers concise and factual (1-3 sentences or bullet points) stating what was created, confirmed dimensions, and key assumptions."""
 
 # Ordered list of (section_tag, body) pairs. Adding or reordering a section is a
@@ -323,12 +327,63 @@ def format_calculation_limit_nudge(
     )
 
 
+NUDGE_TRUNCATED_TOOL_CALL_TEMPLATE = (
+    "CRITICAL: Your previous tool call ({tools_text}) was cut off by token limits before arguments finished. "
+    "Cease all internal reasoning immediately. Do NOT explain, repeat your reasoning, or apologize. "
+    "Emit the complete tool call NOW with concise, compact arguments "
+    "(for write_file/edit_file: keep OpenSCAD code compact, omit verbose comments, scaffold core geometry first)."
+)
+
+
+def format_truncated_tool_call_nudge(tool_names: list[str]) -> str:
+    """Format synthetic reminder when a tool call was truncated mid-argument stream."""
+    tools_text = ", ".join(tool_names) if tool_names else "tool"
+    return NUDGE_TRUNCATED_TOOL_CALL_TEMPLATE.format(tools_text=tools_text)
+
+
+NUDGE_TRUNCATED_REASONING_PENDING_CAD = (
+    "CRITICAL: Output token limit reached. Cease all internal reasoning immediately. "
+    "Do NOT repeat reasoning, explain, or apologize. "
+    "CAD operations or verification fixes are pending: emit your tool call "
+    "(e.g. python, write_file, edit_file, cad_build) directly NOW."
+)
+
+NUDGE_TRUNCATED_REASONING_READY = (
+    "CRITICAL: Output token limit reached. Cease all internal reasoning immediately. "
+    "Do NOT repeat reasoning or output commentary. Emit your tool call "
+    "(e.g. write_file, edit_file, cad_build) or final answer directly NOW."
+)
+
+NUDGE_REASONING_ONLY_PENDING_CAD = (
+    "CRITICAL: Reasoning finished but no tool call was emitted. "
+    "Do NOT reason further or repeat your analysis. "
+    "CAD operations or verification fixes are pending: output your tool call "
+    "(e.g. python, write_file, edit_file, cad_build) directly NOW."
+)
+
+NUDGE_REASONING_ONLY_READY = (
+    "CRITICAL: Reasoning finished but no tool call was emitted. "
+    "Do NOT reason further or repeat your analysis. "
+    "Output your tool call (e.g. write_file, cad_build) or final answer directly NOW."
+)
+
+NUDGE_CAD_WARNING_FIX = (
+    "CRITICAL: cad_build reported physical printability WARNING(s) with specific coordinates "
+    "(e.g. steep unsupported overhangs, thin local walls, or unstable base). "
+    "Do NOT finalize or explain the warning away. Use python to compute exact clearances or "
+    "teardrop geometry at the reported coordinates if needed, apply the fix to model.scad using "
+    "edit_file or write_file, and re-run cad_build NOW."
+)
+
+
 # Multimodal Visual Inspection Prompt (wrapped around relocated tool images)
 TOOL_IMAGE_PROMPT = (
     "Rendered view(s) from the preceding tool call. Visually verify: "
     "(1) no component floats in mid-air above Z=0, "
-    "(2) hollow vessels have an unobstructed through-opening from neck to body, and "
-    "(3) hole patterns and mating features are centered and symmetric:"
+    "(2) hollow vessels have an unobstructed through-opening from neck to body, "
+    "(3) hole patterns and mating features are centered and symmetric, and "
+    "(4) if the preceding cad_build verification reported any CRITICAL issues or physical printability WARNINGs "
+    "(e.g. SEVERE_OVERHANG, SINGLE_PERIMETER_LOCAL_WALL, UNSTABLE_BASE) and step budget remains, fix model.scad and rebuild before finalizing:"
 )
 
 
