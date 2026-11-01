@@ -291,7 +291,6 @@ class CadTool:
                     self._atomic_copy(cached_metrics_path, self.project_dir / ".cad_metrics.json")
                     if mode.produces_render:
                         self._atomic_copy(cache_dir / "render.png", self.project_dir / "render.png")
-                    self._record_build_success(metrics)
                     preview_sha = (
                         cached.get("preview_sha256")
                         or hashlib.sha256(cached_stl.read_bytes()).hexdigest()
@@ -300,7 +299,6 @@ class CadTool:
                         "metrics": metrics,
                         "feature_summary": cached.get("feature_summary") or {},
                         "declared_parameters": cached.get("declared_parameters") or [],
-                        "validation_results": cached.get("validation_results") or [],
                         "model_sha256": model_sha,
                         "preview_sha256": preview_sha,
                         "review_manifest": cached_review_manifest or cached.get("review_manifest"),
@@ -405,7 +403,6 @@ class CadTool:
                     raise RuntimeError(error_msg)
                 self._atomic_copy(render_path, self.project_dir / "render.png")
             self._atomic_copy(metrics_path, self.project_dir / ".cad_metrics.json")
-            self._record_build_success(metrics)
 
             model_sha = cached.get("model_sha256") or hashlib.sha256(model_code.encode("utf-8")).hexdigest()
             if model_sha:
@@ -434,7 +431,6 @@ class CadTool:
                 "metrics": metrics,
                 "feature_summary": cached.get("feature_summary") or {},
                 "declared_parameters": cached.get("declared_parameters") or [],
-                "validation_results": cached.get("validation_results") or [],
                 "model_sha256": cached.get("model_sha256"),
                 "preview_sha256": cached.get("preview_sha256"),
                 "review_manifest": review_manifest,
@@ -851,7 +847,6 @@ class CadTool:
             "render": "render.png" if mode.produces_render else None,
             "feature_summary": payload.get("feature_summary") or {},
             "declared_parameters": payload.get("declared_parameters") or [],
-            "validation_results": payload.get("validation_results") or [],
         }
         if model_sha:
             result["model_sha256"] = model_sha
@@ -909,6 +904,14 @@ class CadTool:
             model_code=precomputed_code if isinstance(precomputed_code, str) else None,
         )
         result["verification"] = verification
+
+        # Gate revision build status and LKG promotion on verification outcome
+        if isinstance(verification, dict) and verification.get("status") == "FAILED":
+            self._record_build_failure(
+                verification.get("summary") or "CAD verification failed with critical defects."
+            )
+        elif isinstance(metrics, dict):
+            self._record_build_success(metrics)
 
         # Persist verification (and any merged review_manifest) in working copy and cache .cad_metrics.json in one pass
         model_sha = result.get("model_sha256")

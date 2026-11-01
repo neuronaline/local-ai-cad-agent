@@ -10,7 +10,10 @@
   <body data-mobile-view="chat">
     <nav class="mobile-tabs" aria-label="Workspace">
       <button type="button" data-mobile-view="chat" aria-pressed="true">Chat</button>
-      <button type="button" data-mobile-view="viewer" aria-pressed="false">Preview</button>
+      <button type="button" data-mobile-view="viewer" aria-pressed="false">
+        <span>Preview</span>
+        <span id="mobile-preview-badge" class="mobile-badge hidden">●</span>
+      </button>
     </nav>
     <main class="app-shell">
       <section class="chat-panel">
@@ -20,9 +23,22 @@
             <h1>{{ project_name }}</h1>
             <span id="connection-status" class="connection-status" role="status" aria-label="Connecting" title="Connecting…"></span>
           </div>
+          <div class="header-right">
+            <div id="balance-pill" class="balance-pill" hidden title="Provider credit balance">
+              <span class="balance-dot"></span>
+              <span id="balance-amount" class="balance-amount"></span>
+            </div>
+          </div>
         </header>
+        <div id="preflight-banner" class="preflight-banner" hidden></div>
         <div id="busy-project-banner" class="busy-project-banner" hidden></div>
         <div id="chat-feed" class="chat-feed" aria-live="polite"></div>
+        <button id="scroll-bottom-btn" type="button" class="scroll-bottom-btn" hidden title="Scroll to bottom" aria-label="Scroll to bottom">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <path d="M12 5v14m0 0 6-6m-6 6-6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <span id="scroll-bottom-badge" class="scroll-badge" hidden></span>
+        </button>
         <template id="chat-empty">
           <div class="empty-state">
             <strong>{{ project_name }}</strong>
@@ -86,6 +102,13 @@
                 <option value="max"{% if reasoning_effort == 'max' %} selected{% endif %}>Max</option>
               </select>
             </div>
+            <button id="hardware-picker-btn" type="button" class="hardware-picker-btn toolbar-pill quiet" title="Printer & Filament Preferences" aria-label="Printer & Filament Preferences">
+              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <path d="M6 18h12M6 14h12M8 10h8M9 6h6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+                <rect x="3" y="3" width="18" height="18" rx="3" fill="none" stroke="currentColor" stroke-width="1.6"/>
+              </svg>
+              <span id="hardware-picker-label">FDM Profile</span>
+            </button>
             <span class="composer-hint">Enter sends · Shift+Enter adds a line · / for commands</span>
             <button id="send-toggle" type="button" class="send-toggle" title="Send" aria-label="Send">
               <span class="send-toggle-icon" data-mode="send">
@@ -108,10 +131,26 @@
           <div class="viewer-title">
             <div class="viewer-tabs" role="tablist" aria-label="Viewer modes">
               <button id="view-tab-3d" type="button" class="viewer-tab active" role="tab" aria-selected="true">3D View</button>
-              <button id="view-tab-code" type="button" class="viewer-tab" role="tab" aria-selected="false">Code</button>
+              <button id="view-tab-code" type="button" class="viewer-tab" role="tab" aria-selected="false">
+                <span>Code</span>
+                <span id="code-dirty-dot" class="dirty-dot" hidden title="Unsaved changes">●</span>
+              </button>
             </div>
             <span id="dimensions">No preview yet</span>
             <span id="grid-warning" class="grid-warning" hidden title="Model exceeds the configured grid surface"></span>
+            <div class="verification-wrap">
+              <button id="verification-pill" type="button" class="verification-pill" hidden aria-expanded="false" aria-haspopup="true" title="Verification & Printability">
+                <span id="verification-icon" class="verification-icon">✓</span>
+                <span id="verification-label" class="verification-label">Verified</span>
+              </button>
+              <div id="telemetry-popover" class="telemetry-popover" hidden role="dialog" aria-label="CAD Verification & Telemetry">
+                <div class="popover-header">
+                  <strong>CAD & FDM Telemetry</strong>
+                  <button type="button" id="telemetry-close" class="quiet icon-only" title="Close">✕</button>
+                </div>
+                <div id="telemetry-body" class="popover-body"></div>
+              </div>
+            </div>
           </div>
           <div class="viewer-actions" aria-label="Preview controls">
             <div class="toolbar-group display-tools-group" role="group" aria-label="Display and screenshot tools">
@@ -227,6 +266,12 @@
                 </svg>
                 <span>Save</span>
               </button>
+              <button id="btn-code-build" type="button" class="primary toolbar-pill code-action-btn" title="Save and build 3D preview (Ctrl+Enter)" aria-label="Save and build">
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                  <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.9 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                <span>Save & Build</span>
+              </button>
               <button id="copy-code-btn" type="button" class="quiet toolbar-pill code-action-btn" title="Copy code" aria-label="Copy code">
                 <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
                   <rect x="9" y="9" width="13" height="13" rx="2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
@@ -236,7 +281,10 @@
               </button>
             </div>
           </div>
-          <textarea id="code-editor" class="code-editor" spellcheck="false" placeholder="// No model.scad found"></textarea>
+          <div class="code-editor-layout">
+            <div id="code-gutter" class="code-gutter" aria-hidden="true"></div>
+            <textarea id="code-editor" class="code-editor" spellcheck="false" placeholder="// No model.scad found"></textarea>
+          </div>
         </div>
       </section>
     </main>
@@ -247,7 +295,7 @@
       </header>
       <div id="revisions-content" class="drawer-content"></div>
     </aside>
-    <div id="image-preview-modal" class="modal hidden" aria-hidden="true" role="dialog" aria-label="Image preview">
+    <div id="image-preview-modal" class="modal" hidden aria-hidden="true" role="dialog" aria-label="Image preview">
       <div class="image-modal-content">
         <div class="image-modal-header">
           <span id="image-modal-title" class="image-modal-title">Reference Image</span>
@@ -258,6 +306,62 @@
         </div>
       </div>
     </div>
+    <div id="hardware-modal" class="modal" hidden aria-hidden="true" role="dialog" aria-labelledby="hardware-modal-title">
+      <div class="modal-content hardware-modal-content">
+        <div class="modal-header">
+          <h3 id="hardware-modal-title">Printer & Filament Preferences</h3>
+          <button id="hardware-modal-close" type="button" class="quiet icon-only" title="Close" aria-label="Close">✕</button>
+        </div>
+        <form id="hardware-form" class="hardware-form">
+          <div class="form-group">
+            <label for="hw-printer">Printer Model</label>
+            <input id="hw-printer" type="text" placeholder="e.g. Bambu Lab X1C, Prusa MK4, Ender 3 V2" list="hw-printer-suggestions" autocomplete="off">
+            <datalist id="hw-printer-suggestions">
+              <option value="Bambu Lab X1-Carbon">
+              <option value="Bambu Lab P1S / P1P">
+              <option value="Bambu Lab A1 / A1 mini">
+              <option value="Prusa MK4 / MK3S+">
+              <option value="Prusa XL">
+              <option value="Creality Ender 3 V2 / S1">
+              <option value="Voron 2.4 / Trident">
+              <option value="Anycubic Kobra 2">
+            </datalist>
+          </div>
+          <div class="form-row">
+            <div class="form-group half">
+              <label for="hw-filament">Filament Material</label>
+              <select id="hw-filament">
+                <option value="PLA">PLA (Standard)</option>
+                <option value="PLA-CF">PLA-CF (Carbon Fiber)</option>
+                <option value="PETG">PETG (Tough / Heat)</option>
+                <option value="ABS">ABS (Enclosure required)</option>
+                <option value="ASA">ASA (UV / Weather)</option>
+                <option value="TPU">TPU (Flexible)</option>
+                <option value="PC">PC (Polycarbonate)</option>
+                <option value="PA-CF">Nylon / PA-CF</option>
+              </select>
+            </div>
+            <div class="form-group half">
+              <label for="hw-nozzle">Nozzle Diameter</label>
+              <select id="hw-nozzle">
+                <option value="0.4mm">0.4 mm (Standard)</option>
+                <option value="0.2mm">0.2 mm (Ultra Detail)</option>
+                <option value="0.6mm">0.6 mm (High Flow)</option>
+                <option value="0.8mm">0.8 mm (Fast Draft)</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-group">
+            <label for="hw-additional">Additional Print Notes & Rules</label>
+            <textarea id="hw-additional" rows="2" placeholder="e.g. 0.2mm layer height, 15% gyroid infill, no supports if possible, 3 wall perimeters"></textarea>
+          </div>
+          <div class="modal-actions">
+            <button type="button" id="hardware-modal-cancel" class="quiet">Cancel</button>
+            <button type="submit" class="primary">Save Preferences</button>
+          </div>
+        </form>
+      </div>
+    </div>
     <script id="app-config" type="application/json">
       {{ {
         'projectName': project_name,
@@ -265,6 +369,7 @@
         'reasoningEffort': reasoning_effort,
         'activeModelKey': active_model_key,
         'availableModels': available_models,
+        'userPreferences': user_preferences,
         'viewerGrid': {
           'size': viewer_grid_size,
           'divisions': viewer_grid_divisions,

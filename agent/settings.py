@@ -266,6 +266,27 @@ def with_model_selection(settings: Settings, model_key: str) -> Settings:
     return replace(settings, **updates)
 
 
+def with_user_preferences(
+    settings: Settings,
+    *,
+    printer: str | None = None,
+    nozzle: str | None = None,
+    filament: str | None = None,
+    additional_info: str | None = None,
+) -> Settings:
+    """Return a copy of ``settings`` with user hardware and printing preferences updated."""
+    updates: dict[str, Any] = {}
+    if printer is not None:
+        updates["user_printer"] = str(printer).strip()
+    if nozzle is not None:
+        updates["user_nozzle"] = str(nozzle).strip()
+    if filament is not None:
+        updates["user_filament"] = str(filament).strip()
+    if additional_info is not None:
+        updates["user_additional_info"] = str(additional_info).strip()
+    return replace(settings, **updates) if updates else settings
+
+
 def _read_yaml(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}

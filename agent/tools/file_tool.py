@@ -149,9 +149,9 @@ class OpenScadPreflight:
                     "maximum safe limit (256) and will stall OpenSCAD compilation. Use $fn <= 64 (or <= 36 for threads)."
                 )
                 return
-            if fn_val > 100:
+            if fn_val > 128:
                 self.warnings.append(
-                    f"PRE-FLIGHT WARNING: $fn = {fn_val} (> 100) at line {line_num} causes slow rendering. Prefer $fn <= 64."
+                    f"PRE-FLIGHT WARNING: $fn = {fn_val} (> 128) at line {line_num} causes slow rendering. Prefer $fn <= 64."
                 )
 
         for sl_m in re.finditer(r"\bslices\s*=\s*([0-9]+)", clean_code):
@@ -174,8 +174,10 @@ class OpenScadPreflight:
             )
             return
 
-        # 6. Check for UPPER_CASE parameter definition
-        has_params = bool(re.search(r"^[ \t]*[A-Z][A-Z0-9_]*[ \t]*=", clean_code, re.MULTILINE))
+        # 6. Check for UPPER_CASE parameter definition (excluding EPS constants)
+        has_params = bool(
+            re.search(r"^[ \t]*(?!EPS\b|EPSILON\b)[A-Z][A-Z0-9_]*[ \t]*=", clean_code, re.MULTILINE)
+        )
         if not has_params:
             self.warnings.append(
                 "PRE-FLIGHT WARNING: No UPPER_CASE parameters declared at top of model.scad. "

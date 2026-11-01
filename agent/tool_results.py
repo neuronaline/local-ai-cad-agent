@@ -72,7 +72,7 @@ def compact_verification_findings(findings: list[Any], limit: int = 8) -> list[d
             "code": item.get("code"),
             "message": item.get("message"),
         }
-        for opt in ("line", "impact", "culprit"):
+        for opt in ("line", "impact", "culprit", "suggestion"):
             if item.get(opt) is not None:
                 entry[opt] = item[opt]
         compacted.append(entry)

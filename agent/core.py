@@ -30,6 +30,7 @@ from agent.conversation import (
     ConversationStore,
     shared_history_lock,
 )
+from agent.converter import export_project_model
 from agent.dispatcher import (
     cancel_remaining_tool_calls,
     group_tool_calls_into_waves,
@@ -49,7 +50,6 @@ from agent.llm_base import (
     sanitize_assistant_message,
     strip_encrypted_reasoning,
 )
-from agent.converter import export_project_model
 from agent.print_advisor import (
     THREE_MF_COMMAND_MARKER,
     extract_json_block,
@@ -71,7 +71,12 @@ from agent.revisions import (
     compute_model_sha256,
     model_is_built,
 )
-from agent.settings import Settings, with_model_selection, with_reasoning_effort
+from agent.settings import (
+    Settings,
+    with_model_selection,
+    with_reasoning_effort,
+    with_user_preferences,
+)
 from agent.tool_schemas import TOOL_SCHEMAS
 from agent.tools.cad_tool import CadTool
 from agent.tools.file_tool import FileTool
@@ -393,6 +398,24 @@ class AgentRunner:
         """Update the active ``<provider>:<model>`` dynamically for future runs."""
         with self._lock:
             self.settings = with_model_selection(self.settings, model_key)
+
+    def set_user_preferences(
+        self,
+        *,
+        printer: str | None = None,
+        nozzle: str | None = None,
+        filament: str | None = None,
+        additional_info: str | None = None,
+    ) -> None:
+        """Update hardware preferences dynamically for future runs."""
+        with self._lock:
+            self.settings = with_user_preferences(
+                self.settings,
+                printer=printer,
+                nozzle=nozzle,
+                filament=filament,
+                additional_info=additional_info,
+            )
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -2681,6 +2704,13 @@ class AgentRunner:
                 pass
             else:
                 if isinstance(answers, dict):
+                    if len(questions) == 1 and isinstance(questions[0], dict):
+                        qid = str(questions[0].get("id", ""))
+                        if qid and qid not in answers:
+                            if "answer" in answers:
+                                answers = {qid: answers["answer"]}
+                            elif len(answers) == 1:
+                                answers = {qid: next(iter(answers.values()))}
                     lines = ["User answers:"]
                     for q in questions:
                         qid = q.get("id", "")
@@ -2693,6 +2723,17 @@ class AgentRunner:
                                 formatted_val = str(value)
                             lines.append(f"- {qtext}: {formatted_val}")
                     return "\n".join(lines)
+        else:
+            try:
+                parsed = json.loads(answer)
+            except json.JSONDecodeError:
+                return answer
+            if isinstance(parsed, dict) and ("answer" in parsed or len(parsed) == 1):
+                parsed = parsed["answer"] if "answer" in parsed else next(iter(parsed.values()))
+                if not isinstance(parsed, list):
+                    return str(parsed)
+            if isinstance(parsed, list):
+                return ", ".join(str(v) for v in parsed)
         return answer
 
     @staticmethod

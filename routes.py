@@ -54,6 +54,7 @@ from agent.revisions import (
     RevisionIntegrityError,
     RevisionOrigin,
     RevisionStore,
+    atomic_write_bytes,
     cached_model_sha256,
 )
 from agent.settings import (
@@ -61,6 +62,7 @@ from agent.settings import (
     Settings,
     with_model_selection,
     with_reasoning_effort,
+    with_user_preferences,
 )
 
 # 1-128 chars; no path separators, "..", URL/shell-hostile or control
@@ -323,6 +325,38 @@ def _sync_model_selection(model_key_raw: Any, *, persist: bool = True) -> str | 
     return model_key
 
 
+def _sync_user_preferences(
+    *,
+    printer: str | None = None,
+    nozzle: str | None = None,
+    filament: str | None = None,
+    additional_info: str | None = None,
+) -> dict[str, str]:
+    """Sync user hardware preferences with app config and agent runner."""
+    settings: Settings = current_app.config["SETTINGS"]
+    updated = with_user_preferences(
+        settings,
+        printer=printer,
+        nozzle=nozzle,
+        filament=filament,
+        additional_info=additional_info,
+    )
+    current_app.config["SETTINGS"] = updated
+    runner: AgentRunner = current_app.config["AGENT_RUNNER"]
+    runner.set_user_preferences(
+        printer=printer,
+        nozzle=nozzle,
+        filament=filament,
+        additional_info=additional_info,
+    )
+    return {
+        "printer": updated.user_printer,
+        "nozzle": updated.user_nozzle,
+        "filament": updated.user_filament,
+        "additional_info": updated.user_additional_info,
+    }
+
+
 def _run_preflight(settings: Settings) -> dict[str, Any]:
     from agent.sandbox import _BWRAP, seccomp_filter_fd
 
@@ -484,6 +518,29 @@ def preflight():
     return jsonify(_run_preflight(current_app.config["SETTINGS"]))
 
 
+@projects_bp.get("/api/settings/hardware")
+def get_hardware_settings():
+    settings: Settings = current_app.config["SETTINGS"]
+    return jsonify({
+        "printer": settings.user_printer,
+        "nozzle": settings.user_nozzle,
+        "filament": settings.user_filament,
+        "additional_info": settings.user_additional_info,
+    })
+
+
+@projects_bp.post("/api/settings/hardware")
+def update_hardware_settings():
+    payload = request.get_json(silent=True) or {}
+    updated = _sync_user_preferences(
+        printer=payload.get("printer"),
+        nozzle=payload.get("nozzle"),
+        filament=payload.get("filament"),
+        additional_info=payload.get("additional_info"),
+    )
+    return jsonify(updated)
+
+
 @projects_bp.get("/project/<name>")
 def project_view(name: str) -> str:
     try:
@@ -500,6 +557,12 @@ def project_view(name: str) -> str:
         reasoning_effort=settings.reasoning_effort or "",
         active_model_key=settings.active_model_key,
         available_models=[opt.to_dict() for opt in settings.available_models],
+        user_preferences={
+            "printer": settings.user_printer,
+            "nozzle": settings.user_nozzle,
+            "filament": settings.user_filament,
+            "additional_info": settings.user_additional_info,
+        },
         cache_bust=int(time.time()),
         example_prompts=UI_EXAMPLE_PROMPTS,
     )
@@ -867,7 +930,14 @@ def answer_question():
     raw_answer = payload.get("answer", "")
     answers = payload.get("answers")
     if isinstance(answers, dict):
-        raw_answer = json.dumps(answers, ensure_ascii=False, separators=(",", ":"))
+        if "answer" in answers and len(answers) == 1:
+            val = answers["answer"]
+            if isinstance(val, (list, dict)):
+                raw_answer = json.dumps(val, ensure_ascii=False, separators=(",", ":"))
+            else:
+                raw_answer = str(val).strip()
+        else:
+            raw_answer = json.dumps(answers, ensure_ascii=False, separators=(",", ":"))
     else:
         raw_answer = str(raw_answer).strip()
     if not raw_answer:
@@ -1071,12 +1141,30 @@ def preview_meta(project_name: str):
     # but it always resolves to ``"not_required"`` because there is no
     # reviewer gate in front of the preview.
     review_status = "not_required"
+
+    metrics_data = None
+    verification_data = None
+    metrics_file = project_dir / ".cad_metrics.json"
+    if metrics_file.is_file():
+        try:
+            raw_metrics = json.loads(metrics_file.read_text(encoding="utf-8"))
+            if isinstance(raw_metrics, dict):
+                if isinstance(raw_metrics.get("metrics"), dict):
+                    metrics_data = raw_metrics["metrics"]
+                elif "dimensions_mm" in raw_metrics or "volume_mm3" in raw_metrics:
+                    metrics_data = raw_metrics
+                verification_data = raw_metrics.get("verification")
+        except (OSError, json.JSONDecodeError):
+            pass
+
     return jsonify({
         "available": True,
         "displayable": True,
         "revision": f"{stat.st_mtime_ns}-{stat.st_size}",
         "model_sha256": model_sha256,
         "review_status": review_status,
+        "metrics": metrics_data,
+        "verification": verification_data,
     })
 
 
@@ -1372,8 +1460,8 @@ def restore_revision(project_name: str, revision_id: str):
                 (project_dir / "render.png").unlink(missing_ok=True)
             metrics = {}
             verification = {}
+            loaded: dict[str, Any] = {}
             if cached_metrics.is_file() and cached_metrics.stat().st_size > 0:
-                shutil.copy2(cached_metrics, project_dir / ".cad_metrics.json")
                 try:
                     loaded = json.loads(cached_metrics.read_text(encoding="utf-8"))
                     metrics = loaded.get("metrics") or {}
@@ -1382,11 +1470,41 @@ def restore_revision(project_name: str, revision_id: str):
                     metrics = {}
                     verification = {}
 
-            store.record_build_success(
-                revision.id,
-                metrics,
-                project_dir / "preview.stl",
-            )
+            if metrics:
+                from agent.tools.cad_verifier import CadVerifier
+                verifier = CadVerifier(
+                    project_dir,
+                    bus.publish,
+                    user_printer=settings.user_printer,
+                    user_nozzle=settings.user_nozzle,
+                    user_filament=settings.user_filament,
+                )
+                verification = verifier.verify(
+                    precomputed_metrics=metrics,
+                    model_code=source,
+                )
+                loaded["verification"] = verification
+                try:
+                    atomic_write_bytes(
+                        project_dir / ".cad_metrics.json",
+                        json.dumps(loaded).encode("utf-8"),
+                    )
+                except OSError:
+                    pass
+
+            if isinstance(verification, dict) and verification.get("status") == "FAILED":
+                build_status = "failed"
+                store.record_build_failure(
+                    revision.id,
+                    verification.get("summary") or "CAD verification failed with critical defects.",
+                )
+            else:
+                build_status = "succeeded"
+                store.record_build_success(
+                    revision.id,
+                    metrics,
+                    project_dir / "preview.stl",
+                )
             preview_id = runner._register_preview(project_name, project_dir)
             bus.publish("preview_updated", {
                 "project": project_name,
@@ -1401,7 +1519,7 @@ def restore_revision(project_name: str, revision_id: str):
                 "ok": True,
                 "restored": True,
                 "revision_id": revision.id,
-                "build_status": "succeeded",
+                "build_status": build_status,
                 "metrics": metrics,
                 "verification": verification,
                 "preview_id": preview_id,

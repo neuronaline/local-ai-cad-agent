@@ -30,6 +30,7 @@ class Finding:
     message: str
     line: int | None = None
     impact: str | None = None
+    suggestion: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -41,6 +42,8 @@ class Finding:
             result["line"] = self.line
         if self.impact is not None:
             result["impact"] = self.impact
+        if self.suggestion is not None:
+            result["suggestion"] = self.suggestion
         return result
 
 
@@ -59,7 +62,7 @@ def _strip_comments_preserve_lines(code: str) -> str:
 
 
 def _detect_expected_part_count(code: str) -> int | None:
-    """Extract the expected number of parts when PART_TYPE defines explicit single-part variants."""
+    """Extract the expected number of parts when PART_TYPE / part_mode defines explicit single-part variants."""
     clean = _strip_comments_preserve_lines(code)
     multi_tokens = {
         "ALL",
@@ -69,11 +72,15 @@ def _detect_expected_part_count(code: str) -> int | None:
         "SET",
         "COMBINED",
         "PRINT_BED",
+        "PRINT_PLATE",
+        "PRINT_PLATE_ALL",
+        "EXPLODED",
     }
     variants: set[str] = set()
     for m in re.finditer(
-        r"\bPART_TYPE\s*==\s*[\"\']([A-Za-z0-9_]+)[\"\']",
+        r"\b(?:PART_TYPE|PART_MODE|LAYOUT|MODE|VIEW)\s*==\s*[\"\']([A-Za-z0-9_]+)[\"\']",
         clean,
+        re.IGNORECASE,
     ):
         token = m.group(1).upper()
         if token not in multi_tokens:
@@ -83,9 +90,9 @@ def _detect_expected_part_count(code: str) -> int | None:
 
     # Also check Customizer option comment: PART_TYPE = "ALL"; // [ALL, BOTTLE, CAP]
     comment_match = re.search(
-        r"^[ \t]*PART_TYPE[ \t]*=[ \t]*[\"\'][^\"\']+[\"\'][ \t]*;[ \t]*//[ \t]*\[([^\]]+)\]",
+        r"^[ \t]*(?:PART_TYPE|PART_MODE|MODE|LAYOUT)[ \t]*=[ \t]*[\"\'][^\"\']+[\"\'][ \t]*;[ \t]*//[ \t]*\[([^\]]+)\]",
         code,
-        re.MULTILINE,
+        re.MULTILINE | re.IGNORECASE,
     )
     if comment_match:
         opts = [
@@ -98,47 +105,67 @@ def _detect_expected_part_count(code: str) -> int | None:
     return None
 
 
-def _detect_multi_part_intent(code: str) -> bool:
-    """Detect whether model.scad intentionally defines a multi-part assembly or plate layout."""
+def _detect_multi_part_intent(code: str) -> tuple[bool, bool, str | None]:
+    """Detect whether model.scad intentionally defines a multi-part assembly or plate layout.
+
+    Returns:
+        (multi_part_intent: bool, is_assembly: bool, mode_name: str | None)
+    """
     clean_code = _strip_comments_preserve_lines(code)
     param_matches = re.finditer(
-        r"^[ \t]*([A-Z][A-Z0-9_]*)[ \t]*=[ \t]*[\"\']?([A-Za-z0-9_]+)[\"\']?[ \t]*;",
+        r"^[ \t]*([a-zA-Z_][a-zA-Z0-9_]*)[ \t]*=[ \t]*[\"\']?([A-Za-z0-9_]+)[\"\']?[ \t]*;",
         clean_code,
         re.MULTILINE,
     )
     selector_found = False
     for m in param_matches:
         param_name, param_val = m.group(1).upper(), m.group(2).upper()
-        if param_name in ("PART_TYPE", "LAYOUT", "MODE", "VIEW", "ARRANGEMENT"):
+        if param_name in (
+            "PART_TYPE",
+            "PART_MODE",
+            "LAYOUT",
+            "MODE",
+            "VIEW",
+            "ARRANGEMENT",
+            "EXPORT_MODE",
+            "BUILD_MODE",
+            "RENDER_MODE",
+            "PLATE",
+        ):
             selector_found = True
+            if param_val in ("ASSEMBLY", "EXPLODED", "MECHANISM", "FULL_ASSEMBLY"):
+                return True, True, m.group(2)
             if param_val in (
                 "ALL",
                 "PLATE",
+                "PRINT_PLATE",
+                "PRINT_PLATE_ALL",
                 "BOTH",
-                "ASSEMBLY",
                 "SET",
                 "COMBINED",
                 "PRINT_BED",
+                "PRINT_LAYOUT",
             ):
-                return True
-        if param_name in ("ASSEMBLY", "MULTI_PART", "PRINT_BED", "PLATE_LAYOUT") and param_val in (
+                return True, False, m.group(2)
+        if param_name in ("ASSEMBLY", "IS_ASSEMBLY", "EXPLODED") and param_val in ("TRUE", "1"):
+            return True, True, "assembly"
+        if param_name in ("MULTI_PART", "PRINT_BED", "PLATE_LAYOUT", "PRINT_PLATE", "PLATE") and param_val in (
             "TRUE",
             "1",
         ):
-            return True
+            return True, False, "plate"
 
     # If an explicit selector was found (e.g. PART_TYPE = "50"), the user specifically
     # selected a single variant. Do not fall back to generic comment matching.
     if selector_found:
-        return False
+        return False, False, None
 
-    return bool(
-        re.search(
-            r"//.*?\b(?:multi[- ]part|assembly|plate layout|print bed|side[- ]by[- ]side)\b",
-            code,
-            re.IGNORECASE,
-        )
-    )
+    if re.search(r"//.*?\b(?:assembly|exploded view)\b", code, re.IGNORECASE):
+        return True, True, "assembly"
+    if re.search(r"//.*?\b(?:multi[- ]part|plate layout|print bed|side[- ]by[- ]side)\b", code, re.IGNORECASE):
+        return True, False, "multi-part"
+
+    return False, False, None
 
 
 class CadVerifier:
@@ -245,6 +272,8 @@ class CadVerifier:
             mesh_findings, mesh_meta = self._verify_mesh(
                 preview_path,
                 multi_part_intent=bool(code_meta.get("multi_part_intent")),
+                is_assembly=bool(code_meta.get("is_assembly")),
+                assembly_mode_name=code_meta.get("assembly_mode_name"),
                 expected_part_count=code_meta.get("expected_part_count"),
                 precomputed_metrics=precomputed_metrics,
             )
@@ -390,11 +419,11 @@ class CadVerifier:
             elif mod_char == "%":
                 findings.append(
                     Finding(
-                        category="WARNING",
+                        category="INFO",
                         code="BACKGROUND_MODIFIER_OMITTED",
                         message=f"Background modifier '%' found at line {line_num} ('%{target}').",
                         line=line_num,
-                        impact="Background modifier geometry is visual-only in OpenSCAD GUI and omitted from STL export.",
+                        impact="Background modifier geometry is visual-only in OpenSCAD GUI and intentionally omitted from STL export.",
                     )
                 )
 
@@ -482,17 +511,18 @@ class CadVerifier:
                         used_in_rhs = bool(re.search(var_pat, rhs_text))
                         used_later_in_block = bool(re.search(var_pat, rem_in_block))
                         used_after_block = bool(re.search(var_pat, after_block))
-                        if used_later_in_block and not used_in_rhs and not used_after_block:
+                        if not (used_in_rhs or used_after_block):
                             continue
                         abs_pos = base_offset + start_idx + 1 + reassign_m.start(1)
                         line_num = clean_code[:abs_pos].count("\n") + 1
                         findings.append(
                             Finding(
-                                category="CRITICAL",
+                                category="WARNING",
                                 code="SHADOWED_BLOCK_ASSIGNMENT",
                                 message=f"Variable '{var}' is reassigned inside {block_kind}() block at line {line_num}.",
                                 line=line_num,
-                                impact=f"OpenSCAD variables are immutable and lexical. Reassignment inside {block_kind}() only shadows the inner scope; outer '{var}' remains unchanged. Use a ternary expression '(cond ? a : b)' or 'let()'.",
+                                impact=f"OpenSCAD variables are immutable and lexical. Reassignment inside {block_kind}() only shadows the inner scope; outer '{var}' remains unchanged.",
+                                suggestion="Use ternary expression '(cond ? a : b)' or 'let()' instead of mutating inside block.",
                             )
                         )
 
@@ -512,33 +542,36 @@ class CadVerifier:
         if fn_val is None and not has_adaptive_facets:
             findings.append(
                 Finding(
-                    category="WARNING",
+                    category="INFO",
                     code="MISSING_FN",
                     message="No global $fn declared at top of model.scad (e.g. $fn = 32; or $fa = 6; $fs = 1;).",
-                    impact="Circles and cylinders will render with coarse, unpredictable default facets.",
+                    impact="Circles and cylinders will render with default facets.",
+                    suggestion="Declare $fn = 64; or $fa = 6; $fs = 1; at top of model.scad.",
                 )
             )
         elif fn_val is not None and fn_val < 16:
             findings.append(
                 Finding(
-                    category="WARNING",
+                    category="INFO",
                     code="LOW_FN",
                     message=f"Global $fn is set to {fn_val} (< 16).",
                     impact="Cylindrical surfaces will have noticeable polygonal faceting.",
+                    suggestion="Increase $fn to at least 32 or 64 for circular primitives.",
                 )
             )
 
         for fm in fn_matches:
             val = int(fm.group(1))
-            if val > 100:
+            if val > 128:
                 line_num = clean_code[: fm.start()].count("\n") + 1
                 findings.append(
                     Finding(
                         category="WARNING",
                         code="EXCESSIVE_FN",
-                        message=f"$fn is set to {val} (> 100) at line {line_num}.",
+                        message=f"$fn is set to {val} (> 128) at line {line_num}.",
                         line=line_num,
                         impact="Excessive triangle count causes slow rendering and sandbox timeouts.",
+                        suggestion="Keep $fn <= 64 for standard features, or <= 36 for threads.",
                     )
                 )
 
@@ -553,25 +586,27 @@ class CadVerifier:
             if not has_eps:
                 findings.append(
                     Finding(
-                        category="WARNING",
+                        category="INFO",
                         code="MISSING_EPS",
                         message="difference() used without EPS constant declared (e.g. EPS = 0.01;).",
                         impact="Subtractions and cutter geometry risk non-manifold coincident faces and Z-fighting.",
+                        suggestion="Define EPS = 0.01; at the top to give difference() cutters slight overlap.",
                     )
                 )
             else:
                 eps_name = eps_match.group(1)
                 eps_count = len(re.findall(rf"\b{re.escape(eps_name)}\b", clean_code))
                 has_numeric_offset = bool(
-                    re.search(r"[-+]\s*(?:0\.0[1-9]|0\.1|0\.00[1-9])\b", clean_code)
+                    re.search(r"[-+]\s*(?:0\.0[1-9]|0\.1|0\.00[1-9]|1|2)\b", clean_code)
                 )
                 if eps_count <= 1 and not has_numeric_offset:
                     findings.append(
                         Finding(
-                            category="WARNING",
+                            category="INFO",
                             code="UNUSED_EPS_IN_CUTTERS",
                             message=f"{eps_name} is declared but never referenced in difference() cutters (expected -{eps_name} offset or +2*{eps_name} length).",
                             impact="Cutters sharing exact boundaries with target create non-manifold coincident faces and Z-fighting.",
+                            suggestion=f"Use -{eps_name} offset or +2*{eps_name} height on through-hole cutters.",
                         )
                     )
 
@@ -585,10 +620,11 @@ class CadVerifier:
         if not param_names:
             findings.append(
                 Finding(
-                    category="WARNING",
+                    category="INFO",
                     code="NO_UPPERCASE_PARAMETERS",
                     message="No UPPER_CASE parameters defined at top of model.scad.",
                     impact="Hardcoded magic numbers inside geometry violate design principles and reduce maintainability.",
+                    suggestion="Define design dimensions as uppercase constants at top (e.g. WIDTH = 50;).",
                 )
             )
 
@@ -622,7 +658,7 @@ class CadVerifier:
                     )
                 )
 
-        multi_part = _detect_multi_part_intent(code)
+        multi_part, is_assembly, mode_name = _detect_multi_part_intent(code)
         expected_parts = _detect_expected_part_count(code) if multi_part else None
         code_meta = {
             "exists": True,
@@ -631,6 +667,8 @@ class CadVerifier:
             "fn_value": fn_val,
             "eps_defined": has_eps,
             "multi_part_intent": multi_part,
+            "is_assembly": is_assembly,
+            "assembly_mode_name": mode_name,
             "expected_part_count": expected_parts,
         }
         return findings, code_meta
@@ -639,13 +677,16 @@ class CadVerifier:
         self,
         stl_path: Path,
         multi_part_intent: bool = False,
+        is_assembly: bool = False,
+        assembly_mode_name: str | None = None,
         expected_part_count: int | None = None,
         precomputed_metrics: dict[str, Any] | None = None,
     ) -> tuple[list[Finding], dict[str, Any]]:
         findings: list[Finding] = []
         self._check_cancelled()
 
-        if not stl_path.is_file() or stl_path.stat().st_size == 0:
+        has_mesh_file = stl_path.is_file() and stl_path.stat().st_size > 0
+        if not has_mesh_file and precomputed_metrics is None:
             findings.append(
                 Finding(
                     category="CRITICAL",
@@ -786,7 +827,7 @@ class CadVerifier:
                     )
                 )
 
-        if vertex_count == 0 or triangle_count == 0:
+        if (vertex_count == 0 or triangle_count == 0) and volume <= 0.0001:
             findings.append(
                 Finding(
                     category="CRITICAL",
@@ -938,10 +979,27 @@ class CadVerifier:
         solids_min_z = cached_metrics.get("solids_min_z") or []
         printability = cached_metrics.get("printability") or {}
         floating_solids = cached_metrics.get("floating_solids") or []
-        components = cached_metrics.get("components") or []
+        components_raw = cached_metrics.get("components")
+        components = components_raw if isinstance(components_raw, list) else []
 
         if solid_count > 1:
-            if floating_solid_count > 0:
+            if is_assembly:
+                findings.append(
+                    Finding(
+                        category="INFO",
+                        code="MULTI_PART_ASSEMBLY",
+                        message=(
+                            f"Model is rendered in assembly view"
+                            f"{f' ({assembly_mode_name})' if assembly_mode_name else ''} with {solid_count} components "
+                            f"positioned in 3D functional space."
+                        ),
+                        impact=(
+                            "Assembly view visualizes components in operating positions. For 3D print verification "
+                            "and slicing, switch to individual part mode or plate layout."
+                        ),
+                    )
+                )
+            elif floating_solid_count > 0:
                 if floating_solids:
                     solids_desc = [
                         f"Z: [{s.get('min_z')}..{s.get('max_z')}] mm, center: ({(s.get('center_xy') or [0, 0])[0]}, {(s.get('center_xy') or [0, 0])[1]}) mm, size: {s.get('bbox_mm') or []} mm"
@@ -966,7 +1024,7 @@ class CadVerifier:
                         ),
                     )
                 )
-            if multi_part_intent and expected_part_count is not None and solid_count != expected_part_count:
+            if multi_part_intent and not is_assembly and expected_part_count is not None and solid_count != expected_part_count:
                 findings.append(
                     Finding(
                         category="CRITICAL" if solid_count > expected_part_count else "WARNING",
@@ -981,7 +1039,7 @@ class CadVerifier:
                         ),
                     )
                 )
-            if multi_part_intent and floating_solid_count == 0:
+            if multi_part_intent and not is_assembly and floating_solid_count == 0:
                 overlapping_part_count = int(cached_metrics.get("overlapping_part_count", 0) or 0)
                 min_part_gap_mm = cached_metrics.get("min_part_gap_mm")
                 if overlapping_part_count > 0:
@@ -1027,159 +1085,161 @@ class CadVerifier:
 
         # 5. Printability, Per-Component Stability, Ceiling & Wall Thickness Checks
         if isinstance(printability, dict) and printability:
-            overhang_60 = float(printability.get("overhang_area_60deg_mm2", 0.0) or 0.0)
             surf_area = float(printability.get("surface_area_mm2", 0.0) or 0.0)
-            base_z = min(solids_min_z) if solids_min_z else 0.0
+            if not is_assembly:
+                overhang_60 = float(printability.get("overhang_area_60deg_mm2", 0.0) or 0.0)
+                base_z = min(solids_min_z) if solids_min_z else 0.0
 
-            grounded_comps = [
-                c
-                for c in components
-                if isinstance(c, dict)
-                and float((c.get("bounds_mm") or {}).get("min_z", 0.0)) <= base_z + 0.08
-            ]
+                grounded_comps = [
+                    c
+                    for c in components
+                    if isinstance(c, dict)
+                    and float((c.get("bounds_mm") or {}).get("min_z", 0.0)) <= base_z + 0.08
+                ]
 
-            # 5a. Per-component Bed Contact & CoM Static Stability
-            for c in grounded_comps:
-                c_idx = c.get("index", 1)
-                c_vol = float(c.get("volume_mm3", 0.0) or 0.0)
-                c_bed = float(c.get("bed_contact_area_mm2", 0.0) or 0.0)
-                c_ratio = float(c.get("bed_contact_ratio", 0.0) or 0.0)
-                c_bbox = c.get("bbox_mm") or [0.0, 0.0, 0.0]
-                c_dz = float(c_bbox[2]) if len(c_bbox) >= 3 else 0.0
-                c_xy = c.get("center_xy") or [0.0, 0.0]
-                part_label = (
-                    f"Component #{c_idx} at XY=({c_xy[0]:.1f}, {c_xy[1]:.1f}) mm"
-                    if len(grounded_comps) > 1
-                    else "Model"
-                )
-
-                if c_vol > 25.0 and (
-                    c_bed < 3.0
-                    or (c_dz >= 5.0 and c_ratio < 0.015 and c_bed < 15.0)
-                ):
-                    findings.append(
-                        Finding(
-                            category="CRITICAL",
-                            code="LOW_BED_CONTACT",
-                            message=(
-                                f"{part_label} has insufficient build plate contact area "
-                                f"({c_bed:.2f} mm², {c_ratio * 100:.1f}% of footprint)."
-                            ),
-                            impact=(
-                                "Part rests on a point, dome, or knife-edge at Z = 0 and will detach during the first layer. "
-                                "Ensure every component has a flat horizontal base face resting squarely on Z = 0."
-                            ),
-                        )
+                # 5a. Per-component Bed Contact & CoM Static Stability
+                for c in grounded_comps:
+                    c_idx = c.get("index", 1)
+                    c_vol = float(c.get("volume_mm3", 0.0) or 0.0)
+                    c_bed = float(c.get("bed_contact_area_mm2", 0.0) or 0.0)
+                    c_ratio = float(c.get("bed_contact_ratio", 0.0) or 0.0)
+                    c_bbox = c.get("bbox_mm") or [0.0, 0.0, 0.0]
+                    c_dz = float(c_bbox[2]) if len(c_bbox) >= 3 else 0.0
+                    c_xy = c.get("center_xy") or [0.0, 0.0]
+                    part_label = (
+                        f"Component #{c_idx} at XY=({c_xy[0]:.1f}, {c_xy[1]:.1f}) mm"
+                        if len(grounded_comps) > 1
+                        else "Model"
                     )
-                elif c_dz >= 5.0 and c_bed >= 1.0:
-                    c_stable = c.get("is_statically_stable", True)
-                    c_margin = float(c.get("stability_margin_mm", 0.0) or 0.0)
-                    if c_stable is False and c_margin < -0.5:
-                        com_mm = c.get("center_of_mass_mm")
-                        support_bounds = c.get("support_footprint_bounds_mm")
-                        com_str = (
-                            f"({com_mm[0]:.1f}, {com_mm[1]:.1f}, {com_mm[2]:.1f}) mm"
-                            if isinstance(com_mm, list) and len(com_mm) == 3
-                            else "outside base"
-                        )
-                        bounds_str = (
-                            f"X=[{support_bounds['min_x']:.1f}, {support_bounds['max_x']:.1f}], "
-                            f"Y=[{support_bounds['min_y']:.1f}, {support_bounds['max_y']:.1f}] mm"
-                            if isinstance(support_bounds, dict)
-                            else "Z=0 contact polygon"
-                        )
+
+                    if c_vol > 25.0 and (
+                        c_bed < 3.0
+                        or (c_dz >= 5.0 and c_ratio < 0.015 and c_bed < 15.0)
+                    ):
                         findings.append(
                             Finding(
                                 category="CRITICAL",
-                                code="UNSTABLE_CENTER_OF_MASS",
+                                code="LOW_BED_CONTACT",
                                 message=(
-                                    f"{part_label} Center of Mass {com_str} projects {abs(c_margin):.2f} mm outside "
-                                    f"its convex Z=0 base support footprint ({bounds_str})."
+                                    f"{part_label} has insufficient build plate contact area "
+                                    f"({c_bed:.2f} mm², {c_ratio * 100:.1f}% of footprint)."
                                 ),
                                 impact=(
-                                    "Freestanding part is statically unstable and will tip over under gravity. "
-                                    "Widen the Z=0 base footprint, add a support foot under the overhang, or re-orient the part."
+                                    "Part rests on a point, dome, or knife-edge at Z = 0 and will detach during the first layer. "
+                                    "Ensure every component has a flat horizontal base face resting squarely on Z = 0."
                                 ),
                             )
                         )
+                    elif c_dz >= 5.0 and c_bed >= 1.0:
+                        c_stable = c.get("is_statically_stable", True)
+                        c_margin = float(c.get("stability_margin_mm", 0.0) or 0.0)
+                        if c_stable is False and c_margin < -0.5:
+                            com_mm = c.get("center_of_mass_mm")
+                            support_bounds = c.get("support_footprint_bounds_mm")
+                            com_str = (
+                                f"({com_mm[0]:.1f}, {com_mm[1]:.1f}, {com_mm[2]:.1f}) mm"
+                                if isinstance(com_mm, list) and len(com_mm) == 3
+                                else "outside base"
+                            )
+                            bounds_str = (
+                                f"X=[{support_bounds['min_x']:.1f}, {support_bounds['max_x']:.1f}], "
+                                f"Y=[{support_bounds['min_y']:.1f}, {support_bounds['max_y']:.1f}] mm"
+                                if isinstance(support_bounds, dict)
+                                else "Z=0 contact polygon"
+                            )
+                            findings.append(
+                                Finding(
+                                    category="CRITICAL",
+                                    code="UNSTABLE_CENTER_OF_MASS",
+                                    message=(
+                                        f"{part_label} Center of Mass {com_str} projects {abs(c_margin):.2f} mm outside "
+                                        f"its convex Z=0 base support footprint ({bounds_str})."
+                                    ),
+                                    impact=(
+                                        "Freestanding part is statically unstable and will tip over under gravity. "
+                                        "Widen the Z=0 base footprint, add a support foot under the overhang, or re-orient the part."
+                                    ),
+                                )
+                            )
 
-            # 5b. Intra-solid mid-air floating islands (local Z-minima)
-            unsupported_floating = printability.get("unsupported_floating_features") or []
-            if unsupported_floating:
-                feat_descs = [
-                    f"Z=[{u.get('min_z_mm')}..{u.get('max_z_mm')}] mm at XY=({(u.get('center_xy') or [0, 0])[0]}, {(u.get('center_xy') or [0, 0])[1]}) mm"
-                    for u in unsupported_floating[:3]
-                ]
-                findings.append(
-                    Finding(
-                        category="CRITICAL",
-                        code="UNSUPPORTED_FLOATING_FEATURE",
-                        message=(
-                            f"Model has {len(unsupported_floating)} intra-solid feature(s) starting in mid-air with zero support from the layer below "
-                            f"({'; '.join(feat_descs)})."
-                        ),
-                        impact=(
-                            "Even though connected to the body at a higher layer, these local Z-minima (such as severed internal cones, "
-                            "un-ramped internal ledges, or hanging bosses) print in thin air and collapse in the slicer. "
-                            "Add a >= 45 deg bottom support taper/chamfer down to a supporting wall or Z = 0."
-                        ),
+                # 5b. Intra-solid mid-air floating islands (local Z-minima)
+                unsupported_floating = printability.get("unsupported_floating_features") or []
+                if unsupported_floating:
+                    feat_descs = [
+                        f"Z=[{u.get('min_z_mm')}..{u.get('max_z_mm')}] mm at XY=({(u.get('center_xy') or [0, 0])[0]}, {(u.get('center_xy') or [0, 0])[1]}) mm"
+                        for u in unsupported_floating[:3]
+                    ]
+                    findings.append(
+                        Finding(
+                            category="CRITICAL",
+                            code="UNSUPPORTED_FLOATING_FEATURE",
+                            message=(
+                                f"Model has {len(unsupported_floating)} intra-solid feature(s) starting in mid-air with zero support from the layer below "
+                                f"({'; '.join(feat_descs)})."
+                            ),
+                            impact=(
+                                "Even though connected to the body at a higher layer, these local Z-minima (such as severed internal cones, "
+                                "un-ramped internal ledges, or hanging bosses) print in thin air and collapse in the slicer. "
+                                "Add a >= 45 deg bottom support taper/chamfer down to a supporting wall or Z = 0."
+                            ),
+                        )
                     )
-                )
 
-            # 5c. Perforated unsupported horizontal ceilings
-            perforated_ceilings = printability.get("perforated_ceilings") or []
-            if perforated_ceilings:
-                ceil_descs = [
-                    f"Z={p.get('z_mm')} mm, area={p.get('area_mm2')} mm², span={p.get('span_xy_mm')} mm, holes={p.get('upward_loops')} at XY=({(p.get('center_xy') or [0, 0])[0]}, {(p.get('center_xy') or [0, 0])[1]}) mm"
-                    for p in perforated_ceilings[:3]
-                ]
-                findings.append(
-                    Finding(
-                        category="CRITICAL",
-                        code="PERFORATED_UNSUPPORTED_CEILING",
-                        message=(
-                            f"Model contains {len(perforated_ceilings)} elevated horizontal ceiling(s) pierced by unsupported mid-air holes "
-                            f"({'; '.join(ceil_descs)})."
-                        ),
-                        impact=(
-                            "Circular or slotted hole perimeters inside an elevated horizontal bridge have nothing to anchor to and collapse into spaghetti during FDM printing. "
-                            "Orient perforated caps/lids flat outer-face-down on Z = 0 (with cavity/skirt opening upward +Z), or use a continuous >= 45 deg conical interior funnel."
-                        ),
+                # 5c. Perforated unsupported horizontal ceilings
+                perforated_ceilings = printability.get("perforated_ceilings") or []
+                if perforated_ceilings:
+                    ceil_descs = [
+                        f"Z={p.get('z_mm')} mm, area={p.get('area_mm2')} mm², span={p.get('span_xy_mm')} mm, holes={p.get('upward_loops')} at XY=({(p.get('center_xy') or [0, 0])[0]}, {(p.get('center_xy') or [0, 0])[1]}) mm"
+                        for p in perforated_ceilings[:3]
+                    ]
+                    findings.append(
+                        Finding(
+                            category="CRITICAL",
+                            code="PERFORATED_UNSUPPORTED_CEILING",
+                            message=(
+                                f"Model contains {len(perforated_ceilings)} elevated horizontal ceiling(s) pierced by unsupported mid-air holes "
+                                f"({'; '.join(ceil_descs)})."
+                            ),
+                            impact=(
+                                "Circular or slotted hole perimeters inside an elevated horizontal bridge have nothing to anchor to and collapse into spaghetti during FDM printing. "
+                                "Orient perforated caps/lids flat outer-face-down on Z = 0 (with cavity/skirt opening upward +Z), or use a continuous >= 45 deg conical interior funnel."
+                            ),
+                        )
                     )
-                )
 
-            # 5d. Severe unchamfered overhangs (>60 deg)
-            severe_patches = printability.get("severe_overhang_patches") or []
-            severe_patch_area = sum(
-                float(p.get("area_mm2", 0.0) or 0.0) for p in severe_patches
-            )
-            max_patch_area = max(
-                (float(p.get("area_mm2", 0.0) or 0.0) for p in severe_patches),
-                default=0.0,
-            )
-            if severe_patches and (
-                severe_patch_area >= 50.0
-                or max_patch_area >= 35.0
-                or overhang_60 >= 120.0
-            ):
-                p_strs = [
-                    f"Z={p.get('z_mm')} mm ({p.get('area_mm2')} mm², span={p.get('span_xy_mm')} mm, XY_bounds={p.get('bounds_xy_mm')})"
-                    for p in severe_patches[:3]
-                ]
-                patch_detail = f" Major overhang zones: {'; '.join(p_strs)}."
-                findings.append(
-                    Finding(
-                        category="CRITICAL",
-                        code="SEVERE_OVERHANG",
-                        message=(
-                            f"Model has {overhang_60:.1f} mm² of steep (>60 deg) unsupported overhang area.{patch_detail}"
-                        ),
-                        impact=(
-                            "Horizontal internal roofs, rectangular rail ledges (cube() grooves), stepped lid lips at Z > 0, or wide flat-topped wall slots will sag or collapse during FDM printing. "
-                            "Replace 90-deg steps/grooves with 45-deg self-supporting tapers (e.g. Playbook dovetail_prism where dr == dz), keep sliding lids flat-bottomed on Z = 0 without raised overhanging lips, and keep wall slots narrow (<= 2.0 mm width)."
-                        ),
-                    )
+                # 5d. Severe unchamfered overhangs (>60 deg)
+                severe_patches = printability.get("severe_overhang_patches") or []
+                severe_patch_area = sum(
+                    float(p.get("area_mm2", 0.0) or 0.0) for p in severe_patches
                 )
+                max_patch_area = max(
+                    (float(p.get("area_mm2", 0.0) or 0.0) for p in severe_patches),
+                    default=0.0,
+                )
+                if severe_patches and (
+                    severe_patch_area >= 50.0
+                    or max_patch_area >= 35.0
+                    or overhang_60 >= 120.0
+                ):
+                    p_strs = [
+                        f"Z={p.get('z_mm')} mm ({p.get('area_mm2')} mm², span={p.get('span_xy_mm')} mm, XY_bounds={p.get('bounds_xy_mm')})"
+                        for p in severe_patches[:3]
+                    ]
+                    patch_detail = f" Major overhang zones: {'; '.join(p_strs)}."
+                    findings.append(
+                        Finding(
+                            category="WARNING",
+                            code="SEVERE_OVERHANG",
+                            message=(
+                                f"Model has {overhang_60:.1f} mm² of steep (>60 deg) unsupported overhang area.{patch_detail}"
+                            ),
+                            impact=(
+                                "Horizontal internal roofs, rectangular rail ledges (cube() grooves), stepped lid lips at Z > 0, or wide flat-topped wall slots will sag without supports. "
+                                "Replace 90-deg steps/grooves with 45-deg self-supporting tapers, keep sliding lids flat-bottomed on Z = 0 without raised overhanging lips, or print with slicer supports enabled."
+                            ),
+                            suggestion="Add 45-deg support tapers/chamfers or enable slicer supports for steep overhangs.",
+                        )
+                    )
 
             # 5e. Global & 2D Z-slice local wall thickness checks
             if surf_area > 0 and volume > 0 and not any(d <= 0.0001 for d in (dim_x, dim_y, dim_z)):
@@ -1255,19 +1315,35 @@ class CadVerifier:
     ) -> dict[str, Any]:
         criticals = [f for f in findings if f.category == "CRITICAL"]
         warnings = [f for f in findings if f.category == "WARNING"]
+        infos = [f for f in findings if f.category == "INFO"]
 
         # Risk score calculation: 0 (perfect) to 100 (critical fail)
-        warning_score = min(40, len(warnings) * 10)
-        critical_score = min(100, len(criticals) * 50)
-        risk_score = min(100, critical_score + warning_score)
+        _PHYSICAL_WARN_CODES = {
+            "SEVERE_OVERHANG",
+            "MODERATE_OVERHANG",
+            "UNSTABLE_BASE",
+            "WEAK_BED_ADHESION_AREA",
+            "BUILD_VOLUME_EXCEEDED",
+            "INVERTED_NORMALS",
+            "SINGLE_PERIMETER_LOCAL_WALL",
+            "CROWDED_PART_LAYOUT",
+            "MULTI_BODY_SUSPECT",
+        }
+        phys_warn_count = sum(1 for w in warnings if w.code in _PHYSICAL_WARN_CODES)
+        code_warn_count = len(warnings) - phys_warn_count
 
+        warning_score = min(40, phys_warn_count * 15 + code_warn_count * 10)
+        critical_score = min(100, len(criticals) * 50)
         if criticals:
+            risk_score = min(100, max(60, critical_score + warning_score))
             status = "FAILED"
             risk_level = "HIGH_RISK"
         elif warnings:
+            risk_score = min(40, max(10, warning_score))
             status = "WARNING"
-            risk_level = "MODERATE_RISK" if risk_score >= 30 else "LOW_RISK"
+            risk_level = "MODERATE_RISK" if risk_score >= 25 else "LOW_RISK"
         else:
+            risk_score = 0
             status = "PASSED"
             risk_level = "EXCELLENT"
 
@@ -1276,7 +1352,9 @@ class CadVerifier:
             summary_parts.append(f"{len(criticals)} critical issue(s)")
         if warnings:
             summary_parts.append(f"{len(warnings)} warning(s)")
-        if not criticals and not warnings:
+        if infos:
+            summary_parts.append(f"{len(infos)} note(s)")
+        if not findings:
             summary_parts.append("All checks passed cleanly")
 
         watertight_str = "watertight" if mesh_integrity.get("watertight") else "non-manifold/unverified"
@@ -1285,12 +1363,24 @@ class CadVerifier:
             f"Risk score: {risk_score}/100 ({risk_level}). Mesh is {watertight_str}."
         )
 
+        category_order = {"CRITICAL": 0, "WARNING": 1, "INFO": 2}
+        sorted_findings = sorted(
+            findings,
+            key=lambda f: (
+                category_order.get(f.category, 3),
+                f.line if f.line is not None else 999999,
+            ),
+        )
+
         return {
             "status": status,
             "risk_score": risk_score,
             "risk_level": risk_level,
+            "critical_count": len(criticals),
+            "warning_count": len(warnings),
+            "info_count": len(infos),
             "summary": summary,
-            "findings": [f.to_dict() for f in findings],
+            "findings": [f.to_dict() for f in sorted_findings],
             "code_integrity": code_integrity,
             "mesh_integrity": mesh_integrity,
         }

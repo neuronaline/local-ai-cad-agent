@@ -23,13 +23,30 @@ class QuestionValidator:
                 pass
             else:
                 if isinstance(answers, dict):
+                    if len(questions) == 1 and isinstance(questions[0], dict):
+                        qid = str(questions[0].get("id", ""))
+                        if qid and qid not in answers:
+                            if "answer" in answers:
+                                answers = {qid: answers["answer"]}
+                            elif len(answers) == 1:
+                                answers = {qid: next(iter(answers.values()))}
                     return QuestionValidator._validate_multi(questions, answers)
-            # JSON parse failed — try single-question format with raw text answer.
-            if len(questions) == 1:
+            # JSON parse failed or not a dict — try single-question format with raw text answer.
+            if len(questions) == 1 and isinstance(questions[0], dict):
                 return QuestionValidator._validate_single(questions[0], answer)
             return False
         if "question" in question:
-            return QuestionValidator._validate_single(question, answer)
+            single_answer = answer
+            try:
+                parsed = json.loads(answer)
+                if isinstance(parsed, dict):
+                    if "answer" in parsed:
+                        single_answer = parsed["answer"]
+                    elif len(parsed) == 1:
+                        single_answer = next(iter(parsed.values()))
+            except json.JSONDecodeError:
+                pass
+            return QuestionValidator._validate_single(question, single_answer)
         return False
 
     @staticmethod
@@ -125,16 +142,28 @@ class QuestionValidator:
             if not isinstance(options, list):
                 return False
             str_options = {str(o) for o in options} | set(options)
-            return answer in str_options
-        if not isinstance(answer, str):
-            return False
+            return isinstance(answer, str) and answer in str_options
         if input_type == "multiselect":
             options = question.get("options", [])
             if not isinstance(options, list):
                 return False
             str_options = {str(o) for o in options} | set(options)
-            selected = [value.strip() for value in answer.split(",") if value.strip()]
+            if isinstance(answer, list):
+                selected = [str(v).strip() for v in answer if str(v).strip()]
+            elif isinstance(answer, str):
+                try:
+                    parsed = json.loads(answer)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, list):
+                    selected = [str(v).strip() for v in parsed if str(v).strip()]
+                else:
+                    selected = [value.strip() for value in answer.split(",") if value.strip()]
+            else:
+                return False
             return bool(selected) and all(v in str_options for v in selected)
+        if not isinstance(answer, str):
+            return False
         if input_type == "number":
             return QuestionValidator._is_valid_number_with_unit(answer)
         return bool(answer.strip())

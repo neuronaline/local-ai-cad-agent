@@ -30,6 +30,7 @@
           </button>
         </div>
       </header>
+      <div id="preflight-banner" class="preflight-banner" hidden></div>
 
       <div id="new-project-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="new-project-title">
         <div class="modal-content">
@@ -83,6 +84,6 @@
       </div>
     </main>
 
-    <script src="{{ url_for('static', filename='js/projects.js') }}?v={{ cache_bust }}"></script>
+    <script type="module" src="{{ url_for('static', filename='js/projects.js') }}?v={{ cache_bust }}"></script>
   </body>
 </html>

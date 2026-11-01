@@ -1,11 +1,6 @@
-const grid = document.querySelector('#projects-grid');
+import { api, escapeHTML, checkPreflight } from './utils.js';
 
-async function api(path, options = {}) {
-  const response = await fetch(path, options);
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error || 'Request failed');
-  return data;
-}
+const grid = document.querySelector('#projects-grid');
 
 function formatDate(iso) {
   if (!iso) return '—';
@@ -66,12 +61,6 @@ function cardTemplate(project) {
       </div>
     </div>
   `;
-}
-
-function escapeHTML(str) {
-  return String(str ?? '').replace(/[&<>"']/g, c => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-  }[c]));
 }
 
 async function loadProjects() {
@@ -293,6 +282,5 @@ document.querySelector('#confirm-delete')?.addEventListener('click', async (e) =
   });
 });
 
-/* ── Init ── */
-
+checkPreflight();
 loadProjects();
