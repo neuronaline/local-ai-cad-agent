@@ -282,6 +282,7 @@ class _RunState:
     consecutive_readonly_turns: int = 0
     calculation_warning_sent: bool = False
     last_turn_was_continuation: bool = False
+    tool_call_turn: int = 0
     settings: Settings | None = None
     export_3mf: bool = False
     export_3mf_retries: int = 0
@@ -565,8 +566,12 @@ class AgentRunner:
         """Stop agent work and clear pending state for one or all projects."""
         affected: list[str] = []
         with self._lock:
-            stop_active_task = self._thread is not None and not self._run_complete.is_set()
-            if self._active_project and self._active_project not in affected:
+            stop_active_task = (
+                self._thread is not None
+                and not self._run_complete.is_set()
+                and (project is None or project == self._active_project)
+            )
+            if stop_active_task and self._active_project and self._active_project not in affected:
                 affected.append(self._active_project)
             if project is not None and project not in affected:
                 affected.append(project)
@@ -673,6 +678,7 @@ class AgentRunner:
                 if outcome is _TurnOutcome.CONTINUE:
                     if not state.last_turn_was_continuation:
                         tool_turn += 1
+                        state.tool_call_turn = tool_turn
                         if tool_turn >= limit:
                             break
                         self._report_step_budget(state, tool_turn)
@@ -820,9 +826,12 @@ class AgentRunner:
         run_id = state.run_id
 
         def publish_stream(event: dict[str, Any]) -> None:
-            event_type = event.pop("type")
+            event_type = event.get("type")
+            if not event_type:
+                return
+            event_payload = {k: v for k, v in event.items() if k != "type"}
             msg_id = state.current_message_id
-            delta = event.get("delta") or ""
+            delta = event_payload.get("delta") or ""
             if event_type == "content":
                 state.current_content += delta
                 sse_name = "agent_content_delta"
@@ -832,7 +841,7 @@ class AgentRunner:
             elif event_type == "tool_call":
                 sse_name = "agent_tool_delta"
             elif event_type == "status":
-                status_msg = event.get("message") or "Thinking..."
+                status_msg = event_payload.get("message") or "Thinking..."
                 publish(
                     "agent_status",
                     {
@@ -872,14 +881,14 @@ class AgentRunner:
                 sse_name = f"agent_{event_type}_delta"
             publish(
                 sse_name,
-                {"project": project, "run_id": run_id, "message_id": msg_id, **event},
+                {"project": project, "run_id": run_id, "message_id": msg_id, **event_payload},
             )
             if log is not None:
                 # Mirror the SSE stream into the activity log so the
                 # operator has the same content the UI consumed.
                 log(
                     sse_name,
-                    {"run_id": run_id, "message_id": msg_id, **event},
+                    {"run_id": run_id, "message_id": msg_id, **event_payload},
                     run_id=run_id,
                 )
 
@@ -903,8 +912,9 @@ class AgentRunner:
                     "message": "Thinking...",
                 },
             )
+        active_tools = None if state.export_3mf else TOOL_SCHEMAS
         try:
-            response = state.client.chat(state.messages, TOOL_SCHEMAS)
+            response = state.client.chat(state.messages, active_tools)
         except CompletionTruncatedError as trunc_err:
             has_partial = bool(
                 trunc_err.reasoning_text
@@ -1435,8 +1445,16 @@ class AgentRunner:
         :class:`_TurnOutcome.CONTINUE` once the batch completes.
         """
         processed_call_ids: set[str] = set()
+        run_settings = state.settings or self.settings
+        budget_limit = run_settings.agent_tool_call_limit
+        turn_step = state.tool_call_turn + 1
+        turn_budget = {
+            "step": turn_step,
+            "limit": budget_limit,
+            "remaining": max(0, budget_limit - turn_step),
+        }
         waves = group_tool_calls_into_waves(tool_calls)
-        for wave in waves:
+        for wave_idx, wave in enumerate(waves):
             if self._stop_event.is_set():
                 self._cancel_remaining_tool_calls(
                     state.project_dir,
@@ -1453,8 +1471,9 @@ class AgentRunner:
 
             if len(wave) == 1:
                 call = wave[0]
+                local_msgs: list[dict] = []
                 res_preview_id, res_cad_error, res_cad_fix_required, waiting = (
-                    self._process_tool_call(
+                    process_tool_call(
                         state.tools,
                         state.project,
                         state.project_dir,
@@ -1462,7 +1481,13 @@ class AgentRunner:
                         state.cad_fix_required,
                         state.preview_id,
                         state.cad_error,
-                        state.messages,
+                        local_msgs,
+                        publish=self.publish,
+                        register_preview=self._register_preview,
+                        append_message=lambda _p, _m: None,
+                        debug_log=self._debug_tool_error,
+                        activity_logger=state.activity_logger,
+                        run_id=state.run_id,
                     )
                 )
                 wave_outcomes: list[
@@ -1472,7 +1497,7 @@ class AgentRunner:
                         str | None,
                         bool,
                         bool,
-                        list[dict] | None,
+                        list[dict],
                     ]
                 ] = [
                     (
@@ -1481,7 +1506,7 @@ class AgentRunner:
                         res_cad_error,
                         res_cad_fix_required,
                         waiting,
-                        None,
+                        local_msgs,
                     )
                 ]
             else:
@@ -1516,6 +1541,20 @@ class AgentRunner:
                     wave_outcomes = [
                         (c, *fut.result()) for c, fut in zip(wave, futures)
                     ]
+
+            # If this is the final wave of the turn, attach step_budget to the
+            # trailing tool message before persisting to conversation.jsonl.
+            if wave_idx == len(waves) - 1:
+                last_msg = None
+                for _c, _p, _e, _f, _w, d_msgs in reversed(wave_outcomes):
+                    if d_msgs:
+                        last_msg = d_msgs[-1]
+                        break
+                if last_msg is not None:
+                    payload = _tool_payload(last_msg)
+                    if payload is not None:
+                        payload["step_budget"] = turn_budget
+                        _set_tool_payload(last_msg, payload)
 
             for (
                 call,
@@ -1714,9 +1753,10 @@ class AgentRunner:
         for msg in _trailing_tool_batch(state.messages):
             payload = _tool_payload(msg)
             if payload is not None:
-                payload["step_budget"] = budget
-                _set_tool_payload(msg, payload)
-                ConversationStore.replace_tool_result(state.project_dir, msg)
+                if payload.get("step_budget") != budget:
+                    payload["step_budget"] = budget
+                    _set_tool_payload(msg, payload)
+                    ConversationStore.replace_tool_result(state.project_dir, msg)
                 break
 
         if state.messages and state.messages[-1].get("role") == "user":

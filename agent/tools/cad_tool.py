@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -526,6 +527,17 @@ class CadTool:
             pass  # Best-effort; don't block CAD errors on revision issues.
 
     @staticmethod
+    def _link_or_copy(source: Path, target: Path) -> None:
+        if source == target or source.resolve() == target.resolve():
+            return
+        try:
+            if target.exists():
+                target.unlink()
+            os.link(source, target)
+        except OSError:
+            shutil.copyfile(source, target)
+
+    @staticmethod
     def _atomic_copy(source: Path, target: Path) -> None:
         # Read the source into memory and delegate to the canonical byte
         # helper so the temp-cleanup + replace semantics match every other
@@ -597,7 +609,7 @@ class CadTool:
                 src = existing_views_dir / f"{vid}.png"
                 if vid and src.is_file():
                     merged_views[vid] = ev
-                    shutil.copyfile(src, views_target / f"{vid}.png")
+                    self._link_or_copy(src, views_target / f"{vid}.png")
 
         try:
             for entry in views:
@@ -612,7 +624,7 @@ class CadTool:
                         f"Review view {view_id} was not produced by the sandbox."
                     )
                 destination = views_target / f"{view_id}.png"
-                shutil.copyfile(source, destination)
+                self._link_or_copy(source, destination)
                 if destination.stat().st_size != expected_size:
                     raise RuntimeError(
                         f"Review view {view_id} size mismatch."
@@ -634,14 +646,14 @@ class CadTool:
                 and len(existing_manifest.get("views", []) or []) > len(views)
                 and (review_dir / _REVIEW_SHEET_NAME).is_file()
             ):
-                shutil.copyfile(review_dir / _REVIEW_SHEET_NAME, sheet_target)
+                self._link_or_copy(review_dir / _REVIEW_SHEET_NAME, sheet_target)
                 persisted_manifest["contact_sheet"] = existing_manifest.get("contact_sheet") or contact_sheet
                 kept_existing_sheet = True
 
             if not kept_existing_sheet:
                 if not sheet_path.is_file() or sheet_path.stat().st_size == 0:
                     raise RuntimeError("Review contact sheet was not produced by the sandbox.")
-                shutil.copyfile(sheet_path, sheet_target)
+                self._link_or_copy(sheet_path, sheet_target)
                 if not sheet_target.is_file() or sheet_target.stat().st_size == 0:
                     raise RuntimeError("Review contact sheet could not be staged.")
                 actual_sheet_sha = hashlib.sha256(sheet_target.read_bytes()).hexdigest()

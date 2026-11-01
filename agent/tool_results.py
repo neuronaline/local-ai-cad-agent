@@ -58,6 +58,29 @@ def _truncate_error_message(msg: str, max_chars: int = 600, max_lines: int = 10)
     return text
 
 
+def compact_verification_findings(findings: list[Any], limit: int = 8) -> list[dict[str, Any]]:
+    """Format and bound verifier findings for LLM context envelopes."""
+    if not isinstance(findings, list):
+        return []
+    valid_items = [item for item in findings if isinstance(item, dict)]
+    severity_order = {"CRITICAL": 0, "WARNING": 1, "INFO": 2}
+    valid_items.sort(key=lambda x: severity_order.get(str(x.get("category", "")).upper(), 3))
+    compacted: list[dict[str, Any]] = []
+    for item in valid_items:
+        entry: dict[str, Any] = {
+            "category": item.get("category"),
+            "code": item.get("code"),
+            "message": item.get("message"),
+        }
+        for opt in ("line", "impact", "culprit"):
+            if item.get(opt) is not None:
+                entry[opt] = item[opt]
+        compacted.append(entry)
+        if len(compacted) >= limit:
+            break
+    return compacted
+
+
 def compact_for_context(tool: str, result: str) -> str:
     """Compact verbose tool envelopes for LLM context while keeping essential metrics."""
     if tool not in {
@@ -187,7 +210,7 @@ def compact_for_context(tool: str, result: str) -> str:
         }
         findings = verif.get("findings")
         if findings:
-            verif_dict["findings"] = findings
+            verif_dict["findings"] = compact_verification_findings(findings)
         compact_data["verification"] = verif_dict
     raw_images = data.get("images")
     if isinstance(raw_images, list) and raw_images:

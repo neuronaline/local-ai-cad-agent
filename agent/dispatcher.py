@@ -98,6 +98,19 @@ def _deduplicate_tool_keys(pairs: list) -> dict:
     return result
 
 
+_KNOWN_FENCE_LANGUAGES = frozenset({
+    "scad",
+    "openscad",
+    "python",
+    "py",
+    "json",
+    "text",
+    "txt",
+    "bash",
+    "sh",
+})
+
+
 def _clean_code_fences(code: str) -> str:
     """Strip markdown code block fences if an LLM wraps code in ```scad ... ```.
 
@@ -111,9 +124,13 @@ def _clean_code_fences(code: str) -> str:
     if not text or not text.startswith("```"):
         return code
     if text.endswith("```") and len(text) >= 6 and "\n" not in text:
-        inner = text[3:-3].strip()
-        m = re.match(r"^[a-zA-Z0-9_-]+\s+(.*)$", inner)
-        return m.group(1) if m else inner
+        inner = text[3:-3]
+        if inner.strip().lower() in _KNOWN_FENCE_LANGUAGES:
+            return ""
+        m = re.match(r"^([a-zA-Z0-9_-]+)[ \t]+(.*)$", inner)
+        if m and m.group(1).lower() in _KNOWN_FENCE_LANGUAGES:
+            return m.group(2)
+        return inner
     match = re.match(
         r"^```(?:[a-zA-Z0-9_-]+)?[ \t]*\r?\n(.*?)\r?\n```$",
         text,

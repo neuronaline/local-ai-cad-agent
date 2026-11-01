@@ -27,6 +27,7 @@ from agent.llm_base import (
     CompletionTruncatedError,
     RequestCancelled,
     THOUGHT_SIGNATURE_SENTINEL,
+    TOOL_IMAGE_PROMPT,
     StreamResponseError,
     _force_close_response,
     attach_thought_signature,
@@ -115,13 +116,16 @@ def convert_tools_to_declarations(
 
 def convert_messages_to_interactions(
     messages: list[dict[str, Any]],
+    *,
+    already_sanitized: bool = False,
 ) -> tuple[str | None, list[dict[str, Any]]]:
     """Extract system instruction and convert conversation history into typed steps.
 
     Returns:
         (system_instruction, steps)
     """
-    messages = normalize_messages(relocate_tool_images(messages))
+    if not already_sanitized:
+        messages = normalize_messages(relocate_tool_images(messages))
     system_instruction: str | None = None
     steps: list[dict[str, Any]] = []
     call_id_to_name: dict[str, str] = {}
@@ -345,6 +349,8 @@ def parse_interactions_stream(
     finish_time: float | None = None
     last_activity_time = time.monotonic()
     current_event_type: str | None = None
+    step_had_arg_delta: set[str] = set()
+    step_had_text_delta: set[str] = set()
 
     try:
         for raw_line in iter_lines_with_cancel(response, stop_event=stop_event):
@@ -558,15 +564,13 @@ def parse_interactions_stream(
                     if sig and not entry.get("thought_signature"):
                         entry["thought_signature"] = str(sig)
                 elif stype == "thought" and event_type in ("step.stop", "interaction.step.done"):
-                    if not reasoning_text:
-                        th_text = _extract_text(step_obj.get("summary")) or _extract_text(step_obj.get("content"))
-                        if th_text:
-                            reasoning_text += th_text
+                    th_text = _extract_text(step_obj.get("summary")) or _extract_text(step_obj.get("content"))
+                    if th_text and (not sid or str(sid) not in step_had_text_delta):
+                        reasoning_text += th_text
                 elif stype == "model_output" and event_type in ("step.stop", "interaction.step.done"):
-                    if not content:
-                        out_text = _extract_text(step_obj.get("content")) or _extract_text(step_obj.get("output"))
-                        if out_text:
-                            content += out_text
+                    out_text = _extract_text(step_obj.get("content")) or _extract_text(step_obj.get("output"))
+                    if out_text and (not sid or str(sid) not in step_had_text_delta):
+                        content += out_text
 
                 active_step = step_info
                 if sid:
@@ -619,6 +623,8 @@ def parse_interactions_stream(
                     )
                     if th:
                         reasoning_text += th
+                        if delta_sid:
+                            step_had_text_delta.add(str(delta_sid))
                         if stream_callback:
                             stream_callback({"type": "reasoning", "delta": th})
 
@@ -673,7 +679,11 @@ def parse_interactions_stream(
                     if fn_name and not entry["function"]["name"]:
                         entry["function"]["name"] = fn_name
                     if args_delta:
-                        entry["function"]["arguments"] += args_delta
+                        if call_id not in step_had_arg_delta:
+                            entry["function"]["arguments"] = args_delta
+                            step_had_arg_delta.add(call_id)
+                        else:
+                            entry["function"]["arguments"] += args_delta
 
                     sig = (
                         fc_data.get("thought_signature")
@@ -704,6 +714,8 @@ def parse_interactions_stream(
                     )
                     if t:
                         content += t
+                        if delta_sid:
+                            step_had_text_delta.add(str(delta_sid))
                         if stream_callback:
                             stream_callback({"type": "content", "delta": t})
 
@@ -986,7 +998,9 @@ class GoogleInteractionsClient(BaseLLMClient):
         tools: list[dict[str, Any]] | None,
     ) -> dict[str, Any]:
         wire_messages = self.sanitize_messages(messages)
-        system_instruction, steps = convert_messages_to_interactions(wire_messages)
+        system_instruction, steps = convert_messages_to_interactions(
+            wire_messages, already_sanitized=True
+        )
         declarations = convert_tools_to_declarations(tools)
 
         # The Interactions API expects bare model IDs (no OpenRouter / REST prefixes).
@@ -1130,7 +1144,9 @@ class GoogleInteractionsClient(BaseLLMClient):
                 filtered_content = [
                     p
                     for p in step["content"]
-                    if isinstance(p, dict) and p.get("type") != "image"
+                    if isinstance(p, dict)
+                    and p.get("type") != "image"
+                    and not (p.get("type") == "text" and p.get("text") == TOOL_IMAGE_PROMPT)
                 ]
                 if len(filtered_content) != len(step["content"]):
                     removed = True

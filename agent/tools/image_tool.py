@@ -27,6 +27,7 @@ from agent.prompt import TOOL_HINTS
 from agent.review_paths import review_dir
 from agent.revisions import compute_model_sha256
 from agent.tool_results import _is_png, _view_hash
+from agent.tools.cad_scripts.renderer import VIEW_ALIASES
 
 # Canonical eight views from ``renderer.py:VIEWS`` mirrored as a tuple of
 # ids so an unknown value can be rejected with a single membership test.
@@ -42,46 +43,6 @@ CANONICAL_VIEW_IDS: tuple[str, ...] = (
     "isometric_positive",
     "isometric_negative",
 )
-
-VIEW_ALIASES: dict[str, str] = {
-    "all": "all",
-    "sheet": "all",
-    "contact": "all",
-    "contact_sheet": "all",
-    "review-sheet": "all",
-    "review_sheet": "all",
-    "overview": "all",
-    "isometric": "isometric_positive",
-    "iso": "isometric_positive",
-    "iso+": "isometric_positive",
-    "iso_pos": "isometric_positive",
-    "iso_positive": "isometric_positive",
-    "isometric+": "isometric_positive",
-    "isometric_positive": "isometric_positive",
-    "iso-": "isometric_negative",
-    "iso_neg": "isometric_negative",
-    "iso_negative": "isometric_negative",
-    "isometric-": "isometric_negative",
-    "isometric_negative": "isometric_negative",
-    "top": "z_positive",
-    "+z": "z_positive",
-    "bottom": "z_negative",
-    "-z": "z_negative",
-    "front": "y_negative",
-    "-y": "y_negative",
-    "back": "y_positive",
-    "+y": "y_positive",
-    "right": "x_positive",
-    "+x": "x_positive",
-    "left": "x_negative",
-    "-x": "x_negative",
-    "x_positive": "x_positive",
-    "x_negative": "x_negative",
-    "y_positive": "y_positive",
-    "y_negative": "y_negative",
-    "z_positive": "z_positive",
-    "z_negative": "z_negative",
-}
 
 _MAX_VIEWS_PER_CALL = 8
 

@@ -17,6 +17,7 @@ import operator
 import re
 import statistics
 import sys
+import types
 import typing
 from pathlib import Path
 from typing import Any
@@ -105,6 +106,17 @@ DANGEROUS_ATTRIBUTES = frozenset({
     "gi_frame",
     "cr_frame",
     "ag_frame",
+    "sys",
+    "os",
+    "_sys",
+    "_os",
+    "builtins",
+    "__loader__",
+    "__spec__",
+    "__package__",
+    "f2py",
+    "distutils",
+    "testing",
 })
 
 
@@ -183,7 +195,14 @@ def _safe_getattr(obj: Any, name: str, *default: Any) -> Any:
     """Safe getattr that blocks access to dunder and restricted attributes."""
     if not isinstance(name, str) or name in DANGEROUS_ATTRIBUTES or name.startswith("__"):
         raise AttributeError(f"Access to restricted attribute '{name}' is not permitted.")
-    return getattr(obj, name, *default)
+    val = getattr(obj, name, *default)
+    if isinstance(val, types.ModuleType):
+        mod_root = val.__name__.split(".")[0]
+        if mod_root not in ALLOWED_ROOTS and not val.__name__.startswith(("numpy", "sympy")):
+            raise AttributeError(f"Access to restricted module '{val.__name__}' is not permitted.")
+        if _is_blocked_submodule(val.__name__):
+            raise AttributeError(f"Access to restricted submodule '{val.__name__}' is not permitted.")
+    return val
 
 
 def _safe_hasattr(obj: Any, name: str) -> bool:
@@ -209,8 +228,10 @@ def _build_safe_builtins() -> dict[str, Any]:
     return safe
 
 
-def _serialize_value(val: Any) -> Any:
+def _serialize_value(val: Any, _depth: int = 0, _max_depth: int = 12) -> Any:
     """Format evaluation result into a JSON-compatible representation."""
+    if _depth > _max_depth:
+        return "[Max depth exceeded]"
     if val is None or isinstance(val, (bool, int)):
         return val
     if isinstance(val, float):
@@ -220,22 +241,22 @@ def _serialize_value(val: Any) -> Any:
             return "Infinity" if val > 0 else "-Infinity"
         return val
     if isinstance(val, str):
-        return val
+        return val[:65536]
     if isinstance(val, np.generic):
-        return _serialize_value(val.item())
+        return _serialize_value(val.item(), _depth + 1, _max_depth)
     if isinstance(val, np.ndarray):
         if val.size <= 2000:
-            return _serialize_value(val.tolist())
+            return _serialize_value(val.tolist(), _depth + 1, _max_depth)
         return f"ndarray(shape={val.shape}, dtype={val.dtype})"
     if sp is not None and isinstance(val, (sp.Basic, sp.MatrixBase)):
-        return str(val)
+        return str(val)[:65536]
     if isinstance(val, (list, tuple)):
-        return [_serialize_value(item) for item in val]
+        return [_serialize_value(item, _depth + 1, _max_depth) for item in val[:1000]]
     if isinstance(val, dict):
-        return {str(k): _serialize_value(v) for k, v in val.items()}
+        return {str(k): _serialize_value(v, _depth + 1, _max_depth) for k, v in list(val.items())[:1000]}
     if isinstance(val, (set, frozenset)):
-        return [_serialize_value(item) for item in sorted(val, key=str)]
-    return str(val)
+        return [_serialize_value(item, _depth + 1, _max_depth) for item in sorted(val, key=str)[:1000]]
+    return str(val)[:4096]
 
 
 def execute_script(code_text: str) -> dict[str, Any]:
@@ -293,6 +314,8 @@ def execute_script(code_text: str) -> dict[str, Any]:
         exec(module_code, env)
         result_raw = eval(expr_code, env) if expr_code is not None else None
         captured_stdout = stdout_buf.getvalue()
+        if len(captured_stdout) > 65536:
+            captured_stdout = captured_stdout[:65536] + "\n[Output truncated at 64KB]"
         return {
             "ok": True,
             "stdout": captured_stdout.strip(),
@@ -300,6 +323,8 @@ def execute_script(code_text: str) -> dict[str, Any]:
         }
     except Exception as err:
         captured_stdout = stdout_buf.getvalue()
+        if len(captured_stdout) > 65536:
+            captured_stdout = captured_stdout[:65536] + "\n[Output truncated at 64KB]"
         return {
             "ok": False,
             "error": f"{type(err).__name__}: {err}",

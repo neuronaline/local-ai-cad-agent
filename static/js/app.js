@@ -19,6 +19,11 @@ const usagePill = document.querySelector('#usage-pill');
 const attachmentPreview = document.querySelector('#attachment-preview');
 const downloadModelBtn = document.querySelector('#download-model');
 const exportFormatSelect = document.querySelector('#export-format');
+const screenshotBtn = document.querySelector('#screenshot-btn');
+const screenshotMenuBtn = document.querySelector('#screenshot-menu-btn');
+const screenshotMenu = document.querySelector('#screenshot-menu');
+const screenshotSingleBtn = document.querySelector('#screenshot-single-btn');
+const screenshotAllBtn = document.querySelector('#screenshot-all-btn');
 const appConfig = JSON.parse(document.querySelector('#app-config')?.textContent || '{}');
 const showInfoMessages = appConfig.showInfoMessages ?? true;
 const currentProject = appConfig.projectName || '';
@@ -1021,6 +1026,17 @@ async function api(url, options = {}) {
   return body;
 }
 
+function setScreenshotButtonsDisabled(disabled) {
+  if (screenshotBtn) screenshotBtn.disabled = disabled;
+  if (screenshotMenuBtn) screenshotMenuBtn.disabled = disabled;
+  if (screenshotSingleBtn) screenshotSingleBtn.disabled = disabled;
+  if (screenshotAllBtn) screenshotAllBtn.disabled = disabled;
+  if (disabled && screenshotMenu && !screenshotMenu.hidden) {
+    screenshotMenu.hidden = true;
+    screenshotMenuBtn?.setAttribute('aria-expanded', 'false');
+  }
+}
+
 async function loadCurrentPreview(previewId) {
   if (!currentProject) return;
   if (previewLoadPromise) {
@@ -1034,6 +1050,7 @@ async function loadCurrentPreview(previewId) {
       await viewer.load(url);
       previewProject = project;
       if (downloadModelBtn) downloadModelBtn.disabled = false;
+      setScreenshotButtonsDisabled(false);
       api(`/api/projects/${encodeURIComponent(project)}/preview/meta`)
         .then(meta => {
           if (meta) loadedPreviewRevision = meta.revision || loadedPreviewRevision;
@@ -1042,6 +1059,7 @@ async function loadCurrentPreview(previewId) {
     } catch (error) {
       if (error.message?.includes('superseded')) return;
       if (downloadModelBtn) downloadModelBtn.disabled = true;
+      setScreenshotButtonsDisabled(true);
       addMessage(`Preview failed: ${error.message}`, 'error');
     } finally {
       previewLoadPromise = null;
@@ -1059,6 +1077,7 @@ function hideUnapprovedPreview(reviewStatus = 'pending') {
   previewProject = '';
   loadedPreviewRevision = '';
   if (downloadModelBtn) downloadModelBtn.disabled = true;
+  setScreenshotButtonsDisabled(true);
   viewer.clear(
     reviewStatus === 'fail'
       ? 'Preview was rejected by review'
@@ -1782,6 +1801,83 @@ downloadModelBtn?.addEventListener('click', async () => {
     downloadModelBtn.disabled = !previewProject;
   }
 });
+
+// Screenshot capture & options menu
+function closeScreenshotMenu() {
+  if (screenshotMenu) screenshotMenu.hidden = true;
+  if (screenshotMenuBtn) screenshotMenuBtn.setAttribute('aria-expanded', 'false');
+}
+
+function toggleScreenshotMenu() {
+  if (!screenshotMenu || screenshotMenuBtn?.disabled) return;
+  const isHidden = screenshotMenu.hidden;
+  screenshotMenu.hidden = !isHidden;
+  screenshotMenuBtn?.setAttribute('aria-expanded', String(isHidden));
+}
+
+screenshotMenuBtn?.addEventListener('click', (event) => {
+  event.stopPropagation();
+  toggleScreenshotMenu();
+});
+
+document.addEventListener('click', (event) => {
+  if (screenshotMenu && !screenshotMenu.hidden && !event.target.closest('.screenshot-combo')) {
+    closeScreenshotMenu();
+  }
+});
+
+window.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && screenshotMenu && !screenshotMenu.hidden) {
+    closeScreenshotMenu();
+    screenshotMenuBtn?.focus();
+  }
+});
+
+let isCapturingScreenshot = false;
+
+async function handleSingleScreenshot() {
+  closeScreenshotMenu();
+  if (isCapturingScreenshot || !previewProject || !viewer.hasModel() || screenshotBtn?.disabled) return;
+  isCapturingScreenshot = true;
+  setScreenshotButtonsDisabled(true);
+  try {
+    const blob = await viewer.captureSingleScreenshot();
+    triggerBlobDownload(blob, `${currentProject || 'model'}-view.png`);
+    flashButtonFeedback(screenshotBtn, 'Saved!', { duration: 1500 });
+  } catch (error) {
+    console.error('Screenshot capture failed', error);
+    addMessage(`Screenshot failed: ${error.message}`, 'error');
+  } finally {
+    isCapturingScreenshot = false;
+    setScreenshotButtonsDisabled(!previewProject);
+  }
+}
+
+async function handleAllAnglesScreenshot() {
+  closeScreenshotMenu();
+  if (isCapturingScreenshot || !previewProject || !viewer.hasModel() || screenshotBtn?.disabled) return;
+  isCapturingScreenshot = true;
+  setScreenshotButtonsDisabled(true);
+  try {
+    const dimensionsText = document.querySelector('#dimensions')?.textContent || '';
+    const blob = await viewer.captureMultiViewScreenshot({
+      projectName: currentProject,
+      dimensionsText,
+    });
+    triggerBlobDownload(blob, `${currentProject || 'model'}-all-angles.png`);
+    flashButtonFeedback(screenshotBtn, 'Saved!', { duration: 1500 });
+  } catch (error) {
+    console.error('Multi-angle screenshot capture failed', error);
+    addMessage(`Multi-angle screenshot failed: ${error.message}`, 'error');
+  } finally {
+    isCapturingScreenshot = false;
+    setScreenshotButtonsDisabled(!previewProject);
+  }
+}
+
+screenshotBtn?.addEventListener('click', handleSingleScreenshot);
+screenshotSingleBtn?.addEventListener('click', handleSingleScreenshot);
+screenshotAllBtn?.addEventListener('click', handleAllAnglesScreenshot);
 document.querySelectorAll('[data-view]').forEach(button => {
   button.addEventListener('click', () => {
     viewer.setView(button.dataset.view);

@@ -141,7 +141,7 @@ module helical_thread(major_d, pitch, length, depth = 0.8) {
     linear_extrude(
         height = length,
         twist = -360 * turns,
-        slices = max(16, round(turns * 24)),
+        slices = min(180, max(16, round(turns * 18))), // Preflight limit: slices <= 180 and <= turns * 18
         convexity = 10
     )
         translate([offset_r, 0, 0])

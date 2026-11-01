@@ -38,18 +38,23 @@ class VertexClient(ChatCompletionsClient):
     # ``sanitize_assistant_message`` always populates.
     preserve_reasoning = False
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, *, provider_name: str | None = None) -> None:
         super().__init__(settings, provider_label="Google Cloud Vertex AI (gcloud)")
+        self._provider = (provider_name or settings.llm_provider).strip().lower()
+
+    @property
+    def _use_gemini_config(self) -> bool:
+        return self._provider in ("gemini", "google")
 
     def _resolved_project(self) -> str:
-        if self.settings.llm_provider in ("gemini", "google"):
+        if self._use_gemini_config:
             configured = self.settings.gemini_project_id or self.settings.vertex_project_id
         else:
             configured = self.settings.vertex_project_id or self.settings.gemini_project_id
         return gcloud_auth.get_project(configured)
 
     def _resolved_location(self) -> str:
-        if self.settings.llm_provider in ("gemini", "google"):
+        if self._use_gemini_config:
             configured = self.settings.gemini_location or self.settings.vertex_location
         else:
             configured = self.settings.vertex_location or self.settings.gemini_location
@@ -97,7 +102,7 @@ class VertexClient(ChatCompletionsClient):
     def model(self) -> str:
         # Not ``settings.llm_model``: as the fallback client, ``llm_provider``
         # names the primary provider, not Vertex.
-        if self.settings.llm_provider in ("gemini", "google"):
+        if self._use_gemini_config:
             raw_model = self.settings.gemini_model
         else:
             raw_model = self.settings.vertex_model
@@ -127,7 +132,7 @@ class VertexClient(ChatCompletionsClient):
 
         effort = (
             self.settings.gemini_reasoning_effort
-            if self.settings.llm_provider in ("gemini", "google")
+            if self._use_gemini_config
             else self.settings.vertex_reasoning_effort
         )
         model_lower = self.model.lower()
@@ -171,7 +176,7 @@ class VertexClient(ChatCompletionsClient):
     def _post(self, payload: dict[str, Any], headers: dict[str, str]) -> Any:
         timeout = (
             self.settings.gemini_timeout_seconds
-            if self.settings.llm_provider in ("gemini", "google")
+            if self._use_gemini_config
             else self.settings.vertex_timeout_seconds
         )
         # Always inject current access token dynamically for each attempt

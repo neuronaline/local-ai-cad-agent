@@ -2099,7 +2099,7 @@ def _build_provider_client(provider: str, settings: Settings) -> BaseLLMClient:
     if canonical in ("vertex", "gcloud"):
         from agent.vertex_client import VertexClient
 
-        return VertexClient(settings)
+        return VertexClient(settings, provider_name=canonical)
     if canonical in ("gemini", "google"):
         raw_slug = provider.strip().lower()
         if raw_slug in ("aistudio", "google_ai_studio", "google-ai-studio", "ai_studio"):
@@ -2109,7 +2109,7 @@ def _build_provider_client(provider: str, settings: Settings) -> BaseLLMClient:
         if getattr(settings, "gemini_auth_mode", "api_key") == "gcloud":
             from agent.vertex_client import VertexClient
 
-            return VertexClient(settings)
+            return VertexClient(settings, provider_name=canonical)
         from agent.gemini_client import GoogleInteractionsClient
 
         return GoogleInteractionsClient(settings)

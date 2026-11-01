@@ -413,22 +413,30 @@ class CadVerifier:
         # 6. Lexical Scope Block Reassignment Detection (per enclosing scope)
         for base_offset, scope_code in self._extract_lexical_scopes(clean_code):
             scope_vars: set[str] = set()
-            brace_depth = 0
-            paren_depth = 0
-            for line in scope_code.splitlines():
-                open_c = line.count("{")
-                close_c = line.count("}")
-                open_p = line.count("(")
-                close_p = line.count(")")
-                if brace_depth == 0 and paren_depth == 0:
-                    for assign_m in re.finditer(
-                        r"(?:^|[;])\s*([A-Za-z0-9_]+)\s*=(?!=)", line
-                    ):
+            b_d = 0
+            p_d = 0
+            i = 0
+            code_len = len(scope_code)
+            while i < code_len:
+                ch = scope_code[i]
+                if ch == "(":
+                    p_d += 1
+                elif ch == ")":
+                    p_d = max(0, p_d - 1)
+                elif ch == "{":
+                    b_d += 1
+                elif ch == "}":
+                    b_d = max(0, b_d - 1)
+                elif b_d == 0 and p_d == 0 and (i == 0 or scope_code[i - 1] in (";", "\n", "{", "}")):
+                    assign_m = re.match(
+                        r"\s*([A-Za-z0-9_]+)\s*=(?!=)", scope_code[i:]
+                    )
+                    if assign_m:
                         var = assign_m.group(1)
-                        if not var.startswith("$") and var != "EPS":
+                        if not var.startswith("$") and var not in ("EPS", "eps", "epsilon"):
                             scope_vars.add(var)
-                brace_depth = max(0, brace_depth + open_c - close_c)
-                paren_depth = max(0, paren_depth + open_p - close_p)
+                        i += assign_m.end() - 1
+                i += 1
 
             if not scope_vars:
                 continue
@@ -535,7 +543,10 @@ class CadVerifier:
                 )
 
         # 8. Golden Rules: EPS constant & difference() cutter overshoot rule
-        eps_match = re.search(r"\bEPS\s*=\s*([0-9\.]+(?:[eE][-+]?[0-9]+)?)\s*;", clean_code)
+        eps_match = re.search(
+            r"\b(EPS|eps|EPSILON|epsilon)\s*=\s*([0-9\.]+(?:[eE][-+]?[0-9]+)?)\s*;",
+            clean_code,
+        )
         has_eps = eps_match is not None
         diff_matches = list(re.finditer(r"\bdifference\s*\(\s*\)", clean_code))
         if diff_matches:
@@ -549,13 +560,17 @@ class CadVerifier:
                     )
                 )
             else:
-                eps_count = len(re.findall(r"\bEPS\b", clean_code))
-                if eps_count <= 1:
+                eps_name = eps_match.group(1)
+                eps_count = len(re.findall(rf"\b{re.escape(eps_name)}\b", clean_code))
+                has_numeric_offset = bool(
+                    re.search(r"[-+]\s*(?:0\.0[1-9]|0\.1|0\.00[1-9])\b", clean_code)
+                )
+                if eps_count <= 1 and not has_numeric_offset:
                     findings.append(
                         Finding(
                             category="WARNING",
                             code="UNUSED_EPS_IN_CUTTERS",
-                            message="EPS is declared but never referenced in difference() cutters (expected -EPS offset or +2*EPS length).",
+                            message=f"{eps_name} is declared but never referenced in difference() cutters (expected -{eps_name} offset or +2*{eps_name} length).",
                             impact="Cutters sharing exact boundaries with target create non-manifold coincident faces and Z-fighting.",
                         )
                     )

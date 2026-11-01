@@ -530,6 +530,7 @@ _VIEW_ALIASES: dict[str, str] = {
     "z_positive": "z_positive",
     "z_negative": "z_negative",
 }
+VIEW_ALIASES = _VIEW_ALIASES
 
 
 def render_views(

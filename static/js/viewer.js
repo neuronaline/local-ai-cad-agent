@@ -9,6 +9,8 @@ const VIEW_DIRECTIONS = Object.freeze({
   front: new THREE.Vector3(0, 0, 1),
   top: new THREE.Vector3(0, 1, 0.001).normalize(),
   right: new THREE.Vector3(1, 0, 0),
+  back: new THREE.Vector3(0, 0, -1),
+  left: new THREE.Vector3(-1, 0, 0),
 });
 
 function readGridConfig(appConfig) {
@@ -38,7 +40,7 @@ export class CadViewer {
     this.scene.background = new THREE.Color('#0d1524');
     this.camera = new THREE.PerspectiveCamera(45, 1, 0.1, 10000);
     this.camera.position.set(120, 100, 120);
-    this.renderer = new THREE.WebGLRenderer({antialias: true});
+    this.renderer = new THREE.WebGLRenderer({antialias: true, preserveDrawingBuffer: true});
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     container.appendChild(this.renderer.domElement);
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
@@ -49,6 +51,9 @@ export class CadViewer {
     const light = new THREE.DirectionalLight(0xffffff, 3);
     light.position.set(80, 120, 100);
     this.scene.add(light);
+    const fillLight = new THREE.DirectionalLight(0xb0c4de, 1.5);
+    fillLight.position.set(-80, 80, -100);
+    this.scene.add(fillLight);
     this.gridHelper = this._buildGridHelper();
     this.scene.add(this.gridHelper);
     this.loader = new STLLoader();
@@ -320,5 +325,171 @@ export class CadViewer {
 
   _hideSpinner() {
     if (this._spinner) this._spinner.style.display = 'none';
+  }
+
+  async captureSingleScreenshot() {
+    if (!this.model) {
+      throw new Error('No model loaded to capture.');
+    }
+    this.controls.update();
+    this.renderer.render(this.scene, this.camera);
+    return new Promise((resolve, reject) => {
+      this.renderer.domElement.toBlob(blob => {
+        if (blob) resolve(blob);
+        else reject(new Error('Failed to generate image blob.'));
+      }, 'image/png');
+    });
+  }
+
+  async captureMultiViewScreenshot({ projectName = '', dimensionsText = '' } = {}) {
+    if (!this.model || !this.modelBounds) {
+      throw new Error('No model loaded to capture.');
+    }
+
+    const { center, largest } = this.modelBounds;
+    const distance = largest * 2.2;
+
+    const views = [
+      { key: 'iso', label: 'ISO' },
+      { key: 'front', label: 'FRONT' },
+      { key: 'right', label: 'RIGHT' },
+      { key: 'top', label: 'TOP' },
+      { key: 'back', label: 'BACK' },
+      { key: 'left', label: 'LEFT' },
+    ];
+
+    const cellWidth = 640;
+    const cellHeight = 480;
+    const cols = 3;
+    const rows = 2;
+    const headerHeight = 64;
+    const totalWidth = cellWidth * cols;
+    const totalHeight = headerHeight + (cellHeight * rows);
+
+    const canvas = document.createElement('canvas');
+    canvas.width = totalWidth;
+    canvas.height = totalHeight;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error('Could not create 2D canvas context.');
+
+    // Save camera & renderer state
+    const prevPos = this.camera.position.clone();
+    const prevTarget = this.controls.target.clone();
+    const prevUp = this.camera.up.clone();
+    const prevAspect = this.camera.aspect;
+    const prevSize = new THREE.Vector2();
+    this.renderer.getSize(prevSize);
+    const { clientWidth: origWidth, clientHeight: origHeight } = this.container;
+
+    try {
+      // Header background
+      ctx.fillStyle = '#080e1a';
+      ctx.fillRect(0, 0, totalWidth, headerHeight);
+
+      // Header title
+      ctx.font = 'bold 20px Inter, system-ui, sans-serif';
+      ctx.fillStyle = '#e6edf8';
+      ctx.textBaseline = 'middle';
+      const titleText = projectName ? `${projectName}` : 'CAD Model Review';
+      ctx.fillText(titleText, 24, headerHeight / 2);
+
+      // Header dimensions text
+      const dims = dimensionsText || (this.cadDimensions
+        ? `${this.cadDimensions.x.toFixed(1)} × ${this.cadDimensions.y.toFixed(1)} × ${this.cadDimensions.z.toFixed(1)} mm`
+        : '');
+      if (dims) {
+        ctx.font = '600 14px ui-monospace, SFMono-Regular, Menlo, monospace';
+        ctx.fillStyle = '#8ca8ff';
+        ctx.textAlign = 'right';
+        ctx.fillText(dims, totalWidth - 24, headerHeight / 2);
+        ctx.textAlign = 'left';
+      }
+
+      // Border under header
+      ctx.strokeStyle = '#263650';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(0, headerHeight - 0.5);
+      ctx.lineTo(totalWidth, headerHeight - 0.5);
+      ctx.stroke();
+
+      // Configure renderer for cell size
+      this.camera.aspect = cellWidth / cellHeight;
+      this.camera.updateProjectionMatrix();
+      this.renderer.setSize(cellWidth, cellHeight, false);
+
+      for (let i = 0; i < views.length; i++) {
+        const view = views[i];
+        const col = i % cols;
+        const row = Math.floor(i / cols);
+        const cellX = col * cellWidth;
+        const cellY = headerHeight + row * cellHeight;
+
+        if (view.key === 'top') {
+          this.camera.position.set(center.x, center.y + distance, center.z);
+          this.camera.up.set(0, 0, -1);
+        } else {
+          const direction = VIEW_DIRECTIONS[view.key] || VIEW_DIRECTIONS.iso;
+          this.camera.position.copy(center).addScaledVector(direction, distance);
+          this.camera.up.set(0, 1, 0);
+        }
+        this.camera.lookAt(center);
+        this.renderer.render(this.scene, this.camera);
+
+        // Draw rendered WebGL canvas into cell
+        ctx.drawImage(this.renderer.domElement, cellX, cellY, cellWidth, cellHeight);
+
+        // Cell borders
+        ctx.strokeStyle = '#1e2c44';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(cellX + 0.5, cellY + 0.5, cellWidth - 1, cellHeight - 1);
+
+        // View pill badge in top-left of each cell
+        const badgeX = cellX + 16;
+        const badgeY = cellY + 16;
+        const badgeW = 74;
+        const badgeH = 26;
+        const radius = 5;
+
+        ctx.fillStyle = 'rgba(11, 18, 32, 0.85)';
+        ctx.strokeStyle = 'rgba(74, 104, 175, 0.5)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        if (typeof ctx.roundRect === 'function') {
+          ctx.roundRect(badgeX, badgeY, badgeW, badgeH, radius);
+        } else {
+          ctx.rect(badgeX, badgeY, badgeW, badgeH);
+        }
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.font = 'bold 11px Inter, system-ui, sans-serif';
+        ctx.fillStyle = '#dce6ff';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(view.label, badgeX + badgeW / 2, badgeY + badgeH / 2);
+        ctx.textAlign = 'left';
+      }
+
+      return new Promise((resolve, reject) => {
+        canvas.toBlob(blob => {
+          if (blob) resolve(blob);
+          else reject(new Error('Failed to generate composite screenshot blob.'));
+        }, 'image/png');
+      });
+    } finally {
+      // Restore camera & renderer
+      this.camera.aspect = prevAspect;
+      this.camera.position.copy(prevPos);
+      this.camera.up.copy(prevUp);
+      this.camera.lookAt(prevTarget);
+      this.camera.updateProjectionMatrix();
+      const restoreWidth = origWidth > 0 ? origWidth : prevSize.x;
+      const restoreHeight = origHeight > 0 ? origHeight : prevSize.y;
+      if (restoreWidth > 0 && restoreHeight > 0) {
+        this.renderer.setSize(restoreWidth, restoreHeight, false);
+      }
+      this.requestRender();
+    }
   }
 }

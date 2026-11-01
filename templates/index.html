@@ -114,31 +114,80 @@
             <span id="grid-warning" class="grid-warning" hidden title="Model exceeds the configured grid surface"></span>
           </div>
           <div class="viewer-actions" aria-label="Preview controls">
-            <button id="build-btn" type="button" class="quiet toolbar-pill" title="Rebuild model from model.scad" aria-label="Rebuild model">
-              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.9 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
-              </svg>
-              <span>Build</span>
-            </button>
-            <button id="toggle-wireframe" type="button" class="quiet toolbar-pill" aria-pressed="false" title="Toggle wireframe" aria-label="Toggle wireframe">
-              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                <path d="m21 16-9 5-9-5V8l9-5 9 5v8z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
-                <path d="M12 3v18M3 8l18 8M3 16l18-8" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" opacity="0.6"/>
-              </svg>
-              <span>Wireframe</span>
-            </button>
-            <button id="toggle-grid" type="button" class="quiet toolbar-pill" aria-pressed="true" title="Toggle grid" aria-label="Toggle grid">
-              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                <path d="M3 3h18v18H3zM3 9h18M3 15h18M9 3v18M15 3v18" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
-              </svg>
-              <span>Grid</span>
-            </button>
-            <button id="history-btn" type="button" class="quiet toolbar-pill" title="Revision history" aria-label="Revision history" aria-expanded="false" aria-controls="history-drawer">
-              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                <path d="M3 12a9 9 0 1 0 3.6-7.2M3 4v5h5M12 8v5l3 2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
-              </svg>
-              <span>Revisions</span>
-            </button>
+            <div class="toolbar-group display-tools-group" role="group" aria-label="Display and screenshot tools">
+              <button id="toggle-wireframe" type="button" class="quiet toolbar-pill icon-only" aria-pressed="false" title="Toggle wireframe" aria-label="Toggle wireframe">
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                  <path d="m21 16-9 5-9-5V8l9-5 9 5v8z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+                  <path d="M12 3v18M3 8l18 8M3 16l18-8" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" opacity="0.6"/>
+                </svg>
+                <span class="sr-only">Wireframe</span>
+              </button>
+              <button id="toggle-grid" type="button" class="quiet toolbar-pill icon-only" aria-pressed="true" title="Toggle grid" aria-label="Toggle grid">
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                  <path d="M3 3h18v18H3zM3 9h18M3 15h18M9 3v18M15 3v18" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+                </svg>
+                <span class="sr-only">Grid</span>
+              </button>
+              <div class="screenshot-combo" role="group" aria-label="Capture screenshot">
+                <button id="screenshot-btn" type="button" class="screenshot-btn" title="Capture current view screenshot" aria-label="Capture screenshot" disabled>
+                  <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                    <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+                    <circle cx="12" cy="13" r="4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+                  </svg>
+                  <span>SS</span>
+                </button>
+                <button id="screenshot-menu-btn" type="button" class="screenshot-menu-btn" title="Screenshot options" aria-label="Screenshot options" aria-haspopup="true" aria-expanded="false" disabled>
+                  <svg class="icon chevron-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                    <path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                  </svg>
+                </button>
+                <div id="screenshot-menu" class="screenshot-menu" hidden role="menu" aria-label="Screenshot options">
+                  <button id="screenshot-single-btn" type="button" class="screenshot-menu-item" role="menuitem" disabled>
+                    <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                      <rect x="3" y="3" width="18" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/>
+                      <circle cx="8.5" cy="8.5" r="1.5" fill="currentColor"/>
+                      <polyline points="21 15 16 10 5 21" fill="none" stroke="currentColor" stroke-width="1.6"/>
+                    </svg>
+                    <div class="menu-item-text">
+                      <strong>Current View</strong>
+                      <small>Single PNG from current angle</small>
+                    </div>
+                  </button>
+                  <button id="screenshot-all-btn" type="button" class="screenshot-menu-item" role="menuitem" disabled>
+                    <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                      <rect x="3" y="3" width="7" height="7" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/>
+                      <rect x="14" y="3" width="7" height="7" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/>
+                      <rect x="3" y="14" width="7" height="7" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/>
+                      <rect x="14" y="14" width="7" height="7" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/>
+                    </svg>
+                    <div class="menu-item-text">
+                      <strong>All Angles</strong>
+                      <small>6-view grid contact sheet PNG</small>
+                    </div>
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <span class="toolbar-divider" aria-hidden="true"></span>
+
+            <div class="toolbar-group model-tools-group" role="group" aria-label="Model actions">
+              <button id="build-btn" type="button" class="quiet toolbar-pill" title="Rebuild model from model.scad" aria-label="Rebuild model">
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                  <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.9 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                <span>Build</span>
+              </button>
+              <button id="history-btn" type="button" class="quiet toolbar-pill" title="Revision history" aria-label="Revision history" aria-expanded="false" aria-controls="history-drawer">
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                  <path d="M3 12a9 9 0 1 0 3.6-7.2M3 4v5h5M12 8v5l3 2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                <span>Revisions</span>
+              </button>
+            </div>
+
+            <span class="toolbar-divider" aria-hidden="true"></span>
+
             <div class="export-combo" role="group" aria-label="Export model">
               <select id="export-format" class="export-select" title="Export format" aria-label="Export format">
                 <option value="stl" selected>STL (.stl)</option>
