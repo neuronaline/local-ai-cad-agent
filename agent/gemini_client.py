@@ -88,15 +88,21 @@ def _sanitize_schema_for_gemini(schema: Any) -> Any:
 def convert_tools_to_declarations(
     tools: list[dict[str, Any]] | None,
 ) -> list[dict[str, Any]] | None:
-    """Convert OpenAI-compatible tool specifications to Google function declarations."""
+    """Convert OpenAI-compatible tool specifications to Google Interactions API tool objects."""
     if not tools:
         return None
     declarations: list[dict[str, Any]] = []
     for tool in tools:
-        if tool.get("type") == "function":
-            fn = tool.get("function") or {}
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("type") == "function" or ("name" in tool and "type" not in tool):
+            fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+            fn_name = fn.get("name")
+            if not fn_name:
+                continue
             decl: dict[str, Any] = {
-                "name": fn.get("name"),
+                "type": "function",
+                "name": str(fn_name),
                 "description": fn.get("description", ""),
             }
             if "parameters" in fn:
@@ -105,13 +111,21 @@ def convert_tools_to_declarations(
         elif "function_declarations" in tool or "functionDeclarations" in tool:
             raw_decls = tool.get("function_declarations") or tool.get("functionDeclarations") or []
             for decl in raw_decls:
-                cleaned_decl = dict(decl)
-                if "parameters" in cleaned_decl:
+                if not isinstance(decl, dict) or not decl.get("name"):
+                    continue
+                cleaned_decl: dict[str, Any] = {
+                    "type": "function",
+                    "name": str(decl.get("name")),
+                    "description": decl.get("description", ""),
+                }
+                if "parameters" in decl:
                     cleaned_decl["parameters"] = _sanitize_schema_for_gemini(
-                        cleaned_decl["parameters"]
+                        decl["parameters"]
                     )
                 declarations.append(cleaned_decl)
-    return [{"function_declarations": declarations}] if declarations else None
+        elif "type" in tool:
+            declarations.append(dict(tool))
+    return declarations if declarations else None
 
 
 def convert_messages_to_interactions(
@@ -196,14 +210,19 @@ def convert_messages_to_interactions(
         elif role == "assistant":
             tool_calls = msg.get("tool_calls") or []
             # The turn's real signature (thought step + unsigned calls); stored
-            # calls without one carry the sentinel, so skip those.
-            turn_sig = get_thought_signature(msg) or next(
-                (
-                    sig
-                    for sig in map(get_thought_signature, tool_calls)
-                    if sig and sig != THOUGHT_SIGNATURE_SENTINEL
-                ),
-                THOUGHT_SIGNATURE_SENTINEL,
+            # calls without one carry the sentinel, so prioritize genuine signatures.
+            msg_sig = get_thought_signature(msg)
+            turn_sig = (
+                msg_sig
+                if (msg_sig and msg_sig != THOUGHT_SIGNATURE_SENTINEL)
+                else next(
+                    (
+                        sig
+                        for sig in map(get_thought_signature, tool_calls)
+                        if sig and sig != THOUGHT_SIGNATURE_SENTINEL
+                    ),
+                    msg_sig or THOUGHT_SIGNATURE_SENTINEL,
+                )
             )
 
             # 1. Intermediate thoughts
@@ -212,18 +231,19 @@ def convert_messages_to_interactions(
                 or msg.get("reasoning_content")
                 or msg.get("thinking")
             )
-            if isinstance(reasoning, str) and reasoning.strip():
-                clean_r = strip_encrypted_reasoning(reasoning)
+            clean_r = (
+                strip_encrypted_reasoning(reasoning)
+                if isinstance(reasoning, str) and reasoning.strip()
+                else ""
+            )
+            if clean_r or tool_calls:
+                thought_step: dict[str, Any] = {
+                    "type": "thought",
+                    "signature": turn_sig,
+                }
                 if clean_r:
-                    steps.append(
-                        {
-                            "type": "thought",
-                            "signature": turn_sig,
-                            "thought_signature": turn_sig,
-                            "summary": [{"type": "text", "text": clean_r}],
-                            "content": [{"type": "text", "text": clean_r}],
-                        }
-                    )
+                    thought_step["summary"] = [{"type": "text", "text": clean_r}]
+                steps.append(thought_step)
 
             # 2. Text content — placed before function_call steps so that
             # function_call immediately precedes function_result in the steps array.
@@ -233,8 +253,6 @@ def convert_messages_to_interactions(
                     {
                         "type": "model_output",
                         "content": [{"type": "text", "text": content}],
-                        "thought_signature": turn_sig,
-                        "signature": turn_sig,
                     }
                 )
 
@@ -255,21 +273,16 @@ def convert_messages_to_interactions(
                     args = raw_args
                 else:
                     args = {}
-                sig = get_thought_signature(tc) or turn_sig
                 step_item = {
                     "type": "function_call",
                     "id": call_id,
-                    "call_id": call_id,
                     "name": fn_name,
-                    "arguments": args,
-                    "args": args,
-                    "thought_signature": sig,
-                    "signature": sig,
+                    "arguments": args if isinstance(args, dict) else {},
                 }
                 steps.append(step_item)
 
         elif role == "tool":
-            call_id = msg.get("tool_call_id") or ""
+            call_id = msg.get("tool_call_id") or msg.get("call_id") or msg.get("id") or ""
             fn_name = msg.get("name") or call_id_to_name.get(call_id, "unknown_tool")
             content = msg.get("content")
             if isinstance(content, list):
@@ -294,7 +307,6 @@ def convert_messages_to_interactions(
                 {
                     "type": "function_result",
                     "call_id": call_id,
-                    "id": call_id,
                     "name": fn_name,
                     "result": res_val if isinstance(res_val, dict) else {"output": res_val},
                 }
@@ -465,27 +477,37 @@ def parse_interactions_stream(
                 p_tokens = (
                     usage_meta.get("prompt_tokens")
                     or usage_meta.get("prompt_token_count")
+                    or usage_meta.get("total_input_tokens")
                     or 0
                 )
                 c_tokens = (
                     usage_meta.get("completion_tokens")
                     or usage_meta.get("candidates_token_count")
+                    or usage_meta.get("total_output_tokens")
                     or 0
                 )
                 r_tokens = (
                     usage_meta.get("reasoning_tokens")
                     or usage_meta.get("thoughts_token_count")
+                    or usage_meta.get("total_thought_tokens")
                     or 0
                 )
                 cached_tokens = (
                     usage_meta.get("cached_content_token_count")
                     or usage_meta.get("cached_tokens")
+                    or usage_meta.get("total_cached_tokens")
                     or (usage_meta.get("prompt_tokens_details") or {}).get("cached_tokens")
                     or 0
+                )
+                tot_tokens = (
+                    usage_meta.get("total_tokens")
+                    or usage_meta.get("total_token_count")
+                    or (int(p_tokens) + int(c_tokens))
                 )
                 last_usage = {
                     "prompt_tokens": int(p_tokens),
                     "completion_tokens": int(c_tokens),
+                    "total_tokens": int(tot_tokens),
                     "reasoning_tokens": int(r_tokens),
                     "completion_tokens_details": {
                         "reasoning_tokens": int(r_tokens),
@@ -553,16 +575,27 @@ def parse_interactions_stream(
                         {
                             "id": call_id,
                             "type": "function",
-                            "function": {"name": fn_name, "arguments": ""},
+                            "function": {"name": fn_name, "arguments": "{}"},
                             "index": len(tool_calls),
                         },
                     )
                     if fn_name and not entry["function"]["name"]:
                         entry["function"]["name"] = fn_name
-                    if arg_str and not entry["function"]["arguments"]:
+                    if arg_str and entry["function"]["arguments"] in ("", "{}"):
                         entry["function"]["arguments"] = arg_str
                     if sig and not entry.get("thought_signature"):
                         entry["thought_signature"] = str(sig)
+                    if stream_callback and event_type in ("step.start", "interaction.step.start") and (fn_name or arg_str):
+                        stream_callback(
+                            {
+                                "type": "tool_call",
+                                "index": entry["index"],
+                                "id": call_id,
+                                "name": entry["function"]["name"],
+                                "name_delta": fn_name,
+                                "arguments_delta": arg_str,
+                            }
+                        )
                 elif stype == "thought" and event_type in ("step.stop", "interaction.step.done"):
                     th_text = _extract_text(step_obj.get("summary")) or _extract_text(step_obj.get("content"))
                     if th_text and (not sid or str(sid) not in step_had_text_delta):
@@ -819,8 +852,12 @@ def parse_interactions_stream(
             )
 
     message: dict[str, Any] = {"role": "assistant", "content": content or None}
+    if last_thought_signature:
+        attach_thought_signature(message, last_thought_signature)
     if tool_calls:
         for tc in tool_calls.values():
+            if not tc.get("function", {}).get("arguments"):
+                tc.setdefault("function", {})["arguments"] = "{}"
             attach_thought_signature(tc, tc.get("thought_signature") or last_thought_signature)
         message["tool_calls"] = list(tool_calls.values())
     if reasoning_text.strip():
@@ -880,27 +917,37 @@ def parse_interactions_response(body: dict[str, Any]) -> dict[str, Any]:
         p_tokens = (
             usage_meta.get("prompt_tokens")
             or usage_meta.get("prompt_token_count")
+            or usage_meta.get("total_input_tokens")
             or 0
         )
         c_tokens = (
             usage_meta.get("completion_tokens")
             or usage_meta.get("candidates_token_count")
+            or usage_meta.get("total_output_tokens")
             or 0
         )
         r_tokens = (
             usage_meta.get("reasoning_tokens")
             or usage_meta.get("thoughts_token_count")
+            or usage_meta.get("total_thought_tokens")
             or 0
         )
         cached_tokens = (
             usage_meta.get("cached_content_token_count")
             or usage_meta.get("cached_tokens")
+            or usage_meta.get("total_cached_tokens")
             or (usage_meta.get("prompt_tokens_details") or {}).get("cached_tokens")
             or 0
+        )
+        tot_tokens = (
+            usage_meta.get("total_tokens")
+            or usage_meta.get("total_token_count")
+            or (int(p_tokens) + int(c_tokens))
         )
         usage = {
             "prompt_tokens": int(p_tokens),
             "completion_tokens": int(c_tokens),
+            "total_tokens": int(tot_tokens),
             "reasoning_tokens": int(r_tokens),
             "completion_tokens_details": {
                 "reasoning_tokens": int(r_tokens),
@@ -946,8 +993,12 @@ def parse_interactions_response(body: dict[str, Any]) -> dict[str, Any]:
             )
 
     message: dict[str, Any] = {"role": "assistant", "content": content or None}
+    if last_thought_signature:
+        attach_thought_signature(message, last_thought_signature)
     if tool_calls:
         for tc in tool_calls:
+            if not tc.get("function", {}).get("arguments"):
+                tc.setdefault("function", {})["arguments"] = "{}"
             attach_thought_signature(tc, tc.get("thought_signature") or last_thought_signature)
         message["tool_calls"] = tool_calls
     if reasoning_text.strip():
@@ -1012,7 +1063,6 @@ class GoogleInteractionsClient(BaseLLMClient):
             "model": raw_model,
             "input": steps,
             "stream": True,
-            "thinking_summaries": "auto",
         }
         if system_instruction:
             payload["system_instruction"] = system_instruction
@@ -1023,59 +1073,36 @@ class GoogleInteractionsClient(BaseLLMClient):
         else:
             payload["store"] = True
 
-        gen_config: dict[str, Any] = {"thinking_summaries": "auto"}
+        gen_config: dict[str, Any] = {}
         if self.settings.llm_max_completion_tokens:
             # Google GenAI API enforces maxOutputTokens < 65536.
             gen_config["max_output_tokens"] = min(self.settings.llm_max_completion_tokens, 65535)
 
         model_name = raw_model.lower()
-        is_gemini_2 = "2.5" in model_name or "gemini-2" in model_name
+        is_gemini_2 = (
+            ("2.5" in model_name or "gemini-2" in model_name)
+            and "gemini-3" not in model_name
+        )
+        min_level = "minimal" if (is_gemini_2 and "flash" in model_name) else "low"
         effort = (self.settings.gemini_reasoning_effort or "").lower().strip()
-        eff = effort if effort else ("minimal" if "flash" in model_name else "low")
+        eff = effort if effort else min_level
         if is_continuation_messages(messages) and eff != "none":
-            eff = "minimal" if "flash" in model_name else "low"
+            eff = min_level
 
-        thinking_config: dict[str, Any] = {
-            "include_thoughts": eff != "none",
-            "thinking_summaries": "auto",
-        }
         if eff != "none":
-            if not is_gemini_2:
-                level_map = {
-                    "minimal": "MINIMAL" if "flash" in model_name else "LOW",
-                    "low": "LOW",
-                    "medium": "MEDIUM",
-                    "high": "HIGH",
-                    "xhigh": "HIGH",
-                    "max": "HIGH",
-                }
-                level = level_map.get(eff, "LOW")
-                if "gemini-4" in model_name and level == "MINIMAL":
-                    level = "LOW"
-                thinking_config["thinking_level"] = level
-            else:
-                budget_map = {
-                    "minimal": 1024,
-                    "low": 2048,
-                    "medium": 4096,
-                    "high": 6144,
-                    "xhigh": 8192,
-                    "max": 8192,
-                }
-                thinking_config["thinking_budget"] = budget_map.get(eff, 2048)
-        elif eff == "none":
-            thinking_config.pop("thinking_summaries", None)
-            gen_config.pop("thinking_summaries", None)
-            if not is_gemini_2:
-                thinking_config["thinking_level"] = (
-                    "MINIMAL"
-                    if ("flash" in model_name and "gemini-4" not in model_name)
-                    else "LOW"
-                )
-            elif "pro" not in model_name:
-                thinking_config["thinking_budget"] = 0
+            gen_config["thinking_summaries"] = "auto"
+            level_map = {
+                "minimal": min_level,
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
+                "xhigh": "high",
+                "max": "high",
+            }
+            gen_config["thinking_level"] = level_map.get(eff, "low")
+        else:
+            gen_config["thinking_level"] = min_level
 
-        gen_config["thinking_config"] = thinking_config
         if gen_config:
             payload["generation_config"] = gen_config
 

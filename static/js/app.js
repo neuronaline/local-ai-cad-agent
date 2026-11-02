@@ -1532,6 +1532,7 @@ function openSlashPopup(items) {
   visibleCommands = items;
   slashSelectedIndex = 0;
   renderSlashPopup(items);
+  slashPopup.classList.remove('hidden');
   slashPopup.hidden = false;
 }
 
