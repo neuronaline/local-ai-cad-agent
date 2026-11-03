@@ -1247,6 +1247,10 @@ async function loadCurrentPreview(previewId) {
       if (error.message?.includes('superseded')) return;
       if (downloadModelBtn) downloadModelBtn.disabled = true;
       setScreenshotButtonsDisabled(true);
+      if (error.message?.includes('404') || error.message?.includes('NOT FOUND')) {
+        viewer.clear('No preview yet');
+        return;
+      }
       addMessage(`Preview failed: ${error.message}`, 'error');
     } finally {
       previewLoadPromise = null;
@@ -2817,7 +2821,7 @@ async function saveHardware(prefs) {
   try { localStorage.setItem(HW_STORAGE_KEY, JSON.stringify(currentHardware)); } catch {}
   updateHardwarePickerLabel();
   if (currentProject) {
-    loadCurrentPreview().catch(() => {});
+    syncCurrentPreview().catch(() => {});
   }
 }
 

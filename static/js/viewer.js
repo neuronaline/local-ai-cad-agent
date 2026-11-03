@@ -260,7 +260,8 @@ export class CadViewer {
         error => {
           if (sequence === this.loadSequence) {
             this._hideSpinner();
-            if (!this.model) this.clear('Preview could not be displayed');
+            const isNotFound = error?.message?.includes('404') || error?.message?.includes('NOT FOUND');
+            if (!this.model) this.clear(isNotFound ? 'No preview yet' : 'Preview could not be displayed');
           }
           reject(new Error(error?.message || 'The preview file could not be loaded.'));
         },
