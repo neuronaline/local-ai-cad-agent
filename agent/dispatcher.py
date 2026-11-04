@@ -29,6 +29,7 @@ _LOG = logging.getLogger(__name__)
 from agent.tool_results import failure as tool_failure
 from agent.tool_results import success as tool_success
 from agent.tools.cad_tool import RenderMode
+from agent.tools.cad_verifier import verification_passed
 
 
 def _is_empty_or_none(val: object) -> bool:
@@ -661,10 +662,7 @@ def process_tool_call(
         context_content = multimodal["content"]
     if is_cad_build(name) and build_succeeded:
         verif = raw_result.get("verification") if isinstance(raw_result, dict) else None
-        if isinstance(verif, dict) and verif.get("status") == "FAILED":
-            cad_fix_required = True
-        else:
-            cad_fix_required = False
+        cad_fix_required = not verification_passed(verif)
     tool_message = {"role": "tool", "tool_call_id": call_id, "content": context_content}
     messages.append(tool_message)
     append_message(project_dir, tool_message)

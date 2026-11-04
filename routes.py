@@ -1449,56 +1449,80 @@ def restore_revision(project_name: str, revision_id: str):
         bus.publish("revision_updated", {"project": project_name})
 
         # Fast path: Check for pre-built artifacts in cache (<15ms)
+        from agent.tools.cad_tool import CadTool, RenderMode, _toolchain_id
+        from agent.tools.cad_verifier import CadVerifier, verification_passed
+
         cache_dir = project_dir / ".cad-agent" / "cache" / revision.model_sha256
         cached_preview = cache_dir / "preview.stl"
         cached_render = cache_dir / "render.png"
         cached_metrics = cache_dir / ".cad_metrics.json"
 
-        if cached_preview.is_file() and cached_preview.stat().st_size > 0:
+        fast_cache_valid = False
+        loaded: dict[str, Any] = {}
+        metrics: dict[str, Any] = {}
+        if (
+            cached_preview.is_file()
+            and cached_preview.stat().st_size > 0
+            and cached_metrics.is_file()
+            and cached_metrics.stat().st_size > 0
+        ):
+            try:
+                loaded_raw = json.loads(cached_metrics.read_text(encoding="utf-8"))
+                loaded_m = loaded_raw.get("metrics") if isinstance(loaded_raw, dict) else None
+                expected_prev_sha = loaded_raw.get("preview_sha256") if isinstance(loaded_raw, dict) else None
+                if (
+                    isinstance(loaded_raw, dict)
+                    and loaded_raw.get("model_sha256") == revision.model_sha256
+                    and loaded_raw.get("toolchain_id") == _toolchain_id()
+                    and isinstance(expected_prev_sha, str)
+                    and len(expected_prev_sha) == 64
+                    and isinstance(loaded_m, dict)
+                    and "dimensions_mm" in loaded_m
+                    and "volume_mm3" in loaded_m
+                    and "boundary_edges" in loaded_m
+                    and "components" in loaded_m
+                    and isinstance(loaded_m.get("compiler_warnings"), list)
+                ):
+                    actual_prev_sha = hashlib.sha256(cached_preview.read_bytes()).hexdigest()
+                    if actual_prev_sha == expected_prev_sha:
+                        fast_cache_valid = True
+                        loaded = loaded_raw
+                        metrics = loaded_m
+            except (OSError, json.JSONDecodeError):
+                fast_cache_valid = False
+
+        if fast_cache_valid:
             shutil.copy2(cached_preview, project_dir / "preview.stl")
             if cached_render.is_file() and cached_render.stat().st_size > 0:
                 shutil.copy2(cached_render, project_dir / "render.png")
             else:
                 (project_dir / "render.png").unlink(missing_ok=True)
-            metrics = {}
-            verification = {}
-            loaded: dict[str, Any] = {}
-            if cached_metrics.is_file() and cached_metrics.stat().st_size > 0:
-                try:
-                    loaded = json.loads(cached_metrics.read_text(encoding="utf-8"))
-                    metrics = loaded.get("metrics") or {}
-                    verification = loaded.get("verification") or {}
-                except (OSError, json.JSONDecodeError):
-                    metrics = {}
-                    verification = {}
 
-            if metrics:
-                from agent.tools.cad_verifier import CadVerifier
-                verifier = CadVerifier(
-                    project_dir,
-                    bus.publish,
-                    user_printer=settings.user_printer,
-                    user_nozzle=settings.user_nozzle,
-                    user_filament=settings.user_filament,
-                )
-                verification = verifier.verify(
-                    precomputed_metrics=metrics,
-                    model_code=source,
-                )
-                loaded["verification"] = verification
+            verifier = CadVerifier(
+                project_dir,
+                bus.publish,
+                user_printer=settings.user_printer,
+                user_nozzle=settings.user_nozzle,
+                user_filament=settings.user_filament,
+            )
+            verification = verifier.verify(
+                precomputed_metrics=metrics,
+                model_code=store.source(revision.id),
+            )
+            loaded["verification"] = verification
+            encoded_doc = json.dumps(loaded).encode("utf-8")
+            for m_path in (project_dir / ".cad_metrics.json", cached_metrics):
                 try:
-                    atomic_write_bytes(
-                        project_dir / ".cad_metrics.json",
-                        json.dumps(loaded).encode("utf-8"),
-                    )
+                    atomic_write_bytes(m_path, encoded_doc)
                 except OSError:
                     pass
 
-            if isinstance(verification, dict) and verification.get("status") == "FAILED":
+            if not verification_passed(verification):
                 build_status = "failed"
                 store.record_build_failure(
                     revision.id,
-                    verification.get("summary") or "CAD verification failed with critical defects.",
+                    (verification.get("summary") if isinstance(verification, dict) else None)
+                    or "CAD verification failed with critical defects.",
                 )
             else:
                 build_status = "succeeded"
@@ -1535,7 +1559,6 @@ def restore_revision(project_name: str, revision_id: str):
             "message": f"Restoring revision {revision.id[:8]} and rebuilding…",
         })
 
-        from agent.tools.cad_tool import CadTool, RenderMode
         cad = CadTool(
             project_dir,
             bus.publish,
@@ -1567,6 +1590,7 @@ def restore_revision(project_name: str, revision_id: str):
                 "error": str(error),
             }), 207
 
+        build_status = "succeeded" if verification_passed(verification) else "failed"
         preview_id = runner._register_preview(project_name, project_dir)
         bus.publish("preview_updated", {
             "project": project_name,
@@ -1581,7 +1605,7 @@ def restore_revision(project_name: str, revision_id: str):
             "ok": True,
             "restored": True,
             "revision_id": revision.id,
-            "build_status": "succeeded",
+            "build_status": build_status,
             "metrics": metrics,
             "verification": verification,
             "preview_id": preview_id,
@@ -1621,6 +1645,7 @@ def build_project(project_name: str):
 
         bus = current_app.config["EVENT_BUS"]
         from agent.tools.cad_tool import CadTool, RenderMode
+        from agent.tools.cad_verifier import verification_passed
         cad = CadTool(
             project_dir,
             None,
@@ -1641,6 +1666,7 @@ def build_project(project_name: str):
                 "error": str(error),
             }), 422
 
+        build_status = "succeeded" if verification_passed(verification) else "failed"
         preview_id = runner._register_preview(project_name, project_dir)
         bus.publish("preview_updated", {
             "project": project_name,
@@ -1648,7 +1674,7 @@ def build_project(project_name: str):
         })
         return jsonify({
             "ok": True,
-            "build_status": "succeeded",
+            "build_status": build_status,
             "metrics": metrics,
             "verification": verification,
             "preview_id": preview_id,

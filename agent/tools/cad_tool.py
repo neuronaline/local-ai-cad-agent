@@ -19,7 +19,7 @@ from agent.llm_base import RequestCancelled
 from agent.review_paths import review_dir
 from agent.revisions import MODEL_FILENAME, RevisionIntegrityError, RevisionStore
 from agent.sandbox import command as sandbox_command
-from agent.tools.cad_verifier import CadVerifier
+from agent.tools.cad_verifier import CadVerifier, verification_passed
 from agent.tools.file_tool import FileTool
 from agent.tools.process_runner import (
     MAX_SANDBOX_TIMEOUT_SECONDS,
@@ -51,6 +51,7 @@ _REVIEW_SHEET_NAME = "review-sheet.png"
 
 
 _MANIFOLD_SUPPORTED: bool | None = None
+_TOOLCHAIN_ID: str | None = None
 
 
 def _supports_manifold() -> bool:
@@ -71,6 +72,31 @@ def _supports_manifold() -> bool:
     except (subprocess.SubprocessError, OSError):
         _MANIFOLD_SUPPORTED = False
     return _MANIFOLD_SUPPORTED
+
+
+def _toolchain_id() -> str:
+    """Return a stable fingerprint of the host OpenSCAD version and CSG backend."""
+    global _TOOLCHAIN_ID
+    if _TOOLCHAIN_ID is not None:
+        return _TOOLCHAIN_ID
+    version_out = "unknown"
+    try:
+        proc = subprocess.run(
+            ["openscad", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        raw = ((proc.stdout or "") + (proc.stderr or "")).strip()
+        if raw:
+            version_out = raw.splitlines()[0].strip()
+    except (subprocess.SubprocessError, OSError):
+        pass
+    manifold = _supports_manifold()
+    payload = f"{version_out}|manifold={int(manifold)}"
+    _TOOLCHAIN_ID = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    return _TOOLCHAIN_ID
 
 
 class RenderMode(Enum):
@@ -188,6 +214,7 @@ class CadTool:
         mode: RenderMode,
         requested_views: list[str] | None = None,
         resolution: int = 512,
+        compiler_warnings: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """JSON-kwarg payload forwarded to ``runner.main`` as ``argv[1]``.
 
@@ -196,7 +223,7 @@ class CadTool:
         injected globals. The flags are derived strictly from the validated
         :class:`RenderMode`.
         """
-        return {
+        payload: dict[str, Any] = {
             "render_views": mode.produces_manifest,
             "write_isometric": mode.produces_render,
             "render_workers": self._review_render_workers,
@@ -204,7 +231,11 @@ class CadTool:
             "requested_views": requested_views,
             "resolution": int(resolution or 512),
             "enable_manifold": _supports_manifold(),
+            "toolchain_id": _toolchain_id(),
         }
+        if compiler_warnings is not None:
+            payload["compiler_warnings"] = compiler_warnings
+        return payload
 
     def _execute(
         self,
@@ -221,17 +252,45 @@ class CadTool:
         FileTool.validate_model(model_code)
 
         model_sha = hashlib.sha256(model_code.encode("utf-8")).hexdigest()
+        toolchain = _toolchain_id()
         cache_dir = self.project_dir / ".cad-agent" / "cache" / model_sha
         cached_stl = cache_dir / "preview.stl"
         cached_metrics_path = cache_dir / ".cad_metrics.json"
 
-        # Check whether cache can satisfy this build
-        can_use_cache = (
+        # Validate cached STL + metrics against model_sha, preview_sha, toolchain_id, and compiler_warnings
+        stl_cache_valid = False
+        prior_cached_doc: dict[str, Any] | None = None
+        prior_compiler_warnings: list[dict[str, Any]] | None = None
+        if (
             cached_stl.is_file()
             and cached_stl.stat().st_size > 0
             and cached_metrics_path.is_file()
             and cached_metrics_path.stat().st_size > 0
-        )
+        ):
+            try:
+                loaded_doc = json.loads(cached_metrics_path.read_text(encoding="utf-8"))
+                loaded_metrics = loaded_doc.get("metrics") if isinstance(loaded_doc, dict) else None
+                expected_prev_sha = loaded_doc.get("preview_sha256") if isinstance(loaded_doc, dict) else None
+                if (
+                    isinstance(loaded_doc, dict)
+                    and loaded_doc.get("model_sha256") == model_sha
+                    and loaded_doc.get("toolchain_id") == toolchain
+                    and isinstance(expected_prev_sha, str)
+                    and len(expected_prev_sha) == 64
+                    and isinstance(loaded_metrics, dict)
+                    and "components" in loaded_metrics
+                    and isinstance(loaded_metrics.get("compiler_warnings"), list)
+                ):
+                    actual_prev_sha = hashlib.sha256(cached_stl.read_bytes()).hexdigest()
+                    if actual_prev_sha == expected_prev_sha:
+                        stl_cache_valid = True
+                        prior_cached_doc = loaded_doc
+                        prior_compiler_warnings = loaded_metrics["compiler_warnings"]
+            except (OSError, json.JSONDecodeError):
+                stl_cache_valid = False
+
+        # Check whether cache can satisfy this build
+        can_use_cache = stl_cache_valid
         if can_use_cache and mode.produces_render:
             can_use_cache = (cache_dir / "render.png").is_file() and (cache_dir / "render.png").stat().st_size > 0
 
@@ -281,9 +340,9 @@ class CadTool:
             else:
                 can_use_cache = False
 
-        if can_use_cache:
+        if can_use_cache and prior_cached_doc is not None:
             try:
-                cached = json.loads(cached_metrics_path.read_text(encoding="utf-8"))
+                cached = prior_cached_doc
                 metrics = cached.get("metrics")
                 if isinstance(metrics, dict) and "components" in metrics:
                     self._enforce_basic_geometry(metrics)
@@ -291,10 +350,7 @@ class CadTool:
                     self._atomic_copy(cached_metrics_path, self.project_dir / ".cad_metrics.json")
                     if mode.produces_render:
                         self._atomic_copy(cache_dir / "render.png", self.project_dir / "render.png")
-                    preview_sha = (
-                        cached.get("preview_sha256")
-                        or hashlib.sha256(cached_stl.read_bytes()).hexdigest()
-                    )
+                    preview_sha = cached["preview_sha256"]
                     return {
                         "metrics": metrics,
                         "feature_summary": cached.get("feature_summary") or {},
@@ -308,7 +364,7 @@ class CadTool:
                         "model_code": model_code,
                         "raw_metrics_doc": cached,
                     }
-            except (OSError, json.JSONDecodeError, ValueError):
+            except (OSError, ValueError):
                 pass  # Fall back to normal sandbox execution on cache read issue
 
         # Only allow selective single/subset view rendering when all 8 canonical
@@ -326,6 +382,7 @@ class CadTool:
                 mode,
                 requested_views=effective_requested_views,
                 resolution=resolution,
+                compiler_warnings=prior_compiler_warnings if stl_cache_valid else None,
             )
         )
 
@@ -340,7 +397,7 @@ class CadTool:
                 (_SCRIPTS_DIR / _RENDERER_FILENAME).read_text(encoding="utf-8"),
                 encoding="utf-8",
             )
-            if cached_stl.is_file() and cached_stl.stat().st_size > 0:
+            if stl_cache_valid and cached_stl.is_file() and cached_stl.stat().st_size > 0:
                 try:
                     shutil.copyfile(cached_stl, workspace / "preview.stl")
                 except OSError:
@@ -906,9 +963,10 @@ class CadTool:
         result["verification"] = verification
 
         # Gate revision build status and LKG promotion on verification outcome
-        if isinstance(verification, dict) and verification.get("status") == "FAILED":
+        if not verification_passed(verification):
             self._record_build_failure(
-                verification.get("summary") or "CAD verification failed with critical defects."
+                (verification.get("summary") if isinstance(verification, dict) else None)
+                or "CAD verification failed with critical defects."
             )
         elif isinstance(metrics, dict):
             self._record_build_success(metrics)

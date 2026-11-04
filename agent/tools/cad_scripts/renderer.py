@@ -380,8 +380,8 @@ def load_stl(stl_path: Path) -> tuple[np.ndarray, np.ndarray]:
         ])
         records = np.frombuffer(data[84:], dtype=dtype, count=num_triangles)
         tri_coords = np.stack([records["v0"], records["v1"], records["v2"]], axis=1).reshape(-1, 3)
-        tri_coords_snapped = np.round(tri_coords, decimals=5)
-        unique_verts, inverse_indices = np.unique(tri_coords_snapped, axis=0, return_inverse=True)
+        tri_coords = np.where(tri_coords == 0.0, np.float32(0.0), tri_coords)
+        unique_verts, inverse_indices = np.unique(tri_coords, axis=0, return_inverse=True)
         triangles = inverse_indices.reshape(-1, 3).astype(np.int32)
         return unique_verts.astype(np.float64), triangles
 
@@ -398,8 +398,8 @@ def load_stl(stl_path: Path) -> tuple[np.ndarray, np.ndarray]:
     if not coords or len(coords) % 3 != 0:
         raise ValueError("Invalid STL: no renderable triangles found.")
     tri_coords = np.array(coords, dtype=np.float32)
-    tri_coords_snapped = np.round(tri_coords, decimals=5)
-    unique_verts, inverse_indices = np.unique(tri_coords_snapped, axis=0, return_inverse=True)
+    tri_coords = np.where(tri_coords == 0.0, np.float32(0.0), tri_coords)
+    unique_verts, inverse_indices = np.unique(tri_coords, axis=0, return_inverse=True)
     triangles = inverse_indices.reshape(-1, 3).astype(np.int32)
     return unique_verts.astype(np.float64), triangles
 

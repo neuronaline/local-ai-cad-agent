@@ -54,6 +54,8 @@ except ModuleNotFoundError:
 # in lock-step with this literal so the two failure modes (outer bubblewrap
 # kill vs. inner OpenSCAD timeout) remain back-to-back.
 _OPENSCAD_TIMEOUT_SECONDS = 120
+GROUND_TOL_MM = 0.05
+BED_PLANARITY_TOL_MM = 0.002
 
 
 # ---------------------------------------------------------------------------
@@ -362,7 +364,18 @@ def _analyze_connected_components(
             "com_vec": ref_pt,
         })
 
-    solid_components.sort(key=lambda c: (round(c["min_z"], 2), round(c["min_x"], 2)))
+    trapped_cavities.sort(
+        key=lambda c: (c["min_z"], c["max_z"], c["volume_mm3"], tuple(c["bbox_mm"]))
+    )
+    solid_components.sort(
+        key=lambda c: (
+            round(c["min_z"], 3),
+            round(c["min_x"], 3),
+            round(c["min_y"], 3),
+            round(c["max_z"], 3),
+            round(c["volume"], 3),
+        )
+    )
     solid_count = len(solid_components)
     disconnected_count = max(0, solid_count - 1)
     solids_min_z = [round(c["min_z"], 3) for c in solid_components]
@@ -371,7 +384,7 @@ def _analyze_connected_components(
     floating_solids: list[dict[str, Any]] = []
     if solid_count > 1:
         for c in solid_components:
-            if c["min_z"] > base_z + 0.08:
+            if c["min_z"] > base_z + GROUND_TOL_MM:
                 floating_solids.append({
                     "min_z": round(c["min_z"], 3),
                     "max_z": round(c["max_z"], 3),
@@ -381,7 +394,7 @@ def _analyze_connected_components(
                 })
     floating_solid_count = len(floating_solids)
 
-    grounded = [c for c in solid_components if c["min_z"] <= base_z + 0.08]
+    grounded = [c for c in solid_components if c["min_z"] <= base_z + GROUND_TOL_MM]
     overlapping_part_count = 0
     min_part_gap_mm: float | None = None
     if len(grounded) >= 2:
@@ -404,37 +417,47 @@ def _analyze_connected_components(
     if min_part_gap_mm is not None:
         min_part_gap_mm = round(min_part_gap_mm, 3)
 
-    # Compute per-component printability and stability metrics
+    # Compute per-component printability and stability metrics (normalizing inverted components)
     component_summaries: list[dict[str, Any]] = []
+    inverted_tri_mask = np.zeros(len(triangles), dtype=bool)
+    inverted_component_count = 0
     for comp_idx, c in enumerate(solid_components, start=1):
+        is_inverted = bool(c["raw_volume"] < -1e-4)
+        orient_sign = -1.0 if c["raw_volume"] < -1e-9 else 1.0
+        if is_inverted:
+            inverted_component_count += 1
+            inverted_tri_mask[c["tri_indices"]] = True
+
         c_tri_arr = triangles[c["tri_indices"]]
         v0_c = vertices[c_tri_arr[:, 0]]
         v1_c = vertices[c_tri_arr[:, 1]]
         v2_c = vertices[c_tri_arr[:, 2]]
-        cross_c = np.cross(v1_c - v0_c, v2_c - v0_c)
+        cross_c = np.cross(v1_c - v0_c, v2_c - v0_c) * orient_sign
         norms_c = np.linalg.norm(cross_c, axis=1)
         areas_c = 0.5 * norms_c
         surf_c = float(np.sum(areas_c))
-        safe_norms_c = np.where(norms_c > 1e-12, norms_c, 1.0)
+        geo_c = norms_c > 1e-12
+        safe_norms_c = np.where(geo_c, norms_c, 1.0)
         nz_c = cross_c[:, 2] / safe_norms_c
         max_z_c = np.maximum.reduce([v0_c[:, 2], v1_c[:, 2], v2_c[:, 2]])
         min_z_c = np.minimum.reduce([v0_c[:, 2], v1_c[:, 2], v2_c[:, 2]])
 
         bed_mask_c = (
-            (max_z_c <= base_z + 0.05)
-            & ((max_z_c - min_z_c) <= 0.002)
+            geo_c
+            & (max_z_c <= base_z + GROUND_TOL_MM)
+            & ((max_z_c - min_z_c) <= BED_PLANARITY_TOL_MM)
             & (nz_c <= -0.998)
         )
         bed_area_c = float(np.sum(areas_c[bed_mask_c]))
         fp_area_c = max(c["dx"] * c["dy"], 1e-6)
         bed_ratio_c = float(min(1.0, bed_area_c / fp_area_c))
 
-        elev_c = max_z_c > (c["min_z"] + 0.40)
+        elev_c = geo_c & (max_z_c > (c["min_z"] + 0.40))
         ov45_c = float(np.sum(areas_c[elev_c & (nz_c < -0.70710678)]))
         ov60_c = float(np.sum(areas_c[elev_c & (nz_c < -0.86602540)]))
 
         c_verts = vertices[c["vert_indices"]]
-        grounded_xy_c = c_verts[c_verts[:, 2] <= base_z + 0.05, :2]
+        grounded_xy_c = c_verts[c_verts[:, 2] <= base_z + GROUND_TOL_MM, :2]
         com_c = c["com_vec"]
         stable_c, margin_c, supp_bounds_c = _compute_static_stability(
             com_c[:2], grounded_xy_c
@@ -442,6 +465,8 @@ def _analyze_connected_components(
 
         component_summaries.append({
             "index": comp_idx,
+            "grounded": bool(c["min_z"] <= base_z + GROUND_TOL_MM),
+            "inverted": is_inverted,
             "bbox_mm": [round(c["dx"], 3), round(c["dy"], 3), round(c["dz"], 3)],
             "bounds_mm": {
                 "min_x": round(c["min_x"], 3),
@@ -479,6 +504,8 @@ def _analyze_connected_components(
         "trapped_cavities": trapped_cavities,
         "min_part_gap_mm": min_part_gap_mm,
         "overlapping_part_count": overlapping_part_count,
+        "inverted_component_count": inverted_component_count,
+        "inverted_tri_mask": inverted_tri_mask,
         "components": component_summaries,
     }
 
@@ -674,14 +701,12 @@ def _analyze_overhang_and_floating_features(
                                     vert_down[u] = vert_down.get(u, 0) + 1
                                     vert_down[v] = vert_down.get(v, 0) + 1
 
-        # Count boundary loops and upward-turning inner hole loops
+        # Count boundary loops and upward-turning inner hole loops (excluding outer perimeter loop)
         b_visited: set[int] = set()
-        loop_count = 0
-        upward_loops = 0
+        loops_meta: list[tuple[float, int, int]] = []
         for bv in b_adj:
             if bv in b_visited:
                 continue
-            loop_count += 1
             bq = [bv]
             b_visited.add(bv)
             loop_verts: list[int] = []
@@ -692,10 +717,23 @@ def _analyze_overhang_and_floating_features(
                     if nxt_v not in b_visited:
                         b_visited.add(nxt_v)
                         bq.append(nxt_v)
+            l_pts = vertices[loop_verts, :2]
+            l_span_area = float(np.ptp(l_pts[:, 0]) * np.ptp(l_pts[:, 1])) if len(l_pts) > 0 else 0.0
             l_up = sum(vert_up.get(v, 0) for v in loop_verts) // 2
             l_down = sum(vert_down.get(v, 0) for v in loop_verts) // 2
-            if l_up > l_down and l_up >= 3:
-                upward_loops += 1
+            loops_meta.append((l_span_area, l_up, l_down))
+
+        loop_count = len(loops_meta)
+        upward_loops = 0
+        if loop_count >= 2:
+            loops_meta.sort(key=lambda item: item[0], reverse=True)
+            for _area, l_up, l_down in loops_meta[1:]:
+                if l_up > l_down and l_up >= 3:
+                    upward_loops += 1
+
+        z_span = float(p_max[2] - p_min[2])
+        mean_patch_nz = float(np.mean(nz[p_arr]))
+        is_horizontal_ceiling = z_span <= 0.30 and mean_patch_nz <= -0.98
 
         patch_info = {
             "area_mm2": round(p_area, 2),
@@ -712,13 +750,20 @@ def _analyze_overhang_and_floating_features(
             "upward_loops": upward_loops,
         }
 
-        if loop_count >= 2 and upward_loops >= 1 and span_xy >= 5.0:
+        if is_horizontal_ceiling and loop_count >= 2 and upward_loops >= 1 and span_xy >= 5.0:
             perforated_ceilings.append(patch_info)
         elif p_area >= 25.0 and (span_xy >= 2.5 or upward_loops >= 1):
             severe_overhang_patches.append(patch_info)
 
-    perforated_ceilings.sort(key=lambda p: p["area_mm2"], reverse=True)
-    severe_overhang_patches.sort(key=lambda p: p["area_mm2"], reverse=True)
+    unsupported_floating_features.sort(
+        key=lambda f: (f["min_z_mm"], f["center_xy"][0], f["center_xy"][1], f["vertex_count"])
+    )
+    perforated_ceilings.sort(
+        key=lambda p: (-p["area_mm2"], p["z_mm"], p["center_xy"][0], p["center_xy"][1])
+    )
+    severe_overhang_patches.sort(
+        key=lambda p: (-p["area_mm2"], p["z_mm"], p["center_xy"][0], p["center_xy"][1])
+    )
 
     return {
         "unsupported_floating_features": unsupported_floating_features,
@@ -871,7 +916,7 @@ def _measure_min_local_wall_thickness(
         opp_t = min_t[opposing]
         opp_len = len_q[opposing]
         opp_mid = mid_q[opposing]
-        order = np.argsort(opp_t)
+        order = np.lexsort((opp_mid[:, 1], opp_mid[:, 0], np.round(opp_t, 5)))
         opp_t = opp_t[order]
         opp_len = opp_len[order]
         opp_mid = opp_mid[order]
@@ -881,8 +926,9 @@ def _measure_min_local_wall_thickness(
                 np.linalg.norm(opp_mid - opp_mid[k], axis=1) <= 8.0
             )
             if float(np.sum(opp_len[near_mask])) >= 3.0:
-                if best_min_t is None or t_cand < best_min_t:
-                    best_min_t = round(t_cand, 3)
+                t_rounded = round(t_cand, 3)
+                if best_min_t is None or t_rounded < best_min_t:
+                    best_min_t = t_rounded
                     best_loc = {
                         "z_mm": round(float(zs), 2),
                         "xy_mm": [
@@ -908,34 +954,33 @@ def mesh_metrics(vertices: np.ndarray, triangles: np.ndarray) -> dict[str, Any]:
     if not all(math.isfinite(d) for d in (dim_x, dim_y, dim_z)):
         raise ValueError("The generated CAD shape has non-finite geometry.")
 
-    # 1. Filter index-degenerate and zero-area collinear triangles
+    # 1. Separate topology-valid triangles (distinct indices) from geometry-valid (non-zero area)
     idx_valid = (
         (triangles[:, 0] != triangles[:, 1])
         & (triangles[:, 1] != triangles[:, 2])
         & (triangles[:, 2] != triangles[:, 0])
     )
-    v0_all = vertices[triangles[:, 0]]
-    v1_all = vertices[triangles[:, 1]]
-    v2_all = vertices[triangles[:, 2]]
-    raw_cross = np.cross(v1_all - v0_all, v2_all - v0_all)
-    norms_all = np.linalg.norm(raw_cross, axis=1)
-    area_valid = norms_all > 1e-12
-    valid_mask = idx_valid & area_valid
+    topo_triangles = triangles[idx_valid]
+    if len(topo_triangles) == 0:
+        raise ValueError("The generated CAD mesh contains no non-degenerate triangles.")
 
-    non_deg_triangles = triangles[valid_mask]
-    degenerate_triangle_count = int(len(triangles) - len(non_deg_triangles))
+    v0_topo = vertices[topo_triangles[:, 0]]
+    v1_topo = vertices[topo_triangles[:, 1]]
+    v2_topo = vertices[topo_triangles[:, 2]]
+    topo_cross = np.cross(v1_topo - v0_topo, v2_topo - v0_topo)
+    topo_norms = np.linalg.norm(topo_cross, axis=1)
+    geo_mask = topo_norms > 1e-12
+    non_deg_count = int(np.sum(geo_mask))
+    degenerate_triangle_count = int(len(triangles) - non_deg_count)
 
-    if len(non_deg_triangles) == 0:
+    if non_deg_count == 0:
         raise ValueError("The generated CAD mesh contains no non-degenerate triangles.")
 
     # Exact signed volume and volumetric Center of Mass via tetrahedron sum
-    v0 = vertices[non_deg_triangles[:, 0]]
-    v1 = vertices[non_deg_triangles[:, 1]]
-    v2 = vertices[non_deg_triangles[:, 2]]
     ref_pt = 0.5 * (min_pt + max_pt)
-    u0 = v0 - ref_pt
-    u1 = v1 - ref_pt
-    u2 = v2 - ref_pt
+    u0 = v0_topo - ref_pt
+    u1 = v1_topo - ref_pt
+    u2 = v2_topo - ref_pt
     tet_vols = np.sum(np.cross(u0, u1) * u2, axis=1) / 6.0
     raw_volume = float(np.sum(tet_vols))
     volume = abs(raw_volume)
@@ -950,10 +995,10 @@ def mesh_metrics(vertices: np.ndarray, triangles: np.ndarray) -> dict[str, Any]:
         round(float(com_vec[2]), 3),
     ]
 
-    # Watertight Manifold Edge-sharing Check & Directed Half-Edge Winding
+    # Watertight Manifold Edge-sharing Check & Directed Half-Edge Winding (on topo_triangles)
     edges: dict[tuple[int, int], int] = {}
     directed_edges: dict[tuple[int, int], int] = {}
-    for tri in non_deg_triangles:
+    for tri in topo_triangles:
         t0, t1, t2 = int(tri[0]), int(tri[1]), int(tri[2])
         for u, v in ((t0, t1), (t1, t2), (t2, t0)):
             directed_edges[(u, v)] = directed_edges.get((u, v), 0) + 1
@@ -971,7 +1016,7 @@ def mesh_metrics(vertices: np.ndarray, triangles: np.ndarray) -> dict[str, Any]:
             if fwd != 1 or rev != 1:
                 inconsistent_winding_edges += 1
 
-    comp_analysis = _analyze_connected_components(vertices, non_deg_triangles)
+    comp_analysis = _analyze_connected_components(vertices, topo_triangles)
     solid_count = comp_analysis["solid_count"]
     disconnected_count = comp_analysis["disconnected_count"]
     floating_solid_count = comp_analysis["floating_solid_count"]
@@ -982,13 +1027,42 @@ def mesh_metrics(vertices: np.ndarray, triangles: np.ndarray) -> dict[str, Any]:
     trapped_cavities = comp_analysis["trapped_cavities"]
     min_part_gap_mm = comp_analysis["min_part_gap_mm"]
     overlapping_part_count = comp_analysis["overlapping_part_count"]
+    inverted_component_count = int(comp_analysis.get("inverted_component_count", 0))
+    inverted_tri_mask = comp_analysis.get("inverted_tri_mask")
     components = comp_analysis.get("components", [])
+
+    # Normalize orientation of inverted solid components before volume, CoM, and direction-dependent checks
+    oriented_topo_tris = topo_triangles.copy()
+    oriented_topo_cross = topo_cross.copy()
+    oriented_tet_vols = tet_vols.copy()
+    if isinstance(inverted_tri_mask, np.ndarray) and np.any(inverted_tri_mask):
+        oriented_topo_tris[inverted_tri_mask, 1] = topo_triangles[inverted_tri_mask, 2]
+        oriented_topo_tris[inverted_tri_mask, 2] = topo_triangles[inverted_tri_mask, 1]
+        oriented_topo_cross[inverted_tri_mask] *= -1.0
+        oriented_tet_vols[inverted_tri_mask] *= -1.0
+        oriented_vol_sum = float(np.sum(oriented_tet_vols))
+        volume = abs(oriented_vol_sum)
+        if abs(oriented_vol_sum) > 1e-9:
+            tet_centroids_rel = (u0 + u1 + u2) * 0.25
+            com_vec = ref_pt + np.sum(oriented_tet_vols[:, None] * tet_centroids_rel, axis=0) / oriented_vol_sum
+        else:
+            com_vec = ref_pt
+        center_of_mass_mm = [
+            round(float(com_vec[0]), 3),
+            round(float(com_vec[1]), 3),
+            round(float(com_vec[2]), 3),
+        ]
 
     is_valid = volume > 0 and dim_x > 0 and dim_y > 0 and dim_z > 0
 
+    non_deg_triangles = oriented_topo_tris[geo_mask]
+    v0 = vertices[non_deg_triangles[:, 0]]
+    v1 = vertices[non_deg_triangles[:, 1]]
+    v2 = vertices[non_deg_triangles[:, 2]]
+
     # Printability telemetry (surface area, bed contact, overhangs, stability)
-    tri_cross = raw_cross[valid_mask]
-    norms = norms_all[valid_mask]
+    tri_cross = oriented_topo_cross[geo_mask]
+    norms = topo_norms[geo_mask]
     tri_areas = 0.5 * norms
     surface_area = float(np.sum(tri_areas))
 
@@ -998,8 +1072,8 @@ def mesh_metrics(vertices: np.ndarray, triangles: np.ndarray) -> dict[str, Any]:
     min_z_tri_all = np.minimum.reduce([v0[:, 2], v1[:, 2], v2[:, 2]])
 
     bed_mask = (
-        (max_z_tri <= min_pt[2] + 0.05)
-        & ((max_z_tri - min_z_tri_all) <= 0.002)
+        (max_z_tri <= min_pt[2] + GROUND_TOL_MM)
+        & ((max_z_tri - min_z_tri_all) <= BED_PLANARITY_TOL_MM)
         & (nz <= -0.998)
     )
     bed_contact_area = float(np.sum(tri_areas[bed_mask]))
@@ -1016,9 +1090,9 @@ def mesh_metrics(vertices: np.ndarray, triangles: np.ndarray) -> dict[str, Any]:
     min_horizontal_dim = max(min(dim_x, dim_y), 0.1)
     slenderness_ratio = float(dim_z / min_horizontal_dim)
 
-    active_vert_indices = np.unique(non_deg_triangles)
+    active_vert_indices = np.unique(topo_triangles)
     active_verts = vertices[active_vert_indices]
-    grounded_xy = active_verts[active_verts[:, 2] <= min_pt[2] + 0.05, :2]
+    grounded_xy = active_verts[active_verts[:, 2] <= min_pt[2] + GROUND_TOL_MM, :2]
     is_statically_stable, stability_margin_mm, support_footprint_bounds_mm = (
         _compute_static_stability(com_vec[:2], grounded_xy)
     )
@@ -1026,7 +1100,11 @@ def mesh_metrics(vertices: np.ndarray, triangles: np.ndarray) -> dict[str, Any]:
     grounded_comps = [
         c
         for c in components
-        if (c.get("bounds_mm") or {}).get("min_z", 0.0) <= float(min_pt[2]) + 0.08
+        if bool(
+            c.get("grounded")
+            if "grounded" in c
+            else (c.get("bounds_mm") or {}).get("min_z", 0.0) <= float(min_pt[2]) + GROUND_TOL_MM
+        )
     ]
     if len(grounded_comps) >= 2:
         if any(not c.get("is_statically_stable", True) for c in grounded_comps):
@@ -1099,6 +1177,7 @@ def mesh_metrics(vertices: np.ndarray, triangles: np.ndarray) -> dict[str, Any]:
         "trapped_cavities": trapped_cavities,
         "min_part_gap_mm": min_part_gap_mm,
         "overlapping_part_count": overlapping_part_count,
+        "inverted_component_count": inverted_component_count,
         "components": components,
         "boundary_edges": boundary_edges,
         "multi_face_edges": multi_face_edges,
@@ -1190,13 +1269,28 @@ def _run_model(
             raise RuntimeError(f"OpenSCAD execution failed:\n{summary or 'OpenSCAD produced no output or an empty STL.'}")
 
     compiler_warnings: list[dict[str, Any]] = []
-    if needs_compile and stderr:
-        for line in stderr.splitlines():
+    if needs_compile:
+        seen_warn: set[tuple[str, int | None]] = set()
+        for line in (stderr or "").splitlines():
             line_s = line.strip()
             if "warning:" in line_s.lower():
-                m_line = re.search(r"line\s+(\d+)", line_s, re.IGNORECASE)
-                lineno = int(m_line.group(1)) if m_line else None
-                compiler_warnings.append({"message": line_s, "line": lineno})
+                lineno: int | None = None
+                if "in file " in line_s.lower():
+                    m_line = re.search(r"model\.scad,\s*line\s+(\d+)", line_s, re.IGNORECASE)
+                    if m_line:
+                        lineno = int(m_line.group(1))
+                else:
+                    m_line = re.search(r"\bline\s+(\d+)", line_s, re.IGNORECASE)
+                    if m_line:
+                        lineno = int(m_line.group(1))
+                key = (line_s, lineno)
+                if key not in seen_warn:
+                    seen_warn.add(key)
+                    compiler_warnings.append({"message": line_s, "line": lineno})
+    else:
+        seeded_warnings = settings.get("compiler_warnings")
+        if isinstance(seeded_warnings, list):
+            compiler_warnings = [w for w in seeded_warnings if isinstance(w, dict)]
 
     preview_bytes = preview_stl.read_bytes()
     preview_sha256 = hashlib.sha256(preview_bytes).hexdigest()
@@ -1204,8 +1298,7 @@ def _run_model(
     # 2. Parse STL mesh and compute geometry metrics
     vertices, triangles = load_stl(preview_stl)
     metrics = _mesh_metrics(vertices, triangles)
-    if compiler_warnings:
-        metrics["compiler_warnings"] = compiler_warnings
+    metrics["compiler_warnings"] = compiler_warnings
     dims = metrics["dimensions_mm"]
 
     if not metrics["is_valid"] or metrics["solid_count"] < 1 or metrics["volume_mm3"] <= 0:
@@ -1281,6 +1374,7 @@ def _run_model(
     # 5. Save .cad_metrics.json
     cache = {
         "schema_version": 2,
+        "toolchain_id": str(settings.get("toolchain_id", "") or ""),
         "model_sha256": hashlib.sha256(model_code.encode("utf-8")).hexdigest(),
         "preview_sha256": preview_sha256,
         "metrics": metrics,

@@ -74,7 +74,7 @@ _OPERATIONAL_RULES = """\
   * When verification findings report specific coordinates (e.g. steep overhangs at `Z = ...`, thin local walls at `XY = ...`, or unstable base), use `python` to solve exact geometry adjustments at those coordinates, apply fixes with `edit_file` or `write_file`, and rebuild automatically.
   * When a visual or spatial defect is reported, call ``get_view_images(views=['front', 'top', 'isometric'])`` (or ``views=['all']``) to inspect rendered views before editing.
   * Clarify blocking physical contradictions with a single batched ``question``.
-- Verification requirement: A task is ready only after `model.scad` compiles and passes ``cad_build`` with zero critical issues and—while step budget remains (remaining >= 2)—zero unresolved physical printability WARNINGs (e.g. SEVERE_OVERHANG, SINGLE_PERIMETER_LOCAL_WALL, UNSTABLE_BASE).
+- Verification requirement: A task is ready only after `model.scad` compiles and passes ``cad_build`` with zero critical issues and—while step budget remains (remaining >= 2)—zero unresolved physical printability WARNINGs (e.g. SEVERE_OVERHANG, SINGLE_PERIMETER_LOCAL_WALL, UNSTABLE_CENTER_OF_MASS).
 - Response style: Keep final answers concise and factual (1-3 sentences or bullet points) stating what was created, confirmed dimensions, and key assumptions."""
 
 # Ordered list of (section_tag, body) pairs. Adding or reordering a section is a

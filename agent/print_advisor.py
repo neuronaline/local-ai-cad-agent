@@ -283,15 +283,18 @@ def parse_printer_spec(printer_str: str | None) -> dict[str, Any]:
     """Parse explicit build plate dimensions (e.g. '256x256') if present in printer string."""
     text = (printer_str or "").strip()
     bed_x, bed_y = 256.0, 256.0
+    bed_explicit = False
     dim_match = re.search(r"\b(\d{3})\s*[x×]\s*(\d{3})\b", text.lower())
     if dim_match:
         bx, by = float(dim_match.group(1)), float(dim_match.group(2))
         if 100.0 <= bx <= 600.0 and 100.0 <= by <= 600.0:
             bed_x, bed_y = bx, by
+            bed_explicit = True
     return {
         "name": text,
         "bed_x_mm": bed_x,
         "bed_y_mm": bed_y,
+        "bed_explicit": bed_explicit,
     }
 
 

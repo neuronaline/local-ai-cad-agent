@@ -253,17 +253,7 @@ class _TurnOutcome(Enum):
     FINAL_VERIFICATION_MISSING = "final_verification_missing"
 
 
-PHYSICAL_WARNING_CODES: set[str] = {
-    "SEVERE_OVERHANG",
-    "MODERATE_OVERHANG",
-    "UNSTABLE_BASE",
-    "WEAK_BED_ADHESION_AREA",
-    "BUILD_VOLUME_EXCEEDED",
-    "INVERTED_NORMALS",
-    "SINGLE_PERIMETER_LOCAL_WALL",
-    "CROWDED_PART_LAYOUT",
-    "MULTI_BODY_SUSPECT",
-}
+from agent.tools.cad_verifier import PHYSICAL_WARNING_CODES
 
 
 @dataclass

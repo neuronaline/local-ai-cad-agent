@@ -49,6 +49,33 @@ class Finding:
 
 _clean_code_preserve_lines = OpenScadPreflight.clean_code_preserve_lines
 
+MIN_FEATURE_RATIO = 0.50
+TWO_PERIMETER_RATIO = 1.65
+MIN_LAYER_HEIGHT_MM = 0.08
+ZERO_BED_CONTACT_MM2 = 0.50
+LOW_BED_CONTACT_MM2 = 3.00
+LOW_BED_CONTACT_RATIO = 0.015
+CROWDED_PART_GAP_MM = 2.00
+
+PHYSICAL_WARNING_CODES: frozenset[str] = frozenset({
+    "SEVERE_OVERHANG",
+    "PERFORATED_UNSUPPORTED_CEILING",
+    "UNSUPPORTED_FLOATING_FEATURE",
+    "UNSTABLE_CENTER_OF_MASS",
+    "LOW_BED_CONTACT",
+    "SINGLE_PERIMETER_LOCAL_WALL",
+    "BUILD_VOLUME_EXCEEDED",
+    "INVERTED_NORMALS",
+    "TRAPPED_INTERNAL_CAVITY",
+    "CROWDED_PART_LAYOUT",
+    "DISCONNECTED_SOLIDS",
+})
+
+
+def verification_passed(verification: object) -> bool:
+    """Return True only when a verification envelope exists and has no CRITICAL findings."""
+    return isinstance(verification, dict) and verification.get("status") in {"PASSED", "WARNING"}
+
 
 def _strip_comments_preserve_lines(code: str) -> str:
     """Strip line and block comments while preserving string literals and line numbers."""
@@ -64,7 +91,7 @@ def _strip_comments_preserve_lines(code: str) -> str:
 def _detect_expected_part_count(code: str) -> int | None:
     """Extract the expected number of parts when PART_TYPE / part_mode defines explicit single-part variants."""
     clean = _strip_comments_preserve_lines(code)
-    multi_tokens = {
+    non_part_tokens = {
         "ALL",
         "PLATE",
         "BOTH",
@@ -75,20 +102,17 @@ def _detect_expected_part_count(code: str) -> int | None:
         "PRINT_PLATE",
         "PRINT_PLATE_ALL",
         "EXPLODED",
+        "DEBUG",
+        "PREVIEW",
+        "SECTION",
+        "CUTAWAY",
+        "CROSS_SECTION",
+        "TEST",
+        "NONE",
+        "FIT_TEST",
+        "TOLERANCE_TEST",
     }
-    variants: set[str] = set()
-    for m in re.finditer(
-        r"\b(?:PART_TYPE|PART_MODE|LAYOUT|MODE|VIEW)\s*==\s*[\"\']([A-Za-z0-9_]+)[\"\']",
-        clean,
-        re.IGNORECASE,
-    ):
-        token = m.group(1).upper()
-        if token not in multi_tokens:
-            variants.add(token)
-    if len(variants) >= 2:
-        return len(variants)
-
-    # Also check Customizer option comment: PART_TYPE = "ALL"; // [ALL, BOTTLE, CAP]
+    # Prefer explicit Customizer option comment when present: PART_TYPE = "ALL"; // [ALL, BOTTLE, CAP]
     comment_match = re.search(
         r"^[ \t]*(?:PART_TYPE|PART_MODE|MODE|LAYOUT)[ \t]*=[ \t]*[\"\'][^\"\']+[\"\'][ \t]*;[ \t]*//[ \t]*\[([^\]]+)\]",
         code,
@@ -99,25 +123,39 @@ def _detect_expected_part_count(code: str) -> int | None:
             opt.strip().split(":")[0].strip().strip("\"'").upper()
             for opt in comment_match.group(1).split(",")
         ]
-        single_opts = {o for o in opts if o and o not in multi_tokens}
+        single_opts = {o for o in opts if o and o not in non_part_tokens}
         if len(single_opts) >= 2:
             return len(single_opts)
+
+    variants_by_selector: dict[str, set[str]] = {}
+    for m in re.finditer(
+        r"\b(PART_TYPE|PART_MODE|LAYOUT|MODE|VIEW)\s*==\s*[\"\']([A-Za-z0-9_]+)[\"\']",
+        clean,
+        re.IGNORECASE,
+    ):
+        sel = m.group(1).upper()
+        token = m.group(2).upper()
+        if token not in non_part_tokens:
+            variants_by_selector.setdefault(sel, set()).add(token)
+    for variants in variants_by_selector.values():
+        if len(variants) >= 2:
+            return len(variants)
     return None
 
 
 def _detect_multi_part_intent(code: str) -> tuple[bool, bool, str | None]:
-    """Detect whether model.scad intentionally defines a multi-part assembly or plate layout.
+    """Detect whether model.scad explicitly defines a multi-part assembly or plate layout.
 
     Returns:
         (multi_part_intent: bool, is_assembly: bool, mode_name: str | None)
     """
     clean_code = _strip_comments_preserve_lines(code)
+    top_scope = CadVerifier._extract_lexical_scopes(clean_code)[0][1]
     param_matches = re.finditer(
         r"^[ \t]*([a-zA-Z_][a-zA-Z0-9_]*)[ \t]*=[ \t]*[\"\']?([A-Za-z0-9_]+)[\"\']?[ \t]*;",
-        clean_code,
+        top_scope,
         re.MULTILINE,
     )
-    selector_found = False
     for m in param_matches:
         param_name, param_val = m.group(1).upper(), m.group(2).upper()
         if param_name in (
@@ -132,7 +170,6 @@ def _detect_multi_part_intent(code: str) -> tuple[bool, bool, str | None]:
             "RENDER_MODE",
             "PLATE",
         ):
-            selector_found = True
             if param_val in ("ASSEMBLY", "EXPLODED", "MECHANISM", "FULL_ASSEMBLY"):
                 return True, True, m.group(2)
             if param_val in (
@@ -147,6 +184,7 @@ def _detect_multi_part_intent(code: str) -> tuple[bool, bool, str | None]:
                 "PRINT_LAYOUT",
             ):
                 return True, False, m.group(2)
+            return False, False, None
         if param_name in ("ASSEMBLY", "IS_ASSEMBLY", "EXPLODED") and param_val in ("TRUE", "1"):
             return True, True, "assembly"
         if param_name in ("MULTI_PART", "PRINT_BED", "PLATE_LAYOUT", "PRINT_PLATE", "PLATE") and param_val in (
@@ -154,16 +192,6 @@ def _detect_multi_part_intent(code: str) -> tuple[bool, bool, str | None]:
             "1",
         ):
             return True, False, "plate"
-
-    # If an explicit selector was found (e.g. PART_TYPE = "50"), the user specifically
-    # selected a single variant. Do not fall back to generic comment matching.
-    if selector_found:
-        return False, False, None
-
-    if re.search(r"//.*?\b(?:assembly|exploded view)\b", code, re.IGNORECASE):
-        return True, True, "assembly"
-    if re.search(r"//.*?\b(?:multi[- ]part|plate layout|print bed|side[- ]by[- ]side)\b", code, re.IGNORECASE):
-        return True, False, "multi-part"
 
     return False, False, None
 
@@ -375,6 +403,35 @@ class CadVerifier:
                 )
             )
 
+        # 5b. Unsafe include/use paths and extreme slice/facet counts blocked by preflight
+        for inc_m in re.finditer(r"(?:include|use)\s*<([^>]+)>", clean_code):
+            inc_path = inc_m.group(1).strip()
+            if inc_path.startswith("/") or ".." in inc_path or "\\" in inc_path:
+                line_num = clean_code[: inc_m.start()].count("\n") + 1
+                findings.append(
+                    Finding(
+                        category="CRITICAL",
+                        code="PREFLIGHT_BLOCKED",
+                        message=f"Unsafe include/use path '{inc_path}' at line {line_num}.",
+                        line=line_num,
+                        impact="Path must be relative and cannot escape the project directory.",
+                    )
+                )
+
+        for sl_m in re.finditer(r"\bslices\s*=\s*([0-9]+)", clean_code):
+            sl_val = int(sl_m.group(1))
+            if sl_val > 180:
+                line_num = clean_code[: sl_m.start()].count("\n") + 1
+                findings.append(
+                    Finding(
+                        category="CRITICAL",
+                        code="PREFLIGHT_BLOCKED",
+                        message=f"Excessive extrusion slices = {sl_val} (> 180) at line {line_num}.",
+                        line=line_num,
+                        impact="Exceeds maximum safe slice limit and stalls OpenSCAD compilation.",
+                    )
+                )
+
         # Active scene modifiers
         # In OpenSCAD, '!', '*', and '%' modifiers prefix a module or primitive instantiation at statement
         # boundaries (start of file or after ';', '{', or '}'). Operators in multi-line expressions
@@ -399,21 +456,21 @@ class CadVerifier:
             if mod_char == "!":
                 findings.append(
                     Finding(
-                        category="CRITICAL",
+                        category="WARNING",
                         code="ACTIVE_ROOT_SCENE_MODIFIER",
                         message=f"Root scene modifier '!' found at line {line_num} ('!{target}').",
                         line=line_num,
-                        impact="OpenSCAD will isolate this element and discard the rest of the model from the STL export.",
+                        impact="OpenSCAD isolates this element and omits the rest of the scene from the STL export.",
                     )
                 )
             elif mod_char == "*":
                 findings.append(
                     Finding(
-                        category="CRITICAL",
+                        category="WARNING",
                         code="ACTIVE_DISABLE_SCENE_MODIFIER",
                         message=f"Disable scene modifier '*' found at line {line_num} ('*{target}').",
                         line=line_num,
-                        impact="This feature is disabled and will be omitted from the exported STL mesh.",
+                        impact="This subtree is disabled and omitted from the exported STL mesh.",
                     )
                 )
             elif mod_char == "%":
@@ -444,27 +501,42 @@ class CadVerifier:
             scope_vars: set[str] = set()
             b_d = 0
             p_d = 0
+            k_d = 0
+            stmt_ready = True
             i = 0
             code_len = len(scope_code)
             while i < code_len:
                 ch = scope_code[i]
                 if ch == "(":
                     p_d += 1
+                    stmt_ready = False
                 elif ch == ")":
                     p_d = max(0, p_d - 1)
+                elif ch == "[":
+                    k_d += 1
+                    stmt_ready = False
+                elif ch == "]":
+                    k_d = max(0, k_d - 1)
                 elif ch == "{":
                     b_d += 1
+                    stmt_ready = True
                 elif ch == "}":
                     b_d = max(0, b_d - 1)
-                elif b_d == 0 and p_d == 0 and (i == 0 or scope_code[i - 1] in (";", "\n", "{", "}")):
-                    assign_m = re.match(
-                        r"\s*([A-Za-z0-9_]+)\s*=(?!=)", scope_code[i:]
-                    )
-                    if assign_m:
-                        var = assign_m.group(1)
-                        if not var.startswith("$") and var not in ("EPS", "eps", "epsilon"):
-                            scope_vars.add(var)
-                        i += assign_m.end() - 1
+                    stmt_ready = True
+                elif ch == ";":
+                    if b_d == 0 and p_d == 0 and k_d == 0:
+                        stmt_ready = True
+                elif not ch.isspace():
+                    if b_d == 0 and p_d == 0 and k_d == 0 and stmt_ready:
+                        assign_m = re.match(
+                            r"([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)", scope_code[i:]
+                        )
+                        if assign_m:
+                            var = assign_m.group(1)
+                            if not var.startswith("$") and var not in ("EPS", "eps", "epsilon"):
+                                scope_vars.add(var)
+                            i += assign_m.end() - 1
+                    stmt_ready = False
                 i += 1
 
             if not scope_vars:
@@ -497,34 +569,63 @@ class CadVerifier:
                     cur_idx += 1
                 inner_content = scope_code[start_idx + 1 : cur_idx - 1]
                 after_block = scope_code[cur_idx:]
-                for var in scope_vars:
-                    var_pat = rf"\b{re.escape(var)}\b"
-                    for reassign_m in re.finditer(
-                        rf"(?:^|[;{{}}])\s*({re.escape(var)})\s*=(?!=)",
-                        inner_content,
-                        re.MULTILINE,
-                    ):
-                        stmt_tail = inner_content[reassign_m.end() :]
-                        semi_idx = stmt_tail.find(";")
-                        rhs_text = stmt_tail[:semi_idx] if semi_idx != -1 else stmt_tail
-                        rem_in_block = stmt_tail[semi_idx + 1 :] if semi_idx != -1 else ""
-                        used_in_rhs = bool(re.search(var_pat, rhs_text))
-                        used_later_in_block = bool(re.search(var_pat, rem_in_block))
-                        used_after_block = bool(re.search(var_pat, after_block))
-                        if not (used_in_rhs or used_after_block):
-                            continue
-                        abs_pos = base_offset + start_idx + 1 + reassign_m.start(1)
-                        line_num = clean_code[:abs_pos].count("\n") + 1
-                        findings.append(
-                            Finding(
-                                category="WARNING",
-                                code="SHADOWED_BLOCK_ASSIGNMENT",
-                                message=f"Variable '{var}' is reassigned inside {block_kind}() block at line {line_num}.",
-                                line=line_num,
-                                impact=f"OpenSCAD variables are immutable and lexical. Reassignment inside {block_kind}() only shadows the inner scope; outer '{var}' remains unchanged.",
-                                suggestion="Use ternary expression '(cond ? a : b)' or 'let()' instead of mutating inside block.",
+
+                # Scan inner_content for statement-level assignments (p_d == 0 and k_d == 0)
+                inner_assigns: list[tuple[str, int, int]] = []
+                in_p = 0
+                in_k = 0
+                in_ready = True
+                j = 0
+                inner_len = len(inner_content)
+                while j < inner_len:
+                    ch = inner_content[j]
+                    if ch == "(":
+                        in_p += 1
+                        in_ready = False
+                    elif ch == ")":
+                        in_p = max(0, in_p - 1)
+                    elif ch == "[":
+                        in_k += 1
+                        in_ready = False
+                    elif ch == "]":
+                        in_k = max(0, in_k - 1)
+                    elif ch in (";", "{", "}"):
+                        if in_p == 0 and in_k == 0:
+                            in_ready = True
+                    elif not ch.isspace():
+                        if in_p == 0 and in_k == 0 and in_ready:
+                            m_in = re.match(
+                                r"([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)", inner_content[j:]
                             )
+                            if m_in:
+                                v_name = m_in.group(1)
+                                if v_name in scope_vars:
+                                    inner_assigns.append((v_name, j, j + m_in.end()))
+                                j += m_in.end() - 1
+                        in_ready = False
+                    j += 1
+
+                for var, var_pos, rhs_start in inner_assigns:
+                    var_read_pat = rf"\b{re.escape(var)}\b(?!\s*=(?!=))"
+                    stmt_tail = inner_content[rhs_start:]
+                    semi_idx = stmt_tail.find(";")
+                    rhs_text = stmt_tail[:semi_idx] if semi_idx != -1 else stmt_tail
+                    used_in_rhs = bool(re.search(var_read_pat, rhs_text))
+                    used_after_block = bool(re.search(var_read_pat, after_block))
+                    if not (used_in_rhs or used_after_block):
+                        continue
+                    abs_pos = base_offset + start_idx + 1 + var_pos
+                    line_num = clean_code[:abs_pos].count("\n") + 1
+                    findings.append(
+                        Finding(
+                            category="WARNING",
+                            code="SHADOWED_BLOCK_ASSIGNMENT",
+                            message=f"Variable '{var}' is reassigned inside {block_kind}() block at line {line_num}.",
+                            line=line_num,
+                            impact=f"OpenSCAD variables are immutable and lexical. Reassignment inside {block_kind}() only shadows the inner scope; outer '{var}' remains unchanged.",
+                            suggestion="Use ternary expression '(cond ? a : b)' or 'let()' instead of mutating inside block.",
                         )
+                    )
 
         # 7. Golden Rules: $fn check
         fn_matches = list(re.finditer(r"\$fn\s*=\s*([0-9]+)", clean_code))
@@ -562,8 +663,19 @@ class CadVerifier:
 
         for fm in fn_matches:
             val = int(fm.group(1))
-            if val > 128:
-                line_num = clean_code[: fm.start()].count("\n") + 1
+            line_num = clean_code[: fm.start()].count("\n") + 1
+            if val > 256:
+                findings.append(
+                    Finding(
+                        category="CRITICAL",
+                        code="PREFLIGHT_BLOCKED",
+                        message=f"$fn is set to {val} (> 256) at line {line_num}.",
+                        line=line_num,
+                        impact="Exceeds maximum safe facet limit (256) and stalls OpenSCAD compilation.",
+                        suggestion="Keep $fn <= 64 for standard features, or <= 36 for threads.",
+                    )
+                )
+            elif val > 128:
                 findings.append(
                     Finding(
                         category="WARNING",
@@ -628,36 +740,6 @@ class CadVerifier:
                 )
             )
 
-        # 10. Hardware-aware wall thickness parameter inspection
-        nozzle_spec = parse_nozzle_spec(self.user_nozzle)
-        nozzle_dia = float(nozzle_spec.get("diameter_mm") or 0.40)
-        wall_param_match = re.search(
-            r"^[ \t]*(WALL_THICKNESS|WALL|THICKNESS|SHELL_THICKNESS|WALL_T)\s*=\s*([0-9\.]+)\s*;",
-            clean_code,
-            re.MULTILINE,
-        )
-        if wall_param_match:
-            wall_name = wall_param_match.group(1)
-            wall_val = float(wall_param_match.group(2))
-            if wall_val < nozzle_dia:
-                findings.append(
-                    Finding(
-                        category="CRITICAL",
-                        code="THIN_WALL_PARAMETER",
-                        message=f"Declared wall thickness parameter {wall_name} = {wall_val:.2f} mm is thinner than nozzle diameter ({nozzle_dia:.2f} mm).",
-                        impact="Slicers will drop walls thinner than a single extrusion perimeter.",
-                    )
-                )
-            elif wall_val < 2 * nozzle_dia * 0.95:
-                findings.append(
-                    Finding(
-                        category="WARNING",
-                        code="SINGLE_PERIMETER_WALL",
-                        message=f"Declared wall thickness {wall_name} = {wall_val:.2f} mm produces only a single perimeter for a {nozzle_dia:.2f} mm nozzle.",
-                        impact="Single-perimeter walls are prone to leaking, stringing, and delamination. Minimum 2 perimeters recommended.",
-                    )
-                )
-
         multi_part, is_assembly, mode_name = _detect_multi_part_intent(code)
         expected_parts = _detect_expected_part_count(code) if multi_part else None
         code_meta = {
@@ -713,12 +795,23 @@ class CadVerifier:
                 cached_data = json.loads(metrics_file.read_text(encoding="utf-8"))
                 if isinstance(cached_data, dict) and isinstance(cached_data.get("metrics"), dict):
                     expected_sha = cached_data.get("preview_sha256")
-                    is_valid_cache = True
-                    if expected_sha and isinstance(expected_sha, str):
+                    is_valid_cache = isinstance(expected_sha, str) and len(expected_sha) == 64
+                    if is_valid_cache:
                         self._check_cancelled()
                         actual_sha = hashlib.sha256(stl_path.read_bytes()).hexdigest()
                         if actual_sha != expected_sha:
                             is_valid_cache = False
+                    model_path = self.project_dir / MODEL_FILENAME
+                    if is_valid_cache and model_path.is_file():
+                        expected_model_sha = cached_data.get("model_sha256")
+                        if not isinstance(expected_model_sha, str) or len(expected_model_sha) != 64:
+                            is_valid_cache = False
+                        else:
+                            raw_model = model_path.read_text(encoding="utf-8", errors="replace")
+                            norm_model = raw_model.replace("\r\n", "\n").replace("\r", "\n")
+                            actual_model_sha = hashlib.sha256(norm_model.encode("utf-8")).hexdigest()
+                            if actual_model_sha != expected_model_sha:
+                                is_valid_cache = False
                     if is_valid_cache:
                         m = cached_data["metrics"]
                         if (
@@ -726,6 +819,7 @@ class CadVerifier:
                             and "volume_mm3" in m
                             and "boundary_edges" in m
                             and "components" in m
+                            and isinstance(m.get("compiler_warnings"), list)
                         ):
                             cached_metrics = m
             except (OSError, json.JSONDecodeError, UnicodeDecodeError):
@@ -784,11 +878,18 @@ class CadVerifier:
         triangle_count = int(cached_metrics.get("triangle_count", 0))
 
         # 0. OpenSCAD compiler diagnostics captured during execution
+        seen_cw: set[tuple[str, int | None]] = set()
         for cw in cached_metrics.get("compiler_warnings", []):
-            msg = cw.get("message", "")
+            msg = str(cw.get("message", "")).strip()
             lineno = cw.get("line")
+            if not msg or (msg, lineno) in seen_cw:
+                continue
+            seen_cw.add((msg, lineno))
             msg_lower = msg.lower()
-            if any(sym in msg_lower for sym in ("unknown variable", "unknown module", "unknown function", "can't open library", "cannot open library")):
+            if re.search(
+                r"ignoring unknown (?:variable|module|function)\b|can'?t open (?:library|include file)\b|cannot open (?:library|include file)\b|failed to open (?:library|include)\b",
+                msg_lower,
+            ):
                 findings.append(
                     Finding(
                         category="CRITICAL",
@@ -796,24 +897,6 @@ class CadVerifier:
                         message=f"OpenSCAD reported undefined symbol: {msg}",
                         line=lineno,
                         impact="OpenSCAD ignored the undefined symbol/module, resulting in missing or corrupt geometry.",
-                    )
-                )
-            elif any(
-                kw in msg_lower
-                for kw in (
-                    "not a valid 2-manifold",
-                    "self-intersect",
-                    "cgal",
-                    "degenerate",
-                )
-            ):
-                findings.append(
-                    Finding(
-                        category="CRITICAL",
-                        code="COMPILER_GEOMETRY_WARNING",
-                        message=f"OpenSCAD compiler manifold/CSG error: {msg}",
-                        line=lineno,
-                        impact="OpenSCAD reported non-manifold or invalid CSG topology during evaluation.",
                     )
                 )
             else:
@@ -866,36 +949,52 @@ class CadVerifier:
                 )
             )
         else:
-            # Build plate bounds check
+            # Build plate bounds check (only when printer string specifies explicit bed dimensions)
             if self.user_printer:
                 printer_spec = parse_printer_spec(self.user_printer)
-                bed_x = float(printer_spec.get("bed_x_mm") or 256.0)
-                bed_y = float(printer_spec.get("bed_y_mm") or 256.0)
-                fits_normal = (dim_x <= bed_x and dim_y <= bed_y)
-                fits_rotated = (dim_x <= bed_y and dim_y <= bed_x)
-                if not (fits_normal or fits_rotated):
-                    findings.append(
-                        Finding(
-                            category="WARNING",
-                            code="BUILD_VOLUME_EXCEEDED",
-                            message=f"Model dimensions ({dim_x:.1f} × {dim_y:.1f} mm) exceed build plate bounds ({bed_x:.1f} × {bed_y:.1f} mm) for {self.user_printer}.",
-                            impact="The model will not fit on the configured 3D printer bed without scaling or splitting.",
+                if printer_spec.get("bed_explicit"):
+                    bed_x = float(printer_spec.get("bed_x_mm") or 256.0)
+                    bed_y = float(printer_spec.get("bed_y_mm") or 256.0)
+                    fits_normal = (dim_x <= bed_x and dim_y <= bed_y)
+                    fits_rotated = (dim_x <= bed_y and dim_y <= bed_x)
+                    if not (fits_normal or fits_rotated):
+                        findings.append(
+                            Finding(
+                                category="WARNING",
+                                code="BUILD_VOLUME_EXCEEDED",
+                                message=f"Model dimensions ({dim_x:.1f} × {dim_y:.1f} mm) exceed build plate bounds ({bed_x:.1f} × {bed_y:.1f} mm) for {self.user_printer}.",
+                                impact="The model will not fit on the configured 3D printer bed without scaling or splitting.",
+                            )
                         )
-                    )
 
-            # Nozzle-aware thin wall check
-            min_dim = min(dim_x, dim_y, dim_z)
-            if min_dim < nozzle_dia:
+            # Nozzle-aware minimum feature width (XY) and minimum layer height (Z) check
+            min_xy_dim = min(dim_x, dim_y)
+            if min_xy_dim < MIN_FEATURE_RATIO * nozzle_dia:
                 findings.append(
                     Finding(
                         category="CRITICAL",
                         code="THIN_BOUNDING_DIMENSION",
-                        message=f"Model has a thin dimension under nozzle diameter {nozzle_dia:.2f} mm ({min_dim:.3f} mm).",
-                        impact=f"Features below nozzle diameter ({nozzle_dia:.2f} mm) cannot be extruded by standard slicers.",
+                        message=(
+                            f"Model horizontal bounding dimension ({min_xy_dim:.3f} mm) is below minimum "
+                            f"extrudable feature width ({MIN_FEATURE_RATIO * nozzle_dia:.2f} mm for a {nozzle_dia:.2f} mm nozzle)."
+                        ),
+                        impact=f"Horizontal features below {MIN_FEATURE_RATIO * nozzle_dia:.2f} mm cannot be extruded by standard slicers.",
+                    )
+                )
+            elif dim_z < MIN_LAYER_HEIGHT_MM:
+                findings.append(
+                    Finding(
+                        category="CRITICAL",
+                        code="THIN_BOUNDING_DIMENSION",
+                        message=(
+                            f"Model Z height ({dim_z:.3f} mm) is thinner than minimum printable layer height ({MIN_LAYER_HEIGHT_MM:.2f} mm)."
+                        ),
+                        impact="Models thinner than a single print layer produce empty slicer toolpaths.",
                     )
                 )
 
         # 2. Signed Polyhedron Volume
+        inverted_comp_count = int(cached_metrics.get("inverted_component_count", 0) or 0)
         if is_finite_geom:
             if volume <= 0.0001:
                 findings.append(
@@ -906,7 +1005,7 @@ class CadVerifier:
                         impact="Zero-volume or self-intersecting collapsed geometry.",
                     )
                 )
-            elif raw_volume < -0.0001:
+            elif raw_volume < -0.0001 or inverted_comp_count > 0:
                 findings.append(
                     Finding(
                         category="WARNING",
@@ -956,10 +1055,10 @@ class CadVerifier:
             ]
             findings.append(
                 Finding(
-                    category="CRITICAL",
+                    category="WARNING",
                     code="TRAPPED_INTERNAL_CAVITY",
-                    message=f"Model contains {len(trapped_cavities)} trapped internal sealed cavity/void(s) with negative signed volume ({'; '.join(cav_descs)}).",
-                    impact="Subtractive cutter did not break through outer shell or neck was sealed off. Extend cutters through openings using EPS.",
+                    message=f"Model contains {len(trapped_cavities)} enclosed internal cavity/void(s) ({'; '.join(cav_descs)}).",
+                    impact="If a through-hole or open pocket was intended, the subtractive cutter did not break through the outer shell. Extend cutters using EPS.",
                 )
             )
 
@@ -986,16 +1085,16 @@ class CadVerifier:
             if is_assembly:
                 findings.append(
                     Finding(
-                        category="INFO",
-                        code="MULTI_PART_ASSEMBLY",
+                        category="WARNING",
+                        code="ASSEMBLY_VIEW_NOT_PRINT_VERIFIED",
                         message=(
                             f"Model is rendered in assembly view"
                             f"{f' ({assembly_mode_name})' if assembly_mode_name else ''} with {solid_count} components "
-                            f"positioned in 3D functional space."
+                            f"positioned in 3D functional space; printability checks are skipped."
                         ),
                         impact=(
-                            "Assembly view visualizes components in operating positions. For 3D print verification "
-                            "and slicing, switch to individual part mode or plate layout."
+                            "Assembly view visualizes components in operating positions and is not directly printable. "
+                            "Switch to individual part mode or plate layout (PART_TYPE = \"ALL\") for print verification."
                         ),
                     )
                 )
@@ -1007,7 +1106,7 @@ class CadVerifier:
                     ]
                     part_detail = f" ({'; '.join(solids_desc)})"
                 else:
-                    floating_zs = [z for z in solids_min_z[1:] if z > (solids_min_z[0] if solids_min_z else 0.0) + 0.08]
+                    floating_zs = [z for z in solids_min_z[1:] if z > (solids_min_z[0] if solids_min_z else 0.0) + 0.05]
                     part_detail = f" (at Z = {floating_zs} mm)" if floating_zs else ""
 
                 findings.append(
@@ -1027,14 +1126,14 @@ class CadVerifier:
             if multi_part_intent and not is_assembly and expected_part_count is not None and solid_count != expected_part_count:
                 findings.append(
                     Finding(
-                        category="CRITICAL" if solid_count > expected_part_count else "WARNING",
+                        category="WARNING",
                         code="UNEXPECTED_SOLID_COUNT",
                         message=(
                             f"PART_TYPE defines {expected_part_count} part variant(s), but the compiled mesh "
                             f"contains {solid_count} disconnected solids."
                         ),
                         impact=(
-                            "One of the components is split into disconnected pieces (if solid_count > expected) "
+                            "One of the components may be split into disconnected pieces (if solid_count > expected) "
                             "or fused/missing (if solid_count < expected)."
                         ),
                     )
@@ -1045,18 +1144,23 @@ class CadVerifier:
                 if overlapping_part_count > 0:
                     findings.append(
                         Finding(
-                            category="CRITICAL",
-                            code="OVERLAPPING_PARTS",
-                            message=f"Model has {overlapping_part_count} pair(s) of grounded parts with overlapping XY footprints.",
-                            impact="Adjacent parts in plate layout will fuse together during 3D printing. Increase layout spacing between parts (PART_GAP >= 10 mm).",
+                            category="WARNING",
+                            code="CROWDED_PART_LAYOUT",
+                            message=(
+                                f"Model has {overlapping_part_count} pair(s) of grounded parts with overlapping XY bounding boxes."
+                            ),
+                            impact=(
+                                "Parts arranged with overlapping or tight XY bounding boxes may collide or fuse on the build plate. "
+                                "Separate components cleanly with PART_GAP >= 10 mm."
+                            ),
                         )
                     )
-                elif min_part_gap_mm is not None and min_part_gap_mm < 2.0:
+                elif min_part_gap_mm is not None and min_part_gap_mm < CROWDED_PART_GAP_MM:
                     findings.append(
                         Finding(
                             category="WARNING",
                             code="CROWDED_PART_LAYOUT",
-                            message=f"Minimum clearance between grounded parts is only {min_part_gap_mm:.2f} mm (< 2.0 mm).",
+                            message=f"Minimum bounding-box clearance between grounded parts is only {min_part_gap_mm:.2f} mm (< {CROWDED_PART_GAP_MM:.1f} mm).",
                             impact="Parts are arranged too close together on the build plate and may fuse or cause nozzle collisions. Increase PART_GAP to >= 10 mm (minimum >= 3 mm).",
                         )
                     )
@@ -1075,16 +1179,26 @@ class CadVerifier:
                         category="WARNING",
                         code="DISCONNECTED_SOLIDS",
                         message=(
-                            f"Model contains {solid_count} disconnected solid bodies. "
-                            "If intended as a multi-part assembly or plate layout, set PART_TYPE = \"ALL\" "
-                            "or add a '// multi-part' comment."
+                            f"Model contains {solid_count} disconnected solid bodies on the build plate without an explicit "
+                            "multi-part selector (e.g. PART_TYPE = \"ALL\";)."
                         ),
-                        impact="Parts may be detached unless explicitly intended as a multi-part assembly.",
+                        impact="Parts may be detached unintentionally unless explicitly declared as a multi-part plate layout.",
                     )
                 )
 
         # 5. Printability, Per-Component Stability, Ceiling & Wall Thickness Checks
-        if isinstance(printability, dict) and printability:
+        # Root-cause gating: skip orientation- and volume-dependent printability checks when topology is invalid.
+        is_orientable_manifold = is_watertight and inconsistent_winding_edges == 0
+        if not is_orientable_manifold:
+            findings.append(
+                Finding(
+                    category="INFO",
+                    code="PRINTABILITY_CHECKS_SKIPPED",
+                    message="Printability and wall-thickness checks skipped until mesh manifold/winding errors are resolved.",
+                    impact="Orientation- and volume-dependent metrics require a closed, orientable 2-manifold mesh.",
+                )
+            )
+        elif isinstance(printability, dict) and printability:
             surf_area = float(printability.get("surface_area_mm2", 0.0) or 0.0)
             if not is_assembly:
                 overhang_60 = float(printability.get("overhang_area_60deg_mm2", 0.0) or 0.0)
@@ -1094,7 +1208,11 @@ class CadVerifier:
                     c
                     for c in components
                     if isinstance(c, dict)
-                    and float((c.get("bounds_mm") or {}).get("min_z", 0.0)) <= base_z + 0.08
+                    and bool(
+                        c.get("grounded")
+                        if "grounded" in c
+                        else float((c.get("bounds_mm") or {}).get("min_z", 0.0)) <= base_z + 0.05
+                    )
                 ]
 
                 # 5a. Per-component Bed Contact & CoM Static Stability
@@ -1112,21 +1230,36 @@ class CadVerifier:
                         else "Model"
                     )
 
-                    if c_vol > 25.0 and (
-                        c_bed < 3.0
-                        or (c_dz >= 5.0 and c_ratio < 0.015 and c_bed < 15.0)
-                    ):
+                    if c_vol > 25.0 and c_bed < ZERO_BED_CONTACT_MM2:
                         findings.append(
                             Finding(
                                 category="CRITICAL",
-                                code="LOW_BED_CONTACT",
+                                code="ZERO_BED_CONTACT",
                                 message=(
-                                    f"{part_label} has insufficient build plate contact area "
+                                    f"{part_label} has virtually zero flat build plate contact area "
                                     f"({c_bed:.2f} mm², {c_ratio * 100:.1f}% of footprint)."
                                 ),
                                 impact=(
-                                    "Part rests on a point, dome, or knife-edge at Z = 0 and will detach during the first layer. "
+                                    "Part rests on a point, dome apex, or knife-edge at Z = 0 and cannot adhere to the build plate. "
                                     "Ensure every component has a flat horizontal base face resting squarely on Z = 0."
+                                ),
+                            )
+                        )
+                    elif c_vol > 25.0 and (
+                        c_bed < LOW_BED_CONTACT_MM2
+                        or (c_dz >= 5.0 and c_ratio < LOW_BED_CONTACT_RATIO and c_bed < 15.0)
+                    ):
+                        findings.append(
+                            Finding(
+                                category="WARNING",
+                                code="LOW_BED_CONTACT",
+                                message=(
+                                    f"{part_label} has small build plate contact area "
+                                    f"({c_bed:.2f} mm², {c_ratio * 100:.1f}% of footprint)."
+                                ),
+                                impact=(
+                                    "Small first-layer contact area risks poor bed adhesion without a brim. "
+                                    "Widen the flat base on Z = 0 or re-orient the part onto a larger flat face."
                                 ),
                             )
                         )
@@ -1149,14 +1282,14 @@ class CadVerifier:
                             )
                             findings.append(
                                 Finding(
-                                    category="CRITICAL",
+                                    category="WARNING",
                                     code="UNSTABLE_CENTER_OF_MASS",
                                     message=(
                                         f"{part_label} Center of Mass {com_str} projects {abs(c_margin):.2f} mm outside "
                                         f"its convex Z=0 base support footprint ({bounds_str})."
                                     ),
                                     impact=(
-                                        "Freestanding part is statically unstable and will tip over under gravity. "
+                                        "Freestanding part is statically unstable and may tip over without a brim or supports. "
                                         "Widen the Z=0 base footprint, add a support foot under the overhang, or re-orient the part."
                                     ),
                                 )
@@ -1171,7 +1304,7 @@ class CadVerifier:
                     ]
                     findings.append(
                         Finding(
-                            category="CRITICAL",
+                            category="WARNING",
                             code="UNSUPPORTED_FLOATING_FEATURE",
                             message=(
                                 f"Model has {len(unsupported_floating)} intra-solid feature(s) starting in mid-air with zero support from the layer below "
@@ -1179,7 +1312,7 @@ class CadVerifier:
                             ),
                             impact=(
                                 "Even though connected to the body at a higher layer, these local Z-minima (such as severed internal cones, "
-                                "un-ramped internal ledges, or hanging bosses) print in thin air and collapse in the slicer. "
+                                "un-ramped internal ledges, or hanging bosses) require supports or will sag in the slicer. "
                                 "Add a >= 45 deg bottom support taper/chamfer down to a supporting wall or Z = 0."
                             ),
                         )
@@ -1194,14 +1327,14 @@ class CadVerifier:
                     ]
                     findings.append(
                         Finding(
-                            category="CRITICAL",
+                            category="WARNING",
                             code="PERFORATED_UNSUPPORTED_CEILING",
                             message=(
                                 f"Model contains {len(perforated_ceilings)} elevated horizontal ceiling(s) pierced by unsupported mid-air holes "
                                 f"({'; '.join(ceil_descs)})."
                             ),
                             impact=(
-                                "Circular or slotted hole perimeters inside an elevated horizontal bridge have nothing to anchor to and collapse into spaghetti during FDM printing. "
+                                "Circular or slotted hole perimeters inside an elevated horizontal bridge cannot anchor cleanly without supports during FDM printing. "
                                 "Orient perforated caps/lids flat outer-face-down on Z = 0 (with cavity/skirt opening upward +Z), or use a continuous >= 45 deg conical interior funnel."
                             ),
                         )
@@ -1259,22 +1392,23 @@ class CadVerifier:
             if isinstance(min_wall_t, (int, float)):
                 loc_z = min_wall_loc.get("z_mm", 0.0)
                 loc_xy = min_wall_loc.get("xy_mm") or [0.0, 0.0]
-                if min_wall_t < nozzle_dia * 0.95:
+                if min_wall_t < nozzle_dia * MIN_FEATURE_RATIO:
                     findings.append(
                         Finding(
                             category="CRITICAL",
                             code="THIN_LOCAL_WALL",
                             message=(
                                 f"Local wall thickness drops to {min_wall_t:.2f} mm at Z = {loc_z} mm, "
-                                f"XY = ({loc_xy[0]}, {loc_xy[1]}) mm, which is thinner than nozzle diameter ({nozzle_dia:.2f} mm)."
+                                f"XY = ({loc_xy[0]}, {loc_xy[1]}) mm, which is below minimum extrudable width "
+                                f"({nozzle_dia * MIN_FEATURE_RATIO:.2f} mm for a {nozzle_dia:.2f} mm nozzle)."
                             ),
                             impact=(
-                                "Slicers drop walls thinner than a single extrusion width, creating open holes or severed walls "
-                                "(commonly behind dovetail grooves, bores, or deep cutouts). Reduce cutout depth or increase outer wall dimensions so all walls are >= 2 perimeters."
+                                "Slicers drop walls narrower than half the nozzle diameter, creating open holes or severed walls "
+                                "(commonly behind dovetail grooves, bores, or deep cutouts). Reduce cutout depth or increase outer wall dimensions."
                             ),
                         )
                     )
-                elif min_wall_t < nozzle_dia * 1.65:
+                elif min_wall_t < nozzle_dia * TWO_PERIMETER_RATIO:
                     findings.append(
                         Finding(
                             category="WARNING",
@@ -1318,18 +1452,7 @@ class CadVerifier:
         infos = [f for f in findings if f.category == "INFO"]
 
         # Risk score calculation: 0 (perfect) to 100 (critical fail)
-        _PHYSICAL_WARN_CODES = {
-            "SEVERE_OVERHANG",
-            "MODERATE_OVERHANG",
-            "UNSTABLE_BASE",
-            "WEAK_BED_ADHESION_AREA",
-            "BUILD_VOLUME_EXCEEDED",
-            "INVERTED_NORMALS",
-            "SINGLE_PERIMETER_LOCAL_WALL",
-            "CROWDED_PART_LAYOUT",
-            "MULTI_BODY_SUSPECT",
-        }
-        phys_warn_count = sum(1 for w in warnings if w.code in _PHYSICAL_WARN_CODES)
+        phys_warn_count = sum(1 for w in warnings if w.code in PHYSICAL_WARNING_CODES)
         code_warn_count = len(warnings) - phys_warn_count
 
         warning_score = min(40, phys_warn_count * 15 + code_warn_count * 10)
@@ -1369,6 +1492,8 @@ class CadVerifier:
             key=lambda f: (
                 category_order.get(f.category, 3),
                 f.line if f.line is not None else 999999,
+                f.code,
+                f.message,
             ),
         )
 
