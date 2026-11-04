@@ -59,6 +59,8 @@ def fetch_provider_balance(
         result = _fetch_gemini_balance(settings)
     elif target_provider == "vertex":
         result = _fetch_vertex_balance(settings)
+    elif target_provider == "mimo":
+        result = _fetch_mimo_balance(settings)
     else:
         result = {
             "provider": target_provider,
@@ -276,3 +278,60 @@ def _fetch_vertex_balance(settings: Settings) -> dict[str, Any]:
         "currency": "USD",
         "error": None if ok else (detail or "gcloud CLI not authenticated"),
     }
+
+
+def _fetch_mimo_balance(settings: Settings) -> dict[str, Any]:
+    """Verify Xiaomi MiMo API key and connection status."""
+    api_key = os.getenv("MIMO_API_KEY", "").strip()
+    if not api_key:
+        return {
+            "provider": "mimo",
+            "supported": True,
+            "status": "unconfigured",
+            "label": "Xiaomi MiMo",
+            "model": settings.mimo_model,
+            "currency": "USD",
+            "error": "MIMO_API_KEY is not set in environment or .env.",
+        }
+
+    base = (settings.mimo_base_url or "https://api.xiaomimimo.com/v1").rstrip("/")
+    probe_url = f"{base}/models"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "api-key": api_key,
+    }
+    try:
+        with httpx.Client(timeout=4.0) as client:
+            resp = client.get(probe_url, headers=headers)
+            if resp.status_code == 200:
+                return {
+                    "provider": "mimo",
+                    "supported": True,
+                    "status": "active",
+                    "label": "Xiaomi MiMo",
+                    "model": settings.mimo_model,
+                    "currency": "USD",
+                }
+            err_msg = f"HTTP {resp.status_code}: {resp.text[:150]}"
+            _LOG.warning("Xiaomi MiMo probe returned %s", err_msg)
+            return {
+                "provider": "mimo",
+                "supported": True,
+                "status": "error",
+                "label": "Xiaomi MiMo (Invalid Key)" if resp.status_code in (400, 401, 403) else "Xiaomi MiMo (Error)",
+                "model": settings.mimo_model,
+                "currency": "USD",
+                "error": err_msg,
+            }
+    except (httpx.HTTPError, OSError, ValueError) as exc:
+        _LOG.debug("Xiaomi MiMo probe connection failed: %s", exc)
+        return {
+            "provider": "mimo",
+            "supported": True,
+            "status": "error",
+            "label": "Xiaomi MiMo (Connection Error)",
+            "model": settings.mimo_model,
+            "currency": "USD",
+            "error": f"Failed to reach Xiaomi MiMo API: {exc}",
+        }
+

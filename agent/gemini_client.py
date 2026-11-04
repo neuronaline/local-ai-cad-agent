@@ -346,7 +346,7 @@ def parse_interactions_stream(
     provider_label: str = "Google AI Studio",
     stop_event: threading.Event | None = None,
     stream_callback: Any | None = None,
-    idle_timeout: float = 180.0,
+    idle_timeout: float = 300.0,
 ) -> dict[str, Any]:
     """Parse Server-Sent Events from the Interactions API."""
     content = ""
@@ -1129,6 +1129,7 @@ class GoogleInteractionsClient(BaseLLMClient):
                 provider_label=self._provider_label,
                 stop_event=self.stop_event,
                 stream_callback=self.stream_callback,
+                idle_timeout=float(self.settings.gemini_timeout_seconds),
             )
             usage = result.get("usage") if isinstance(result, dict) else None
             self.last_usage = usage if isinstance(usage, dict) else None

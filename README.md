@@ -4,7 +4,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![CI Status](https://img.shields.io/badge/CI-Passing-brightgreen.svg)](https://github.com/neuronaline/local-ai-cad-agent/actions)
 
-A local-first web application for **creating and refining parametric 3D CAD models through natural language**. Built with [OpenSCAD](https://openscad.org/), [Three.js](https://threejs.org/), and [Bubblewrap](https://github.com/containers/bubblewrap) for isolated execution. Run completely offline via **Ollama**, or connect to **OpenRouter**, **OpenAI**, **Gemini (Google AI Studio)**, or **Vertex AI**.
+A local-first web application for **creating and refining parametric 3D CAD models through natural language**. Built with [OpenSCAD](https://openscad.org/), [Three.js](https://threejs.org/), and [Bubblewrap](https://github.com/containers/bubblewrap) for isolated execution. Run completely offline via **Ollama**, or connect to **OpenRouter**, **OpenAI**, **Gemini (Google AI Studio)**, **Vertex AI**, or **Xiaomi MiMo**.
 
 <p align="center">
   <img src="screenshots/screenshot.png" alt="Local AI CAD Agent user interface" width="850">
@@ -54,6 +54,7 @@ Set `llm.provider` (e.g. `openrouter` or `gemini:gemini-3.8-flash`) and define y
 | **OpenAI** | `openai` | Set `OPENAI_API_KEY` in `.env` and add model slugs under `openai.models` in `config.yaml` |
 | **Gemini** | `gemini` | Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) in `.env`; models under `gemini.models` |
 | **Vertex AI** | `vertex` | Run `gcloud auth application-default login`; models under `vertex.models` |
+| **Xiaomi MiMo** | `mimo` | Set `MIMO_API_KEY` in `.env`; models under `mimo.models` |
 
 *(Optional: Set your 3D printer, nozzle, and filament under `user:` in `config.yaml` for tailored `/3mf` recommendations and slicer profiles.)*
 

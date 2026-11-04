@@ -52,14 +52,16 @@
           </div>
         </template>
         <div id="question-area"></div>
-        <details id="activity-panel" class="activity-panel" hidden>
-          <summary>
-            <span id="activity-title">Activity</span>
-            <span id="usage-pill" class="usage-pill" hidden></span>
-            <span class="activity-chevron">⌄</span>
-          </summary>
-          <div id="activity-list" class="activity-list"></div>
-        </details>
+        <div id="usage-bar" class="usage-bar" hidden aria-label="Token usage">
+          <div id="usage-pill-turn" class="usage-pill" hidden>
+            <span class="usage-pill-label">Last Turn</span>
+            <span id="usage-turn-metrics" class="usage-pill-metrics"></span>
+          </div>
+          <div id="usage-pill-total" class="usage-pill" hidden>
+            <span class="usage-pill-label">All Chat</span>
+            <span id="usage-total-metrics" class="usage-pill-metrics"></span>
+          </div>
+        </div>
         <form id="chat-form" class="composer">
           <div id="slash-popup" class="slash-popup" hidden role="listbox" aria-label="Commands">
             <div class="slash-popup-header">Commands</div>
@@ -87,19 +89,20 @@
                 {% endfor %}
               </select>
             </div>
-            <div class="effort-picker" title="Model reasoning effort">
+            {% set is_mimo_active = (active_model_key or '').startswith('mimo:') or (active_model_key or '').startswith('xiaomi:') %}
+            <div class="effort-picker" title="{% if is_mimo_active %}MiMo Deep Thinking (enabled / disabled){% else %}Model reasoning effort{% endif %}">
               <svg class="icon effort-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
                 <path d="M12 2a7 7 0 0 0-7 7c0 2.38 1.19 4.47 3 5.74V17a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1v-2.26c1.81-1.27 3-3.36 3-5.74a7 7 0 0 0-7-7M9 21a1 1 0 0 0 1 1h4a1 1 0 0 0 1-1v-1H9z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
               </svg>
-              <select id="reasoning-effort" class="effort-select" aria-label="Model reasoning effort" title="Model reasoning effort">
-                <option value=""{% if not reasoning_effort %} selected{% endif %}>Default</option>
-                <option value="none"{% if reasoning_effort == 'none' %} selected{% endif %}>None</option>
-                <option value="minimal"{% if reasoning_effort == 'minimal' %} selected{% endif %}>Minimal</option>
-                <option value="low"{% if reasoning_effort == 'low' %} selected{% endif %}>Low</option>
-                <option value="medium"{% if reasoning_effort == 'medium' %} selected{% endif %}>Medium</option>
-                <option value="high"{% if reasoning_effort == 'high' %} selected{% endif %}>High</option>
-                <option value="xhigh"{% if reasoning_effort == 'xhigh' %} selected{% endif %}>XHigh</option>
-                <option value="max"{% if reasoning_effort == 'max' %} selected{% endif %}>Max</option>
+              <select id="reasoning-effort" class="effort-select" aria-label="{% if is_mimo_active %}MiMo Deep Thinking{% else %}Model reasoning effort{% endif %}" title="{% if is_mimo_active %}MiMo Deep Thinking{% else %}Model reasoning effort{% endif %}">
+                <option value=""{% if not reasoning_effort %} selected{% endif %}>{% if is_mimo_active %}Enabled (Default){% else %}Default{% endif %}</option>
+                <option value="none"{% if reasoning_effort == 'none' %} selected{% endif %}>{% if is_mimo_active %}Disabled{% else %}None{% endif %}</option>
+                <option value="minimal"{% if reasoning_effort == 'minimal' %} selected{% endif %}{% if is_mimo_active %} hidden disabled{% endif %}>Minimal</option>
+                <option value="low"{% if reasoning_effort == 'low' %} selected{% endif %}{% if is_mimo_active %} hidden disabled{% endif %}>Low</option>
+                <option value="medium"{% if reasoning_effort == 'medium' %} selected{% endif %}{% if is_mimo_active %} hidden disabled{% endif %}>Medium</option>
+                <option value="high"{% if reasoning_effort == 'high' %} selected{% endif %}{% if is_mimo_active %} hidden disabled{% endif %}>High</option>
+                <option value="xhigh"{% if reasoning_effort == 'xhigh' %} selected{% endif %}{% if is_mimo_active %} hidden disabled{% endif %}>XHigh</option>
+                <option value="max"{% if reasoning_effort == 'max' %} selected{% endif %}{% if is_mimo_active %} hidden disabled{% endif %}>Max</option>
               </select>
             </div>
             <button id="hardware-picker-btn" type="button" class="hardware-picker-btn toolbar-pill quiet" title="Printer & Filament Preferences" aria-label="Printer & Filament Preferences">

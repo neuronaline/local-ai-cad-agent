@@ -288,13 +288,15 @@ def _sync_reasoning_effort(effort_raw: Any, *, persist: bool = True) -> str | No
     if effort_raw is None:
         return None
     effort = str(effort_raw).strip().lower()
-    if effort in ("", "default", "auto"):
+    if effort in ("", "default", "auto", "enabled", "on", "true"):
         if persist:
             settings = current_app.config["SETTINGS"]
             current_app.config["SETTINGS"] = with_reasoning_effort(settings, None)
             runner: AgentRunner = current_app.config["AGENT_RUNNER"]
             runner.set_reasoning_effort(None)
         return ""
+    if effort in ("disabled", "off", "false"):
+        effort = "none"
     if effort not in REASONING_EFFORTS:
         raise ValueError(
             f"Invalid reasoning_effort: {effort!r}. Must be one of: {', '.join(sorted(REASONING_EFFORTS))}"

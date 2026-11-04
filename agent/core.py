@@ -1279,8 +1279,9 @@ class AgentRunner:
                 combined_reasoning = "\n\n".join(state.run_reasonings)
                 content_text = (assistant_message.get("content") or "").strip()
                 if combined_reasoning and combined_reasoning.strip() != content_text:
-                    assistant_message["reasoning"] = combined_reasoning
                     published_reasoning = combined_reasoning
+                    if not has_tools:
+                        assistant_message["reasoning"] = combined_reasoning
             self.publish(
                 "agent_stream_end",
                 {
@@ -1292,7 +1293,12 @@ class AgentRunner:
                     "has_tools": has_tools,
                 },
             )
-            self._append_message(state.project_dir, assistant_message)
+            stored_message = (
+                {**assistant_message, "reasoning": published_reasoning}
+                if published_reasoning and assistant_message.get("reasoning") != published_reasoning
+                else assistant_message
+            )
+            self._append_message(state.project_dir, stored_message)
             if has_tools:
                 state.run_reasonings.clear()
         state.messages.append(assistant_message)
@@ -2433,22 +2439,22 @@ class AgentRunner:
         c_val = summary["completion_tokens"]
         cost_val = summary["cost"]
         total_cost = round(state.total_cost, 6) if state and state.total_cost > 0 else cost_val
-        self.publish(
-            "agent_usage",
-            {
-                "project": project,
-                "prompt_tokens": usage.get("prompt_tokens"),
-                "completion_tokens": usage.get("completion_tokens"),
-                "cached_tokens": cached_tokens,
-                "cache_write_tokens": summary["cache_write_tokens"],
-                "cache_hit_rate": summary["cache_hit_rate"],
-                "cost": cost_val,
-                "total_cost": total_cost,
-                "total_prompt_tokens": state.total_prompt_tokens if state else p_val,
-                "total_completion_tokens": state.total_completion_tokens if state else c_val,
-                "total_cached_tokens": state.total_cached_tokens if state else cached_tokens,
-            },
-        )
+        usage_payload: dict[str, Any] = {
+            "project": project,
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+            "cached_tokens": cached_tokens,
+            "cache_write_tokens": summary["cache_write_tokens"],
+            "cache_hit_rate": summary["cache_hit_rate"],
+            "cost": cost_val,
+            "total_cost": total_cost,
+            "total_prompt_tokens": state.total_prompt_tokens if state else p_val,
+            "total_completion_tokens": state.total_completion_tokens if state else c_val,
+            "total_cached_tokens": state.total_cached_tokens if state else cached_tokens,
+        }
+        if state and state.run_id:
+            usage_payload["run_id"] = state.run_id
+        self.publish("agent_usage", usage_payload)
 
     # ------------------------------------------------------------------ dispatch
 
@@ -2514,6 +2520,8 @@ class AgentRunner:
             key_url = "https://platform.openai.com/api-keys"
         elif provider in ("gemini", "google"):
             key_url = "https://aistudio.google.com/apikey"
+        elif provider in ("mimo", "xiaomi", "xiaomi_mimo", "xiaomi-mimo", "xiaomi mimo"):
+            key_url = "https://platform.xiaomimimo.com"
         else:
             key_url = "https://openrouter.ai/keys"
 
@@ -2596,7 +2604,22 @@ class AgentRunner:
             or "google" in lower
             or "vertex" in lower
             or "gcloud" in lower
-            or provider in ("openrouter", "openai", "ollama", "gemini", "google", "vertex", "gcloud")
+            or "mimo" in lower
+            or "xiaomi" in lower
+            or provider in (
+                "openrouter",
+                "openai",
+                "ollama",
+                "gemini",
+                "google",
+                "vertex",
+                "gcloud",
+                "mimo",
+                "xiaomi",
+                "xiaomi_mimo",
+                "xiaomi-mimo",
+                "xiaomi mimo",
+            )
         ) and (
             "timeout" in lower or "timed out" in lower or "connection" in lower
         ):

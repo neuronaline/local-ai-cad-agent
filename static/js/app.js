@@ -44,10 +44,11 @@ const stopIcon = sendToggle?.querySelector('[data-mode="stop"]');
 const slashPopup = document.querySelector('#slash-popup');
 const slashPopupList = document.querySelector('#slash-popup-list');
 const questionArea = document.querySelector('#question-area');
-const activityPanel = document.querySelector('#activity-panel');
-const activityTitle = document.querySelector('#activity-title');
-const activityList = document.querySelector('#activity-list');
-const usagePill = document.querySelector('#usage-pill');
+const usageBar = document.querySelector('#usage-bar');
+const usagePillTurn = document.querySelector('#usage-pill-turn');
+const usageTurnMetrics = document.querySelector('#usage-turn-metrics');
+const usagePillTotal = document.querySelector('#usage-pill-total');
+const usageTotalMetrics = document.querySelector('#usage-total-metrics');
 const attachmentPreview = document.querySelector('#attachment-preview');
 const downloadModelBtn = document.querySelector('#download-model');
 const exportFormatSelect = document.querySelector('#export-format');
@@ -95,6 +96,9 @@ const validModelKeys = new Set(availableModels.map(m => m.key));
 // ── Models & Reasoning Effort ──
 function getSupportedEffortsForModel(modelKey) {
   const [provider = '', model = ''] = String(modelKey || '').toLowerCase().split(':');
+  if (provider === 'mimo' || provider === 'xiaomi') {
+    return new Set(['', 'none']);
+  }
   if (provider === 'gemini' || provider === 'vertex') {
     const efforts = new Set(['', 'none', 'low', 'medium', 'high']);
     if (model.includes('2.5') || model.includes('gemini-2')) {
@@ -106,17 +110,37 @@ function getSupportedEffortsForModel(modelKey) {
     }
     return efforts;
   }
+  if (provider === 'openai') {
+    return new Set(['', 'none', 'low', 'medium', 'high']);
+  }
   return VALID_EFFORTS;
 }
 
 function syncEffortOptionsForModel(modelKey) {
   if (!reasoningEffortSelect) return;
+  const [provider = ''] = String(modelKey || '').toLowerCase().split(':');
   const supported = getSupportedEffortsForModel(modelKey);
+  const isMimo = provider === 'mimo' || provider === 'xiaomi';
+
   for (const opt of reasoningEffortSelect.options) {
     const allowed = supported.has(opt.value);
     opt.hidden = !allowed;
     opt.disabled = !allowed;
+    if (opt.value === '') {
+      opt.textContent = isMimo ? 'Enabled (Default)' : 'Default';
+    } else if (opt.value === 'none') {
+      opt.textContent = isMimo ? 'Disabled' : 'None';
+    }
   }
+
+  const picker = reasoningEffortSelect.closest('.effort-picker');
+  const tooltip = isMimo ? 'MiMo Deep Thinking (enabled / disabled)' : 'Model reasoning effort';
+  if (picker) {
+    picker.title = tooltip;
+  }
+  reasoningEffortSelect.title = tooltip;
+  reasoningEffortSelect.setAttribute('aria-label', tooltip);
+
   if (!supported.has(reasoningEffortSelect.value)) {
     reasoningEffortSelect.value = '';
   }
@@ -477,7 +501,7 @@ function addMessage(text, type = 'agent', options = {}) {
   return item;
 }
 
-// ── Activity Drawer & Status Summary ──
+// ── Persistent Inline Tool Call Bubbles & Dual Token Usage ──
 const activityLabels = {
   cad_build: 'Building model',
   cad_build_and_verify: 'Building model',
@@ -489,6 +513,7 @@ const activityLabels = {
   calculate: 'Running calculation',
   run_python: 'Running calculation',
   question: 'Requesting input',
+  Images: 'Reference images',
   cad_screenshot: 'Re-rasterising views',
   cad_review: 'Reviewing build',
   rendering_subset: 'Re-rasterising a few views',
@@ -503,6 +528,7 @@ const activityLabels = {
   started: 'Starting',
   completed: 'Completed',
   error: 'Error',
+  failed: 'Failed',
   stopped: 'Stopped',
   pass: 'Pass',
   fail: 'Fail',
@@ -514,14 +540,20 @@ function activityLabel(value) {
   return activityLabels[value] || String(value || 'Activity').replace(/[_-]+/g, ' ');
 }
 
+function parseResultPayload(value) {
+  if (!value) return null;
+  if (typeof value === 'object') return value;
+  if (typeof value === 'string') {
+    try { return JSON.parse(value); } catch { return null; }
+  }
+  return null;
+}
+
 function activityDetail(tool, status, value) {
   if (!value) return '';
-  if (!['completed', 'error'].includes(status)) return String(value);
-  let payload = value;
-  if (typeof value === 'string') {
-    try { payload = JSON.parse(value); } catch { return value; }
-  }
-  if (!payload || typeof payload !== 'object') return String(payload || '');
+  if (!['completed', 'error', 'failed'].includes(status)) return String(value);
+  const payload = parseResultPayload(value);
+  if (!payload || typeof payload !== 'object') return String(value || '');
   if (payload.ok === false) return String(payload.error?.message || 'The step failed.');
   const data = payload.ok === true ? payload.data : payload;
   if (typeof data === 'string') return data;
@@ -545,97 +577,251 @@ function activityDetail(tool, status, value) {
     const output = data.stdout || data.stderr || data.message || data.summary;
     if (typeof output === 'string' && output.trim()) return output.trim();
   }
-  return status === 'error' ? 'The step failed.' : 'Completed.';
+  return (status === 'error' || status === 'failed') ? 'The step failed.' : 'Completed.';
 }
 
 const activityItems = new Map();
 const activeRunningTools = new Set();
-const TERMINAL_STATUSES = new Set(['completed', 'error', 'failed', 'stopped']);
-let userManuallyToggled = false;
+const TERMINAL_STATUSES = new Set(['completed', 'error', 'failed', 'stopped', 'pass', 'fail']);
 
-activityPanel?.querySelector('summary')?.addEventListener('click', () => {
-  userManuallyToggled = true;
-});
-
-function clearActivity() {
-  userManuallyToggled = false;
+function clearActivity({ resetUsage = false } = {}) {
   activeRunningTools.clear();
   activityItems.clear();
-  activityList?.replaceChildren();
-  if (activityPanel) activityPanel.hidden = true;
-  resetUsagePill();
+  if (resetUsage) resetUsagePill();
 }
 
-function updateActivitySummary() {
-  const items = [...activityItems.values()];
-  if (!items.length) {
-    if (activityPanel) activityPanel.hidden = true;
-    return;
-  }
-  const running = items.filter(item => !TERMINAL_STATUSES.has(item.status));
-  const failed = items.filter(item => item.status === 'error' || item.status === 'failed');
-  const current = running.at(-1);
+function getToolShortMeta(item) {
+  const tool = item.tool || '';
+  const args = item.arguments;
+  const firstLine = (str) => String(str || '').split(/\r?\n/)[0].trim();
 
-  if (activityTitle) {
-    activityTitle.textContent = current
-      ? `${activityLabel(current.tool)} · ${current.displayState || activityLabel(current.status)}`
-      : failed.length
-        ? `${failed.length} failed ${failed.length === 1 ? 'task' : 'tasks'}`
-        : `${items.length} ${items.length === 1 ? 'step' : 'steps'} completed`;
+  const isErr = item.status === 'error' || item.status === 'failed' || item.status === 'fail';
+  if (isErr && item.result) {
+    const line = firstLine(item.result);
+    if (line) {
+      return line.length > 90 ? `${line.slice(0, 87)}…` : line;
+    }
   }
-  if (!userManuallyToggled && failed.length > 0 && activityPanel) {
-    activityPanel.open = true;
+  if (args && typeof args === 'object') {
+    if (tool === 'write_file' && typeof args.content === 'string') {
+      const lines = args.content.split(/\r?\n/).length;
+      return `model.scad · ${lines} ${lines === 1 ? 'line' : 'lines'}`;
+    }
+    if (tool === 'edit_file') {
+      const edits = Array.isArray(args.edits) ? args.edits.length : (args.old_string !== undefined ? 1 : 0);
+      return edits > 0 ? `model.scad · ${edits} ${edits === 1 ? 'edit' : 'edits'}` : 'model.scad';
+    }
+    if (tool === 'read_file') {
+      const range = args.offset || args.limit ? ` (offset ${args.offset || 1}${args.limit ? `, limit ${args.limit}` : ''})` : '';
+      return `model.scad${range}`;
+    }
+    if (tool === 'get_view_images' && args.views) {
+      const views = Array.isArray(args.views) ? args.views.join(', ') : String(args.views);
+      return views;
+    }
+    if (tool === 'cad_build' && args.views) {
+      const views = Array.isArray(args.views) ? args.views.join(', ') : String(args.views);
+      return `views: ${views}`;
+    }
   }
-  if (activityPanel) activityPanel.hidden = false;
+  if (item.result) {
+    const line = firstLine(item.result);
+    if (line && line !== 'Completed.') {
+      return line.length > 90 ? `${line.slice(0, 87)}…` : line;
+    }
+  }
+  return '';
 }
 
-function addToolMessage(data) {
+function appendDetailSection(container, label, text, { isCode = false, isError = false } = {}) {
+  if (!text || !String(text).trim()) return;
+  const section = document.createElement('div');
+  section.className = 'tool-detail-section';
+  const labelEl = document.createElement('span');
+  labelEl.className = 'tool-detail-label';
+  labelEl.textContent = label;
+  section.appendChild(labelEl);
+
+  const raw = String(text);
+  const clipped = raw.length > 3500 ? `${raw.slice(0, 3500)}\n… [truncated]` : raw;
+  if (isCode) {
+    const pre = document.createElement('pre');
+    pre.className = 'tool-detail-code';
+    pre.textContent = clipped;
+    section.appendChild(pre);
+  } else {
+    const div = document.createElement('div');
+    div.className = `tool-detail-text${isError ? ' is-error' : ''}`;
+    div.textContent = clipped;
+    section.appendChild(div);
+  }
+  container.appendChild(section);
+}
+
+function populateToolBubbleBody(bodyEl, item) {
+  bodyEl.replaceChildren();
+  const tool = item.tool || '';
+  const args = item.arguments;
+  const isErr = item.status === 'error' || item.status === 'failed' || item.status === 'fail';
+
+  if (args && typeof args === 'object') {
+    if (tool === 'write_file' && typeof args.content === 'string' && args.content.trim()) {
+      appendDetailSection(bodyEl, 'model.scad content', args.content, { isCode: true });
+    } else if (tool === 'edit_file') {
+      const edits = Array.isArray(args.edits)
+        ? args.edits
+        : (typeof args.old_string === 'string' ? [{ old_string: args.old_string, new_string: args.new_string ?? '' }] : []);
+      if (edits.length > 0) {
+        const snippet = edits.map((e, idx) => {
+          const header = edits.length > 1 ? `// Edit ${idx + 1}\n` : '';
+          return `${header}- ${(e.old_string || '').trim()}\n+ ${(e.new_string || '').trim()}`;
+        }).join('\n\n');
+        appendDetailSection(bodyEl, `Changes (${edits.length})`, snippet, { isCode: true });
+      }
+    } else if ((tool === 'python' || tool === 'calculate' || tool === 'run_python') && typeof args.code === 'string' && args.code.trim()) {
+      appendDetailSection(bodyEl, 'Python script', args.code, { isCode: true });
+    } else if (tool === 'read_file') {
+      const parts = ['File: model.scad'];
+      if (args.offset) parts.push(`Offset: line ${args.offset}`);
+      if (args.limit) parts.push(`Limit: ${args.limit} lines`);
+      appendDetailSection(bodyEl, 'Parameters', parts.join(' · '));
+    } else if (tool === 'cad_build' || tool === 'get_view_images') {
+      const parts = [];
+      if (args.views) parts.push(`Views: ${Array.isArray(args.views) ? args.views.join(', ') : args.views}`);
+      if (args.resolution) parts.push(`Resolution: ${args.resolution}px`);
+      if (args.crop) parts.push(`Crop: ${JSON.stringify(args.crop)}`);
+      if (parts.length > 0) appendDetailSection(bodyEl, 'Parameters', parts.join(' · '));
+    } else if (tool === 'question' && Array.isArray(args.questions)) {
+      const qList = args.questions.map(q => `• ${q.question || q.id || ''}`).join('\n');
+      appendDetailSection(bodyEl, 'Questions', qList);
+    }
+  }
+
+  if (item.result) {
+    appendDetailSection(bodyEl, isErr ? 'Error' : 'Result', item.result, { isError: isErr });
+  } else if (!bodyEl.children.length) {
+    appendDetailSection(
+      bodyEl,
+      'Status',
+      TERMINAL_STATUSES.has(item.status) ? activityLabel(item.status) : `${activityLabel(tool)} in progress…`
+    );
+  }
+}
+
+function renderToolBubbleContent(bubble, item) {
+  const status = item.status || 'running';
+  bubble.dataset.status = status;
+  bubble.dataset.tool = item.tool || 'tool';
+  if (status === 'error' || status === 'failed' || status === 'fail') {
+    bubble.open = true;
+  }
+
+  let summary = bubble.querySelector('.tool-bubble-summary');
+  let body = bubble.querySelector('.tool-bubble-body');
+  if (!summary) {
+    summary = document.createElement('summary');
+    summary.className = 'tool-bubble-summary';
+    bubble.appendChild(summary);
+  }
+  if (!body) {
+    body = document.createElement('div');
+    body.className = 'tool-bubble-body';
+    bubble.appendChild(body);
+  }
+
+  let iconClass = 'is-running';
+  let iconChar = '';
+  if (status === 'completed' || status === 'pass') {
+    iconClass = 'is-completed';
+    iconChar = '✓';
+  } else if (status === 'error' || status === 'failed' || status === 'fail') {
+    iconClass = 'is-error';
+    iconChar = '✕';
+  } else if (status === 'stopped') {
+    iconClass = 'is-stopped';
+    iconChar = '■';
+  }
+
+  summary.replaceChildren();
+  const iconEl = document.createElement('span');
+  iconEl.className = `tool-status-icon ${iconClass}`;
+  iconEl.setAttribute('aria-hidden', 'true');
+  iconEl.textContent = iconChar;
+
+  const titleEl = document.createElement('span');
+  titleEl.className = 'tool-bubble-title';
+  titleEl.textContent = activityLabel(item.tool);
+
+  const badgeEl = document.createElement('span');
+  badgeEl.className = 'tool-bubble-badge';
+  badgeEl.textContent = item.tool || 'tool';
+
+  const metaEl = document.createElement('span');
+  metaEl.className = 'tool-bubble-meta';
+  metaEl.textContent = getToolShortMeta(item);
+
+  const stateEl = document.createElement('span');
+  stateEl.className = 'tool-bubble-state';
+  stateEl.textContent = item.displayState || activityLabel(status);
+
+  const chevronEl = document.createElement('span');
+  chevronEl.className = 'tool-bubble-chevron';
+  chevronEl.setAttribute('aria-hidden', 'true');
+  chevronEl.textContent = '⌄';
+
+  summary.append(iconEl, titleEl, badgeEl, metaEl, stateEl, chevronEl);
+  populateToolBubbleBody(body, item);
+}
+
+function addToolMessage(data, { target = feed } = {}) {
   const callId = data.call_id || generateUUID();
+  if (callId === 'agent-run' || data.tool === 'agent') {
+    return null;
+  }
   const status = data.status || 'running';
-  if (status === 'running' || status === 'preparing') {
-    if (callId !== 'agent-run') activeRunningTools.add(callId);
-  } else if (TERMINAL_STATUSES.has(status)) {
+  if (!TERMINAL_STATUSES.has(status)) {
+    activeRunningTools.add(callId);
+  } else {
     activeRunningTools.delete(callId);
   }
 
-  if (callId !== 'agent-run' && activityItems.has('agent-run')) {
-    activityList?.querySelector('[data-call-id="agent-run"]')?.remove();
-    activityItems.delete('agent-run');
-  }
-
-  const item = activityItems.get(callId) || { callId, tool: data.tool || 'agent' };
+  const item = activityItems.get(callId) || { callId, tool: data.tool || 'tool' };
   item.tool = data.tool || item.tool;
   item.status = status;
-  item.result = activityDetail(item.tool, status, data.result) || item.result || '';
+  if (data.arguments && typeof data.arguments === 'object') {
+    item.arguments = data.arguments;
+  }
+  if (data.result !== undefined && data.result !== null) {
+    item.rawResult = data.result;
+  }
+  const detail = activityDetail(item.tool, status, data.result);
+  if (detail) item.result = detail;
   activityItems.set(callId, item);
 
-  let row = activityList?.querySelector(`[data-call-id="${CSS.escape(callId)}"]`);
-  if (!row) {
-    row = document.createElement('div');
-    row.className = 'activity-item';
-    row.dataset.callId = callId;
-    activityList?.appendChild(row);
-  }
-  row.dataset.status = status;
-  row.hidden = false;
+  const container = target || feed;
+  if (!container) return null;
 
-  row.replaceChildren();
-  const name = document.createElement('span');
-  name.className = 'activity-name';
-  name.textContent = activityLabel(item.tool);
-  const state = document.createElement('span');
-  state.className = 'activity-state';
-  state.textContent = item.displayState || activityLabel(status);
-  row.append(name, state);
-
-  if (item.result) {
-    const detail = document.createElement('span');
-    detail.className = 'activity-detail';
-    detail.textContent = item.result.length > 180 ? `${item.result.slice(0, 177)}…` : item.result;
-    row.appendChild(detail);
+  let bubble = container.querySelector(`.tool-bubble[data-call-id="${CSS.escape(callId)}"]`);
+  if (!bubble) {
+    container.querySelector('.empty-state')?.remove();
+    if (container === feed && activeRunCard?.isConnected && activeRunCard.parentElement === container) {
+      if (activeRunCard._rawText?.trim() || activeRunCard._rawReasoning?.trim()) {
+        setCardState(activeRunCard, 'done');
+        activeRunCard = null;
+      } else {
+        activeRunCard.remove();
+        activeRunCard = null;
+      }
+    }
+    bubble = document.createElement('details');
+    bubble.className = 'tool-bubble';
+    bubble.dataset.callId = callId;
+    container.appendChild(bubble);
   }
-  updateActivitySummary();
-  return row;
+
+  renderToolBubbleContent(bubble, item);
+  if (container === feed) scrollFeedToBottom();
+  return bubble;
 }
 
 function refreshLatestToolRow(tool, updates = {}) {
@@ -648,46 +834,63 @@ function refreshLatestToolRow(tool, updates = {}) {
     if (updates.status) item.status = updates.status;
     if (Object.prototype.hasOwnProperty.call(updates, 'result')) item.result = updates.result;
 
-    const row = activityList?.querySelector(`[data-call-id="${CSS.escape(item.callId)}"]`);
-    if (row) {
-      if (item.displayState) {
-        const stateEl = row.querySelector('.activity-state');
-        if (stateEl) stateEl.textContent = item.displayState;
-      }
-      if (updates.status) row.dataset.status = updates.status;
-      if (updates.result) {
-        let detail = row.querySelector('.activity-detail');
-        if (!detail) {
-          detail = document.createElement('span');
-          detail.className = 'activity-detail';
-          row.appendChild(detail);
-        }
-        detail.textContent = updates.result.length > 180 ? `${updates.result.slice(0, 177)}…` : updates.result;
-      }
+    const bubble = feed?.querySelector(`.tool-bubble[data-call-id="${CSS.escape(item.callId)}"]`);
+    if (bubble) {
+      renderToolBubbleContent(bubble, item);
     }
-    updateActivitySummary();
-    return row;
+    return bubble;
   }
   return null;
 }
 
-function markActivityRecovered() {
+function markActivityRecovered(terminalStatus = 'completed') {
+  activeRunningTools.clear();
   for (const item of activityItems.values()) {
     if (!TERMINAL_STATUSES.has(item.status)) {
-      item.status = 'completed';
-      const row = activityList?.querySelector(`[data-call-id="${CSS.escape(item.callId)}"]`);
-      if (row) {
-        row.dataset.status = 'completed';
-        const stateEl = row.querySelector('.activity-state');
-        if (stateEl) stateEl.textContent = 'Completed';
+      item.status = terminalStatus;
+      const bubble = feed?.querySelector(`.tool-bubble[data-call-id="${CSS.escape(item.callId)}"]`);
+      if (bubble) {
+        renderToolBubbleContent(bubble, item);
       }
     }
   }
-  updateActivitySummary();
 }
 
-// ── Token Usage Pill ──
-let lastUsage = null;
+// ── Dual Token Usage Bar (Last Turn & All Chat) ──
+let turnUsageBuckets = [];
+
+function createUsageBucket(runId = null) {
+  return {
+    runId: runId || null,
+    prompt: 0,
+    completion: 0,
+    cached: 0,
+    cost: 0,
+    hasCost: false,
+    calls: 0,
+  };
+}
+
+function startNewTurnUsageBucket(runId = null) {
+  const last = turnUsageBuckets.at(-1);
+  if (last && last.calls === 0) {
+    if (runId) last.runId = runId;
+    return last;
+  }
+  const bucket = createUsageBucket(runId);
+  turnUsageBuckets.push(bucket);
+  return bucket;
+}
+
+function rewindUsageBucketsToUserIndex(userIndex) {
+  if (typeof userIndex === 'number' && userIndex >= 0) {
+    turnUsageBuckets.length = Math.min(turnUsageBuckets.length, userIndex);
+  } else if (turnUsageBuckets.length > 0) {
+    turnUsageBuckets.pop();
+  }
+  startNewTurnUsageBucket();
+  renderUsageBar();
+}
 
 function formatTokenCount(value) {
   const n = Number(value);
@@ -705,60 +908,110 @@ function formatCost(amount) {
   return `$${num.toFixed(3)}`;
 }
 
+function applyUsageBadge(pillEl, metricsEl, scopeTitle, snapshot) {
+  if (!pillEl || !metricsEl) return;
+  const promptLabel = formatTokenCount(snapshot.prompt);
+  const completionLabel = formatTokenCount(snapshot.completion);
+  const cachedLabel = formatTokenCount(snapshot.cached);
+  const hitRate = snapshot.prompt > 0 ? (snapshot.cached / snapshot.prompt) * 100 : 0;
+  const hitRatePercent = Math.round(hitRate);
+
+  let cacheState = 'miss';
+  let cacheLabel = ' · 0% hit';
+  if (snapshot.cached > 0 || hitRatePercent > 0) {
+    cacheState = hitRatePercent >= 80 ? 'hit' : 'partial';
+    cacheLabel = ` · ${hitRatePercent}% hit (${cachedLabel})`;
+  }
+
+  const costVal = snapshot.hasCost ? snapshot.cost : null;
+  const costLabel = costVal != null ? ` · ${formatCost(costVal)}` : '';
+
+  pillEl.dataset.cache = cacheState;
+  metricsEl.textContent = `↑${promptLabel} ↓${completionLabel}${cacheLabel}${costLabel}`;
+  pillEl.title =
+    `${scopeTitle} (${snapshot.calls} LLM ${snapshot.calls === 1 ? 'step' : 'steps'}) — ` +
+    `Prompt: ${snapshot.prompt.toLocaleString()} tokens | ` +
+    `Completion: ${snapshot.completion.toLocaleString()} tokens | ` +
+    `Cached: ${snapshot.cached.toLocaleString()} tokens (${hitRatePercent}% hit)` +
+    (costVal != null ? ` | Cost: ${formatCost(costVal)}` : '');
+  pillEl.hidden = false;
+}
+
+function renderUsageBar() {
+  if (!usageBar) return;
+  const activeBuckets = turnUsageBuckets.filter(b => b.calls > 0);
+  if (!activeBuckets.length) {
+    usageBar.hidden = true;
+    if (usagePillTurn) usagePillTurn.hidden = true;
+    if (usagePillTotal) usagePillTotal.hidden = true;
+    return;
+  }
+
+  const lastTurn = activeBuckets.at(-1);
+  const totalChat = activeBuckets.reduce(
+    (acc, b) => {
+      acc.prompt += b.prompt;
+      acc.completion += b.completion;
+      acc.cached += b.cached;
+      if (b.hasCost) {
+        acc.cost += b.cost;
+        acc.hasCost = true;
+      }
+      acc.calls += b.calls;
+      return acc;
+    },
+    createUsageBucket()
+  );
+
+  applyUsageBadge(usagePillTurn, usageTurnMetrics, 'Last Turn', lastTurn);
+  applyUsageBadge(usagePillTotal, usageTotalMetrics, 'All Chat', totalChat);
+  usageBar.hidden = false;
+}
+
 function updateUsagePill(data = {}) {
   const prompt = Number(data.prompt_tokens);
   const completion = Number(data.completion_tokens);
   const cached = Number(data.cached_tokens || 0);
   const cost = data.cost != null && Number.isFinite(Number(data.cost)) ? Number(data.cost) : null;
-  let totalCost = data.total_cost != null && Number.isFinite(Number(data.total_cost)) ? Number(data.total_cost) : null;
-  if (totalCost == null && lastUsage?.totalCost != null) {
-    totalCost = lastUsage.totalCost + (cost || 0);
-  }
-  const hitRate = data.cache_hit_rate != null && Number.isFinite(Number(data.cache_hit_rate))
-    ? Number(data.cache_hit_rate)
-    : (prompt > 0 ? (cached / prompt) * 100 : 0);
 
-  if (!usagePill) return;
-  if (Number.isFinite(prompt)) {
-    lastUsage = { prompt, completion: Number.isFinite(completion) ? completion : null, cached, cost, totalCost, hitRate };
-  } else if (!lastUsage) {
+  if (!Number.isFinite(prompt) && !Number.isFinite(completion) && cost === null) {
     return;
   }
-  const snapshot = lastUsage;
-  const promptLabel = formatTokenCount(snapshot.prompt);
-  const completionLabel = formatTokenCount(snapshot.completion);
-  const cachedLabel = formatTokenCount(snapshot.cached);
-  const hitRatePercent = Math.round(snapshot.hitRate);
 
-  let cacheState = 'miss';
-  let cacheLabel = '';
-  if (snapshot.cached > 0 || hitRatePercent > 0) {
-    cacheState = hitRatePercent >= 80 ? 'hit' : 'partial';
-    cacheLabel = ` · ${hitRatePercent}% hit (${cachedLabel})`;
-  } else {
-    cacheState = 'miss';
-    cacheLabel = ' · 0% hit';
+  let bucket = turnUsageBuckets.at(-1);
+  if (!bucket) {
+    bucket = startNewTurnUsageBucket(data.run_id || null);
+  } else if (data.run_id && bucket.runId && bucket.runId !== data.run_id && bucket.calls > 0) {
+    bucket = startNewTurnUsageBucket(data.run_id);
+  } else if (data.run_id && !bucket.runId) {
+    bucket.runId = data.run_id;
   }
 
-  const costVal = snapshot.totalCost ?? snapshot.cost;
-  const costLabel = costVal != null ? ` · ${formatCost(costVal)}` : '';
+  if (Number.isFinite(prompt) && prompt >= 0) bucket.prompt += prompt;
+  if (Number.isFinite(completion) && completion >= 0) bucket.completion += completion;
+  if (Number.isFinite(cached) && cached >= 0) bucket.cached += cached;
+  if (cost !== null && cost >= 0) {
+    bucket.cost += cost;
+    bucket.hasCost = true;
+  }
+  bucket.calls += 1;
 
-  usagePill.dataset.cache = cacheState;
-  usagePill.textContent = `↑${promptLabel} ↓${completionLabel}${cacheLabel}${costLabel}`;
-  usagePill.title =
-    `Prompt: ${snapshot.prompt.toLocaleString()} tokens | ` +
-    `Completion: ${(snapshot.completion || 0).toLocaleString()} tokens | ` +
-    `Cached: ${snapshot.cached.toLocaleString()} tokens (${hitRatePercent}% hit)` +
-    (costVal != null ? ` | Cost: ${formatCost(costVal)}` : '');
-  usagePill.hidden = false;
+  renderUsageBar();
 }
 
 function resetUsagePill() {
-  lastUsage = null;
-  if (!usagePill) return;
-  usagePill.textContent = '';
-  usagePill.hidden = true;
-  delete usagePill.dataset.cache;
+  turnUsageBuckets = [];
+  if (usageBar) usageBar.hidden = true;
+  if (usagePillTurn) {
+    usagePillTurn.hidden = true;
+    delete usagePillTurn.dataset.cache;
+  }
+  if (usageTurnMetrics) usageTurnMetrics.textContent = '';
+  if (usagePillTotal) {
+    usagePillTotal.hidden = true;
+    delete usagePillTotal.dataset.cache;
+  }
+  if (usageTotalMetrics) usageTotalMetrics.textContent = '';
 }
 
 // ── Run-Card & Streaming State Machine ──
@@ -1028,12 +1281,6 @@ function handleStreamingToolDelta(runId, data) {
     label = `${label} [${totalParallel} parallel]`;
   }
   setCardState(card, 'working', label);
-  addToolMessage({
-    call_id: 'agent-run',
-    tool: entry.name || 'agent',
-    status: 'running',
-    result: label,
-  });
 }
 
 function finalizeRunCard(runId, finalText, incomingReasoning) {
@@ -1114,7 +1361,8 @@ let lastUserSubmission = null;
 let selectedFiles = [];
 
 async function sendChatRequest({ text, files = [] }) {
-  clearActivity();
+  activeRunningTools.clear();
+  startNewTurnUsageBucket();
   finalizeAllActiveCards();
   setThinking(true);
   scrollFeedToBottom(true);
@@ -1146,6 +1394,27 @@ async function sendChatRequest({ text, files = [] }) {
   return response;
 }
 
+function pruneFeedAfterUserMessage(userIndex = -1) {
+  const allUserMessages = Array.from(feed?.querySelectorAll('.message.user') || []);
+  if (!allUserMessages.length) return;
+  const targetIdx = (typeof userIndex === 'number' && userIndex >= 0 && userIndex < allUserMessages.length)
+    ? userIndex
+    : allUserMessages.length - 1;
+  const targetUserEl = allUserMessages[targetIdx];
+  if (!targetUserEl) return;
+
+  let sibling = targetUserEl.nextElementSibling;
+  while (sibling) {
+    const next = sibling.nextElementSibling;
+    if (sibling.classList.contains('tool-bubble') && sibling.dataset.callId) {
+      activityItems.delete(sibling.dataset.callId);
+      activeRunningTools.delete(sibling.dataset.callId);
+    }
+    sibling.remove();
+    sibling = next;
+  }
+}
+
 async function handleRetry(errorElement = null, context = null, triggerBtn = null) {
   if (!currentProject || isAgentActive()) return;
   const retryBtn = triggerBtn || errorElement?.querySelector('.error-retry-btn') || document.querySelector('.message-retry-btn');
@@ -1166,7 +1435,12 @@ async function handleRetry(errorElement = null, context = null, triggerBtn = nul
       return;
     }
 
-    clearActivity();
+    const userIndex = (context && typeof context.userIndex === 'number' && context.userIndex >= 0)
+      ? context.userIndex
+      : -1;
+    pruneFeedAfterUserMessage(userIndex);
+    rewindUsageBucketsToUserIndex(userIndex);
+    activeRunningTools.clear();
     finalizeAllActiveCards();
     setThinking(true);
     scrollFeedToBottom(true);
@@ -1176,8 +1450,8 @@ async function handleRetry(errorElement = null, context = null, triggerBtn = nul
       reasoning_effort: getActiveReasoningEffort(),
       model_key: getActiveModelKey(),
     };
-    if (context && typeof context.userIndex === 'number' && context.userIndex >= 0) {
-      retryPayload.user_index = context.userIndex;
+    if (userIndex >= 0) {
+      retryPayload.user_index = userIndex;
     }
 
     const response = await api('/api/chat/retry', {
@@ -1354,15 +1628,7 @@ async function loadCurrentState() {
     } else if (data.status === 'idle') {
       setThinking(false);
       finalizeAllActiveCards();
-      const agentRunItem = activityItems.get('agent-run');
-      if (agentRunItem && (agentRunItem.status === 'started' || agentRunItem.status === 'running')) {
-        addToolMessage({
-          call_id: 'agent-run',
-          tool: 'agent',
-          status: 'stopped',
-          result: 'Agent is idle.',
-        });
-      }
+      markActivityRecovered();
     }
   }
 }
@@ -1383,20 +1649,25 @@ async function loadHistory(projectName) {
   const target = feed;
   try {
     const data = await api(`/api/projects/${encodeURIComponent(projectName)}/history`);
-    clearActivity();
+    clearActivity({ resetUsage: true });
     target.replaceChildren();
     clearQuestionArea();
     let renderedAny = false;
 
     let accumulatedReasoning = '';
+    const flushAccumulatedReasoning = () => {
+      if (accumulatedReasoning) {
+        addMessage('', 'agent', { target, reasoning: accumulatedReasoning });
+        accumulatedReasoning = '';
+        renderedAny = true;
+      }
+    };
+
     for (const evt of data.events) {
       const role = evt.role || '';
       if (role === 'user') {
-        if (accumulatedReasoning) {
-          addMessage('', 'agent', { target, reasoning: accumulatedReasoning });
-          accumulatedReasoning = '';
-          renderedAny = true;
-        }
+        flushAccumulatedReasoning();
+        startNewTurnUsageBucket();
         const userImages = extractHistoryImages(evt.content);
         const text = normalizeHistoryContent(evt.content);
         addMessage(text, 'user', { target, images: userImages });
@@ -1408,30 +1679,34 @@ async function loadHistory(projectName) {
             ? `${accumulatedReasoning}\n\n${reasoning}`
             : reasoning;
         }
+        const hasToolCalls = Array.isArray(evt.tool_calls) && evt.tool_calls.length > 0;
         if (!text) {
+          if (hasToolCalls && accumulatedReasoning) {
+            flushAccumulatedReasoning();
+          }
           continue;
         }
         const cleanReasoning = (text === accumulatedReasoning.trim()) ? '' : accumulatedReasoning;
         addMessage(text, 'agent', { target, reasoning: cleanReasoning });
         accumulatedReasoning = '';
         renderedAny = true;
+      } else if (evt.type === 'tool_status') {
+        flushAccumulatedReasoning();
+        const bubble = addToolMessage(evt.data, { target });
+        if (bubble) renderedAny = true;
       } else if (evt.type === 'agent_error') {
-        if (accumulatedReasoning) {
-          addMessage('', 'agent', { target, reasoning: accumulatedReasoning });
-          accumulatedReasoning = '';
-          renderedAny = true;
-        }
+        flushAccumulatedReasoning();
         addMessage(evt.data?.message || evt.content || 'Agent error.', 'error', { target });
         renderedAny = true;
       } else if (evt.type === 'agent_usage') {
         updateUsagePill(evt.data);
       } else if (showInfoMessages) {
-        addInfoMessage(evt.type, evt.data);
+        addInfoMessage(evt.type, evt.data, { target });
       }
     }
-    if (accumulatedReasoning) {
-      addMessage('', 'agent', { target, reasoning: accumulatedReasoning });
-      renderedAny = true;
+    flushAccumulatedReasoning();
+    if (!isAgentActive()) {
+      markActivityRecovered();
     }
     if (!renderedAny) restoreEmptyState(target, projectName);
   } catch (error) {
@@ -1439,25 +1714,13 @@ async function loadHistory(projectName) {
   }
 }
 
-function addInfoMessage(type, data = {}) {
-  if (type === 'agent_status') {
-    addToolMessage({
-      call_id: 'agent-run',
-      tool: 'agent',
-      status: data.status || 'info',
-      result: data.message,
-    });
-  } else if (type === 'tool_status') {
-    addToolMessage(data);
+function addInfoMessage(type, data = {}, options = {}) {
+  if (type === 'tool_status') {
+    addToolMessage(data, options);
   } else if (type === 'agent_usage') {
     updateUsagePill(data);
   } else if (type === 'agent_stopped') {
-    addToolMessage({
-      call_id: 'agent-run',
-      tool: 'agent',
-      status: 'stopped',
-      result: 'Agent task stopped.',
-    });
+    markActivityRecovered('stopped');
   }
 }
 
@@ -1701,12 +1964,7 @@ sendToggle?.addEventListener('click', async () => {
       const activeCard = getActiveCard();
       if (activeCard) setCardState(activeCard, 'stopped', 'Stopped');
       finalizeAllActiveCards();
-      addToolMessage({
-        call_id: 'agent-run',
-        tool: 'agent',
-        status: 'stopped',
-        result: 'Agent task stopped.',
-      });
+      markActivityRecovered('stopped');
     } catch (error) {
       addMessage(error.message, 'error');
     } finally {
@@ -2114,6 +2372,7 @@ function showQuestion(question) {
       });
       clearQuestionArea();
       finalizeAllActiveCards();
+      startNewTurnUsageBucket();
       addMessage(answerLines.join('\n'), 'user');
       getOrCreateRunCard(null, { optimistic: true });
       setThinking(true);
@@ -2142,7 +2401,7 @@ async function syncAfterStreamReset() {
 function applyConversationReset() {
   flushStreamingRender();
   activeRunCard = null;
-  clearActivity();
+  clearActivity({ resetUsage: true });
   feed?.replaceChildren();
   clearQuestionArea();
   restoreEmptyState(feed, currentProject);
@@ -2193,14 +2452,6 @@ function connectStream() {
         if (['stopped', 'failed', 'completed'].includes(data.status)) setBusyWithOther(null);
       }
       if (data.project !== currentProject) return;
-      if (!(data.status === 'completed' && activityItems.size > 0 && !activityItems.has('agent-run'))) {
-        addToolMessage({
-          call_id: 'agent-run',
-          tool: 'agent',
-          status: data.status || 'running',
-          result: data.message,
-        });
-      }
       const runId = data.run_id;
       const card = getActiveCard(runId);
 
@@ -2230,6 +2481,8 @@ function connectStream() {
         if (data.status === 'stopped' && card) setCardState(card, 'stopped', 'Stopped');
         else if (data.status === 'failed' && card) setCardState(card, 'error', 'Failed');
         if (data.status === 'completed') markActivityRecovered();
+        else if (data.status === 'stopped') markActivityRecovered('stopped');
+        else if (data.status === 'failed') markActivityRecovered('error');
         finalizeAllActiveCards();
         checkProviderBalance();
       }
@@ -2253,14 +2506,6 @@ function connectStream() {
         card.querySelector('.thought-disclosure')?.remove();
         renderAgentContent(card, '');
         setCardState(card, 'thinking', 'Retrying response...');
-      }
-      if (activityItems.has('agent-run')) {
-        addToolMessage({
-          call_id: 'agent-run',
-          tool: 'agent',
-          status: 'started',
-          result: 'Retrying response...',
-        });
       }
     },
     agent_reasoning_delta: data => {
@@ -2302,13 +2547,15 @@ function connectStream() {
           renderAgentContent(card, '');
         }
         if (data.has_tools) {
-          if (text) {
+          if (text || combined) {
+            if (combined) {
+              ensureThoughtDisclosure(card, combined, false, false);
+            }
             setCardState(card, 'done');
             if (activeRunCard === card) activeRunCard = null;
-            const nextCard = getOrCreateRunCard(runId);
-            setCardState(nextCard, 'working', 'Running tools');
           } else {
-            setCardState(card, 'working', 'Running tools');
+            card.remove();
+            if (activeRunCard === card) activeRunCard = null;
           }
         } else if (data.continuing) {
           setCardState(card, 'thinking', 'Continuing');
@@ -2330,36 +2577,7 @@ function connectStream() {
     },
     tool_status: data => {
       if (data.project !== currentProject) return;
-      addToolMessage(data);
-      const card = getActiveCard(data.run_id);
-      if (card && card.dataset.state !== 'done' && card.dataset.state !== 'error' && card.dataset.state !== 'stopped') {
-        if (data.status === 'completed' || data.status === 'error') {
-          if (activeRunningTools.size > 0) {
-            const nextCallId = [...activeRunningTools][0];
-            const nextItem = activityItems.get(nextCallId);
-            setCardState(card, 'working', nextItem ? activityLabel(nextItem.tool) : 'Working');
-          } else {
-            setCardState(card, 'thinking', 'Thinking');
-          }
-        } else if (data.status === 'rendering_views' || data.status === 'rendering_subset') {
-          setCardState(card, 'working', data.result || 'Rendering review views');
-        } else if (data.status === 'running' || data.status === 'preparing') {
-          let label = activityLabel(data.tool);
-          const path = data.arguments?.path;
-          if (path && (data.tool === 'read_file' || data.tool === 'write_file' || data.tool === 'edit_file')) {
-            const verb = data.tool === 'read_file' ? 'Reading' : (data.tool === 'write_file' ? 'Writing' : 'Editing');
-            label = `${verb} ${path}`;
-          } else if (data.result && typeof data.result === 'string' && data.result.length <= 40 && !data.result.startsWith('{')) {
-            label = data.result;
-          }
-          setCardState(card, 'working', label);
-        } else {
-          const label = (typeof data.result === 'string' && data.result.length <= 40 && !data.result.startsWith('{'))
-            ? data.result
-            : activityLabel(data.status || data.tool);
-          setCardState(card, 'working', label);
-        }
-      }
+      addToolMessage(data, { target: feed });
     },
     preview_updated: data => {
       if (data.project !== currentProject) return;
@@ -2392,14 +2610,9 @@ function connectStream() {
         else setCardState(card, 'error', 'Failed');
       }
       finalizeAllActiveCards();
+      markActivityRecovered('error');
       addMessage(data.message || 'Agent error.', 'error', {retryable: true});
       setThinking(false);
-      addToolMessage({
-        call_id: 'agent-run',
-        tool: 'agent',
-        status: 'failed',
-        result: data.message || 'Agent error.',
-      });
     },
     agent_stopped: data => {
       if (busyWithOtherProject && (data.project === busyWithOtherProject || (data.affected_projects && data.affected_projects.includes(busyWithOtherProject)))) {
@@ -2413,13 +2626,8 @@ function connectStream() {
         else setCardState(card, 'stopped', 'Stopped');
       }
       finalizeAllActiveCards();
+      markActivityRecovered('stopped');
       setThinking(false);
-      addToolMessage({
-        call_id: 'agent-run',
-        tool: 'agent',
-        status: 'stopped',
-        result: 'Agent task stopped.',
-      });
     },
     export_ready: async data => {
       if (data.project !== currentProject) return;
@@ -2504,12 +2712,7 @@ document.addEventListener('click', async event => {
     const allUserMessages = Array.from(feed?.querySelectorAll('.message.user') || []);
     const userIndex = allUserMessages.indexOf(messageEl);
 
-    let sibling = messageEl.nextElementSibling;
-    while (sibling) {
-      const next = sibling.nextElementSibling;
-      sibling.remove();
-      sibling = next;
-    }
+    pruneFeedAfterUserMessage(userIndex);
     await handleRetry(null, { userIndex }, messageRetryBtn);
     return;
   }

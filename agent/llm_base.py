@@ -42,6 +42,11 @@ PROVIDER_LABELS = {
     "ai_studio": "Google AI Studio",
     "vertex": "Google Cloud Vertex AI (gcloud)",
     "gcloud": "Google Cloud Vertex AI (gcloud)",
+    "mimo": "Xiaomi MiMo",
+    "xiaomi": "Xiaomi MiMo",
+    "xiaomi_mimo": "Xiaomi MiMo",
+    "xiaomi-mimo": "Xiaomi MiMo",
+    "xiaomi mimo": "Xiaomi MiMo",
 }
 
 
@@ -590,7 +595,7 @@ def sanitize_messages(
     return normalize_messages(relocated)
 
 
-MAX_HISTORICAL_IMAGE_BATCHES = 3
+MAX_HISTORICAL_IMAGE_BATCHES = 8
 
 
 def extract_usage_summary(usage: dict[str, Any] | None) -> dict[str, Any]:
@@ -700,11 +705,22 @@ def relocate_tool_images(
     relocated: list[dict[str, Any]] = []
     batch_images: list[dict[str, Any]] = []
     emitted_batch_indices: list[int] = []
+    historical_batch_indices: list[int] = []
+    batch_is_historical = False
+
+    last_real_user_idx = -1
+    for idx, message in enumerate(messages):
+        if message.get("role") == "user" and not message.get("synthetic"):
+            last_real_user_idx = idx
 
     def flush_batch_images() -> None:
+        nonlocal batch_is_historical
         if not batch_images:
             return
-        emitted_batch_indices.append(len(relocated))
+        emitted_idx = len(relocated)
+        emitted_batch_indices.append(emitted_idx)
+        if batch_is_historical:
+            historical_batch_indices.append(emitted_idx)
         relocated.append(
             {
                 "role": "user",
@@ -715,8 +731,9 @@ def relocate_tool_images(
             }
         )
         batch_images.clear()
+        batch_is_historical = False
 
-    for message in messages:
+    for idx, message in enumerate(messages):
         role = message.get("role")
         content = message.get("content")
         if (
@@ -751,18 +768,28 @@ def relocate_tool_images(
         else:
             tool_copy["content"] = "Visual inspection completed."
         relocated.append(tool_copy)
+        if not batch_images:
+            batch_is_historical = idx < last_real_user_idx
         batch_images.extend(deepcopy(part) for part in image_parts)
     flush_batch_images()
 
-    if max_image_batches > 0 and len(emitted_batch_indices) > max_image_batches:
-        for stale_idx in emitted_batch_indices[:-max_image_batches]:
-            relocated[stale_idx] = {
-                "role": "user",
-                "content": (
-                    f"{TOOL_IMAGE_PROMPT} "
-                    "[Earlier rendered view images omitted to preserve context window.]"
-                ),
-            }
+    omitted_msg = {
+        "role": "user",
+        "content": (
+            f"{TOOL_IMAGE_PROMPT} "
+            "[Earlier rendered view images omitted to preserve context window.]"
+        ),
+    }
+    evicted: set[int] = set()
+    if len(historical_batch_indices) > 1:
+        for stale_idx in historical_batch_indices[:-1]:
+            relocated[stale_idx] = dict(omitted_msg)
+            evicted.add(stale_idx)
+
+    remaining_indices = [i for i in emitted_batch_indices if i not in evicted]
+    if max_image_batches > 0 and len(remaining_indices) > max_image_batches:
+        for stale_idx in remaining_indices[:-max_image_batches]:
+            relocated[stale_idx] = dict(omitted_msg)
     return relocated
 
 
@@ -1027,6 +1054,8 @@ def iter_lines_with_cancel(
                 raise item
             yield item
     finally:
+        if not effective_stop.is_set():
+            reader_done.wait(timeout=0.25)
         closed_event.set()
         if reader_done.is_set() and not effective_stop.is_set():
             try:
@@ -1199,7 +1228,7 @@ def parse_chat_stream(
     provider_label: str,
     stop_event: threading.Event | None = None,
     stream_callback: Any | None = None,
-    idle_timeout: float = 180.0,
+    idle_timeout: float = 300.0,
 ) -> dict[str, Any]:
     """Consume an SSE Chat Completions stream and rebuild a non-streaming response."""
     content = ""
@@ -1242,19 +1271,17 @@ def parse_chat_stream(
             if not line:
                 continue
             line = line.strip()
-            if not line.startswith("data:"):
-                if finish_reason is not None and finish_time is not None:
-                    if last_usage is not None or (now - finish_time) >= 1.0:
-                        saw_done = True
-                        break
-                elif idle_timeout > 0 and (now - last_activity_time) >= idle_timeout:
-                    _force_close_response(response)
-                    raise StreamResponseError(
-                        f"{provider_label} stream timed out after {idle_timeout:.0f}s of inactivity.",
-                        retryable=not (content or tool_calls),
-                    )
+            if not line:
                 continue
+            # Reset inactivity timer on any non-empty SSE line or keep-alive frame.
             last_activity_time = now
+            if not line.startswith("data:"):
+                if finish_reason is not None and finish_time is not None and (
+                    last_usage is not None or (now - finish_time) >= 1.0
+                ):
+                    saw_done = True
+                    break
+                continue
             payload = line[5:].strip()
             if payload == "[DONE]":
                 saw_done = True
@@ -1275,9 +1302,6 @@ def parse_chat_stream(
                 last_usage = normalize_usage(chunk["usage"])
             choices = chunk.get("choices") or []
             if not choices:
-                if finish_reason is not None and isinstance(chunk.get("usage"), dict):
-                    saw_done = True
-                    break
                 continue
             choice = choices[0]
             if choice.get("finish_reason"):
@@ -1503,9 +1527,6 @@ def parse_chat_stream(
                             "arguments_delta": arguments_delta,
                         }
                     )
-            if finish_reason is not None and finish_reason != "error" and last_usage is not None:
-                saw_done = True
-                break
     except Exception:
         if stop_event and stop_event.is_set():
             _force_close_response(response)
@@ -1644,6 +1665,8 @@ def api_key_env(provider: str) -> str:
         return "OPENROUTER_API_KEY"
     if key in ("ollama",):
         return "OLLAMA_API_KEY"
+    if key in ("mimo", "xiaomi", "xiaomi_mimo", "xiaomi-mimo", "xiaomi mimo"):
+        return "MIMO_API_KEY"
     if key in ("vertex", "gcloud"):
         return ""
     if key in ("gemini", "google", "google ai studio", "aistudio", "google_ai_studio", "google-ai-studio", "ai_studio"):
@@ -1673,6 +1696,9 @@ def _clamp_payload_reasoning_on_retry(payload: dict[str, Any]) -> None:
     configs: list[dict[str, Any]] = []
     if isinstance(reasoning, dict):
         configs.append(reasoning)
+    thinking = payload.get("thinking")
+    if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+        thinking["type"] = "disabled"
     google = (payload.get("extra_body") or {}).get("google")
     for container in (google, payload.get("generation_config")):
         if isinstance(container, dict) and isinstance(container.get("thinking_config"), dict):
@@ -2120,6 +2146,10 @@ def _build_provider_client(provider: str, settings: Settings) -> BaseLLMClient:
         from agent.ollama_client import OllamaClient
 
         return OllamaClient(settings)
+    if canonical == "mimo":
+        from agent.mimo_client import MiMoClient
+
+        return MiMoClient(settings)
     if canonical in ("vertex", "gcloud"):
         from agent.vertex_client import VertexClient
 
@@ -2318,6 +2348,9 @@ class ChatCompletionsClient(BaseLLMClient):
     preserve_reasoning: bool = False
     requires_api_key: bool = True
 
+    def _idle_timeout(self) -> float:
+        return float(getattr(self.settings, "timeout_seconds", 300))
+
     def _stream_response(self, response: Any) -> dict[str, Any]:
         with self._response_lock:
             self._active_response = response
@@ -2327,6 +2360,7 @@ class ChatCompletionsClient(BaseLLMClient):
                 provider_label=self._provider_label,
                 stop_event=self.stop_event,
                 stream_callback=self.stream_callback,
+                idle_timeout=self._idle_timeout(),
             )
             usage = result.get("usage") if isinstance(result, dict) else None
             self.last_usage = usage if isinstance(usage, dict) else None

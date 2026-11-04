@@ -25,6 +25,10 @@ LLM_PROVIDERS = {
     "google_ai_studio",
     "google-ai-studio",
     "ai_studio",
+    "mimo",
+    "xiaomi",
+    "xiaomi_mimo",
+    "xiaomi-mimo",
 }
 _PROVIDER_ALIASES = {
     "google": "gemini",
@@ -33,6 +37,10 @@ _PROVIDER_ALIASES = {
     "google_ai_studio": "gemini",
     "google-ai-studio": "gemini",
     "ai_studio": "gemini",
+    "xiaomi": "mimo",
+    "xiaomi_mimo": "mimo",
+    "xiaomi-mimo": "mimo",
+    "xiaomi mimo": "mimo",
 }
 PROVIDER_LABELS = {
     "openrouter": "OpenRouter",
@@ -46,9 +54,19 @@ PROVIDER_LABELS = {
     "google-ai-studio": "Google AI Studio",
     "ai_studio": "Google AI Studio",
     "gcloud": "Google Cloud Vertex AI",
+    "mimo": "Xiaomi MiMo",
+    "xiaomi": "Xiaomi MiMo",
+    "xiaomi_mimo": "Xiaomi MiMo",
+    "xiaomi-mimo": "Xiaomi MiMo",
+    "xiaomi mimo": "Xiaomi MiMo",
 }
 # Built-in default model per provider when config.yaml lists none.
-_BUILTIN_MODELS = {"gemini": "gemini-3.8-flash", "vertex": "gemini-3.8-flash", "ollama": "qwen3.8:27b"}
+_BUILTIN_MODELS = {
+    "gemini": "gemini-3.8-flash",
+    "vertex": "gemini-3.8-flash",
+    "ollama": "qwen3.8:27b",
+    "mimo": "mimo-v2.6-flash",
+}
 
 
 def canonical_provider(provider: str) -> str:
@@ -147,6 +165,11 @@ class Settings:
     vertex_model: str = "gemini-3.8-flash"
     vertex_timeout_seconds: int = 300
     vertex_reasoning_effort: str | None = None
+    # Xiaomi MiMo Chat Completions adapter.
+    mimo_base_url: str = "https://api.xiaomimimo.com/v1"
+    mimo_model: str = "mimo-v2.6-flash"
+    mimo_timeout_seconds: int = 600
+    mimo_reasoning_effort: str | None = None
     # ── end provider selection ──
     show_info_messages: bool = True
     agent_tool_call_limit: int = 12
@@ -187,28 +210,50 @@ class Settings:
     @property
     def llm_model(self) -> str:
         """Return the model name of the active provider."""
-        if self.llm_provider == "openai":
+        provider = canonical_provider(self.llm_provider)
+        if provider == "openai":
             return self.openai_model
-        if self.llm_provider == "ollama":
+        if provider == "ollama":
             return self.ollama_model
-        if self.llm_provider in ("gemini", "google"):
+        if provider == "gemini":
             return self.gemini_model
-        if self.llm_provider in ("vertex", "gcloud"):
+        if provider == "vertex":
             return self.vertex_model
+        if provider == "mimo":
+            return self.mimo_model
         return self.openrouter_model
 
     @property
     def reasoning_effort(self) -> str | None:
         """Return the reasoning effort of the active provider."""
-        if self.llm_provider == "openai":
+        provider = canonical_provider(self.llm_provider)
+        if provider == "openai":
             return self.openai_reasoning_effort
-        if self.llm_provider == "ollama":
+        if provider == "ollama":
             return self.ollama_reasoning_effort
-        if self.llm_provider in ("gemini", "google"):
+        if provider == "gemini":
             return self.gemini_reasoning_effort
-        if self.llm_provider in ("vertex", "gcloud"):
+        if provider == "vertex":
             return self.vertex_reasoning_effort
+        if provider == "mimo":
+            return self.mimo_reasoning_effort
         return self.openrouter_reasoning_effort
+
+    @property
+    def timeout_seconds(self) -> int:
+        """Return the timeout in seconds of the active provider."""
+        provider = canonical_provider(self.llm_provider)
+        if provider == "openai":
+            return self.openai_timeout_seconds
+        if provider == "ollama":
+            return self.ollama_timeout_seconds
+        if provider == "gemini":
+            return self.gemini_timeout_seconds
+        if provider == "vertex":
+            return self.vertex_timeout_seconds
+        if provider == "mimo":
+            return self.mimo_timeout_seconds
+        return self.openrouter_timeout_seconds
 
 
 def with_reasoning_effort(settings: Settings, effort: str | None) -> Settings:
@@ -226,6 +271,8 @@ def with_reasoning_effort(settings: Settings, effort: str | None) -> Settings:
             updates["gemini_reasoning_effort"] = cleaned
         elif provider in ("vertex", "gcloud"):
             updates["vertex_reasoning_effort"] = cleaned
+        elif provider in ("mimo", "xiaomi"):
+            updates["mimo_reasoning_effort"] = cleaned
         elif provider == "openrouter":
             updates["openrouter_reasoning_effort"] = cleaned
     if not updates:
@@ -436,6 +483,7 @@ def _validate_auth_mode(val: Any, field_name: str) -> str:
 
 _MODEL_KEYS = {"label", "reasoning_effort"}
 _OPENROUTER_MODEL_KEYS = _MODEL_KEYS | {"providers", "force_provider", "reasoning_max_tokens"}
+_MIMO_MODEL_KEYS = _MODEL_KEYS | {"thinking", "think"}
 
 
 def _parse_model_options(
@@ -454,7 +502,12 @@ def _parse_model_options(
         raw = dict.fromkeys(raw)
     if not isinstance(raw, dict):
         raise TypeError(f"{provider}.models must be a mapping of model name to settings.")
-    allowed = _OPENROUTER_MODEL_KEYS if provider == "openrouter" else _MODEL_KEYS
+    if provider == "openrouter":
+        allowed = _OPENROUTER_MODEL_KEYS
+    elif provider in ("mimo", "xiaomi", "xiaomi_mimo", "xiaomi-mimo"):
+        allowed = _MIMO_MODEL_KEYS
+    else:
+        allowed = _MODEL_KEYS
     options: list[ModelOption] = []
     for raw_name, cfg in raw.items():
         model = str(raw_name).strip()
@@ -473,16 +526,26 @@ def _parse_model_options(
         )
         if force and len(order) > 1:
             raise ValueError(f"{field}: force_provider=true requires at most one provider.")
+
+        model_thinking = cfg.get("thinking")
+        if model_thinking is None and "think" in cfg:
+            model_thinking = cfg.get("think")
+        if model_thinking is not None:
+            if isinstance(model_thinking, bool):
+                model_effort = "" if model_thinking else "none"
+            else:
+                model_effort = _optional_effort(model_thinking)
+        elif "reasoning_effort" in cfg:
+            model_effort = _optional_effort(cfg["reasoning_effort"])
+        else:
+            model_effort = defaults.reasoning_effort
+
         options.append(
             ModelOption(
                 provider=provider,
                 model=model,
                 label=str(cfg.get("label") or model).strip(),
-                reasoning_effort=(
-                    _optional_effort(cfg["reasoning_effort"])
-                    if "reasoning_effort" in cfg
-                    else defaults.reasoning_effort
-                ),
+                reasoning_effort=model_effort,
                 provider_order=order,
                 force_provider=force,
                 reasoning_max_tokens=(
@@ -513,6 +576,13 @@ def load_settings(project_root: Path | None = None) -> Settings:
         or {}
     )
     vertex = config.get("vertex") or config.get("gcloud") or {}
+    mimo = (
+        config.get("mimo")
+        or config.get("xiaomi")
+        or config.get("xiaomi_mimo")
+        or config.get("xiaomi-mimo")
+        or {}
+    )
     server = config.get("server") or {}
     ui = config.get("ui") or {}
     agent = config.get("agent") or {}
@@ -549,6 +619,11 @@ def load_settings(project_root: Path | None = None) -> Settings:
         vertex,
         {"project_id", "location", "model", "models", "timeout_seconds", "reasoning_effort"},
         "vertex",
+    )
+    _reject_unknown(
+        mimo,
+        {"base_url", "model", "models", "timeout_seconds", "reasoning_effort", "thinking", "think"},
+        "mimo",
     )
     _reject_unknown(
         agent,
@@ -666,6 +741,7 @@ def load_settings(project_root: Path | None = None) -> Settings:
         "ollama": ollama,
         "gemini": gemini,
         "vertex": vertex,
+        "mimo": mimo,
     }
     provider_defaults = {
         name: ModelOption(
@@ -678,6 +754,19 @@ def load_settings(project_root: Path | None = None) -> Settings:
     }
     provider_defaults["ollama"] = replace(
         provider_defaults["ollama"], reasoning_effort=ollama_reasoning_effort
+    )
+    mimo_thinking = mimo.get("thinking")
+    if mimo_thinking is None and "think" in mimo:
+        mimo_thinking = mimo.get("think")
+    if mimo_thinking is not None:
+        if isinstance(mimo_thinking, bool):
+            mimo_default_effort = "" if mimo_thinking else "none"
+        else:
+            mimo_default_effort = _optional_effort(mimo_thinking)
+    else:
+        mimo_default_effort = _optional_effort(mimo.get("reasoning_effort"))
+    provider_defaults["mimo"] = replace(
+        provider_defaults["mimo"], reasoning_effort=mimo_default_effort
     )
     provider_defaults["openrouter"] = replace(
         provider_defaults["openrouter"],
@@ -745,6 +834,9 @@ def load_settings(project_root: Path | None = None) -> Settings:
         vertex_location=str(vertex.get("location") or "us-central1").strip(),
         vertex_timeout_seconds=_validate_timeout_seconds(vertex.get("timeout_seconds"), "vertex.timeout_seconds"),
         vertex_reasoning_effort=provider_defaults["vertex"].reasoning_effort,
+        mimo_base_url=str(mimo.get("base_url") or "https://api.xiaomimimo.com/v1").rstrip("/"),
+        mimo_timeout_seconds=_validate_timeout_seconds(mimo.get("timeout_seconds"), "mimo.timeout_seconds", default=600),
+        mimo_reasoning_effort=provider_defaults["mimo"].reasoning_effort,
         show_info_messages=_strict_bool(ui.get("show_info_messages", True), "ui.show_info_messages"),
         agent_tool_call_limit=_positive_int(agent.get("tool_call_limit", 12), "agent.tool_call_limit"),
         revision_retention_count=_non_negative_int(agent.get("revision_retention_count", 0), "agent.revision_retention_count"),
@@ -825,11 +917,18 @@ def _parse_provider_order(value: Any) -> tuple[str, ...]:
 
 def _optional_effort(value: Any) -> str | None:
     effort = _optional_string(value)
-    if effort is not None and effort not in REASONING_EFFORTS:
+    if effort is None:
+        return None
+    cleaned = effort.lower()
+    if cleaned in ("enabled", "true", "on"):
+        return ""
+    if cleaned in ("disabled", "false", "off"):
+        return "none"
+    if cleaned not in REASONING_EFFORTS:
         raise ValueError(
-            "reasoning_effort must be none, minimal, low, medium, high, xhigh, or max."
+            "reasoning_effort must be none, minimal, low, medium, high, xhigh, max, enabled, or disabled."
         )
-    return effort
+    return cleaned
 
 
 def _positive_int(value: Any, name: str) -> int:
