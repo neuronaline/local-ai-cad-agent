@@ -15,7 +15,7 @@ from xml.sax.saxutils import escape as xml_escape, unescape as xml_unescape
 import zipfile
 
 from agent.revisions import compute_model_sha256
-from agent.sandbox import _BWRAP, command as sandbox_command
+from agent.sandbox import OPENSCAD_LIBRARY_DIR, _BWRAP, command as sandbox_command
 from agent.tools.cad_scripts.renderer import load_stl, render_iso
 from agent.tools.cad_tool import _supports_manifold
 
@@ -1090,6 +1090,11 @@ def _run_openscad_export(
                 pass_fds=(seccomp_fd,),
             )
         else:
+            fallback_env = (
+                {**os.environ, "OPENSCADPATH": str(OPENSCAD_LIBRARY_DIR)}
+                if OPENSCAD_LIBRARY_DIR.is_dir()
+                else None
+            )
             proc = subprocess.run(
                 [openscad_bin, *scad_args],
                 capture_output=True,
@@ -1097,6 +1102,7 @@ def _run_openscad_export(
                 timeout=timeout_seconds,
                 check=False,
                 cwd=str(project_dir) if in_workspace else None,
+                env=fallback_env,
             )
         if proc.returncode != 0 or not _cached(temp_file):
             err_msg = (proc.stderr or proc.stdout).strip()

@@ -18,7 +18,7 @@ from agent.io import atomic_write_bytes
 from agent.llm_base import RequestCancelled
 from agent.review_paths import review_dir
 from agent.revisions import MODEL_FILENAME, RevisionIntegrityError, RevisionStore
-from agent.sandbox import command as sandbox_command
+from agent.sandbox import OPENSCAD_LIBRARY_DIR, command as sandbox_command
 from agent.tools.cad_verifier import CadVerifier, verification_passed
 from agent.tools.file_tool import FileTool
 from agent.tools.process_runner import (
@@ -75,7 +75,7 @@ def _supports_manifold() -> bool:
 
 
 def _toolchain_id() -> str:
-    """Return a stable fingerprint of the host OpenSCAD version and CSG backend."""
+    """Return a stable fingerprint of the host OpenSCAD version, CSG backend, and bundled BOSL2."""
     global _TOOLCHAIN_ID
     if _TOOLCHAIN_ID is not None:
         return _TOOLCHAIN_ID
@@ -94,7 +94,11 @@ def _toolchain_id() -> str:
     except (subprocess.SubprocessError, OSError):
         pass
     manifold = _supports_manifold()
-    payload = f"{version_out}|manifold={int(manifold)}"
+    try:
+        bosl2_meta = (OPENSCAD_LIBRARY_DIR / "BOSL2" / "VENDORED").read_text(encoding="utf-8").strip()
+    except OSError:
+        bosl2_meta = ""
+    payload = f"{version_out}|manifold={int(manifold)}|bosl2={bosl2_meta}"
     _TOOLCHAIN_ID = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
     return _TOOLCHAIN_ID
 

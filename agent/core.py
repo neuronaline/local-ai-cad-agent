@@ -2158,7 +2158,12 @@ class AgentRunner:
                 history.append(user_message)
                 self._append_message(project_dir, user_message)
         return [
-            {"role": "system", "content": get_system_prompt()},
+            {
+                "role": "system",
+                "content": get_system_prompt(
+                    bosl2_enabled=eff_settings.openscad_bosl2_enabled
+                ),
+            },
             self._project_state_message(
                 project_dir,
                 history,

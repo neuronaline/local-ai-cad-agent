@@ -17,7 +17,7 @@ A local-first web application for **creating and refining parametric 3D CAD mode
 
 ## ✨ Features
 
-- **Chat-Driven Parametric CAD:** Authors and edits clean, parametric OpenSCAD (`model.scad`) from text prompts and reference images.
+- **Chat-Driven Parametric CAD:** Authors and edits clean, parametric OpenSCAD (`model.scad`) from text prompts and reference images, with bundled [BOSL2](https://github.com/BelfrySCAD/BOSL2) support for threads, gears, fasteners, joiners, and edge rounding.
 - **Deterministic Verification & Visual Review:** Validates manifold topology, volume, and bounds on every build, and renders an 8-view canonical contact sheet so the agent can visually inspect its own geometry.
 - **Sandboxed Execution:** Runs OpenSCAD and math scripts inside an isolated Linux Bubblewrap (`bwrap`) container with detached networking, read-only system mounts, and `libseccomp` syscall filtering.
 - **Interactive 3D Viewport & History:** Live Three.js preview, camera presets, wireframe/grid toggles, source diffs, and one-click revision rollbacks.

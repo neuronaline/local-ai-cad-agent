@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 _BWRAP = shutil.which("bwrap")
+OPENSCAD_LIBRARY_DIR = Path(__file__).resolve().parent.parent / "vendor" / "openscad"
 _DENIED_SYSCALLS = (
     "ptrace",
     "process_vm_readv",
@@ -135,6 +136,11 @@ def command(
     except Exception:
         pass
 
+    openscad_env_vars: list[str] = []
+    if OPENSCAD_LIBRARY_DIR.is_dir():
+        extra_binds.extend(["--ro-bind", str(OPENSCAD_LIBRARY_DIR), "/openscad-libraries"])
+        openscad_env_vars.extend(["--setenv", "OPENSCADPATH", "/openscad-libraries"])
+
     sandbox = [
         _BWRAP,
         "--die-with-parent",
@@ -169,6 +175,7 @@ def command(
         "--setenv", "TMPDIR", "/tmp",
         "--setenv", "LANG", "C.UTF-8",
         *python_env_vars,
+        *openscad_env_vars,
         "--setenv", "OPENBLAS_NUM_THREADS", "1",
         "--setenv", "MKL_NUM_THREADS", "1",
         "--setenv", "OMP_NUM_THREADS", "1",

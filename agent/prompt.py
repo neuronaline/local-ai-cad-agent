@@ -8,13 +8,17 @@ from string import Template
 _PLAYBOOK_PATH = (
     Path(__file__).resolve().parent / "resources" / "openscad_cli_playbook.md"
 )
+_BOSL2_PLAYBOOK_PATH = (
+    Path(__file__).resolve().parent / "resources" / "bosl2_playbook.md"
+)
 
 _SUFFIX_FORMAT = """\n<openscad_cli_playbook>\n{playbook}\n</openscad_cli_playbook>"""
+_BOSL2_SUFFIX_FORMAT = """\n<bosl2_playbook>\n{bosl2_playbook}\n</bosl2_playbook>"""
 
-# Set ``CAD_AGENT_PROMPT_HOT_RELOAD=1`` to make ``PromptCache.get_playbook``
-# re-stat and re-read the playbook on every prompt request. Off by default
-# because the playbook is a static markdown file shipped with the agent;
-# stat'ing it on every LLM call adds a syscall per request for no payoff.
+# Set ``CAD_AGENT_PROMPT_HOT_RELOAD=1`` to make ``PromptCache`` re-stat and
+# re-read the playbooks on every prompt request. Off by default because the
+# playbooks are static markdown files shipped with the agent;
+# stat'ing them on every LLM call adds a syscall per request for no payoff.
 _HOT_RELOAD_ENV = "CAD_AGENT_PROMPT_HOT_RELOAD"
 
 _DESIGN_PRINCIPLES = """\
@@ -109,8 +113,8 @@ def _render_base_prompt() -> str:
 _BASE_PROMPT = _render_base_prompt()
 
 
-def _read_playbook_once() -> str:
-    """Read the playbook from disk at import time.
+def _read_playbook_once(path: Path) -> str:
+    """Read a playbook file from disk at import time.
 
     Reading on every prompt call added a syscall per LLM request for a
     static markdown file; instead we read it once at module import and
@@ -118,43 +122,65 @@ def _read_playbook_once() -> str:
     env var opts back into the per-call re-read for development.
     """
     try:
-        return _PLAYBOOK_PATH.read_text(encoding="utf-8").strip()
+        return path.read_text(encoding="utf-8").strip()
     except OSError:
         return ""
 
 
-_BOOTSTRAP_PLAYBOOK = _read_playbook_once()
+_BOOTSTRAP_PLAYBOOK = _read_playbook_once(_PLAYBOOK_PATH)
+_BOOTSTRAP_BOSL2_PLAYBOOK = _read_playbook_once(_BOSL2_PLAYBOOK_PATH)
 
 
 class PromptCache:
     """Lazy, mtime-aware prompt with embedded playbook content.
 
-    The playbook is loaded once at module import (``_BOOTSTRAP_PLAYBOOK``)
-    so the hot path does not stat or read the file on every request. The
-    ``hot_reload`` constructor flag (or the
+    The playbooks are loaded once at module import (``_BOOTSTRAP_PLAYBOOK``,
+    ``_BOOTSTRAP_BOSL2_PLAYBOOK``) so the hot path does not stat or read the
+    files on every request. The ``hot_reload`` constructor flag (or the
     ``CAD_AGENT_PROMPT_HOT_RELOAD`` env var) opts back into the original
-    mtime-aware behaviour for local development.
+    mtime-aware behaviour for local development. ``bosl2_enabled`` controls
+    whether the BOSL2 playbook is appended after the OpenSCAD CLI playbook.
     """
 
-    def __init__(self, *, hot_reload: bool | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        hot_reload: bool | None = None,
+        bosl2_enabled: bool = True,
+    ) -> None:
         self._content: str | None = None
-        self._playbook_content: str | None = None
-        self._playbook_mtime: float | None = None
-        self._last_playbook: str | None = None
+        self._last_playbooks: tuple[str, str] | None = None
+        self._hot_entries: dict[Path, tuple[float, str]] = {}
+        self._bosl2_enabled: bool = bool(bosl2_enabled)
         if hot_reload is None:
             hot_reload = os.environ.get(_HOT_RELOAD_ENV, "") == "1"
         self._hot_reload: bool = hot_reload
 
     def get(self) -> str:
-        playbook = self.get_playbook()
-        if self._content is not None and playbook == self._last_playbook:
+        playbooks = (
+            self.get_playbook(),
+            self.get_bosl2_playbook() if self._bosl2_enabled else "",
+        )
+        if self._content is not None and playbooks == self._last_playbooks:
             return self._content
-        self._content = _BASE_PROMPT + _SUFFIX_FORMAT.format(playbook=playbook)
-        self._last_playbook = playbook
-        return self._content
+        playbook, bosl2_playbook = playbooks
+        content = _BASE_PROMPT + _SUFFIX_FORMAT.format(playbook=playbook)
+        if bosl2_playbook:
+            content += _BOSL2_SUFFIX_FORMAT.format(bosl2_playbook=bosl2_playbook)
+        self._content = content
+        self._last_playbooks = playbooks
+        return content
 
     def get_playbook(self) -> str:
-        """Return the playbook content.
+        """Return the OpenSCAD CLI playbook content."""
+        return self._read_playbook(_PLAYBOOK_PATH, _BOOTSTRAP_PLAYBOOK)
+
+    def get_bosl2_playbook(self) -> str:
+        """Return the BOSL2 playbook content."""
+        return self._read_playbook(_BOSL2_PLAYBOOK_PATH, _BOOTSTRAP_BOSL2_PLAYBOOK)
+
+    def _read_playbook(self, path: Path, bootstrap: str) -> str:
+        """Return one playbook's content.
 
         Default: return the module-import snapshot, no filesystem calls.
         With ``hot_reload=True``: re-stat the file and re-read only when
@@ -162,38 +188,40 @@ class PromptCache:
         iterating on the playbook content during development).
         """
         if not self._hot_reload:
-            if self._playbook_content is None:
-                self._playbook_content = _BOOTSTRAP_PLAYBOOK
-            return self._playbook_content
+            return bootstrap
         try:
-            stat = _PLAYBOOK_PATH.stat()
-            mtime = stat.st_mtime
+            mtime = path.stat().st_mtime
         except OSError:
             mtime = -1.0
-        if self._playbook_content is not None and self._playbook_mtime == mtime:
-            return self._playbook_content
-        self._playbook_content = (
-            _PLAYBOOK_PATH.read_text(encoding="utf-8").strip() if mtime >= 0 else ""
-        )
-        self._playbook_mtime = mtime
-        return self._playbook_content
+        cached = self._hot_entries.get(path)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        content = path.read_text(encoding="utf-8").strip() if mtime >= 0 else ""
+        self._hot_entries[path] = (mtime, content)
+        return content
 
     def hash(self) -> str:
         """Stable hash for cache-busting / session-reset detection."""
         return hashlib.sha256(self.get().encode("utf-8")).hexdigest()
 
 
-_PROMPT_CACHE = PromptCache()
+# One cache per ``openscad.bosl2.enabled`` value, keyed by that flag.
+_PROMPT_CACHES: dict[bool, PromptCache] = {
+    True: PromptCache(bosl2_enabled=True),
+    False: PromptCache(bosl2_enabled=False),
+}
 
 
-def get_system_prompt() -> str:
-    """Return the latest system prompt, using the cached playbook by default."""
-    return _PROMPT_CACHE.get()
+def get_system_prompt(*, bosl2_enabled: bool = True) -> str:
+    """Return the latest system prompt, using the cached playbooks by default."""
+    return _PROMPT_CACHES[bool(bosl2_enabled)].get()
 
 
-def get_prompt_cache_key(namespace: str | None = None) -> str:
+def get_prompt_cache_key(
+    namespace: str | None = None, *, bosl2_enabled: bool = True
+) -> str:
     """Return a stable, bounded routing key for one prompt/session pair."""
-    key = f"local-ai-cad-agent:{_PROMPT_CACHE.hash()[:16]}"
+    key = f"local-ai-cad-agent:{_PROMPT_CACHES[bool(bosl2_enabled)].hash()[:16]}"
     if namespace:
         session_hash = hashlib.sha256(namespace.encode("utf-8")).hexdigest()[:16]
         key = f"{key}:{session_hash}"

@@ -199,6 +199,7 @@ class Settings:
     user_nozzle: str = ""
     user_filament: str = "PLA"
     user_additional_info: str = ""
+    openscad_bosl2_enabled: bool = True
     # ── Configured model catalog ──
     available_models: tuple[ModelOption, ...] = ()
 
@@ -595,6 +596,13 @@ def load_settings(project_root: Path | None = None) -> Settings:
         {"printer", "nozzle", "filament", "additional_info"},
         "user",
     )
+    openscad_cfg = config.get("openscad") or {}
+    _reject_unknown(openscad_cfg, {"bosl2"}, "openscad")
+    bosl2_cfg = openscad_cfg.get("bosl2") or {}
+    _reject_unknown(bosl2_cfg, {"enabled"}, "openscad.bosl2")
+    openscad_bosl2_enabled = _strict_bool(
+        bosl2_cfg.get("enabled", True), "openscad.bosl2.enabled"
+    )
     _reject_unknown(
         ollama,
         {"base_url", "model", "models", "timeout_seconds", "reasoning_effort", "think"},
@@ -858,6 +866,7 @@ def load_settings(project_root: Path | None = None) -> Settings:
         user_nozzle=str(user_cfg.get("nozzle") or "").strip(),
         user_filament=str(user_cfg.get("filament") or "PLA").strip() or "PLA",
         user_additional_info=str(user_cfg.get("additional_info") or "").strip(),
+        openscad_bosl2_enabled=openscad_bosl2_enabled,
         available_models=tuple(catalog),
     )
     # Activate each provider's default model (its effort/routing override the

@@ -50,7 +50,10 @@ class OpenAIClient(ChatCompletionsClient):
         payload: dict[str, Any] = {
             "model": self.settings.openai_model,
             "messages": wire_messages,
-            "prompt_cache_key": get_prompt_cache_key(self.session_id),
+            "prompt_cache_key": get_prompt_cache_key(
+                self.session_id,
+                bosl2_enabled=self.settings.openscad_bosl2_enabled,
+            ),
             "stream": True,
             "stream_options": {"include_usage": True},
         }

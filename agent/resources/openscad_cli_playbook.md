@@ -80,6 +80,8 @@ OpenSCAD requires watertight 2-manifold meshes. Eliminate coplanar faces and zer
 
 ## 5. Standard Helper Modules
 
+*When the BOSL2 Playbook is active in the system prompt, prefer `BOSL2` modules (`cuboid`, `cyl`, `threaded_rod`, `screw_hole`, `spur_gear`, `dovetail`, `teardrop`) for rounded bodies, threads, fasteners, gears, and joiners; use the plain OpenSCAD helpers below for standalone scripts or simple geometry.*
+
 ```scad
 // Rounded box on XY plane, base at Z = 0
 module rounded_box(w, l, h, r) {

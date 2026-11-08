@@ -64,6 +64,63 @@ def invalidate_model_file_lock(project_dir: Path) -> None:
 class OpenScadPreflight:
     """Catch deterministic OpenSCAD mistakes and unsafe patterns before running CLI."""
 
+    BOSL2_RESERVED_CONSTANTS: frozenset[str] = frozenset({
+        "LEFT",
+        "RIGHT",
+        "FRONT",
+        "FWD",
+        "FORWARD",
+        "BACK",
+        "BOTTOM",
+        "BOT",
+        "DOWN",
+        "TOP",
+        "UP",
+        "CENTER",
+        "CTR",
+        "CENTRE",
+        "INCH",
+        "EPSILON",
+        "INF",
+        "NAN",
+        "PHI",
+        "IDENT",
+        "SEGMENT",
+        "RAY",
+        "LINE",
+        "EDGES_ALL",
+        "EDGES_NONE",
+        "CORNERS_ALL",
+        "CORNERS_NONE",
+        "EDGE_OFFSETS",
+        "CORNER_OFFSETS",
+        "EMPTY_VNF",
+        "BOSL_VERSION",
+        "BOSL2_SHAPES2D",
+    })
+    _3D_PRIMITIVES: tuple[str, ...] = (
+        "cube",
+        "cylinder",
+        "sphere",
+        "polyhedron",
+        "cuboid",
+        "cyl",
+        "xcyl",
+        "ycyl",
+        "zcyl",
+        "prismoid",
+        "tube",
+        "rect_tube",
+        "spheroid",
+        "torus",
+        "teardrop",
+        "onion",
+    )
+    # 3D minkowski() plus the BOSL2 wrappers built on it (round3d() stacks three offset3d() calls).
+    MINKOWSKI_PATTERN = re.compile(r"\b(minkowski|offset3d|minkowski_difference|round3d)\s*\(")
+    _BOSL2_IMPORT_PATTERN = re.compile(r"\b(include|use)\s*<\s*BOSL2/([^>]+)>")
+    _UPPER_ASSIGN_PATTERN = re.compile(r"^[ \t]*([A-Z][A-Z0-9_]*)[ \t]*=(?!=)", re.MULTILINE)
+
     def __init__(self) -> None:
         self.warnings: list[str] = []
         self.blocked_errors: list[str] = []
@@ -112,7 +169,7 @@ class OpenScadPreflight:
             )
             return
 
-        # 2. Check for unsafe file inclusions / path traversal
+        # 2. Check for unsafe file inclusions / path traversal & BOSL2 include rules
         inc_matches = re.findall(r"(?:include|use)\s*<([^>]+)>", clean_code)
         for inc_path in inc_matches:
             inc_path = inc_path.strip()
@@ -123,6 +180,25 @@ class OpenScadPreflight:
                 )
                 return
 
+        for kind, line_num, detail in self.check_bosl2_imports(clean_code):
+            if kind == "use":
+                self.blocked_errors.append(
+                    f"Invalid BOSL2 import at line {line_num}: 'use <BOSL2/{detail}>' strips global "
+                    f"constants (TOP, BOTTOM, CENTER) and causes assertion failures. Use 'include <BOSL2/{detail}>'."
+                )
+                return
+            if kind == "reserved":
+                self.blocked_errors.append(
+                    f"Reserved BOSL2 constant '{detail}' reassigned at line {line_num}. "
+                    f"Overwriting '{detail}' corrupts BOSL2 direction vectors or internal math. "
+                    f"{self.reserved_constant_fix(detail)}"
+                )
+                return
+            self.warnings.append(
+                f"PRE-FLIGHT WARNING: 'include <BOSL2/{detail}>' at line {line_num} used without "
+                "'include <BOSL2/std.scad>'. Always include <BOSL2/std.scad> first."
+            )
+
         # 3. Check balanced delimiters
         delimiter_err = self.check_delimiters(code)
         if delimiter_err:
@@ -130,13 +206,14 @@ class OpenScadPreflight:
             self.blocked_errors.append(err_msg)
             return
 
-        # 4. Block minkowski() and extreme facet/slice counts that lock up OpenSCAD
-        minkowski_match = re.search(r"\bminkowski\s*\(", clean_code)
+        # 4. Block minkowski(), BOSL2 3D minkowski wrappers, and extreme facet/slice counts
+        minkowski_match = self.MINKOWSKI_PATTERN.search(clean_code)
         if minkowski_match:
+            fn_name = minkowski_match.group(1)
             line_num = clean_code[: minkowski_match.start()].count("\n") + 1
             self.blocked_errors.append(
-                f"Unsafe CSG operation: minkowski() at line {line_num} causes severe OpenSCAD "
-                "CSG lockups and timeouts. Use 2D offset() before extrusion or hull() instead."
+                f"Unsafe CSG operation: {fn_name}() at line {line_num} causes severe OpenSCAD "
+                "CSG lockups and timeouts. Use 2D offset() / offset_sweep() or cuboid()/cyl() rounding instead."
             )
             return
 
@@ -204,6 +281,44 @@ class OpenScadPreflight:
             results.append((line_num, m.group(1)))
         return results
 
+    @classmethod
+    def check_bosl2_imports(cls, clean_code: str) -> list[tuple[str, int, str]]:
+        """Return (kind, line_num, detail) BOSL2 import problems, most severe kinds first.
+
+        Kinds: ``use`` (detail: sub-library imported with ``use``), ``reserved``
+        (detail: BOSL2 constant reassigned while BOSL2 is included), and
+        ``missing_std`` (detail: first sub-library included without ``std.scad``).
+        """
+        uses: list[tuple[str, int, str]] = []
+        includes: list[tuple[int, str]] = []
+        for m in cls._BOSL2_IMPORT_PATTERN.finditer(clean_code):
+            line_num = clean_code[: m.start()].count("\n") + 1
+            sub_lib = m.group(2).strip()
+            if m.group(1) == "use":
+                uses.append(("use", line_num, sub_lib))
+            else:
+                includes.append((line_num, sub_lib))
+        if not includes:
+            return uses
+        reserved = [
+            ("reserved", clean_code[: m.start()].count("\n") + 1, m.group(1))
+            for m in cls._UPPER_ASSIGN_PATTERN.finditer(clean_code)
+            if m.group(1) in cls.BOSL2_RESERVED_CONSTANTS
+        ]
+        missing_std = (
+            [("missing_std", *includes[0])]
+            if all(sub_lib != "std.scad" for _, sub_lib in includes)
+            else []
+        )
+        return uses + reserved + missing_std
+
+    @staticmethod
+    def reserved_constant_fix(name: str) -> str:
+        """Return the rename advice for a clobbered BOSL2 constant."""
+        if name == "EPSILON":
+            return "Use 'EPS = 0.01;' for cutter overlap instead."
+        return f"Rename the parameter descriptively (e.g. '{name}_THICK' instead of '{name}')."
+
     @staticmethod
     def _consume_balanced_parens(text: str, start_after_open_paren: int) -> int | None:
         """Return index immediately after the matching ')' or None if unbalanced."""
@@ -264,7 +379,8 @@ class OpenScadPreflight:
                         stmt_end = block.find(";", p_rest)
                         proj_ranges.append((p_m.start(), stmt_end + 1 if stmt_end != -1 else len(block)))
 
-                for prim_m in re.finditer(r"\b(cube|cylinder|sphere|polyhedron)\s*\(", block):
+                prim_pat = rf"\b({'|'.join(cls._3D_PRIMITIVES)})\s*\("
+                for prim_m in re.finditer(prim_pat, block):
                     p_start = prim_m.start()
                     if any(pr_start <= p_start < pr_end for pr_start, pr_end in proj_ranges):
                         continue
@@ -275,7 +391,7 @@ class OpenScadPreflight:
                 child_m = re.match(r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", clean_code[rest_idx:])
                 if child_m:
                     child_name = child_m.group(1)
-                    if child_name in ("cube", "cylinder", "sphere", "polyhedron"):
+                    if child_name in cls._3D_PRIMITIVES:
                         line_num = clean_code[:rest_idx].count("\n") + 1
                         results.append((line_num, ext_name, child_name))
         return results

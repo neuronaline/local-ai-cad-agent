@@ -1241,10 +1241,14 @@ def _run_model(
         except subprocess.TimeoutExpired:
             uncommented = re.sub(r"//[^\n]*|/\*[\s\S]*?\*/", "", model_code)
             culprits: list[str] = []
-            if re.search(r"\bminkowski\s*\(", uncommented):
-                culprits.append("minkowski()")
+            if re.search(r"\b(minkowski|offset3d|minkowski_difference|round3d)\s*\(", uncommented):
+                culprits.append("minkowski()/offset3d()/round3d()")
             if re.search(r"\blinear_extrude\s*\([^)]*\btwist\s*=", uncommented):
                 culprits.append("twisted linear_extrude() (keep $fn <= 36 and slices <= turns*18)")
+            if re.search(r"\b(threaded_rod|threaded_nut|trapezoidal_threaded_rod|acme_threaded_rod|screw_hole)\s*\(", uncommented):
+                culprits.append("BOSL2 threads/screws with high $fn (keep $fn <= 36)")
+            if re.search(r"\b(texture\s*=|path_sweep\s*\(|offset_sweep\s*\(|skin\s*\(|vnf_)", uncommented):
+                culprits.append("complex BOSL2 sweeps/textures (reduce $fn or remove texture=)")
             if re.search(r"\bhull\s*\(", uncommented) and re.search(r"\bfor\s*\(", uncommented):
                 culprits.append("hull() inside for() loops")
             hint_suffix = (
@@ -1260,12 +1264,20 @@ def _run_model(
 
         if ret != 0 or not preview_stl.is_file() or preview_stl.stat().st_size == 0:
             err_detail = (stderr or stdout).strip()
-            lines = [
-                line
-                for line in err_detail.splitlines()
-                if any(k in line.lower() for k in ("error", "warning", "syntax", "can't", "cgal", "expr:"))
-            ]
-            summary = "\n".join(lines) if lines else err_detail[-1000:]
+            raw_lines = err_detail.splitlines()
+            lines: list[str] = []
+            capture_next = False
+            for line in raw_lines:
+                low = line.lower()
+                if any(k in low for k in ("error", "warning", "syntax", "can't", "cgal", "expr:")):
+                    lines.append(line)
+                    capture_next = "assertion" in low and "failed" in low
+                elif capture_next:
+                    lines.append(line)
+                    capture_next = False
+                elif "trace:" in low and "model.scad" in low:
+                    lines.append(line)
+            summary = "\n".join(lines[:25]) if lines else err_detail[-1000:]
             raise RuntimeError(f"OpenSCAD execution failed:\n{summary or 'OpenSCAD produced no output or an empty STL.'}")
 
     compiler_warnings: list[dict[str, Any]] = []

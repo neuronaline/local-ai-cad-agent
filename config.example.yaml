@@ -103,6 +103,10 @@ review:
   render_workers: 4
   required_views: 8
 
+openscad:
+  bosl2:
+    enabled: true               # Inject BOSL2 library playbook into the agent's system prompt
+
 # ── 4. User 3D Printing Setup ────────────────────────────────────────────────
 user:
   printer: ""                   # 3D printer / device model (e.g. Bambu Lab A1, Prusa MK4, Ender 3)

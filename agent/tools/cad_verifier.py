@@ -49,6 +49,19 @@ class Finding:
 
 _clean_code_preserve_lines = OpenScadPreflight.clean_code_preserve_lines
 
+# Lowercased BOSL2 modules/functions/constants whose "Ignoring unknown ..." compiler
+# warnings indicate a missing BOSL2 include (matched exactly, not as substrings).
+_BOSL2_HINT_SYMBOLS: frozenset[str] = frozenset({
+    "cuboid", "cyl", "xcyl", "ycyl", "zcyl", "prismoid", "tube", "rect_tube", "teardrop",
+    "spheroid", "torus", "diff", "tag", "attach", "position", "align", "move", "up", "down",
+    "left", "right", "fwd", "back", "xrot", "yrot", "zrot", "top", "bottom", "bot", "center",
+    "ctr", "threaded_rod", "threaded_nut", "trapezoidal_threaded_rod", "screw_hole",
+    "nut_trap_side", "nut_trap_inline", "spur_gear", "ring_gear", "rack", "gear_dist",
+    "dovetail", "snap_pin", "snap_pin_socket", "offset_sweep", "round_corners", "os_chamfer",
+    "os_circle", "knuckle_hinge", "hex_panel", "generic_bottle_neck", "generic_bottle_cap",
+    "pco1881_neck", "pco1881_cap",
+})
+
 MIN_FEATURE_RATIO = 0.50
 TWO_PERIMETER_RATIO = 1.65
 MIN_LAYER_HEIGHT_MM = 0.08
@@ -379,15 +392,17 @@ class CadVerifier:
             syntax_error = True
 
         for line_num, line in enumerate(clean_code.splitlines(), start=1):
-            # 3. Minkowski ban
-            if re.search(r"\bminkowski\s*\(", line):
+            # 3. Minkowski ban (including BOSL2 3D minkowski wrappers)
+            mink_m = OpenScadPreflight.MINKOWSKI_PATTERN.search(line)
+            if mink_m:
+                fn_name = mink_m.group(1)
                 findings.append(
                     Finding(
                         category="CRITICAL",
                         code="MINKOWSKI_DETECTED",
-                        message=f"Use of 3D minkowski() detected at line {line_num}.",
+                        message=f"Use of 3D {fn_name}() detected at line {line_num}.",
                         line=line_num,
-                        impact="Causes severe OpenSCAD compiler freezing and timeouts. Use hull() or 2D offset() instead.",
+                        impact="Causes severe OpenSCAD compiler freezing and timeouts. Use hull(), 2D offset(), or BOSL2 cuboid()/cyl()/offset_sweep() instead.",
                     )
                 )
 
@@ -403,7 +418,7 @@ class CadVerifier:
                 )
             )
 
-        # 5b. Unsafe include/use paths and extreme slice/facet counts blocked by preflight
+        # 5b. Unsafe include/use paths, BOSL2 include checks, and extreme slice/facet counts
         for inc_m in re.finditer(r"(?:include|use)\s*<([^>]+)>", clean_code):
             inc_path = inc_m.group(1).strip()
             if inc_path.startswith("/") or ".." in inc_path or "\\" in inc_path:
@@ -415,6 +430,42 @@ class CadVerifier:
                         message=f"Unsafe include/use path '{inc_path}' at line {line_num}.",
                         line=line_num,
                         impact="Path must be relative and cannot escape the project directory.",
+                    )
+                )
+
+        uses_bosl2 = re.search(r"\binclude\s*<\s*BOSL2/", clean_code) is not None
+        for kind, line_num, detail in OpenScadPreflight.check_bosl2_imports(clean_code):
+            if kind == "use":
+                findings.append(
+                    Finding(
+                        category="CRITICAL",
+                        code="BOSL2_USE_INSTEAD_OF_INCLUDE",
+                        message=f"'use <BOSL2/{detail}>' used instead of 'include <BOSL2/{detail}>' at line {line_num}.",
+                        line=line_num,
+                        impact="OpenSCAD 'use' drops BOSL2 global constants (TOP, BOTTOM, CENTER) and causes assertion errors.",
+                        suggestion=f"Replace with 'include <BOSL2/{detail}>'.",
+                    )
+                )
+            elif kind == "reserved":
+                findings.append(
+                    Finding(
+                        category="CRITICAL",
+                        code="BOSL2_RESERVED_CONSTANT_OVERWRITTEN",
+                        message=f"Reserved BOSL2 constant '{detail}' reassigned at line {line_num}.",
+                        line=line_num,
+                        impact=f"Overwriting '{detail}' corrupts BOSL2 direction vectors or internal math.",
+                        suggestion=OpenScadPreflight.reserved_constant_fix(detail),
+                    )
+                )
+            else:
+                findings.append(
+                    Finding(
+                        category="WARNING",
+                        code="BOSL2_MISSING_STD_INCLUDE",
+                        message=f"'include <BOSL2/{detail}>' at line {line_num} used without 'include <BOSL2/std.scad>'.",
+                        line=line_num,
+                        impact="BOSL2 sub-libraries depend on core definitions in BOSL2/std.scad.",
+                        suggestion="Add 'include <BOSL2/std.scad>' at the top of model.scad.",
                     )
                 )
 
@@ -688,8 +739,10 @@ class CadVerifier:
                 )
 
         # 8. Golden Rules: EPS constant & difference() cutter overshoot rule
+        # With BOSL2 included, EPSILON is BOSL2's reserved 1e-9 constant, not a cutter overlap.
+        eps_names = "EPS|eps|epsilon" if uses_bosl2 else "EPS|eps|EPSILON|epsilon"
         eps_match = re.search(
-            r"\b(EPS|eps|EPSILON|epsilon)\s*=\s*([0-9\.]+(?:[eE][-+]?[0-9]+)?)\s*;",
+            rf"\b({eps_names})\s*=\s*([0-9\.]+(?:[eE][-+]?[0-9]+)?)\s*;",
             clean_code,
         )
         has_eps = eps_match is not None
@@ -890,6 +943,16 @@ class CadVerifier:
                 r"ignoring unknown (?:variable|module|function)\b|can'?t open (?:library|include file)\b|cannot open (?:library|include file)\b|failed to open (?:library|include)\b",
                 msg_lower,
             ):
+                symbol_m = re.search(r"unknown (?:variable|module|function) '([^']+)'", msg_lower)
+                if symbol_m and symbol_m.group(1) in _BOSL2_HINT_SYMBOLS:
+                    bosl2_hint = (
+                        "Include <BOSL2/std.scad> (and the relevant BOSL2 sub-library such as threading.scad, "
+                        "screws.scad, gears.scad, or joiners.scad) at the top of model.scad."
+                    )
+                elif "bosl2/" in msg_lower:
+                    bosl2_hint = "Fix the BOSL2 include path (case-sensitive), e.g. include <BOSL2/std.scad>."
+                else:
+                    bosl2_hint = None
                 findings.append(
                     Finding(
                         category="CRITICAL",
@@ -897,6 +960,7 @@ class CadVerifier:
                         message=f"OpenSCAD reported undefined symbol: {msg}",
                         line=lineno,
                         impact="OpenSCAD ignored the undefined symbol/module, resulting in missing or corrupt geometry.",
+                        suggestion=bosl2_hint,
                     )
                 )
             else:

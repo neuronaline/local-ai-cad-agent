@@ -1,0 +1,8 @@
+library: BOSL2 (The Belfry OpenSCAD Library v2.0)
+repository: https://github.com/BelfrySCAD/BOSL2
+commit: 2d23674aeb9509ec57e740d648b22ca966fb7afc
+version: 2.0.783
+date: 2026-04-12
+license: BSD-2-Clause
+files: *.scad, LICENSE
+
