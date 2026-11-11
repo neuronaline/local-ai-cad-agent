@@ -31,7 +31,6 @@
           </div>
         </header>
         <div id="preflight-banner" class="preflight-banner" hidden></div>
-        <div id="busy-project-banner" class="busy-project-banner" hidden></div>
         <div id="chat-feed" class="chat-feed" aria-live="polite"></div>
         <button id="scroll-bottom-btn" type="button" class="scroll-bottom-btn" hidden title="Scroll to bottom" aria-label="Scroll to bottom">
           <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
@@ -371,6 +370,7 @@
         'showInfoMessages': show_info_messages,
         'reasoningEffort': reasoning_effort,
         'activeModelKey': active_model_key,
+        'hasProjectModel': has_project_model,
         'availableModels': available_models,
         'userPreferences': user_preferences,
         'viewerGrid': {
@@ -389,6 +389,7 @@
     </script>
     <script src="{{ url_for('static', filename='vendor/marked/marked.min.js') }}"></script>
     <script src="{{ url_for('static', filename='vendor/highlight/highlight.min.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/stream-client.js') }}?v={{ cache_bust }}"></script>
     <script type="module" src="{{ url_for('static', filename='js/app.js') }}?v={{ cache_bust }}"></script>
   </body>
 </html>

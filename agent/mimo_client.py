@@ -58,7 +58,7 @@ class MiMoClient(ChatCompletionsClient):
         # explicit reasoning_effort == 'none' also disables thinking.
         is_continuation = is_continuation_messages(messages)
         effort = (self.settings.mimo_reasoning_effort or "").lower().strip()
-        thinking_enabled = not (is_continuation or effort in ("none", "disabled", "off", "0", "false"))
+        thinking_enabled = not (is_continuation or effort in ("none", "disabled", "off", "0", "false", "minimal"))
         thinking_type = "enabled" if thinking_enabled else "disabled"
 
         # Adapt assistant messages for MiMo's API contract:
@@ -93,7 +93,11 @@ class MiMoClient(ChatCompletionsClient):
         if tools:
             payload["tools"] = tools
         if self.settings.llm_max_completion_tokens:
-            payload["max_completion_tokens"] = self.settings.llm_max_completion_tokens
+            payload["max_completion_tokens"] = (
+                max(16384, self.settings.llm_max_completion_tokens)
+                if thinking_enabled
+                else self.settings.llm_max_completion_tokens
+            )
 
         return payload
 

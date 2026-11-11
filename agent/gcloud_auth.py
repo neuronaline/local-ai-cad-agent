@@ -100,14 +100,20 @@ class GCloudAuthManager:
         self._cached_project: str | None = None
         self._cached_location: str | None = None
 
-    def invalidate_token(self) -> None:
+    def invalidate_token(self, failed_token: str | None = None) -> None:
         """Clear cached access token in memory and on disk.
 
         Purging `access_tokens.db` forces `gcloud auth print-access-token`
         to request a brand-new token from Google OAuth servers instead of
         re-reading stale credentials.
+
+        With ``failed_token``, the purge only happens while that token is
+        still the cached one: if a concurrent run already invalidated or
+        refreshed it, the fresh credentials are left untouched.
         """
         with self._lock:
+            if failed_token is not None and self._cached_token != failed_token:
+                return
             self._cached_token = None
             self._token_expiry_monotonic = 0.0
             _purge_access_tokens_db()

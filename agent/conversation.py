@@ -14,29 +14,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from agent.io import atomic_write_text
-
-_history_lock: threading.RLock = threading.RLock()
-
-
-def shared_history_lock() -> threading.RLock:
-    """Return the shared history write lock (replaceable from the host).
-
-    ``RLock`` lets a thread that already holds the lock (e.g. the
-    ``EventBus`` thread mid-append) re-enter it when calling ``load`` to
-    populate the cache. A plain ``Lock`` would deadlock in that case.
-    """
-    return _history_lock
-
-
-def set_shared_history_lock(lock: threading.RLock) -> None:
-    """Replace the module-level history lock (used by ``app.py`` at startup).
-
-    The Flask ``EventBus`` owns its own ``RLock`` so SSE status writes and
-    ``ConversationStore`` appends serialize against one another. The slot
-    indirection keeps the agent package free of a Flask import.
-    """
-    global _history_lock
-    _history_lock = lock
+from agent.locks import project_history_lock
 
 
 class ConversationStore:
@@ -53,32 +31,31 @@ class ConversationStore:
 
     #: Bounded number of cached projects. Older entries evict FIFO when a
     #: new project reads/writes through the store.
-    CACHE_MAX: ClassVar[int] = 32
+    CACHE_MAX: ClassVar[int] = 64
 
     #: Roles loaded as active LLM conversation turns (filters out non-chat event records).
     _KEPT_ROLES: ClassVar[set[str]] = {"user", "assistant", "tool"}
 
     _cache: ClassVar[dict[str, list[dict[str, Any]]]] = {}
+    #: Guards ``_cache`` itself. File I/O is serialised per project by
+    #: :func:`project_history_lock`; lock order is always history → guard.
+    _cache_guard: ClassVar[threading.Lock] = threading.Lock()
 
     @classmethod
     def invalidate(cls, project_dir: Path) -> None:
         """Forget the cached entry for ``project_dir`` (used after writes
         and on project deletion).
 
-        **Caller MUST hold :func:`shared_history_lock`.** Performing this
-        mutation outside the lock lets a concurrent :meth:`load` refill
-        the cache from a pre-write snapshot and re-cache the now-stale
-        data after this method returns — a thread can subsequently observe
-        the line appended by another writer *forever*. When the lock
-        contract is respected the invalidate and the next file write
-        happen as a single critical section, so no reader can refill
-        stale data between the two steps.
+        Writers call this while holding :func:`project_history_lock`, so a
+        concurrent :meth:`load` cannot refill the cache from a pre-write
+        snapshot between the invalidate and the file write.
         """
-        cls._cache.pop(str(project_dir), None)
-        try:
-            cls._cache.pop(str(project_dir.resolve()), None)
-        except OSError:
-            pass
+        with cls._cache_guard:
+            cls._cache.pop(str(project_dir), None)
+            try:
+                cls._cache.pop(str(project_dir.resolve()), None)
+            except OSError:
+                pass
 
     @classmethod
     def load(cls, project_dir: Path) -> list[dict[str, Any]]:
@@ -88,27 +65,28 @@ class ConversationStore:
         prompt prefix stays byte-stable across turns. Returning the same
         bytes the provider hashed keeps prompt caches warm.
 
-        All cache reads and writes happen under :func:`shared_history_lock`
-        so a concurrent append cannot race with the lookup and silently
-        re-cache a pre-write snapshot. The cache is invalidated by
-        ``append``/``clear`` (also under the lock) so once a turn
-        completes its write the next ``load`` always observes the
-        latest state.
+        Cache hits only take the cache guard. A miss re-checks the cache
+        under :func:`project_history_lock` before parsing, so the parse and
+        the cache fill cannot interleave with an append for the project.
         """
         cache_key = str(project_dir)
-        with shared_history_lock():
+        with cls._cache_guard:
             cached = cls._cache.get(cache_key)
             if cached is not None:
                 if not project_dir.exists():
-                    # Drop the stale entry under the same lock so a
-                    # concurrent append cannot race with the pop and
-                    # silently re-cache stale data afterwards.
                     cls._cache.pop(cache_key, None)
                     return []
                 return [deepcopy(item) for item in cached]
-            # Serialise the read+cache-set against appends so a concurrent
-            # writer cannot have its line missed by this load (or, conversely,
-            # so a partially-written tail cannot be observed).
+
+        with project_history_lock(project_dir):
+            with cls._cache_guard:
+                cached = cls._cache.get(cache_key)
+                if cached is not None:
+                    if not project_dir.exists():
+                        cls._cache.pop(cache_key, None)
+                        return []
+                    return [deepcopy(item) for item in cached]
+
             history: list[dict[str, Any]] = []
             log_path = project_dir / "conversation.jsonl"
             if log_path.exists():
@@ -122,19 +100,39 @@ class ConversationStore:
                         and item.get("role") in cls._KEPT_ROLES
                     ):
                         history.append(item)
-            cls._set_cached(cache_key, history)
+            with cls._cache_guard:
+                cls._set_cached(cache_key, history)
             return [deepcopy(item) for item in history]
+
+    @classmethod
+    def read_raw_events(cls, project_dir: Path) -> list[dict[str, Any]]:
+        """Return every non-synthetic record of ``conversation.jsonl`` (for the History view)."""
+        events: list[dict[str, Any]] = []
+        log_path = project_dir / "conversation.jsonl"
+        with project_history_lock(project_dir):
+            if not log_path.exists():
+                return []
+            for line in log_path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    item = json.loads(line)
+                    if isinstance(item, dict) and not item.get("synthetic"):
+                        events.append(item)
+                except json.JSONDecodeError:
+                    continue
+        return events
 
     @classmethod
     def append(cls, project_dir: Path, message: dict[str, Any]) -> None:
         """Persist a single message and update the in-memory cache if present.
 
-        The cache update, directory check, and file write all happen
-        inside :func:`shared_history_lock` so a concurrent :meth:`load`
-        always observes a consistent snapshot without re-parsing the entire
-        JSONL log on every turn.
+        The file write and the cache update both happen inside
+        :func:`project_history_lock` so a concurrent :meth:`load` always
+        observes a consistent snapshot without re-parsing the entire JSONL
+        log on every turn.
         """
-        with shared_history_lock():
+        with project_history_lock(project_dir):
             log_path = project_dir / "conversation.jsonl"
             log_path.parent.mkdir(parents=True, exist_ok=True)
             with log_path.open("a", encoding="utf-8") as log:
@@ -142,8 +140,9 @@ class ConversationStore:
                     json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n"
                 )
             if isinstance(message, dict) and message.get("role") in cls._KEPT_ROLES:
-                for cached in cls._cached_histories(project_dir):
-                    cached.append(deepcopy(message))
+                with cls._cache_guard:
+                    for cached in cls._cached_histories(project_dir):
+                        cached.append(deepcopy(message))
 
     @classmethod
     def _cached_histories(cls, project_dir: Path) -> list[list[dict[str, Any]]]:
@@ -172,11 +171,12 @@ class ConversationStore:
                 and item.get("tool_call_id") == call_id
             )
 
-        with shared_history_lock():
-            for cached in cls._cached_histories(project_dir):
-                idx = next((i for i in range(len(cached) - 1, -1, -1) if matches(cached[i])), None)
-                if idx is not None:
-                    cached[idx] = deepcopy(message)
+        with project_history_lock(project_dir):
+            with cls._cache_guard:
+                for cached in cls._cached_histories(project_dir):
+                    idx = next((i for i in range(len(cached) - 1, -1, -1) if matches(cached[i])), None)
+                    if idx is not None:
+                        cached[idx] = deepcopy(message)
             log_path = project_dir / "conversation.jsonl"
             if not log_path.exists():
                 return False
@@ -205,16 +205,16 @@ class ConversationStore:
 
         Centralises the ``conversation.jsonl`` writer so the SSE history
         filters (``_load_history`` / ``_KEPT_ROLES``) and the EventBus
-        status persistence share one lock and one plain ``open("a")``
-        handle. Non-role event envelopes do not alter active LLM history
-        (``_KEPT_ROLES``), so the message cache remains warm.
+        status persistence share one per-project lock and one plain
+        ``open("a")`` handle. Non-role event envelopes do not alter active
+        LLM history (``_KEPT_ROLES``), so the message cache remains warm.
         """
         record = {
             "timestamp": timestamp or cls._now_iso(),
             "type": event_type,
             "data": data,
         }
-        with shared_history_lock():
+        with project_history_lock(project_dir):
             log_path = project_dir / "conversation.jsonl"
             log_path.parent.mkdir(parents=True, exist_ok=True)
             with log_path.open("a", encoding="utf-8") as log:
@@ -239,7 +239,7 @@ class ConversationStore:
         user turn. Returns the targeted user message dict, or None if no matching
         user turn is found.
         """
-        with shared_history_lock():
+        with project_history_lock(project_dir):
             cls.invalidate(project_dir)
             log_path = project_dir / "conversation.jsonl"
             if not log_path.exists():
@@ -251,9 +251,8 @@ class ConversationStore:
                     continue
                 try:
                     item = json.loads(line)
-                    if isinstance(item, dict):
-                        if item.get("role") == "user" and not item.get("synthetic"):
-                            user_turns.append((idx, item))
+                    if isinstance(item, dict) and item.get("role") == "user" and not item.get("synthetic"):
+                        user_turns.append((idx, item))
                 except json.JSONDecodeError:
                     continue
             if not user_turns:
@@ -282,12 +281,12 @@ class ConversationStore:
         was removed.
 
         The cache invalidate and the unlink both run inside
-        :func:`shared_history_lock` so a concurrent append or load
+        :func:`project_history_lock` so a concurrent append or load
         cannot race with the unlink and resurrect a half-deleted file.
         """
         log_path = project_dir / "conversation.jsonl"
         removed = False
-        with shared_history_lock():
+        with project_history_lock(project_dir):
             cls.invalidate(project_dir)
             try:
                 log_path.unlink()
@@ -302,11 +301,8 @@ class ConversationStore:
         """Store ``history`` under ``key`` in the read cache, evicting the
         oldest entry first when the cache is full.
 
-        **Caller MUST hold :func:`shared_history_lock`.** The eviction
-        loop iterates ``_cache`` and pops during iteration, which raises
-        ``RuntimeError: dictionary changed size during iteration`` if a
-        concurrent append invalidates an entry between ``len(...)`` and
-        the next ``pop``.
+        **Caller MUST hold** ``_cache_guard``: the eviction loop pops while
+        iterating ``_cache``.
         """
         while len(cls._cache) >= cls.CACHE_MAX:
             oldest = next(iter(cls._cache))

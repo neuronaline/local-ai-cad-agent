@@ -40,7 +40,7 @@ export class CadViewer {
     this.scene.background = new THREE.Color('#0d1524');
     this.camera = new THREE.PerspectiveCamera(45, 1, 0.1, 10000);
     this.camera.position.set(120, 100, 120);
-    this.renderer = new THREE.WebGLRenderer({antialias: true, preserveDrawingBuffer: true});
+    this.renderer = new THREE.WebGLRenderer({antialias: true, preserveDrawingBuffer: false});
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     container.appendChild(this.renderer.domElement);
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
@@ -65,6 +65,24 @@ export class CadViewer {
     this.loadSequence = 0;
     this._needsRender = true;
     this._animating = false;
+    this._contextLost = false;
+
+    // GPU memory pressure (many tabs) can drop the WebGL context. Calling
+    // preventDefault() lets the browser restore it; three.js re-uploads the
+    // existing scene buffers on restore, so no reload is needed. ``animate``
+    // stops itself via ``_canRender`` while the context is lost.
+    this.renderer.domElement.addEventListener('webglcontextlost', (event) => {
+      event.preventDefault();
+      this._contextLost = true;
+      this.container.classList.add('context-lost');
+    });
+
+    this.renderer.domElement.addEventListener('webglcontextrestored', () => {
+      this._contextLost = false;
+      this.container.classList.remove('context-lost');
+      this.resize();
+    });
+
     this.controls.addEventListener('start', () => this.startAnimation());
     this.controls.addEventListener('change', () => this.requestRender());
     new ResizeObserver(() => {
@@ -135,7 +153,7 @@ export class CadViewer {
   }
 
   _canRender() {
-    return !document.hidden && this.container.clientWidth > 0 && this.container.clientHeight > 0;
+    return !this._contextLost && !document.hidden && this.container.clientWidth > 0 && this.container.clientHeight > 0;
   }
 
   startAnimation() {

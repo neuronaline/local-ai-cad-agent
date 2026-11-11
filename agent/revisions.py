@@ -25,6 +25,7 @@ from agent.io import (
     atomic_write_text,
     utc_now_iso,
 )
+from agent.locks import project_model_lock
 
 MODEL_FILENAME = "model.scad"
 SCHEMA_VERSION = 1
@@ -124,17 +125,18 @@ class RevisionIntegrityError(Exception):
 
 
 def _synchronized(method: Callable[_P, _R]) -> Callable[_P, _R]:
-    """Acquire the per-instance RLock so each store serializes its own mutations.
+    """Serialise each store method on the per-project model lock.
 
-    The previous module-level RLock serialized every store across every project
-   ; this decorator uses the instance lock so parallel projects
-    build/restore/prune concurrently while still protecting a single store
-    from interleaved read-modify-write cycles.
+    The lock is :func:`agent.locks.project_model_lock`, shared with
+    ``FileTool`` writes, so every ``RevisionStore`` instance for the same
+    project (agent run, HTTP route) is protected from interleaved
+    read-modify-write cycles while different projects still proceed in
+    parallel.
     """
 
     @wraps(method)
     def wrapped(self: RevisionStore, *args: _P.args, **kwargs: _P.kwargs) -> _R:
-        with self._lock:
+        with project_model_lock(self.project_dir):
             return method(self, *args, **kwargs)
 
     return wrapped
@@ -292,10 +294,6 @@ class RevisionStore:
     def __init__(self, project_dir: Path, retention_count: int = _DEFAULT_RETENTION) -> None:
         self.project_dir = project_dir.resolve()
         self.retention_count = retention_count
-        # Per-instance lock — was a module-level RLock that serialized every
-        # store across every project. Per-instance lets parallel
-        # projects build/restore/prune concurrently.
-        self._lock = threading.RLock()
         history = self.project_dir / ".cad-agent" / "history"
         self._head_path = history / "head.json"
         self._blobs_dir = history / "blobs"
@@ -409,7 +407,7 @@ class RevisionStore:
     def _all_revisions(self) -> list[Revision]:
         """Return every readable revision, newest first, for internal operations.
 
-        Must be called while holding ``self._lock``. All public
+        Must be called while holding the project model lock. All public
         callers wrap this in ``@_synchronized``; new callers must do the same.
 
         A directory scan on a few hundred revisions is on the order of
@@ -771,7 +769,7 @@ class RevisionStore:
         record stays visible in ``builds.jsonl`` for an operator to find.
 
         The result reflects the log as of the call: callers must hold
-        :data:`_lock` (the existing ``@_synchronized`` decorator on every
+        the project model lock (the existing ``@_synchronized`` decorator on every
         public entry point ensures this) so no concurrent append can
         race the read.
         """

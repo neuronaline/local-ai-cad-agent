@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 import re
-import threading
-from collections import OrderedDict
-from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
 
+from agent.locks import project_model_lock
 from agent.revisions import MODEL_FILENAME, RevisionOrigin, RevisionStore
 
 EDITABLE_FILES = {MODEL_FILENAME}
@@ -15,50 +12,6 @@ MAX_FILE_BYTES = 1 * 1024 * 1024
 # the JSON schema's ``maximum`` so the runtime guard and the model-facing
 # limit cannot drift.
 MAX_READ_LINES = 2000
-class _ProjectLock:
-    def __init__(self) -> None:
-        self.lock = threading.RLock()
-        self.active_count = 0
-
-
-_MAX_PROJECT_FILE_LOCKS = 256
-_MODEL_FILE_LOCKS: OrderedDict[str, _ProjectLock] = OrderedDict()
-_MODEL_FILE_LOCKS_GUARD: threading.Lock = threading.Lock()
-
-
-@contextmanager
-def _file_lock(path: Path) -> Iterator[threading.RLock]:
-    """Serialise writes to ``model.scad`` per project with active reference tracking."""
-    key = str(path.parent)
-    with _MODEL_FILE_LOCKS_GUARD:
-        entry = _MODEL_FILE_LOCKS.get(key)
-        if entry is None:
-            entry = _ProjectLock()
-            _MODEL_FILE_LOCKS[key] = entry
-        entry.active_count += 1
-        _MODEL_FILE_LOCKS.move_to_end(key)
-        # Only evict idle locks (active_count == 0) to prevent race conditions
-        if len(_MODEL_FILE_LOCKS) > _MAX_PROJECT_FILE_LOCKS:
-            for k in list(_MODEL_FILE_LOCKS):
-                if len(_MODEL_FILE_LOCKS) <= _MAX_PROJECT_FILE_LOCKS:
-                    break
-                if _MODEL_FILE_LOCKS[k].active_count == 0:
-                    _MODEL_FILE_LOCKS.pop(k, None)
-
-    entry.lock.acquire()
-    try:
-        yield entry.lock
-    finally:
-        entry.lock.release()
-        with _MODEL_FILE_LOCKS_GUARD:
-            entry.active_count = max(0, entry.active_count - 1)
-
-
-def invalidate_model_file_lock(project_dir: Path) -> None:
-    """Drop the per-project file lock when its directory goes away."""
-    key = str(Path(project_dir))
-    with _MODEL_FILE_LOCKS_GUARD:
-        _MODEL_FILE_LOCKS.pop(key, None)
 
 
 class OpenScadPreflight:
@@ -498,6 +451,9 @@ class MatchError(ValueError):
     """
 
 
+class OpenScadPreflightError(ValueError):
+    """Raised when OpenScadPreflight blocks invalid syntax, delimiters, or unsafe constructs."""
+
 
 class FileTool:
     def __init__(
@@ -531,7 +487,7 @@ class FileTool:
         preflight = OpenScadPreflight()
         preflight.validate(code)
         if preflight.blocked_errors:
-            raise ValueError(preflight.blocked_errors[0])
+            raise OpenScadPreflightError(preflight.blocked_errors[0])
         return preflight.warnings
 
     def read_file(
@@ -593,7 +549,7 @@ class FileTool:
         content: str = "",
     ) -> str:
         path = self._path(filename)
-        with _file_lock(path):
+        with project_model_lock(path.parent):
             return self._write_model(content, "write_file")
 
     def _write_model(self, content: str, operation: str) -> str:
@@ -748,7 +704,7 @@ class FileTool:
                 raise ValueError(f"edits[{index}].new_string must be a string.")
             normalised.append((old_string, new_string))
         path = self._path(actual_filename)
-        with _file_lock(path):
+        with project_model_lock(path.parent):
             if not path.exists():
                 raise FileNotFoundError(
                     f"{actual_filename} does not exist; use write_file to create it."

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import queue
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -24,10 +25,12 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
 
-from agent.conversation import ConversationStore, set_shared_history_lock
+from agent.conversation import ConversationStore
 from agent.core import AgentRunner
 from agent.io import utc_now_iso
+from agent.locks import KeyedRLockRegistry
 from agent.settings import Settings, load_settings
+from agent.tools.process_runner import set_global_max_parallel_builds
 
 # Re-export the project name pattern, blueprint registry, and the SSE
 # queue size so existing callers (``tests`` modules, ``run.sh``) that
@@ -54,15 +57,35 @@ _LOCAL_BINDS = frozenset({"localhost", "127.0.0.1", "::1"})
 _ALLOWED_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
+_GLOBAL_SSE_EVENTS = frozenset({
+    "project_created",
+    "project_deleted",
+    "project_renamed",
+    "settings_updated",
+    "stream_reset",
+})
+
+
+@dataclass(eq=False)
+class _Subscriber:
+    """One SSE connection. ``project`` scopes delivery (``None`` = every event)."""
+
+    queue: queue.Queue[dict[str, Any] | None]
+    project: str | None = None
+
+
 class EventBus:
-    """In-process fan-out for the single local browser client(s)."""
+    """In-process fan-out for the browser client(s).
+
+    Project-scoped subscribers only receive events whose ``project`` (or
+    ``old_project`` for renames) matches, plus ``_GLOBAL_SSE_EVENTS``.
+    """
 
     def __init__(self, settings: Settings, app: Flask | None = None) -> None:
         self.settings = settings
         self.app = app
-        self._subscribers: list[queue.Queue[dict[str, Any] | None]] = []
+        self._subscribers: list[_Subscriber] = []
         self._lock = threading.Lock()
-        self._history_lock = threading.RLock()
 
     def _workspace_root(self) -> Path:
         if self.app is not None:
@@ -101,37 +124,48 @@ class EventBus:
                         project_dir, event_type, data, timestamp=utc_now_iso()
                     )
         event = {"type": event_type, "data": data}
+        target_project = data.get("project") if isinstance(data, dict) else None
+        old_project = data.get("old_project") if isinstance(data, dict) else None
+        is_global = event_type in _GLOBAL_SSE_EVENTS
+
         with self._lock:
             subscribers = list(self._subscribers)
-        stale: list[queue.Queue[dict[str, Any] | None]] = []
-        for subscriber in subscribers:
+        stale: list[_Subscriber] = []
+        for sub in subscribers:
+            if (
+                not is_global
+                and sub.project is not None
+                and sub.project != target_project
+                and sub.project != old_project
+            ):
+                continue
             try:
-                subscriber.put_nowait(event)
+                sub.queue.put_nowait(event)
             except queue.Full:
-                stale.append(subscriber)
+                stale.append(sub)
         if stale:
             with self._lock:
-                for subscriber in stale:
-                    if subscriber in self._subscribers:
-                        self._subscribers.remove(subscriber)
+                for sub in stale:
+                    if sub in self._subscribers:
+                        self._subscribers.remove(sub)
                     while True:
                         try:
-                            subscriber.get_nowait()
+                            sub.queue.get_nowait()
                         except queue.Empty:
                             break
-                    subscriber.put_nowait({"type": "stream_reset", "data": {}})
-                    subscriber.put_nowait(None)
+                    sub.queue.put_nowait({"type": "stream_reset", "data": {}})
+                    sub.queue.put_nowait(None)
 
-    def subscribe(self) -> queue.Queue[dict[str, Any] | None]:
-        subscriber: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=SSE_QUEUE_SIZE)
+    def subscribe(self, project: str | None = None) -> queue.Queue[dict[str, Any] | None]:
+        q: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=SSE_QUEUE_SIZE)
+        sub = _Subscriber(queue=q, project=project.strip() if project else None)
         with self._lock:
-            self._subscribers.append(subscriber)
-        return subscriber
+            self._subscribers.append(sub)
+        return q
 
     def unsubscribe(self, subscriber: queue.Queue[dict[str, Any] | None]) -> None:
         with self._lock:
-            if subscriber in self._subscribers:
-                self._subscribers.remove(subscriber)
+            self._subscribers = [s for s in self._subscribers if s.queue is not subscriber]
 
 
 def _hostname(header_value: str) -> str:
@@ -169,16 +203,15 @@ def create_app(settings: Settings | None = None) -> Flask:
     load_dotenv(Path(__file__).resolve().with_name(".env"))
     settings = settings or load_settings()
     settings.workspace_root.mkdir(parents=True, exist_ok=True)
+    set_global_max_parallel_builds(settings.agent_max_parallel_builds)
     app = Flask(__name__)
     app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
     app.config["MAX_CONTENT_LENGTH"] = 52 * 1024 * 1024
     app.config["SETTINGS"] = settings
     bus = EventBus(settings, app)
     app.config["EVENT_BUS"] = bus
-    set_shared_history_lock(bus._history_lock)
     app.config["AGENT_RUNNER"] = AgentRunner(settings, bus.publish)
-    app.config["PROJECT_LOCKS"]: dict[str, threading.Lock] = {}
-    app.config["PROJECT_LOCKS_LOCK"] = threading.Lock()
+    app.config["PROJECT_LOCKS_REGISTRY"] = KeyedRLockRegistry()
     app.config["IDEMPOTENCY_CACHE"]: dict[str, float] = {}
 
     # Mount route blueprints. The order is cosmetic (Flask dispatches by
@@ -196,6 +229,8 @@ def create_app(settings: Settings | None = None) -> Flask:
         response.headers.setdefault(
             "Content-Security-Policy",
             "default-src 'self'; "
+            "worker-src 'self' blob:; "
+            "connect-src 'self'; "
             "style-src 'self' 'unsafe-inline'; "
             "img-src 'self' data: blob:; "
             "script-src 'self' 'unsafe-inline'; "

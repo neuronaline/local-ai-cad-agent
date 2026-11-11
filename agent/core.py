@@ -1,9 +1,10 @@
-"""Background tool-calling loop for one local CAD task at a time.
+"""Background tool-calling loop for local CAD tasks.
 
-The agent runs one user request at a time per workspace.  A worker thread
-streams the model's chat-completions response, dispatches tool calls, and
-re-prompts the model with the tool results until it returns a final message
-or the configured tool-call budget is exhausted.
+The runner allows one active request per project (and a bounded number of
+projects concurrently).  Each run's worker thread streams the model's
+chat-completions response, dispatches tool calls, and re-prompts the model
+with the tool results until it returns a final message or the configured
+tool-call budget is exhausted.
 """
 
 from __future__ import annotations
@@ -21,15 +22,13 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 from agent.activity_log import ActivityLogger, get_logger
 from agent.activity_log import is_enabled as activity_logging_enabled
-from agent.conversation import (
-    ConversationStore,
-    shared_history_lock,
-)
+from agent.conversation import ConversationStore
 from agent.converter import export_project_model
 from agent.dispatcher import (
     cancel_remaining_tool_calls,
@@ -40,6 +39,7 @@ from agent.dispatcher import (
     process_tool_call,
 )
 from agent.images import as_chat_image
+from agent.io import atomic_write_json
 from agent.llm_base import (
     CompletionTruncatedError,
     RequestCancelled,
@@ -50,6 +50,7 @@ from agent.llm_base import (
     sanitize_assistant_message,
     strip_encrypted_reasoning,
 )
+from agent.locks import project_history_lock
 from agent.print_advisor import (
     THREE_MF_COMMAND_MARKER,
     extract_json_block,
@@ -221,11 +222,6 @@ def _set_tool_payload(msg: dict[str, Any], payload: dict[str, Any]) -> None:
     msg["content"] = text
 
 
-def _shared_history_lock() -> threading.Lock:
-    """Return the active history lock (configurable by the Flask app)."""
-    return shared_history_lock()
-
-
 # ---------------------------------------------------------------------------
 # Agent-loop decomposition: per-iteration helpers and lifecycle state.
 # ---------------------------------------------------------------------------
@@ -302,6 +298,7 @@ class _RunState:
     settings: Settings | None = None
     export_3mf: bool = False
     export_3mf_retries: int = 0
+    stop_event: threading.Event = field(default_factory=threading.Event)
 
 
 def _extract_reasoning(message: dict[str, Any]) -> str:
@@ -324,6 +321,19 @@ def _extract_reasoning(message: dict[str, Any]) -> str:
     return ""
 
 
+@dataclass
+class _ProjectRunSession:
+    """Live handles of one project's in-flight run (owned by ``AgentRunner._lock``)."""
+
+    project: str
+    run_id: str
+    thread: threading.Thread
+    stop_event: threading.Event
+    run_complete: threading.Event
+    active_tools: ProjectTools | None = None
+    active_client: Any | None = None
+
+
 class AgentRunner:
     """One-thread-per-task chat-completions driver with tool dispatch."""
 
@@ -334,66 +344,70 @@ class AgentRunner:
     ) -> None:
         self.settings = settings
         self.publish = publish
-        self._stop_event = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._active_tools: ProjectTools | None = None
-        self._active_client: Any | None = None
-        self._active_project: str | None = None
-        # Per-run activity-log handles; ``_run()`` populates them and
-        # ``finally`` clears them so a stale logger never leaks across
-        # runs.
-        self._active_activity_logger: ActivityLogger | None = None
-        self._active_run_id: str | None = None
+        # At most one live session per project; ``_finalize_run`` removes
+        # its own entry (guarded by ``run_id``) and ``_reap_locked`` drops
+        # entries whose thread died without reaching ``finally``.
+        self._sessions: dict[str, _ProjectRunSession] = {}
         self._lock = threading.Lock()
         self._waiting_questions: dict[str, dict[str, object]] = {}
-        # Set by ``_run``'s finally so callers can observe completion
-        # without polling ``thread.is_alive()``.
-        self._run_complete: threading.Event = threading.Event()
-        self._run_complete.set()
+
+    def _reap_locked(self) -> None:
+        """Drop sessions whose run finished. Caller holds ``self._lock``."""
+        for proj, sess in list(self._sessions.items()):
+            if not sess.thread.is_alive() or sess.run_complete.is_set():
+                sess.run_complete.set()
+                del self._sessions[proj]
+
+    def _at_capacity_locked(self) -> bool:
+        """Caller holds ``self._lock`` (a plain ``Lock``; never re-acquire it here)."""
+        self._reap_locked()
+        return len(self._sessions) >= self.settings.agent_max_concurrent_runs
 
     # ------------------------------------------------------------------ state
 
-    def is_running(self) -> bool:
+    def is_running(self, project: str | None = None) -> bool:
         with self._lock:
-            thread = self._thread
-            if thread is None:
-                return False
-            if not thread.is_alive():
-                # Thread has terminated. Clean up stale references if finally was bypassed.
-                self._thread = None
-                self._run_complete.set()
-                self._active_project = None
-                self._active_run_id = None
-                self._active_tools = None
-                self._active_client = None
-                return False
-            return not self._run_complete.is_set()
+            self._reap_locked()
+            if project is not None:
+                return project in self._sessions
+            return bool(self._sessions)
 
     def has_active_state_for(self, project: str) -> bool:
         """Return whether the project has an agent run that must not be deleted."""
         # A persisted waiting question is recoverable UI state, not an active
         # worker.  It must not prevent deleting the project.
-        return self.is_running() and self.active_project() == project
+        return self.is_running(project)
 
-    def active_project(self) -> str | None:
+    def active_projects(self) -> list[str]:
         with self._lock:
-            return self._active_project
+            self._reap_locked()
+            return sorted(self._sessions)
 
-    def active_run_id(self) -> str | None:
+    def active_run_id(self, project: str) -> str | None:
         with self._lock:
-            return self._active_run_id
+            self._reap_locked()
+            sess = self._sessions.get(project)
+            return sess.run_id if sess else None
+
+    def at_capacity(self) -> bool:
+        with self._lock:
+            return self._at_capacity_locked()
+
+    def _agent_state(self, project: str) -> dict[str, Any]:
+        """Return the persisted ``.agent_state.json`` (``{}`` when absent or unreadable)."""
+        state_path = self.settings.workspace_root / project / ".agent_state.json"
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return state if isinstance(state, dict) else {}
 
     def waiting_question(self, project: str) -> dict[str, object] | None:
         with self._lock:
             question = self._waiting_questions.get(project)
         if question:
             return question.copy()
-        state_path = self.settings.workspace_root / project / ".agent_state.json"
-        try:
-            state = json.loads(state_path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, OSError, json.JSONDecodeError):
-            return None
-        question = state.get("waiting_question") if isinstance(state, dict) else None
+        question = self._agent_state(project).get("waiting_question")
         if not isinstance(question, dict):
             return None
         with self._lock:
@@ -441,14 +455,14 @@ class AgentRunner:
     ) -> bool:
         """Validate inputs, take ownership, then spawn the worker thread.
 
-        Validation runs *before* ``_take_run_inputs`` so a rejection
-        never leaves a half-populated run directory behind and the
+        The capacity/ownership checks run *before* ``_take_run_inputs`` so a
+        rejection never leaves a half-populated run directory behind and the
         caller's originals in ``<project>/inputs/`` are untouched.
         """
         if self.waiting_question(project):
             return False
         with self._lock:
-            if self._thread is not None and not self._run_complete.is_set():
+            if project in self._sessions or self._at_capacity_locked():
                 return False
             run_id = uuid.uuid4().hex
             prepared_paths = self._take_run_inputs(
@@ -475,7 +489,7 @@ class AgentRunner:
         if self.waiting_question(project):
             return False
         with self._lock:
-            if self._thread is not None and not self._run_complete.is_set():
+            if project in self._sessions or self._at_capacity_locked():
                 return False
             run_id = uuid.uuid4().hex
             return self._start_locked(
@@ -499,18 +513,22 @@ class AgentRunner:
         reasoning_effort: str | None = None,
         model_key: str | None = None,
     ) -> bool:
-        if self._thread is not None and not self._run_complete.is_set():
+        if project in self._sessions:
             return False
-        self._stop_event.clear()
-        self._run_complete.clear()
-        self._active_project = project
-        self._active_run_id = run_id
-        self._thread = threading.Thread(
+        stop_event = threading.Event()
+        thread = threading.Thread(
             target=self._run,
-            args=(project, message, image_paths, run_id, is_retry, reasoning_effort, model_key),
+            args=(project, message, image_paths, run_id, is_retry, reasoning_effort, model_key, stop_event),
             daemon=True,
         )
-        self._thread.start()
+        self._sessions[project] = _ProjectRunSession(
+            project=project,
+            run_id=run_id,
+            thread=thread,
+            stop_event=stop_event,
+            run_complete=threading.Event(),
+        )
+        thread.start()
         return True
 
     def _take_run_inputs(
@@ -573,44 +591,73 @@ class AgentRunner:
         run_dir = project_dir / _CAD_AGENT_DIRNAME / _RUNS_DIRNAME / run_id
         shutil.rmtree(run_dir, ignore_errors=True)
 
-    def answer(self, project: str, answer: str) -> bool:
-        question = self.waiting_question(project)
-        if not question or not self._validate_answer(question, answer):
-            return False
-        # Wait for the previous run's ``finally`` so we never observe a
+    def answer(
+        self,
+        project: str,
+        answer: str,
+        *,
+        model_key: str | None = None,
+        reasoning_effort: str | None = None,
+    ) -> str | None:
+        """Resume a parked run with the user's answer.
+
+        Returns the formatted answer persisted as the new user turn, or
+        ``None`` when no valid question is pending. Without an explicit
+        ``model_key`` / ``reasoning_effort`` the run resumes with the
+        selection the parked run used (persisted by ``_park_for_question``).
+        """
+        state = self._agent_state(project)
+        question = state.get("waiting_question")
+        if not isinstance(question, dict) or not self._validate_answer(question, answer):
+            return None
+        if not model_key:
+            model_key = state.get("model_key") or None
+        if reasoning_effort is None:
+            reasoning_effort = state.get("reasoning_effort")
+        # Wait for the parked run's ``finally`` so we never observe a
         # half-completed run while still accepting a follow-up message.
         with self._lock:
-            previous_event = self._run_complete
-        previous_event.wait(timeout=10.0)
+            self._reap_locked()
+            parked = self._sessions.get(project)
+        if parked is not None:
+            parked.run_complete.wait(timeout=10.0)
         project_dir = self.settings.workspace_root / project
         formatted = self._format_answer(question, answer)
         with self._lock:
-            if self._thread is not None and not self._run_complete.is_set():
-                return False
+            self._reap_locked()
+            if self._at_capacity_locked() or project in self._sessions:
+                return None
             # Persist the user answer BEFORE starting the new thread so
             # ``_context()`` reads it from the canonical log instead of
             # racing against this append.
             self._append_message(project_dir, {"role": "user", "content": formatted})
-            if not self._start_locked(project, formatted, [], uuid.uuid4().hex):
-                return False
+            if not self._start_locked(
+                project,
+                formatted,
+                [],
+                uuid.uuid4().hex,
+                reasoning_effort=reasoning_effort,
+                model_key=model_key,
+            ):
+                return None
             self._waiting_questions.pop(project, None)
             (project_dir / ".agent_state.json").unlink(missing_ok=True)
-            return True
+            return formatted
+
     def stop(self, project: str | None = None) -> list[str]:
         """Stop agent work and clear pending state for one or all projects."""
-        affected: list[str] = []
         with self._lock:
-            stop_active_task = (
-                self._thread is not None
-                and not self._run_complete.is_set()
-                and (project is None or project == self._active_project)
-            )
-            if stop_active_task and self._active_project and self._active_project not in affected:
-                affected.append(self._active_project)
-            if project is not None and project not in affected:
-                affected.append(project)
-
-            if project is None:
+            self._reap_locked()
+            if project is not None:
+                session = self._sessions.get(project)
+                target_sessions = [session] if session else []
+                # Always report the project so an on-disk waiting question
+                # (not yet mirrored into ``_waiting_questions``) is cleared too.
+                affected = [project]
+                self._waiting_questions.pop(project, None)
+            else:
+                target_sessions = list(self._sessions.values())
+                affected = list(self._sessions)
                 for q_proj in self._waiting_questions:
                     if q_proj not in affected:
                         affected.append(q_proj)
@@ -623,36 +670,26 @@ class AgentRunner:
                         ):
                             affected.append(item.name)
                 self._waiting_questions.clear()
-            else:
-                self._waiting_questions.pop(project, None)
 
-            if stop_active_task:
-                self._stop_event.set()
-                if self._active_tools:
-                    self._active_tools.stop()
-                if self._active_client:
+            for sess in target_sessions:
+                sess.stop_event.set()
+                if sess.active_tools:
+                    sess.active_tools.stop()
+                if sess.active_client:
                     try:
-                        self._active_client.abort()
+                        sess.active_client.abort()
                     except Exception:  # noqa: BLE001, S110
                         pass
-            thread_to_join = self._thread if stop_active_task else None
 
-        if thread_to_join is not None and thread_to_join.is_alive():
-            thread_to_join.join(timeout=3.5)
+        for sess in target_sessions:
+            if sess.thread.is_alive():
+                sess.thread.join(timeout=3.5)
 
         with self._lock:
-            if stop_active_task and (self._thread is None or not self._thread.is_alive()):
-                self._thread = None
-                self._run_complete.set()
-                self._active_project = None
-                self._active_run_id = None
-                self._active_tools = None
-                self._active_client = None
+            self._reap_locked()
 
         for cleared in affected:
-            (
-                self.settings.workspace_root / cleared / ".agent_state.json"
-            ).unlink(missing_ok=True)
+            (self.settings.workspace_root / cleared / ".agent_state.json").unlink(missing_ok=True)
         return affected
 
     # ------------------------------------------------------------------ main loop
@@ -666,6 +703,7 @@ class AgentRunner:
         is_retry: bool = False,
         reasoning_effort: str | None = None,
         model_key: str | None = None,
+        stop_event: threading.Event | None = None,
     ) -> None:
         """Lifecycle wrapper: init, dispatch turns, terminal cleanup.
 
@@ -691,6 +729,7 @@ class AgentRunner:
                 is_retry=is_retry,
                 reasoning_effort=reasoning_effort,
                 model_key=model_key,
+                stop_event=stop_event,
             )
             activity_logger = state.activity_logger
             # Bound once: the publisher reads ``current_message_id`` lazily
@@ -701,7 +740,7 @@ class AgentRunner:
             max_iterations = limit + _MAX_TOTAL_TRUNCATION_CONTINUATIONS + 8
             tool_turn = 0
             for _ in range(max_iterations):
-                if self._stop_event.is_set():
+                if state.stop_event.is_set():
                     self._handle_stop_pre_turn(state)
                     return
                 state.current_message_id = uuid.uuid4().hex
@@ -725,7 +764,7 @@ class AgentRunner:
         except RequestCancelled:
             self._handle_request_cancelled(state)
         except Exception as error:  # noqa: BLE001 - Surface all failures to the local UI.
-            self._handle_unexpected_error(error, project, state)
+            self._handle_unexpected_error(error, project, state, stop_event)
         finally:
             self._finalize_run(project, state, activity_logger, run_id)
 
@@ -742,6 +781,7 @@ class AgentRunner:
         is_retry: bool = False,
         reasoning_effort: str | None = None,
         model_key: str | None = None,
+        stop_event: threading.Event | None = None,
     ) -> _RunState:
         """Build tools/client, log ``run_start``, return the run state.
 
@@ -749,6 +789,7 @@ class AgentRunner:
         dispatch. If this raises, ``_run``'s exception handlers take
         over and ``state`` is ``None`` for the ``finally`` block.
         """
+        eff_stop = stop_event or threading.Event()
         with self._lock:
             effective_settings = self.settings
         if model_key:
@@ -768,19 +809,31 @@ class AgentRunner:
             },
         )
         tools = ProjectTools(
-            project_dir, self.publish, effective_settings, self._stop_event
+            project_dir, self.publish, effective_settings, eff_stop
         )
         client = create_llm_client(effective_settings)
-        client.stop_event = self._stop_event
+        client.stop_event = eff_stop
         session_prefix = (
             effective_settings.openrouter_session_prefix
             if effective_settings.llm_provider == "openrouter"
             else effective_settings.llm_provider
         )
         client.session_id = f"{session_prefix}:{project}"
+        client.error_callback = lambda phase, err, att: self._debug_tool_error(
+            project_dir,
+            f"llm_{att}",
+            "llm",
+            err,
+            "",
+            phase=f"llm_{phase}",
+            run_id=run_id,
+            settings=effective_settings,
+        )
         with self._lock:
-            self._active_tools = tools
-            self._active_client = client
+            session = self._sessions.get(project)
+            if session is not None and session.run_id == run_id:
+                session.active_tools = tools
+                session.active_client = client
         messages = self._context(
             project_dir,
             message,
@@ -796,11 +849,6 @@ class AgentRunner:
             )
             client.activity_logger = activity_logger
             client.run_id = run_id
-            # Stash on the runner so the per-call dispatcher wrapper can
-            # read the logger without re-deriving it. ``finally`` clears
-            # these to keep a stale logger from leaking across runs.
-            self._active_activity_logger = activity_logger
-            self._active_run_id = run_id
             activity_logger.log(
                 "run_start",
                 {
@@ -839,6 +887,7 @@ class AgentRunner:
             start_perf_time=time.perf_counter(),
             settings=effective_settings,
             export_3mf=export_3mf,
+            stop_event=eff_stop,
         )
 
     def _build_stream_publisher(
@@ -959,7 +1008,7 @@ class AgentRunner:
                 state.truncation_continuations < 3
                 and state.total_truncation_continuations < _MAX_TOTAL_TRUNCATION_CONTINUATIONS
                 and has_partial
-                and not self._stop_event.is_set()
+                and not state.stop_event.is_set()
             ):
                 state.total_turns += 1
                 state.truncation_continuations += 1
@@ -1055,7 +1104,7 @@ class AgentRunner:
                     )
                 return _TurnOutcome.CONTINUE
             raise
-        if self._stop_event.is_set():
+        if state.stop_event.is_set():
             raise RequestCancelled("Task stopped by the user.")
         if (
             awaiting_tool_render
@@ -1093,7 +1142,7 @@ class AgentRunner:
                 can_continue = (
                     state.truncation_continuations < 3
                     and state.total_truncation_continuations < _MAX_TOTAL_TRUNCATION_CONTINUATIONS
-                    and not self._stop_event.is_set()
+                    and not state.stop_event.is_set()
                 )
                 self.publish(
                     "agent_stream_end",
@@ -1464,11 +1513,8 @@ class AgentRunner:
             "profile": profile,
         }
         profile_path = state.project_dir / ".cad-agent" / "print_profile.json"
-        profile_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_profile = profile_path.with_suffix(".tmp")
         try:
-            tmp_profile.write_text(json.dumps(profile_store, indent=2), encoding="utf-8")
-            tmp_profile.replace(profile_path)
+            atomic_write_json(profile_path, profile_store)
         except OSError as exc:
             logging.getLogger(__name__).warning("Failed to save 3MF print profile: %s", exc)
 
@@ -1516,9 +1562,10 @@ class AgentRunner:
             "limit": budget_limit,
             "remaining": max(0, budget_limit - turn_step),
         }
+        debug_log = partial(self._debug_tool_error, run_id=state.run_id, settings=run_settings)
         waves = group_tool_calls_into_waves(tool_calls)
         for wave_idx, wave in enumerate(waves):
-            if self._stop_event.is_set():
+            if state.stop_event.is_set():
                 self._cancel_remaining_tool_calls(
                     state.project_dir,
                     tool_calls,
@@ -1548,7 +1595,7 @@ class AgentRunner:
                         publish=self.publish,
                         register_preview=self._register_preview,
                         append_message=lambda _p, _m: None,
-                        debug_log=self._debug_tool_error,
+                        debug_log=debug_log,
                         activity_logger=state.activity_logger,
                         run_id=state.run_id,
                     )
@@ -1579,6 +1626,9 @@ class AgentRunner:
 
                 def _exec_parallel_call(
                     call_item: dict[str, Any],
+                    _fix: bool = base_fix_required,
+                    _prev: str | None = base_preview_id,
+                    _err: str | None = base_cad_error,
                 ) -> tuple[str | None, str | None, bool, bool, list[dict]]:
                     local_msgs: list[dict] = []
                     p_id, c_err, c_fix, wait = process_tool_call(
@@ -1586,14 +1636,14 @@ class AgentRunner:
                         state.project,
                         state.project_dir,
                         call_item,
-                        base_fix_required,
-                        base_preview_id,
-                        base_cad_error,
+                        _fix,
+                        _prev,
+                        _err,
                         local_msgs,
                         publish=self.publish,
                         register_preview=self._register_preview,
                         append_message=lambda _p, _m: None,
-                        debug_log=self._debug_tool_error,
+                        debug_log=debug_log,
                         activity_logger=state.activity_logger,
                         run_id=state.run_id,
                     )
@@ -1774,8 +1824,18 @@ class AgentRunner:
         The model's tool result already captured the question text; the
         UI surfaces it via ``.agent_state.json`` and the
         ``agent_status:waiting_for_user`` SSE event. This helper just
-        finalises the transcript and emits the status event.
+        finalises the transcript and emits the status event. The run's
+        model/effort selection is persisted next to the question *before*
+        the status event so ``answer()`` can resume with the same choice.
         """
+        run_settings = state.settings or self.settings
+        agent_state = self._agent_state(state.project)
+        agent_state["model_key"] = run_settings.active_model_key
+        agent_state["reasoning_effort"] = run_settings.reasoning_effort or ""
+        try:
+            atomic_write_json(state.project_dir / ".agent_state.json", agent_state)
+        except OSError:
+            pass
         self.publish(
             "agent_status",
             {
@@ -1987,13 +2047,15 @@ class AgentRunner:
         error: BaseException,
         project: str,
         state: _RunState | None,
+        stop_event: threading.Event | None = None,
     ) -> None:
         """Surface any unhandled exception to the local UI.
 
         ``state`` may be ``None`` when the failure happened during
         ``_init_run``; in that case we fall back to
         ``settings.workspace_root / project`` so the operator audit
-        trail still lands in the right place.
+        trail still lands in the right place, and to the run's
+        ``stop_event`` to tell a user stop from a genuine failure.
         """
         detail = str(error)
         err_type = type(error).__name__
@@ -2004,6 +2066,8 @@ class AgentRunner:
             if state is not None
             else self.settings.workspace_root / project
         )
+        run_id = state.run_id if state is not None else ""
+        run_settings = (state.settings if state is not None else None) or self.settings
         # Route through ``debug-errors.jsonl`` so agent-loop faults
         # share the same audit trail as tool errors instead of
         # vanishing into stderr.
@@ -2015,11 +2079,12 @@ class AgentRunner:
             result="",
             phase="agent_loop",
             traceback_text=tb_text,
+            run_id=run_id,
+            settings=run_settings,
         )
         current_message_id = (
             state.current_message_id if state is not None else None
         )
-        run_id = state.run_id if state is not None else ""
         if current_message_id is not None:
             stream_end_payload: dict[str, Any] = {
                 "project": project,
@@ -2029,7 +2094,8 @@ class AgentRunner:
             if run_id:
                 stream_end_payload["run_id"] = run_id
             self.publish("agent_stream_end", stream_end_payload)
-        if self._stop_event.is_set():
+        stop_event = state.stop_event if state is not None else stop_event
+        if stop_event is not None and stop_event.is_set():
             stop_payload: dict[str, Any] = {
                 "project": project,
                 "status": "stopped",
@@ -2039,7 +2105,6 @@ class AgentRunner:
                 stop_payload["run_id"] = run_id
             self.publish("agent_status", stop_payload)
             return
-        run_settings = (state.settings if state is not None else None) or self.settings
         err_payload: dict[str, Any] = {
             "project": project,
             "error_type": err_type,
@@ -2063,30 +2128,19 @@ class AgentRunner:
     ) -> None:
         """Terminal ``finally`` block — runs on every exit path.
 
-        Active-handle cleanup is guarded by ``run_id`` so an exiting thread
+        Session cleanup is guarded by ``run_id`` so an exiting thread
         from a stopped run never clobbers a newly started run's state.
         """
         with self._lock:
-            is_current_run = (
-                self._active_run_id is None or self._active_run_id == run_id
-            )
-            if is_current_run:
-                self._active_tools = None
-                self._active_client = None
-                if self._active_project == project:
-                    self._active_project = None
-                    self._active_run_id = None
-                self._active_activity_logger = None
-            # Mark the run finished and drop the thread reference so a
-            # subsequent ``start()`` / ``answer()`` never observes a
-            # stale ``_thread``.
-            if self._thread is None or self._thread is threading.current_thread():
-                self._thread = None
-                self._run_complete.set()
+            session = self._sessions.get(project)
+            if session is not None and session.run_id == run_id:
+                session.run_complete.set()
+                del self._sessions[project]
         if activity_logger is not None:
             try:
                 if state is not None:
-                    if self._stop_event.is_set():
+                    was_stopped = state.stop_event.is_set()
+                    if was_stopped:
                         outcome = "USER_STOP"
                     elif state.cad_error:
                         outcome = "CAD_ERROR"
@@ -2113,7 +2167,7 @@ class AgentRunner:
                             "total_turns": state.total_turns,
                             "tool_calls": state.tool_call_count,
                             "duration_ms": total_duration_ms,
-                            "cancelled": self._stop_event.is_set(),
+                            "cancelled": was_stopped,
                             "usage": {
                                 "prompt_tokens": state.total_prompt_tokens,
                                 "completion_tokens": state.total_completion_tokens,
@@ -2253,9 +2307,9 @@ class AgentRunner:
                             existed = real_exists
                             content = current_content
                             try:
-                                state_file.write_text(
-                                    json.dumps({"existed": existed, "content": content}),
-                                    encoding="utf-8",
+                                atomic_write_json(
+                                    state_file,
+                                    {"existed": existed, "content": content},
                                 )
                             except OSError:
                                 pass
@@ -2298,9 +2352,9 @@ class AgentRunner:
                 pass
 
         try:
-            state_file.write_text(
-                json.dumps({"existed": existed, "content": content}),
-                encoding="utf-8",
+            atomic_write_json(
+                state_file,
+                {"existed": existed, "content": content},
             )
         except OSError:
             pass
@@ -2453,40 +2507,6 @@ class AgentRunner:
 
     # ------------------------------------------------------------------ dispatch
 
-    def _process_tool_call(
-        self,
-        tools: ProjectTools,
-        project: str,
-        project_dir: Path,
-        call: dict,
-        cad_fix_required: bool,
-        prev_preview_id: str | None,
-        cad_error: str | None,
-        messages: list[dict],
-    ) -> tuple[str | None, str | None, bool, bool]:
-        """Per-call wrapper that injects runner callbacks into ``dispatcher.process_tool_call``.
-
-        Centralised here so the agent loop stays focused on lifecycle state
-        and the dispatcher stays unaware of the ``AgentRunner`` instance.
-        """
-        result = process_tool_call(
-            tools,
-            project,
-            project_dir,
-            call,
-            cad_fix_required,
-            prev_preview_id,
-            cad_error,
-            messages,
-            publish=self.publish,
-            register_preview=self._register_preview,
-            append_message=self._append_message,
-            debug_log=self._debug_tool_error,
-            activity_logger=self._active_activity_logger,
-            run_id=self._active_run_id,
-        )
-        return result
-
     @classmethod
     def _cancel_remaining_tool_calls(
         cls,
@@ -2526,6 +2546,15 @@ class AgentRunner:
         # that did not pass the type.
         if err_type == "RequestCancelled" or "task was cancelled" in lower:
             return "Task was cancelled."
+        if (
+            err_type == "UpstreamModerationError"
+            or "blocked the response via content filter" in lower
+            or "canned moderation refusal" in lower
+        ):
+            return (
+                f"{provider_name} content filter flagged the response (likely false-positive on mechanical CAD terminology). "
+                "Retry the request or switch to a different model."
+            )
         if (
             err_type == "CompletionTruncatedError"
             or "completion was truncated" in lower
@@ -2727,11 +2756,13 @@ class AgentRunner:
         project_dir: Path,
         call_id: str,
         tool: str,
-        error: Exception,
+        error: BaseException,
         result: str,
         *,
         phase: str = "tool_call",
         traceback_text: str | None = None,
+        run_id: str | None = None,
+        settings: Settings | None = None,
     ) -> None:
         """Append recoverable tool failures to a project-local debug log.
 
@@ -2741,11 +2772,13 @@ class AgentRunner:
         ``traceback_text``). The shared file format keeps the on-disk
         footprint stable for downstream tools.
         """
-        if not self.settings.agent_debug_log_tool_errors:
+        eff_settings = settings or self.settings
+        if not eff_settings.agent_debug_log_tool_errors:
             return
         try:
             entry: dict[str, object] = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
+                "run_id": run_id or "",
                 "call_id": call_id,
                 "tool": tool,
                 "phase": phase,
@@ -2770,7 +2803,7 @@ class AgentRunner:
                 # ``_failure_detail`` truncation.
                 entry["traceback"] = traceback_text[-4000:]
             with (
-                _shared_history_lock(),
+                project_history_lock(project_dir),
                 (project_dir / "debug-errors.jsonl").open(
                     "a", encoding="utf-8"
                 ) as log,
@@ -2835,7 +2868,7 @@ class AgentRunner:
             "content": content,
         }
         # Route through ``ConversationStore.append`` so the canonical write
-        # path holds ``shared_history_lock`` and invalidates the cache. The
+        # path holds ``project_history_lock`` and updates the cache. The
         # previous direct ``open(..., "a")`` shortcut interleaved bytes with
         # concurrent canonical writes and left the in-memory cache stale,
         # which then dropped the question-log line on the next history load.

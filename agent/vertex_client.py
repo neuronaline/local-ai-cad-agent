@@ -193,7 +193,7 @@ class VertexClient(ChatCompletionsClient):
             )
         except Exception as err:
             if "401" in str(err):
-                gcloud_auth.invalidate_token()
+                gcloud_auth.invalidate_token(current_token)
             raise
 
         # Check for expired/invalid token response (401 Unauthorized)
@@ -203,7 +203,7 @@ class VertexClient(ChatCompletionsClient):
             except Exception:
                 pass
             response = None
-            gcloud_auth.invalidate_token()
+            gcloud_auth.invalidate_token(current_token)
             for auth_attempt in range(1, 3):
                 if self.stop_event and self.stop_event.is_set():
                     raise RequestCancelled("LLM request cancelled.")
@@ -212,6 +212,7 @@ class VertexClient(ChatCompletionsClient):
                 sleep_with_cancel(backoff, self.stop_event)
                 if self.stop_event and self.stop_event.is_set():
                     raise RequestCancelled("LLM request cancelled.")
+                fresh_token: str | None = None
                 try:
                     fresh_token = gcloud_auth.get_access_token(force_refresh=True)
                     active_headers = {**headers, "Authorization": f"Bearer {fresh_token}"}
@@ -228,11 +229,11 @@ class VertexClient(ChatCompletionsClient):
                         response.close()
                     except Exception:
                         pass
-                    gcloud_auth.invalidate_token()
+                    gcloud_auth.invalidate_token(fresh_token)
                 except RequestCancelled:
                     raise
                 except Exception as err:
-                    gcloud_auth.invalidate_token()
+                    gcloud_auth.invalidate_token(fresh_token)
                     _LOG.debug("Auth recovery attempt %d failed: %s", auth_attempt, err)
                     if auth_attempt == 2 and response is None:
                         raise

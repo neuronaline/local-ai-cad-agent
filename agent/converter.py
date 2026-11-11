@@ -18,6 +18,7 @@ from agent.revisions import compute_model_sha256
 from agent.sandbox import OPENSCAD_LIBRARY_DIR, _BWRAP, command as sandbox_command
 from agent.tools.cad_scripts.renderer import load_stl, render_iso
 from agent.tools.cad_tool import _supports_manifold
+from agent.tools.process_runner import acquire_build_slot
 
 SUPPORTED_EXPORT_FORMATS = frozenset({"stl", "scad", "3mf"})
 
@@ -1072,42 +1073,43 @@ def _run_openscad_export(
 
     seccomp_fd: int | None = None
     try:
-        if _BWRAP and in_workspace:
-            cmd, seccomp_fd = sandbox_command(
-                project_dir,
-                scad_args,
-                writable=True,
-                timeout_seconds=timeout_seconds,
-                executable="openscad",
-            )
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds,
-                check=False,
-                cwd=str(project_dir),
-                pass_fds=(seccomp_fd,),
-            )
-        else:
-            fallback_env = (
-                {**os.environ, "OPENSCADPATH": str(OPENSCAD_LIBRARY_DIR)}
-                if OPENSCAD_LIBRARY_DIR.is_dir()
-                else None
-            )
-            proc = subprocess.run(
-                [openscad_bin, *scad_args],
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds,
-                check=False,
-                cwd=str(project_dir) if in_workspace else None,
-                env=fallback_env,
-            )
-        if proc.returncode != 0 or not _cached(temp_file):
-            err_msg = (proc.stderr or proc.stdout).strip()
-            raise RuntimeError(f"OpenSCAD export failed:\n{err_msg or 'No output produced.'}")
-        temp_file.replace(target)
+        with acquire_build_slot(timeout=timeout_seconds * 2):
+            if _BWRAP and in_workspace:
+                cmd, seccomp_fd = sandbox_command(
+                    project_dir,
+                    scad_args,
+                    writable=True,
+                    timeout_seconds=timeout_seconds,
+                    executable="openscad",
+                )
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_seconds,
+                    check=False,
+                    cwd=str(project_dir),
+                    pass_fds=(seccomp_fd,),
+                )
+            else:
+                fallback_env = (
+                    {**os.environ, "OPENSCADPATH": str(OPENSCAD_LIBRARY_DIR)}
+                    if OPENSCAD_LIBRARY_DIR.is_dir()
+                    else None
+                )
+                proc = subprocess.run(
+                    [openscad_bin, *scad_args],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_seconds,
+                    check=False,
+                    cwd=str(project_dir) if in_workspace else None,
+                    env=fallback_env,
+                )
+            if proc.returncode != 0 or not _cached(temp_file):
+                err_msg = (proc.stderr or proc.stdout).strip()
+                raise RuntimeError(f"OpenSCAD export failed:\n{err_msg or 'No output produced.'}")
+            temp_file.replace(target)
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"OpenSCAD export to {target.suffix[1:]} timed out.") from exc
     finally:

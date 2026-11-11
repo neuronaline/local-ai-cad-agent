@@ -15,6 +15,7 @@ from agent.images import as_chat_image
 from agent.prompt import TOOL_HINTS
 from agent.review_paths import review_dir
 from agent.revisions import RevisionIntegrityError
+from agent.tools.file_tool import MatchError, OpenScadPreflightError
 
 _LOG = logging.getLogger(__name__)
 
@@ -404,6 +405,20 @@ def _classify(tool: str, error: Exception, message: str) -> tuple[str, str, bool
                 True,
                 TOOL_HINTS["IMAGE_RUN_CAD_BUILD_FIRST"],
             )
+    if isinstance(error, MatchError):
+        return (
+            "EDIT_MATCH_FAILED",
+            "validation",
+            True,
+            TOOL_HINTS["EDIT_MATCH_FAILED"],
+        )
+    if isinstance(error, OpenScadPreflightError):
+        return (
+            "OPENSCAD_PREFLIGHT_FAILED",
+            "validation",
+            True,
+            TOOL_HINTS["OPENSCAD_PREFLIGHT_FAILED"],
+        )
     if isinstance(error, (ValueError, TypeError, KeyError)):
         return (
             "VALIDATION_ERROR",

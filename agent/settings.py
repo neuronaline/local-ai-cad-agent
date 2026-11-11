@@ -173,15 +173,20 @@ class Settings:
     # ── end provider selection ──
     show_info_messages: bool = True
     agent_tool_call_limit: int = 12
+    agent_max_concurrent_runs: int = 8
+    agent_max_parallel_builds: int = 2
     revision_retention_count: int = 0  # 0 = unlimited, >0 = keep at most N revisions
-    agent_debug_log_tool_errors: bool = False
+    agent_debug_log_tool_errors: bool = True
     # When True, every agent run writes a redacted, append-only JSONL
     # trace of the tool loop (LLM requests, SSE chunks, tool calls, sandbox
     # subprocess I/O) to ``<project>/.cad-agent/activity.jsonl``. Off by
     # default; only enable when debugging model behaviour or wire-level
     # provider errors because the log can grow quickly.
     agent_log_tool_activity: bool = False
-    agent_log_mode: str = "off"  # "off", "debug", "dataset"
+    # Runtime activity-log mode: "off", "debug", or "dataset". The config
+    # alias ``log_mode: errors`` resolves to "off" plus
+    # ``agent_debug_log_tool_errors`` (see ``_validate_log_activity``).
+    agent_log_mode: str = "off"
     # ── Review rendering settings (used by cad_build) ──
     # Multi-view rasterisation is the canonical eight-view + contact-sheet
     # output of ``cad_build``. The structured verdict (the
@@ -194,7 +199,7 @@ class Settings:
     # is the cell count per side. Defaults match the previous hard-coded grid.
     viewer_grid_size: float = 200.0
     viewer_grid_divisions: int = 20
-    llm_max_completion_tokens: int | None = 16384
+    llm_max_completion_tokens: int | None = 32768
     user_printer: str = ""
     user_nozzle: str = ""
     user_filament: str = "PLA"
@@ -641,6 +646,8 @@ def load_settings(project_root: Path | None = None) -> Settings:
             "debug_log_tool_errors",
             "log_tool_activity",
             "log_mode",
+            "max_concurrent_runs",
+            "max_parallel_builds",
         },
         "agent",
     )
@@ -710,7 +717,9 @@ def load_settings(project_root: Path | None = None) -> Settings:
         agent_log_mode,
         agent_debug_log_tool_errors,
     ) = _validate_log_activity(
-        agent.get("log_mode"),
+        # Omitted ``log_mode`` means "errors" (debug-errors.jsonl only),
+        # matching the ``Settings`` dataclass defaults.
+        agent.get("log_mode", "errors"),
         _strict_bool(agent.get("log_tool_activity", False), "agent.log_tool_activity"),
         _strict_bool(
             agent.get("debug_log_tool_errors", False), "agent.debug_log_tool_errors"
@@ -847,6 +856,12 @@ def load_settings(project_root: Path | None = None) -> Settings:
         mimo_reasoning_effort=provider_defaults["mimo"].reasoning_effort,
         show_info_messages=_strict_bool(ui.get("show_info_messages", True), "ui.show_info_messages"),
         agent_tool_call_limit=_positive_int(agent.get("tool_call_limit", 12), "agent.tool_call_limit"),
+        agent_max_concurrent_runs=min(
+            32, _positive_int(agent.get("max_concurrent_runs", 8), "agent.max_concurrent_runs")
+        ),
+        agent_max_parallel_builds=min(
+            16, _positive_int(agent.get("max_parallel_builds", 2), "agent.max_parallel_builds")
+        ),
         revision_retention_count=_non_negative_int(agent.get("revision_retention_count", 0), "agent.revision_retention_count"),
         agent_debug_log_tool_errors=agent_debug_log_tool_errors,
         agent_log_tool_activity=agent_log_tool_activity,
@@ -860,7 +875,7 @@ def load_settings(project_root: Path | None = None) -> Settings:
         viewer_grid_size=grid_size,
         viewer_grid_divisions=grid_divisions,
         llm_max_completion_tokens=_optional_positive_int(
-            llm.get("max_completion_tokens", 16384), "llm.max_completion_tokens"
+            llm.get("max_completion_tokens", 32768), "llm.max_completion_tokens"
         ),
         user_printer=str(user_cfg.get("printer") or "").strip(),
         user_nozzle=str(user_cfg.get("nozzle") or "").strip(),

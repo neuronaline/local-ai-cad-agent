@@ -20,6 +20,7 @@ import {
   initEditor,
   loadModelCode,
   isCodeDirty,
+  handleRemoteRevision,
   setViewerMode,
   jumpToEditorLine,
   triggerBuild,
@@ -87,6 +88,7 @@ const imageModalClose = document.querySelector('#image-modal-close');
 const appConfig = JSON.parse(document.querySelector('#app-config')?.textContent || '{}');
 const showInfoMessages = appConfig.showInfoMessages ?? true;
 const currentProject = appConfig.projectName || '';
+const TAB_CLIENT_ID = 'client_' + Math.random().toString(36).slice(2, 10);
 const viewer = new CadViewer(document.querySelector('#viewer'), document.querySelector('#dimensions'), appConfig);
 
 const VALID_EFFORTS = new Set(['', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
@@ -164,6 +166,9 @@ function setActiveReasoningEffort(effort, syncBackend = true, persistLocal = tru
   reasoningEffortSelect.value = effective;
   if (persistLocal) {
     try {
+      if (currentProject) {
+        sessionStorage.setItem(`cad_effort:${currentProject}`, effective);
+      }
       if (effective) {
         localStorage.setItem('cad_user_reasoning_effort', effective);
       } else {
@@ -172,10 +177,12 @@ function setActiveReasoningEffort(effort, syncBackend = true, persistLocal = tru
     } catch {}
   }
   if (syncBackend) {
+    const payload = { effort: effective };
+    if (currentProject) payload.project = currentProject;
     api('/api/settings/reasoning-effort', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({effort: effective}),
+      body: JSON.stringify(payload),
     }).catch(() => {});
   }
 }
@@ -185,18 +192,26 @@ function setActiveModelKey(key, adoptModelEffort = false) {
   modelSelect.value = key;
   syncEffortOptionsForModel(key);
   try {
+    if (currentProject) {
+      sessionStorage.setItem(`cad_model:${currentProject}`, key);
+    }
     localStorage.setItem('cad_selected_model', key);
   } catch {}
+  const payload = { model_key: key };
+  if (currentProject) payload.project = currentProject;
   return api('/api/settings/models', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({model_key: key}),
+    body: JSON.stringify(payload),
   }).then(res => {
     if (adoptModelEffort && res && VALID_EFFORTS.has(res.reasoning_effort ?? '')) {
       const supported = getSupportedEffortsForModel(key);
       const nextEffort = supported.has(res.reasoning_effort ?? '') ? (res.reasoning_effort ?? '') : '';
       setActiveReasoningEffort(nextEffort, false, false);
       try {
+        if (currentProject) {
+          sessionStorage.setItem(`cad_effort:${currentProject}`, nextEffort);
+        }
         localStorage.removeItem('cad_user_reasoning_effort');
       } catch {}
     }
@@ -207,21 +222,31 @@ function setActiveModelKey(key, adoptModelEffort = false) {
 function initModelAndEffort() {
   try {
     localStorage.removeItem('cad_reasoning_effort');
-    const savedModel = localStorage.getItem('cad_selected_model');
-    const savedEffort = localStorage.getItem('cad_user_reasoning_effort');
-    const activeModel = (savedModel && validModelKeys.has(savedModel)) ? savedModel : getActiveModelKey();
+    let activeModel = currentProject ? sessionStorage.getItem(`cad_model:${currentProject}`) : null;
+    if (!activeModel || !validModelKeys.has(activeModel)) {
+      activeModel = appConfig.activeModelKey;
+    }
+    if (!activeModel || !validModelKeys.has(activeModel)) {
+      const savedGlobal = localStorage.getItem('cad_selected_model');
+      if (savedGlobal && validModelKeys.has(savedGlobal) && !appConfig.hasProjectModel) {
+        activeModel = savedGlobal;
+      }
+    }
+    if (!activeModel || !validModelKeys.has(activeModel)) {
+      activeModel = getActiveModelKey();
+    }
 
     if (modelSelect && activeModel) {
       modelSelect.value = activeModel;
     }
     syncEffortOptionsForModel(activeModel);
 
-    if (savedEffort !== null && VALID_EFFORTS.has(savedEffort)) {
-      setActiveReasoningEffort(savedEffort, false, false);
+    let activeEffort = currentProject ? sessionStorage.getItem(`cad_effort:${currentProject}`) : null;
+    if (activeEffort === null || !VALID_EFFORTS.has(activeEffort)) {
+      activeEffort = appConfig.reasoningEffort ?? '';
     }
-
-    if (savedModel && savedModel !== appConfig.activeModelKey && validModelKeys.has(savedModel)) {
-      setActiveModelKey(savedModel, false);
+    if (activeEffort !== null && VALID_EFFORTS.has(activeEffort)) {
+      setActiveReasoningEffort(activeEffort, false, false);
     }
   } catch {}
 }
@@ -523,6 +548,7 @@ const activityLabels = {
   running: 'In progress',
   rendering: 'Rendering',
   rendering_views: 'Rendering review views',
+  waiting_build_slot: 'Queued for build slot',
   verifying: 'Verifying geometry',
   reviewing: 'Reviewing',
   started: 'Starting',
@@ -1374,6 +1400,7 @@ async function sendChatRequest({ text, files = [] }) {
   body.append('idempotency_key', idempotencyKey);
   body.append('reasoning_effort', getActiveReasoningEffort());
   body.append('model_key', getActiveModelKey());
+  body.append('client_id', TAB_CLIENT_ID);
   if (Array.isArray(files)) {
     files.forEach(file => body.append('attachments', file));
   }
@@ -1449,6 +1476,7 @@ async function handleRetry(errorElement = null, context = null, triggerBtn = nul
       project: currentProject,
       reasoning_effort: getActiveReasoningEffort(),
       model_key: getActiveModelKey(),
+      client_id: TAB_CLIENT_ID,
     };
     if (userIndex >= 0) {
       retryPayload.user_index = userIndex;
@@ -1479,7 +1507,6 @@ let previewProject = '';
 let loadedPreviewRevision = '';
 let previewLoadPromise = null;
 let pendingPreviewRequest = null;
-let busyWithOtherProject = null;
 
 function setScreenshotButtonsDisabled(disabled) {
   if (screenshotBtn) screenshotBtn.disabled = disabled;
@@ -1560,61 +1587,9 @@ async function syncCurrentPreview() {
   } catch {}
 }
 
-function setBusyWithOther(activeProject) {
-  busyWithOtherProject = activeProject || null;
-  const banner = document.querySelector('#busy-project-banner');
-  if (!banner) return;
-  if (activeProject) {
-    const safeProj = escapeHTML(activeProject);
-    banner.innerHTML = `
-      <div class="busy-banner-content">
-        <span class="busy-banner-icon" aria-hidden="true">⚡</span>
-        <span class="busy-banner-text">Agent task is currently running in <strong>${safeProj}</strong>.</span>
-      </div>
-      <div class="busy-banner-actions">
-        <a href="/project/${encodeURIComponent(activeProject)}" class="btn-banner-link">Go to ${safeProj}</a>
-        <button type="button" id="busy-banner-stop-btn" class="btn-banner-stop">Stop Task</button>
-      </div>
-    `;
-    banner.hidden = false;
-    const stopBtn = banner.querySelector('#busy-banner-stop-btn');
-    stopBtn?.addEventListener('click', async () => {
-      stopBtn.disabled = true;
-      stopBtn.textContent = 'Stopping…';
-      try {
-        await api('/api/stop', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({project: activeProject}),
-        });
-        setBusyWithOther(null);
-        addMessage(`Agent task in "${activeProject}" was stopped.`, 'info');
-      } catch (err) {
-        addMessage(`Failed to stop agent: ${err.message}`, 'error');
-        stopBtn.disabled = false;
-        stopBtn.textContent = 'Stop Task';
-      }
-    });
-    if (message) {
-      message.placeholder = `Agent is running in project "${activeProject}"…`;
-    }
-  } else {
-    banner.hidden = true;
-    banner.innerHTML = '';
-    if (message && message.placeholder.startsWith('Agent is running in project')) {
-      message.placeholder = 'Describe the part, dimensions, fit, and required features…';
-    }
-  }
-}
-
 async function loadCurrentState() {
   if (!currentProject) return;
   const data = await api(`/api/projects/${encodeURIComponent(currentProject)}/state`);
-  if (data.busy_with_other && data.active_project) {
-    setBusyWithOther(data.active_project);
-  } else {
-    setBusyWithOther(null);
-  }
   if (data.status === 'waiting_for_user') {
     setThinking(false);
     const q = data.question || {};
@@ -1700,6 +1675,8 @@ async function loadHistory(projectName) {
         renderedAny = true;
       } else if (evt.type === 'agent_usage') {
         updateUsagePill(evt.data);
+      } else if (evt.type === 'agent_stopped') {
+        markActivityRecovered('stopped');
       } else if (showInfoMessages) {
         addInfoMessage(evt.type, evt.data, { target });
       }
@@ -2368,7 +2345,7 @@ function showQuestion(question) {
       await api('/api/questions/answer', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ project: currentProject, answers }),
+        body: JSON.stringify({ project: currentProject, answers, client_id: TAB_CLIENT_ID }),
       });
       clearQuestionArea();
       finalizeAllActiveCards();
@@ -2385,8 +2362,7 @@ function showQuestion(question) {
 }
 
 // ── SSE Stream ──
-let eventSource = null;
-let streamReconnectTimer = null;
+let streamClient = null;
 let streamHadError = false;
 
 async function syncAfterStreamReset() {
@@ -2409,33 +2385,13 @@ function applyConversationReset() {
 }
 
 function connectStream() {
-  if (streamReconnectTimer) {
-    clearTimeout(streamReconnectTimer);
-    streamReconnectTimer = null;
+  if (streamClient) {
+    streamClient.close();
+    streamClient = null;
   }
-  if (eventSource) eventSource.close();
   const status = document.querySelector('#connection-status');
-  eventSource = new EventSource('/api/stream');
 
-  eventSource.addEventListener('error', () => {
-    streamHadError = true;
-    if (status) {
-      status.classList.remove('connected');
-      status.setAttribute('aria-label', 'Disconnected');
-    }
-    if (eventSource) {
-      eventSource.close();
-      eventSource = null;
-    }
-    if (!streamReconnectTimer) {
-      streamReconnectTimer = setTimeout(() => {
-        streamReconnectTimer = null;
-        connectStream();
-      }, 2000);
-    }
-  });
-
-  eventSource.addEventListener('open', () => {
+  const onOpen = () => {
     if (status) {
       status.classList.add('connected');
       status.setAttribute('aria-label', 'Connected');
@@ -2444,13 +2400,33 @@ function connectStream() {
       streamHadError = false;
       syncAfterStreamReset().catch(err => console.error('stream reconnect sync failed', err));
     }
-  });
+  };
+
+  const onError = () => {
+    streamHadError = true;
+    if (status) {
+      status.classList.remove('connected');
+      status.setAttribute('aria-label', 'Disconnected');
+    }
+  };
+
+  const onEvent = (eventName, data) => {
+    if (eventName === 'stream_reset') {
+      syncAfterStreamReset().catch(err => console.error('stream_reset sync failed', err));
+      return;
+    }
+    const handler = handlers[eventName];
+    if (handler) {
+      try {
+        handler(data);
+      } catch (err) {
+        console.error('Failed to handle event', eventName, err);
+      }
+    }
+  };
 
   const handlers = {
     agent_status: data => {
-      if (busyWithOtherProject && data.project === busyWithOtherProject) {
-        if (['stopped', 'failed', 'completed'].includes(data.status)) setBusyWithOther(null);
-      }
       if (data.project !== currentProject) return;
       const runId = data.run_id;
       const card = getActiveCard(runId);
@@ -2588,7 +2564,9 @@ function connectStream() {
     revision_updated: data => {
       if (data.project !== currentProject) return;
       syncCurrentPreview();
-      if (!isCodeDirty()) loadModelCode();
+      if (handleRemoteRevision()) {
+        addMessage('A new revision was saved by the agent or another tab. Your unsaved editor changes were kept.', 'info');
+      }
       if (isRevisionsDrawerOpen()) loadRevisions();
     },
     screenshot_updated: data => {
@@ -2615,9 +2593,6 @@ function connectStream() {
       setThinking(false);
     },
     agent_stopped: data => {
-      if (busyWithOtherProject && (data.project === busyWithOtherProject || (data.affected_projects && data.affected_projects.includes(busyWithOtherProject)))) {
-        setBusyWithOther(null);
-      }
       if (data.project !== currentProject) return;
       const runId = data.run_id || data.message_id;
       const card = getActiveCard(runId);
@@ -2649,20 +2624,58 @@ function connectStream() {
     conversation_reset: data => {
       if (data?.project === currentProject) applyConversationReset();
     },
+    user_message: data => {
+      if (data?.project !== currentProject) return;
+      if (data.sender && data.sender === TAB_CLIENT_ID) return;
+      if (data.is_retry) {
+        // The server rewound the conversation; replay it instead of appending.
+        syncAfterStreamReset().catch(err => console.error('retry sync failed', err));
+        return;
+      }
+      if (data.is_answer) {
+        clearQuestionArea();
+      }
+      startNewTurnUsageBucket();
+      // Attachment thumbnails are not mirrored (no URL exists for run inputs);
+      // History renders them from the persisted turn.
+      addMessage(data.message || '', 'user');
+      getOrCreateRunCard(null, { optimistic: true });
+      setThinking(true);
+      scrollFeedToBottom();
+    },
+    project_renamed: data => {
+      if (data?.old_project === currentProject) {
+        addMessage(`This project was renamed to "${data.project}". Redirecting…`, 'info');
+        setTimeout(() => {
+          window.location.href = `/project/${encodeURIComponent(data.project)}`;
+        }, 1500);
+      }
+    },
+    project_deleted: data => {
+      if (data?.project === currentProject) {
+        addMessage('This project has been deleted from another tab. Redirecting to projects list…', 'error');
+        setTimeout(() => {
+          window.location.href = '/';
+        }, 2000);
+      }
+    },
+    settings_updated: data => {
+      if (data?.hardware) {
+        if (hwPrinter) hwPrinter.value = data.hardware.printer || '';
+        if (hwFilament) hwFilament.value = data.hardware.filament || 'PLA';
+        if (hwNozzle) hwNozzle.value = data.hardware.nozzle || '0.4mm';
+        if (hwAdditional) hwAdditional.value = data.hardware.additional_info || '';
+        updateHardwarePickerLabel();
+      }
+    },
   };
 
-  for (const [eventName, handler] of Object.entries(handlers)) {
-    eventSource.addEventListener(eventName, event => {
-      try {
-        handler(JSON.parse(event.data));
-      } catch (error) {
-        console.error('Failed to parse event', eventName, error);
-      }
-    });
-  }
-
-  eventSource.addEventListener('stream_reset', () => {
-    syncAfterStreamReset().catch(err => console.error('stream_reset sync failed', err));
+  // Connect only after ``handlers`` is initialised: ``onEvent`` reads it.
+  streamClient = window.connectSharedStream({
+    project: currentProject,
+    onEvent,
+    onOpen,
+    onError,
   });
 }
 
@@ -2770,7 +2783,7 @@ window.addEventListener('keydown', (event) => {
 
 // ── Provider Balance Pill ──
 async function checkProviderBalance() {
-  if (!balancePill || !balanceAmount) return;
+  if (!balancePill || !balanceAmount || document.hidden) return;
   try {
     const data = await api('/api/provider/balance');
     if (data.supported && data.credits != null) {
@@ -3110,6 +3123,9 @@ hardwareForm?.addEventListener('submit', async (e) => {
   checkPreflight();
   checkProviderBalance();
   setInterval(checkProviderBalance, 60000);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) checkProviderBalance();
+  });
 
   initEditor({
     getProject: () => currentProject,

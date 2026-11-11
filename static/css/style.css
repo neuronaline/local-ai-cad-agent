@@ -1235,6 +1235,19 @@ input, select, textarea { border: 1px solid var(--line); border-radius: 6px; bac
 
 /* 3D Canvas & Floating presets */
 .viewer { position: relative; flex: 1 1 280px; min-height: 220px; overflow: hidden; }
+/* Set by CadViewer while the WebGL context is lost; cleared on restore. */
+.viewer.context-lost::after {
+  content: '3D preview paused — restoring…';
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(13, 21, 36, 0.85);
+  color: var(--muted);
+  font-size: 0.85rem;
+  pointer-events: none;
+}
 .viewer-floating-presets {
   position: absolute;
   top: 10px;
@@ -1529,77 +1542,6 @@ input, select, textarea { border: 1px solid var(--line); border-radius: 6px; bac
   #project-search { width: 100%; }
   #project-search:focus { width: 100%; }
   .projects-grid { grid-template-columns: 1fr; }
-}
-
-/* Busy project notice banner */
-.busy-project-banner {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.75rem;
-  padding: 0.65rem 0.9rem;
-  margin: 0.4rem 0.5rem;
-  background: rgba(234, 179, 8, 0.12);
-  border: 1px solid rgba(234, 179, 8, 0.35);
-  border-radius: 6px;
-  font-size: 0.85rem;
-  color: var(--text);
-  animation: fadeIn 0.2s ease-in-out;
-}
-
-.busy-banner-content {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-}
-
-.busy-banner-icon {
-  font-size: 1rem;
-  color: #eab308;
-}
-
-.busy-banner-actions {
-  display: flex;
-  align-items: center;
-  gap: 0.4rem;
-  flex-shrink: 0;
-}
-
-.btn-banner-link {
-  font-size: 0.75rem;
-  padding: 0.25rem 0.5rem;
-  border-radius: 4px;
-  background: var(--surface);
-  border: 1px solid var(--line);
-  color: var(--text);
-  text-decoration: none;
-  font-weight: 500;
-  transition: background 0.15s ease;
-}
-
-.btn-banner-link:hover {
-  background: var(--surface-hover, rgba(255, 255, 255, 0.08));
-}
-
-.btn-banner-stop {
-  font-size: 0.75rem;
-  padding: 0.25rem 0.55rem;
-  border-radius: 4px;
-  background: #dc2626;
-  border: 1px solid #b91c1c;
-  color: #fff;
-  cursor: pointer;
-  font-weight: 500;
-  transition: opacity 0.15s ease;
-}
-
-.btn-banner-stop:hover {
-  opacity: 0.88;
-}
-
-.btn-banner-stop:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
 }
 
 /* Running badge on project cards */

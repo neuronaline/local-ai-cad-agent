@@ -19,6 +19,10 @@ const buildBtn = document.querySelector('#build-btn');
 const copyCodeBtn = document.querySelector('#copy-code-btn');
 
 let codeDirty = false;
+// True while this tab's own PUT is in flight: its ``revision_updated`` echo
+// can arrive before the response clears ``codeDirty``.
+let saveInFlight = false;
+const REMOTE_CONFLICT_NOTE = ' · remote revision saved, unsaved edits kept';
 
 export function isCodeDirty() {
   return codeDirty;
@@ -44,6 +48,22 @@ export function updateCodeStats() {
   updateCodeGutter();
 }
 
+/**
+ * React to a ``revision_updated`` event: reload a clean editor, or keep the
+ * user's unsaved edits and flag the conflict. Returns true only the first
+ * time a conflict is flagged for the current dirty session.
+ */
+export function handleRemoteRevision() {
+  if (saveInFlight) return false;
+  if (!codeDirty) {
+    loadModelCode();
+    return false;
+  }
+  if (!codeStats || codeStats.textContent.endsWith(REMOTE_CONFLICT_NOTE)) return false;
+  codeStats.textContent += REMOTE_CONFLICT_NOTE;
+  return true;
+}
+
 export async function loadModelCode() {
   const project = currentGetProject();
   if (!project || !codeEditor) return;
@@ -62,6 +82,7 @@ export async function loadModelCode() {
 export async function saveModelCode() {
   const project = currentGetProject();
   if (!project || !codeEditor || !codeDirty) return true;
+  saveInFlight = true;
   try {
     const res = await api(`/api/projects/${encodeURIComponent(project)}/code`, {
       method: 'PUT',
@@ -77,6 +98,8 @@ export async function saveModelCode() {
   } catch (error) {
     currentAddMessage(`Failed to save code: ${error.message}`, 'error');
     return false;
+  } finally {
+    saveInFlight = false;
   }
 }
 

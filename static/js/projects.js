@@ -282,5 +282,36 @@ document.querySelector('#confirm-delete')?.addEventListener('click', async (e) =
   });
 });
 
+// ``agent_status`` values that end (or park) a run; anything else means running.
+const IDLE_STATUSES = new Set(['completed', 'failed', 'stopped', 'waiting_for_user', 'error']);
+
+function setProjectsRunning(names, isRunning) {
+  let changed = false;
+  for (const name of names) {
+    const item = allProjects.find(p => p.name === name);
+    if (item && item.is_running !== isRunning) {
+      item.is_running = isRunning;
+      changed = true;
+    }
+  }
+  if (changed) filterAndRenderProjects();
+}
+
+function initStream() {
+  // No project scope: the dashboard needs every project's lifecycle events.
+  window.connectSharedStream({
+    onEvent: (type, data) => {
+      if (type === 'project_created' || type === 'project_deleted' || type === 'project_renamed') {
+        loadProjects();
+      } else if (type === 'agent_status' && data?.project) {
+        setProjectsRunning([data.project], !IDLE_STATUSES.has(data.status));
+      } else if (type === 'agent_stopped') {
+        setProjectsRunning(data?.affected_projects || (data?.project ? [data.project] : []), false);
+      }
+    },
+  });
+}
+
 checkPreflight();
 loadProjects();
+initStream();

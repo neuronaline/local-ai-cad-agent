@@ -11,6 +11,7 @@ Public surface:
 - :class:`TimedOut`
 - :func:`terminate`
 - :func:`run_sandbox_subprocess`
+- :func:`acquire_build_slot` / :func:`set_global_max_parallel_builds`
 """
 
 from __future__ import annotations
@@ -19,6 +20,11 @@ import os
 import signal
 import subprocess
 import threading
+import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+
+from agent.llm_base import RequestCancelled
 
 MAX_OUTPUT_BYTES = 1 * 1024 * 1024  # 1 MB per stream
 
@@ -27,6 +33,81 @@ MAX_OUTPUT_BYTES = 1 * 1024 * 1024  # 1 MB per stream
 # the tool class constant, and the schema's ``maximum`` in lock-step so they
 # cannot drift.
 MAX_SANDBOX_TIMEOUT_SECONDS = 120
+
+
+class _BuildSlots:
+    """Process-wide bounded pool for heavy OpenSCAD build/export subprocesses."""
+
+    def __init__(self, max_slots: int) -> None:
+        self._max_slots = max(1, max_slots)
+        self._active = 0
+        self._cond = threading.Condition()
+
+    def resize(self, max_slots: int) -> None:
+        with self._cond:
+            self._max_slots = max(1, max_slots)
+            self._cond.notify_all()
+
+    @contextmanager
+    def acquire(
+        self,
+        *,
+        stop_event: threading.Event | None,
+        timeout: float | None,
+        on_queued: Callable[[], None] | None,
+    ) -> Iterator[None]:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._cond:
+            queued = self._active >= self._max_slots
+        if queued and on_queued is not None:
+            # Outside the condition lock: status publishing may do I/O and
+            # must not stall threads that are releasing their slots.
+            on_queued()
+        with self._cond:
+            while True:
+                if stop_event is not None and stop_event.is_set():
+                    self._cond.notify()
+                    raise RequestCancelled("Build cancelled while waiting for a build slot.")
+                if self._active < self._max_slots:
+                    break
+                # Poll so a stop request is observed even without a release.
+                wait_time = 0.5
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("Timed out waiting for a free build slot.")
+                    wait_time = min(wait_time, remaining)
+                self._cond.wait(timeout=wait_time)
+            self._active += 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._active -= 1
+                self._cond.notify()
+
+
+_BUILD_SLOTS = _BuildSlots(2)
+
+
+def set_global_max_parallel_builds(max_parallel: int) -> None:
+    """Resize the shared build-slot pool (``agent.max_parallel_builds``)."""
+    _BUILD_SLOTS.resize(max_parallel)
+
+
+def acquire_build_slot(
+    *,
+    stop_event: threading.Event | None = None,
+    timeout: float | None = None,
+    on_queued: Callable[[], None] | None = None,
+):
+    """Context manager holding one shared build slot for the duration of a heavy subprocess.
+
+    Raises ``RequestCancelled`` when ``stop_event`` fires while queued and
+    ``TimeoutError`` after ``timeout`` seconds without a free slot.
+    ``on_queued`` runs once, before waiting, when every slot is busy.
+    """
+    return _BUILD_SLOTS.acquire(stop_event=stop_event, timeout=timeout, on_queued=on_queued)
 
 
 class TimedOut(RuntimeError):

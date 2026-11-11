@@ -24,6 +24,7 @@ from agent.tools.file_tool import FileTool
 from agent.tools.process_runner import (
     MAX_SANDBOX_TIMEOUT_SECONDS,
     ProcessSlot,
+    acquire_build_slot,
     run_sandbox_subprocess,
     terminate,
 )
@@ -390,116 +391,123 @@ class CadTool:
             )
         )
 
-        with tempfile.TemporaryDirectory(prefix="cad-agent-") as temporary:
-            workspace = Path(temporary)
-            (workspace / MODEL_FILENAME).write_text(model_code, encoding="utf-8")
-            (workspace / _RUNNER_FILENAME).write_text(
-                (_SCRIPTS_DIR / _RUNNER_FILENAME).read_text(encoding="utf-8"),
-                encoding="utf-8",
-            )
-            (workspace / _RENDERER_FILENAME).write_text(
-                (_SCRIPTS_DIR / _RENDERER_FILENAME).read_text(encoding="utf-8"),
-                encoding="utf-8",
-            )
-            if stl_cache_valid and cached_stl.is_file() and cached_stl.stat().st_size > 0:
-                try:
-                    shutil.copyfile(cached_stl, workspace / "preview.stl")
-                except OSError:
-                    pass
-            command, seccomp_fd = sandbox_command(
-                workspace,
-                [_RUNNER_FILENAME, settings_payload],
-                writable=True,
-                timeout_seconds=MAX_SANDBOX_TIMEOUT_SECONDS,
-            )
-            try:
-                stdout, stderr, returncode = run_sandbox_subprocess(
-                    argv=command,
-                    seccomp_fd=seccomp_fd,
+        with acquire_build_slot(
+            stop_event=self._stop_event,
+            timeout=MAX_SANDBOX_TIMEOUT_SECONDS * 2,
+            on_queued=lambda: self._publish_status(
+                "waiting_build_slot", "Waiting for a free build slot…", call_id
+            ),
+        ):
+            with tempfile.TemporaryDirectory(prefix="cad-agent-") as temporary:
+                workspace = Path(temporary)
+                (workspace / MODEL_FILENAME).write_text(model_code, encoding="utf-8")
+                (workspace / _RUNNER_FILENAME).write_text(
+                    (_SCRIPTS_DIR / _RUNNER_FILENAME).read_text(encoding="utf-8"),
+                    encoding="utf-8",
+                )
+                (workspace / _RENDERER_FILENAME).write_text(
+                    (_SCRIPTS_DIR / _RENDERER_FILENAME).read_text(encoding="utf-8"),
+                    encoding="utf-8",
+                )
+                if stl_cache_valid and cached_stl.is_file() and cached_stl.stat().st_size > 0:
+                    try:
+                        shutil.copyfile(cached_stl, workspace / "preview.stl")
+                    except OSError:
+                        pass
+                command, seccomp_fd = sandbox_command(
+                    workspace,
+                    [_RUNNER_FILENAME, settings_payload],
+                    writable=True,
                     timeout_seconds=MAX_SANDBOX_TIMEOUT_SECONDS,
-                    lock=self._lock,
-                    process_slot=self._process,
-                    timeout_message=(
-                        f"CAD operation timed out after {MAX_SANDBOX_TIMEOUT_SECONDS} seconds."
-                    ),
                 )
-            except RuntimeError as error:
-                detail = f"CAD subprocess failed: {error}"
-                self._record_build_failure(detail)
-                raise RuntimeError(detail) from error
-            if returncode:
-                detail = self._failure_detail(stderr or stdout)
-                final = f"CAD execution failed:\n{detail}"
-                self._record_build_failure(final)
-                raise RuntimeError(final)
+                try:
+                    stdout, stderr, returncode = run_sandbox_subprocess(
+                        argv=command,
+                        seccomp_fd=seccomp_fd,
+                        timeout_seconds=MAX_SANDBOX_TIMEOUT_SECONDS,
+                        lock=self._lock,
+                        process_slot=self._process,
+                        timeout_message=(
+                            f"CAD operation timed out after {MAX_SANDBOX_TIMEOUT_SECONDS} seconds."
+                        ),
+                    )
+                except RuntimeError as error:
+                    detail = f"CAD subprocess failed: {error}"
+                    self._record_build_failure(detail)
+                    raise RuntimeError(detail) from error
+                if returncode:
+                    detail = self._failure_detail(stderr or stdout)
+                    final = f"CAD execution failed:\n{detail}"
+                    self._record_build_failure(final)
+                    raise RuntimeError(final)
 
-            metrics_path = workspace / ".cad_metrics.json"
-            preview_path = workspace / "preview.stl"
-            if not metrics_path.is_file() or not preview_path.is_file():
-                error_msg = (
-                    "CAD execution did not produce preview and geometry metrics."
-                )
-                self._record_build_failure(error_msg)
-                raise RuntimeError(error_msg)
-            cached = json.loads(metrics_path.read_text(encoding="utf-8"))
-            if not isinstance(cached, dict) or not isinstance(
-                cached.get("metrics"), dict
-            ):
-                error_msg = "CAD geometry metrics are malformed."
-                self._record_build_failure(error_msg)
-                raise TypeError(error_msg)
-            metrics = cached["metrics"]
-            self._enforce_basic_geometry(metrics)
-            self._atomic_copy(preview_path, self.project_dir / "preview.stl")
-            review_manifest = (
-                cached.get("review_manifest")
-                if mode.produces_manifest
-                else None
-            )
-            if mode.produces_render:
-                render_path = workspace / "render.png"
-                if not render_path.is_file() or render_path.stat().st_size == 0:
-                    error_msg = "CAD execution did not produce a render."
+                metrics_path = workspace / ".cad_metrics.json"
+                preview_path = workspace / "preview.stl"
+                if not metrics_path.is_file() or not preview_path.is_file():
+                    error_msg = (
+                        "CAD execution did not produce preview and geometry metrics."
+                    )
                     self._record_build_failure(error_msg)
                     raise RuntimeError(error_msg)
-                self._atomic_copy(render_path, self.project_dir / "render.png")
-            self._atomic_copy(metrics_path, self.project_dir / ".cad_metrics.json")
-
-            model_sha = cached.get("model_sha256") or hashlib.sha256(model_code.encode("utf-8")).hexdigest()
-            if model_sha:
-                cache_dir = self.project_dir / ".cad-agent" / "cache" / model_sha
-                cache_dir.mkdir(parents=True, exist_ok=True)
-                self._atomic_copy(preview_path, cache_dir / "preview.stl")
-                self._atomic_copy(metrics_path, cache_dir / ".cad_metrics.json")
+                cached = json.loads(metrics_path.read_text(encoding="utf-8"))
+                if not isinstance(cached, dict) or not isinstance(
+                    cached.get("metrics"), dict
+                ):
+                    error_msg = "CAD geometry metrics are malformed."
+                    self._record_build_failure(error_msg)
+                    raise TypeError(error_msg)
+                metrics = cached["metrics"]
+                self._enforce_basic_geometry(metrics)
+                self._atomic_copy(preview_path, self.project_dir / "preview.stl")
+                review_manifest = (
+                    cached.get("review_manifest")
+                    if mode.produces_manifest
+                    else None
+                )
                 if mode.produces_render:
-                    self._atomic_copy(workspace / "render.png", cache_dir / "render.png")
-            # Stage multi-view review artifacts outside the temp workspace
-            # so ``promote_review`` can verify them after bubblewrap tears
-            # the workspace down. ``FULL_REVIEW`` only; cheaper modes skip
-            # the rasterisation step.
-            staging_views_dir: str | None = None
-            staging_sheet_path: str | None = None
-            if mode.produces_manifest:
-                self._publish_status(
-                    "rendering_views",
-                    "Rendering review views…",
-                    call_id,
-                )
-                staging_views_dir, staging_sheet_path = self._stage_review_artifacts(
-                    workspace
-                )
-            return {
-                "metrics": metrics,
-                "feature_summary": cached.get("feature_summary") or {},
-                "declared_parameters": cached.get("declared_parameters") or [],
-                "model_sha256": cached.get("model_sha256"),
-                "preview_sha256": cached.get("preview_sha256"),
-                "review_manifest": review_manifest,
-                "review_views_dir": staging_views_dir,
-                "review_sheet_path": staging_sheet_path,
-                "model_code": model_code,
-                "raw_metrics_doc": cached,
-            }
+                    render_path = workspace / "render.png"
+                    if not render_path.is_file() or render_path.stat().st_size == 0:
+                        error_msg = "CAD execution did not produce a render."
+                        self._record_build_failure(error_msg)
+                        raise RuntimeError(error_msg)
+                    self._atomic_copy(render_path, self.project_dir / "render.png")
+                self._atomic_copy(metrics_path, self.project_dir / ".cad_metrics.json")
+
+                model_sha = cached.get("model_sha256") or hashlib.sha256(model_code.encode("utf-8")).hexdigest()
+                if model_sha:
+                    cache_dir = self.project_dir / ".cad-agent" / "cache" / model_sha
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    self._atomic_copy(preview_path, cache_dir / "preview.stl")
+                    self._atomic_copy(metrics_path, cache_dir / ".cad_metrics.json")
+                    if mode.produces_render:
+                        self._atomic_copy(workspace / "render.png", cache_dir / "render.png")
+                # Stage multi-view review artifacts outside the temp workspace
+                # so ``promote_review`` can verify them after bubblewrap tears
+                # the workspace down. ``FULL_REVIEW`` only; cheaper modes skip
+                # the rasterisation step.
+                staging_views_dir: str | None = None
+                staging_sheet_path: str | None = None
+                if mode.produces_manifest:
+                    self._publish_status(
+                        "rendering_views",
+                        "Rendering review views…",
+                        call_id,
+                    )
+                    staging_views_dir, staging_sheet_path = self._stage_review_artifacts(
+                        workspace
+                    )
+                return {
+                    "metrics": metrics,
+                    "feature_summary": cached.get("feature_summary") or {},
+                    "declared_parameters": cached.get("declared_parameters") or [],
+                    "model_sha256": cached.get("model_sha256"),
+                    "preview_sha256": cached.get("preview_sha256"),
+                    "review_manifest": review_manifest,
+                    "review_views_dir": staging_views_dir,
+                    "review_sheet_path": staging_sheet_path,
+                    "model_code": model_code,
+                    "raw_metrics_doc": cached,
+                }
 
     def _stage_review_artifacts(
         self, workspace: Path

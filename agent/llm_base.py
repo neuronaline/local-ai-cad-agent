@@ -19,6 +19,7 @@ import ssl
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from copy import deepcopy
 from typing import Any
 
@@ -100,6 +101,54 @@ class StreamResponseError(RuntimeError):
     def __init__(self, message: str, *, retryable: bool) -> None:
         super().__init__(message)
         self.retryable = retryable
+
+
+class UpstreamModerationError(StreamResponseError):
+    """Raised when an upstream provider aborts or replaces output due to a safety/content filter."""
+
+    def __init__(self, message: str, *, finish_reason: str | None = None) -> None:
+        super().__init__(message, retryable=True)
+        self.finish_reason = finish_reason
+
+
+_MODERATION_FINISH_REASONS: frozenset[str] = frozenset({
+    "content_filter",
+    "sensitive",
+    "safety",
+    "prohibited_content",
+    "blocklist",
+    "moderation",
+    "spii",
+})
+
+_CANNED_MODERATION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^\s*the request was rejected because it was considered high risk\.?\s*$", re.I),
+    re.compile(r"^\s*sorry,?\s+i\s+cannot\s+fulfill\s+this\s+request.*content\s+polic", re.I),
+)
+
+
+def check_moderation_rejection(
+    *,
+    provider_label: str,
+    finish_reason: Any,
+    content: str | None,
+    tool_calls: Any,
+) -> None:
+    """Raise ``UpstreamModerationError`` if the turn was blocked by an upstream safety filter."""
+    finish_norm = str(finish_reason or "").strip().lower()
+    if finish_norm in _MODERATION_FINISH_REASONS:
+        raise UpstreamModerationError(
+            f"{provider_label} blocked the response via content filter (finish_reason={finish_reason!r}).",
+            finish_reason=str(finish_reason),
+        )
+    text = (content or "").strip()
+    has_tools = bool(tool_calls)
+    if not has_tools and text and len(text) < 280:
+        if any(pat.match(text) for pat in _CANNED_MODERATION_PATTERNS):
+            raise UpstreamModerationError(
+                f"{provider_label} rejected the response with canned moderation refusal: {text!r}",
+                finish_reason=str(finish_reason or "content_filter"),
+            )
 
 
 class CompletionTruncatedError(RuntimeError):
@@ -1600,6 +1649,13 @@ def parse_chat_stream(
         for idx, call in enumerate(all_extracted_calls):
             tool_calls[idx] = call
 
+    check_moderation_rejection(
+        provider_label=provider_label,
+        finish_reason=finish_reason,
+        content=content,
+        tool_calls=tool_calls,
+    )
+
     finish_norm = str(finish_reason or "").strip().lower()
     if finish_norm in ("length", "max_tokens"):
         raise CompletionTruncatedError(
@@ -1736,8 +1792,19 @@ class BaseLLMClient:
         self._provider_label: str = provider_label
         self.activity_logger: Any | None = None
         self.run_id: str | None = None
+        # Optional ``(phase, error, attempt)`` hook invoked before each retry
+        # so the runner can audit recovered upstream failures.
+        self.error_callback: Callable[[str, BaseException, int], None] | None = None
         self._active_response: Any | None = None
         self._response_lock = threading.Lock()
+
+    def _report_retry(self, phase: str, error: BaseException, attempt: int) -> None:
+        if self.error_callback is None:
+            return
+        try:
+            self.error_callback(phase, error, attempt)
+        except Exception:
+            _LOG.debug("error_callback failed", exc_info=True)
 
     def sanitize_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return sanitize_messages(messages, preserve_reasoning=self.preserve_reasoning)
@@ -1870,6 +1937,7 @@ class BaseLLMClient:
                 if is_last_attempt:
                     raise
                 attempt += 1
+                self._report_retry("request_retry", error, general_attempt)
                 _LOG.warning(
                     "Retrying %s request (attempt %d/%d, model=%s) after error (%s): %s",
                     self._provider_label,
@@ -1975,6 +2043,9 @@ class BaseLLMClient:
                             is_last_attempt = general_attempt >= max_general_attempts
                             if not error.retryable or is_last_attempt:
                                 raise
+                            if isinstance(error, UpstreamModerationError):
+                                _clamp_payload_reasoning_on_retry(payload)
+                            self._report_retry("stream_retry", error, general_attempt)
                             _LOG.warning(
                                 "Retrying %s stream (attempt %d/%d, model=%s) after StreamResponseError: %s",
                                 self._provider_label,
@@ -2006,6 +2077,7 @@ class BaseLLMClient:
                                 raise
                             if isinstance(error, httpx.TimeoutException):
                                 _clamp_payload_reasoning_on_retry(payload)
+                            self._report_retry("transport_retry", error, general_attempt)
                             _LOG.warning(
                                 "Retrying %s stream (attempt %d/%d, model=%s) after transport error (%s): %s",
                                 self._provider_label,
@@ -2031,7 +2103,17 @@ class BaseLLMClient:
                                     run_id=self.run_id,
                                 )
                     else:
-                        parsed_body = self._parse_non_stream_response(response)
+                        try:
+                            parsed_body = self._parse_non_stream_response(response)
+                        except UpstreamModerationError as error:
+                            _force_close_response(response)
+                            general_attempt += 1
+                            is_last_attempt = general_attempt >= max_general_attempts
+                            if is_last_attempt:
+                                raise
+                            _clamp_payload_reasoning_on_retry(payload)
+                            self._report_retry("moderation_retry", error, general_attempt)
+                            continue
                         if log_payload:
                             self._log_llm_response(
                                 attempt, payload.get("model"), call_start, parsed_body
@@ -2092,11 +2174,13 @@ class BaseLLMClient:
 
                     # Adaptively clamp max_tokens on repeated rate limits to reduce TPM quota reservation
                     if rate_limit_attempt >= 2:
-                        if "max_tokens" in payload and isinstance(payload["max_tokens"], int) and payload["max_tokens"] > 8192:
-                            payload["max_tokens"] = 8192
+                        _clamp_payload_reasoning_on_retry(payload)
+                        for tok_key in ("max_tokens", "max_completion_tokens"):
+                            if tok_key in payload and isinstance(payload[tok_key], int) and payload[tok_key] > 16384:
+                                payload[tok_key] = 16384
                         if "generation_config" in payload and isinstance(payload["generation_config"], dict):
-                            if payload["generation_config"].get("max_output_tokens", 0) > 8192:
-                                payload["generation_config"]["max_output_tokens"] = 8192
+                            if payload["generation_config"].get("max_output_tokens", 0) > 16384:
+                                payload["generation_config"]["max_output_tokens"] = 16384
 
                 sleep_with_cancel(delay, self.stop_event)
                 if is_rate_limit and self.stream_callback:
@@ -2192,6 +2276,7 @@ class FallbackChatClient(BaseLLMClient):
         "require_images",
         "activity_logger",
         "run_id",
+        "error_callback",
     )
     # Per-call attributes the runner reads back after a successful chat; we
     # copy them from whichever inner client answered so callers see the
@@ -2410,6 +2495,14 @@ class ChatCompletionsClient(BaseLLMClient):
         self.last_usage = normalize_usage(body.get("usage")) if isinstance(body.get("usage"), dict) else None
         choices = body.get("choices") if isinstance(body, dict) else None
         finish_reason = choices[0].get("finish_reason") if choices else None
+        if choices and isinstance(choices[0].get("message"), dict):
+            _chk_msg = choices[0]["message"]
+            check_moderation_rejection(
+                provider_label=self._provider_label,
+                finish_reason=finish_reason,
+                content=_chk_msg.get("content"),
+                tool_calls=_chk_msg.get("tool_calls"),
+            )
         finish_norm = str(finish_reason or "").strip().lower()
         if choices and finish_norm in ("length", "max_tokens"):
             msg_partial = choices[0].get("message") if isinstance(choices[0].get("message"), dict) else {}

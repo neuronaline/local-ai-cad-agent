@@ -16,7 +16,7 @@ import shutil
 import tempfile
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from difflib import unified_diff
 from pathlib import Path
@@ -43,6 +43,11 @@ from agent.converter import (
 from agent.core import AgentRunner
 from agent.images import store_images
 from agent.io import utc_now_iso
+from agent.locks import (
+    invalidate_project_history_lock,
+    invalidate_project_model_lock,
+    project_model_lock,
+)
 from agent.print_advisor import (
     THREE_MF_COMMAND_MARKER,
     format_3mf_command_prompt,
@@ -56,6 +61,7 @@ from agent.revisions import (
     RevisionStore,
     atomic_write_bytes,
     cached_model_sha256,
+    invalidate_model_digest_cache,
 )
 from agent.settings import (
     REASONING_EFFORTS,
@@ -404,28 +410,32 @@ def _run_preflight(settings: Settings) -> dict[str, Any]:
     return checks
 
 
-def _project_lock(project_name: str) -> threading.Lock:
-    locks: dict[str, threading.Lock] = current_app.config["PROJECT_LOCKS"]
-    lock = locks.get(project_name)
-    if lock is None:
-        with current_app.config["PROJECT_LOCKS_LOCK"]:
-            lock = locks.get(project_name)
-            if lock is None:
-                lock = threading.Lock()
-                locks[project_name] = lock
-    return lock
+@contextmanager
+def _project_lock(project_name: str):
+    """Serialise HTTP-level mutations of one project (reentrant, idle-evicted)."""
+    with current_app.config["PROJECT_LOCKS_REGISTRY"].acquire(project_name) as lk:
+        yield lk
 
 
 @contextmanager
 def _project_locks(*project_names: str):
-    locks = [_project_lock(name) for name in sorted(set(project_names))]
-    for lock in locks:
-        lock.acquire()
-    try:
+    # Sorted acquisition keeps two concurrent renames from deadlocking.
+    with ExitStack() as stack:
+        for name in sorted(set(project_names)):
+            stack.enter_context(_project_lock(name))
         yield
-    finally:
-        for lock in reversed(locks):
-            lock.release()
+
+
+def _cleanup_project_resources(project_name: str, project_dir: Path) -> None:
+    """Drop in-memory caches and idle locks keyed on a deleted/renamed project.
+
+    Keeps a long-running server from accumulating orphaned resources.
+    """
+    ConversationStore.invalidate(project_dir)
+    invalidate_project_history_lock(project_dir)
+    invalidate_project_model_lock(project_dir)
+    invalidate_model_digest_cache(project_dir)
+    current_app.config["PROJECT_LOCKS_REGISTRY"].invalidate(project_name)
 
 
 _PROJECT_MTIME_CANDIDATES = (
@@ -540,24 +550,62 @@ def update_hardware_settings():
         filament=payload.get("filament"),
         additional_info=payload.get("additional_info"),
     )
+    current_app.config["EVENT_BUS"].publish("settings_updated", {"hardware": updated}, transient=True)
     return jsonify(updated)
+
+
+def _resolve_project_model_and_effort(project_dir: Path, settings: Settings) -> tuple[str, str, bool]:
+    """Return ``(model_key, effort, has_project_model)`` for a project.
+
+    A saved catalog model overrides the global selection; a saved effort
+    (``""`` = provider default) overrides the model's configured effort.
+    """
+    meta = _read_project_metadata(project_dir)
+    option = next((o for o in settings.available_models if o.key == meta.get("model_key")), None)
+    if option is not None:
+        model_key, default_effort = option.key, option.reasoning_effort or ""
+    else:
+        model_key, default_effort = settings.active_model_key, settings.reasoning_effort or ""
+    effort = meta.get("reasoning_effort")
+    if not isinstance(effort, str) or (effort and effort not in REASONING_EFFORTS):
+        effort = default_effort
+    return model_key, effort, option is not None
+
+
+def _persist_project_selection(
+    project_dir: Path, *, model_key: str | None = None, effort: str | None = None
+) -> None:
+    """Store the project's model/effort in ``project.json`` (``None`` leaves a field untouched).
+
+    Caller holds ``_project_lock`` for the project.
+    """
+    meta = _read_project_metadata(project_dir)
+    updates = {
+        key: value
+        for key, value in (("model_key", model_key), ("reasoning_effort", effort))
+        if value is not None and meta.get(key) != value
+    }
+    if updates:
+        _write_project_metadata(project_dir, {**meta, **updates})
 
 
 @projects_bp.get("/project/<name>")
 def project_view(name: str) -> str:
     try:
-        _project_path(current_app.config["SETTINGS"], name)
+        project_dir = _project_path(current_app.config["SETTINGS"], name)
     except (ValueError, FileNotFoundError):
         return "Project not found.", 404
     settings: Settings = current_app.config["SETTINGS"]
+    proj_model_key, proj_effort, has_model = _resolve_project_model_and_effort(project_dir, settings)
     return render_template(
         "index.html",
         project_name=name,
         show_info_messages=settings.show_info_messages,
         viewer_grid_size=settings.viewer_grid_size,
         viewer_grid_divisions=settings.viewer_grid_divisions,
-        reasoning_effort=settings.reasoning_effort or "",
-        active_model_key=settings.active_model_key,
+        reasoning_effort=proj_effort,
+        active_model_key=proj_model_key,
+        has_project_model=has_model,
         available_models=[opt.to_dict() for opt in settings.available_models],
         user_preferences={
             "printer": settings.user_printer,
@@ -574,19 +622,20 @@ def project_view(name: str) -> str:
 def list_projects():
     settings: Settings = current_app.config["SETTINGS"]
     runner: AgentRunner = current_app.config["AGENT_RUNNER"]
-    active = runner.active_project() if runner.is_running() else None
+    active_projects = runner.active_projects()
     projects: list[dict[str, Any]] = []
-    for item in sorted(settings.workspace_root.iterdir()):
-        if not item.is_dir() or not PROJECT_NAME_RE.fullmatch(item.name):
-            continue
-        metadata = _read_project_metadata(item)
-        projects.append({
-            "name": item.name,
-            "created_at": metadata.get("created_at"),
-            "modified_at": _project_modified_at(item),
-            "is_running": (item.name == active),
-        })
-    return jsonify({"projects": projects, "active_project": active})
+    if settings.workspace_root.is_dir():
+        for item in sorted(settings.workspace_root.iterdir()):
+            if not item.is_dir() or not PROJECT_NAME_RE.fullmatch(item.name):
+                continue
+            metadata = _read_project_metadata(item)
+            projects.append({
+                "name": item.name,
+                "created_at": metadata.get("created_at"),
+                "modified_at": _project_modified_at(item),
+                "is_running": item.name in active_projects,
+            })
+    return jsonify({"projects": projects, "active_projects": active_projects})
 
 
 @projects_bp.post("/api/projects/new")
@@ -622,14 +671,8 @@ def delete_project(project_name: str):
         if runner.has_active_state_for(project_name):
             return jsonify({"error": "Cannot delete a project with active agent state."}), 409
         shutil.rmtree(project_dir)
-        # Drop the per-project advisory lock and the in-memory caches
-        # keyed on this directory so a long-running server does not
-        # accumulate orphaned resources for deleted projects.
-        from agent.revisions import invalidate_model_digest_cache
-        from agent.tools.file_tool import invalidate_model_file_lock
-
-        invalidate_model_file_lock(project_dir)
-        invalidate_model_digest_cache(project_dir)
+        _cleanup_project_resources(project_name, project_dir)
+        current_app.config["EVENT_BUS"].publish("project_deleted", {"project": project_name}, transient=True)
     return jsonify({"deleted": True})
 
 
@@ -653,7 +696,7 @@ def reset_project(project_name: str):
             return jsonify(
                 {"error": "Cannot reset a project with active agent state."}
             ), 409
-        if runner.is_running():
+        if runner.is_running(project_name):
             return jsonify(
                 {"error": "Cannot reset while an agent task is running."}
             ), 409
@@ -700,6 +743,12 @@ def rename_project(project_name: str):
             project_dir.rename(target)
             renamed = True
             (target / metadata_tmp_name).replace(target / "project.json")
+            _cleanup_project_resources(project_name, project_dir)
+            current_app.config["EVENT_BUS"].publish(
+                "project_renamed",
+                {"old_project": project_name, "project": new_name},
+                transient=True,
+            )
         except Exception:
             (target if renamed else project_dir).joinpath(metadata_tmp_name).unlink(
                 missing_ok=True
@@ -723,7 +772,7 @@ def rename_project(project_name: str):
 def chat():
     payload = request.get_json(silent=True) if request.is_json else request.form
     payload = payload or {}
-    project_name = str(payload.get("project", ""))
+    project_name = str(payload.get("project", "")).strip()
     message = str(payload.get("message", "")).strip()
     idempotency_key = str(payload.get("idempotency_key", "")).strip()
     if not message:
@@ -736,8 +785,9 @@ def chat():
     runner: AgentRunner = current_app.config["AGENT_RUNNER"]
     if runner.waiting_question(project_name):
         return jsonify({"error": "Answer the pending question before sending another message."}), 409
-    if idempotency_key and _idempotency_check(idempotency_key):
-        if runner.is_running():
+    scoped_idem_key = f"{project_name}:{idempotency_key}" if idempotency_key else ""
+    if scoped_idem_key and _idempotency_check(scoped_idem_key):
+        if runner.is_running(project_name):
             return jsonify(
                 {
                     "accepted": True,
@@ -745,27 +795,23 @@ def chat():
                     "error": "Your message is already being processed.",
                 }
             ), 202
-        _idempotency_forget(idempotency_key)
-    if runner.is_running():
-        active = runner.active_project()
-        msg = (
-            f"An agent task is already running in project '{active}'."
-            if active
-            else "An agent task is already running."
-        )
-        return jsonify({"error": msg, "active_project": active}), 409
-    _sync_model_selection(payload.get("model_key"), persist=True)
-    _sync_reasoning_effort(payload.get("reasoning_effort"), persist=True)
+        _idempotency_forget(scoped_idem_key)
+    if runner.is_running(project_name):
+        return jsonify({"error": f"An agent task is already running in project '{project_name}'."}), 409
+    if runner.at_capacity():
+        return jsonify({"error": "The server has reached maximum concurrent agent capacity. Please try again shortly."}), 429
     with _project_lock(project_name):
         project_dir = _resolve_project_or_404(project_name)
         if not isinstance(project_dir, Path):
             return project_dir
+        _persist_project_selection(project_dir, model_key=model_key, effort=effort)
         try:
             image_paths = store_images(request.files.getlist("attachments"), project_dir)
         except FileNotFoundError as error:
             return jsonify({"error": str(error)}), 404
         except (ValueError, OSError) as error:
             return jsonify({"error": str(error)}), 400
+        typed_message = message
         if message.lower() == "/3mf" or message.lower().startswith("/3mf "):
             try:
                 settings_obj: Settings = current_app.config["SETTINGS"]
@@ -775,6 +821,10 @@ def chat():
                 )
             except (FileNotFoundError, ValueError, OSError) as error:
                 return jsonify({"error": str(error)}), 400
+        attachments = [path.relative_to(project_dir).as_posix() for path in image_paths]
+        # Mirror the turn before the run starts so other tabs render it ahead
+        # of the run's ``agent_status: started``.
+        _publish_user_message(project_name, payload, typed_message)
         # ``AgentRunner.start`` takes transactional ownership of the
         # uploaded inputs by moving them into a run-scoped directory under
         # its own lock. Cleanup happens in ``_run``'s ``finally`` block,
@@ -789,12 +839,33 @@ def chat():
             model_key=model_key,
         )
     if not started:
+        _publish_start_failure(project_name, "Unable to start the agent task.")
         return jsonify({"error": "Unable to start the agent task."}), 409
-    if idempotency_key:
-        _idempotency_record(idempotency_key)
-    return jsonify({"accepted": True, "attachments": [
-        path.relative_to(project_dir).as_posix() for path in image_paths
-    ]}), 202
+    if scoped_idem_key:
+        _idempotency_record(scoped_idem_key)
+    return jsonify({"accepted": True, "attachments": attachments}), 202
+
+
+def _publish_user_message(project_name: str, payload: Any, message: str, **extra: Any) -> None:
+    """Mirror a user turn to the project's other tabs (the sender skips its own ``client_id``)."""
+    current_app.config["EVENT_BUS"].publish(
+        "user_message",
+        {
+            "project": project_name,
+            "message": message,
+            "sender": str(payload.get("client_id", "")).strip() or None,
+            "timestamp": utc_now_iso(),
+            **extra,
+        },
+        transient=True,
+    )
+
+
+def _publish_start_failure(project_name: str, message: str) -> None:
+    """Settle other tabs that already rendered a mirrored turn whose run never started."""
+    current_app.config["EVENT_BUS"].publish(
+        "agent_error", {"project": project_name, "message": message}, transient=True
+    )
 
 
 @agent_bp.post("/api/chat/retry")
@@ -812,16 +883,10 @@ def chat_retry():
     runner: AgentRunner = current_app.config["AGENT_RUNNER"]
     if runner.waiting_question(project_name):
         return jsonify({"error": "Answer the pending question before retrying."}), 409
-    if runner.is_running():
-        active = runner.active_project()
-        msg = (
-            f"An agent task is already running in project '{active}'."
-            if active
-            else "An agent task is already running."
-        )
-        return jsonify({"error": msg, "active_project": active}), 409
-    _sync_model_selection(payload.get("model_key"), persist=True)
-    _sync_reasoning_effort(payload.get("reasoning_effort"), persist=True)
+    if runner.is_running(project_name):
+        return jsonify({"error": f"An agent task is already running in project '{project_name}'."}), 409
+    if runner.at_capacity():
+        return jsonify({"error": "The server has reached maximum concurrent agent capacity. Please try again shortly."}), 429
     user_index = -1
     raw_user_index = payload.get("user_index")
     if raw_user_index is not None:
@@ -833,6 +898,7 @@ def chat_retry():
         project_dir = _resolve_project_or_404(project_name)
         if not isinstance(project_dir, Path):
             return project_dir
+        _persist_project_selection(project_dir, model_key=model_key, effort=effort)
         last_user_turn = ConversationStore.rewind_to_user_message(
             project_dir, user_index=user_index
         )
@@ -848,6 +914,8 @@ def chat_retry():
                 if isinstance(part, dict) and part.get("type") == "text":
                     parts.append(str(part.get("text", "")))
             prompt_text = "\n".join(parts)
+        # Other tabs resync their (now rewound) history on ``is_retry``.
+        _publish_user_message(project_name, payload, prompt_text, is_retry=True)
         started = runner.start_retry(
             project_name,
             message=prompt_text,
@@ -855,6 +923,7 @@ def chat_retry():
             model_key=model_key,
         )
     if not started:
+        _publish_start_failure(project_name, "Unable to start retry task.")
         return jsonify({"error": "Unable to start retry task."}), 409
     return jsonify({"accepted": True}), 202
 
@@ -862,11 +931,27 @@ def chat_retry():
 @agent_bp.get("/api/settings/models")
 def get_models():
     settings: Settings = current_app.config["SETTINGS"]
+    project_name = request.args.get("project", "").strip() or None
+    active_key = settings.active_model_key
+    effort = settings.reasoning_effort or ""
+    provider = settings.llm_provider
+    model = settings.llm_model
+    if project_name:
+        try:
+            active_key, effort, has_project_model = _resolve_project_model_and_effort(
+                _project_path(settings, project_name), settings
+            )
+        except (ValueError, FileNotFoundError):
+            pass
+        else:
+            option = next((m for m in settings.available_models if m.key == active_key), None)
+            if has_project_model and option is not None:
+                provider, model = option.provider, option.model
     return jsonify({
-        "active_key": settings.active_model_key,
-        "provider": settings.llm_provider,
-        "model": settings.llm_model,
-        "reasoning_effort": settings.reasoning_effort or "",
+        "active_key": active_key,
+        "provider": provider,
+        "model": model,
+        "reasoning_effort": effort,
         "models": [opt.to_dict() for opt in settings.available_models],
     })
 
@@ -874,12 +959,34 @@ def get_models():
 @agent_bp.post("/api/settings/models")
 def update_model():
     payload = request.get_json(silent=True) or {}
+    project_name = str(payload.get("project", "")).strip() or None
     try:
-        if not _sync_model_selection(payload.get("model_key")):
+        model_key = _sync_model_selection(payload.get("model_key"), persist=(project_name is None))
+        if not model_key:
             return jsonify({"error": "model_key is required."}), 400
     except ValueError as err:
         return jsonify({"error": str(err)}), 400
+
     settings: Settings = current_app.config["SETTINGS"]
+    if project_name:
+        # ``_sync_model_selection`` validated the key against the catalog.
+        option = next(o for o in settings.available_models if o.key == model_key)
+        # Selecting a model adopts its configured effort, mirroring the
+        # global path (``with_model_selection``) and the UI's adoptModelEffort.
+        effort = option.reasoning_effort or ""
+        with _project_lock(project_name):
+            project_dir = _resolve_project_or_404(project_name)
+            if not isinstance(project_dir, Path):
+                return project_dir
+            _persist_project_selection(project_dir, model_key=model_key, effort=effort)
+        return jsonify({
+            "project": project_name,
+            "active_key": model_key,
+            "provider": option.provider,
+            "model": option.model,
+            "reasoning_effort": effort,
+        })
+
     return jsonify({
         "active_key": settings.active_model_key,
         "provider": settings.llm_provider,
@@ -891,7 +998,15 @@ def update_model():
 @agent_bp.get("/api/settings/reasoning-effort")
 def get_reasoning_effort():
     settings: Settings = current_app.config["SETTINGS"]
+    project_name = request.args.get("project", "").strip() or None
     effort = settings.reasoning_effort or ""
+    if project_name:
+        try:
+            _, effort, _ = _resolve_project_model_and_effort(
+                _project_path(settings, project_name), settings
+            )
+        except (ValueError, FileNotFoundError):
+            pass
     return jsonify({
         "reasoning_effort": effort,
         "available_efforts": ["", *sorted(REASONING_EFFORTS)],
@@ -905,10 +1020,24 @@ def update_reasoning_effort():
     payload = payload or {}
     if "effort" not in payload:
         return jsonify({"error": "Effort is required."}), 400
+    project_name = str(payload.get("project", "")).strip() or None
     try:
-        effort = _sync_reasoning_effort(payload.get("effort"))
+        effort = _sync_reasoning_effort(payload.get("effort"), persist=(project_name is None))
     except ValueError as err:
         return jsonify({"error": str(err)}), 400
+
+    if project_name:
+        with _project_lock(project_name):
+            project_dir = _resolve_project_or_404(project_name)
+            if not isinstance(project_dir, Path):
+                return project_dir
+            _persist_project_selection(project_dir, effort=effort or "")
+        return jsonify({
+            "project": project_name,
+            "reasoning_effort": effort or "",
+            "provider": current_app.config["SETTINGS"].llm_provider,
+        })
+
     return jsonify({
         "reasoning_effort": effort or "",
         "provider": current_app.config["SETTINGS"].llm_provider,
@@ -928,7 +1057,7 @@ def get_provider_balance():
 def answer_question():
     payload = request.get_json(silent=True) if request.is_json else request.form
     payload = payload or {}
-    project_name = str(payload.get("project", ""))
+    project_name = str(payload.get("project", "")).strip()
     raw_answer = payload.get("answer", "")
     answers = payload.get("answers")
     if isinstance(answers, dict):
@@ -948,52 +1077,66 @@ def answer_question():
         _project_path(current_app.config["SETTINGS"], project_name)
     except (ValueError, FileNotFoundError) as error:
         return jsonify({"error": str(error)}), 404
+
+    model_key = None
+    effort = None
+    try:
+        if payload.get("model_key"):
+            model_key = _sync_model_selection(payload.get("model_key"), persist=False)
+        if payload.get("reasoning_effort") is not None:
+            effort = _sync_reasoning_effort(payload.get("reasoning_effort"), persist=False)
+    except ValueError as err:
+        return jsonify({"error": str(err)}), 400
+
+    runner: AgentRunner = current_app.config["AGENT_RUNNER"]
+    if runner.at_capacity():
+        return jsonify({"error": "The server has reached maximum concurrent agent capacity. Please try again shortly."}), 429
     with _project_lock(project_name):
-        accepted = current_app.config["AGENT_RUNNER"].answer(project_name, raw_answer)
-    if not accepted:
-        if current_app.config["AGENT_RUNNER"].waiting_question(project_name):
+        project_dir = _resolve_project_or_404(project_name)
+        if not isinstance(project_dir, Path):
+            return project_dir
+        _persist_project_selection(project_dir, model_key=model_key, effort=effort)
+        formatted = runner.answer(
+            project_name,
+            raw_answer,
+            model_key=model_key,
+            reasoning_effort=effort,
+        )
+    if formatted is None:
+        if runner.waiting_question(project_name):
             return jsonify({"error": "The answer does not match the requested input type or options."}), 400
         return jsonify({"error": "No question is awaiting an answer for this project."}), 409
+    # Mirror the formatted turn (as persisted and replayed by History),
+    # not the raw JSON payload.
+    _publish_user_message(project_name, payload, formatted, is_answer=True)
     return jsonify({"accepted": True}), 202
 
 
 @agent_bp.post("/api/stop")
 def stop():
     payload = request.get_json(silent=True) if request.is_json else request.form
-    project_name = str((payload or {}).get("project", "")) or None
+    project_name = str((payload or {}).get("project", "")).strip() or None
     if project_name:
         try:
             _project_path(current_app.config["SETTINGS"], project_name)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 404
     runner: AgentRunner = current_app.config["AGENT_RUNNER"]
-    active_proj = runner.active_project()
-    active_run = runner.active_run_id()
+    target_projects = [project_name] if project_name else runner.active_projects()
+    active_runs = {p: run_id for p in target_projects if (run_id := runner.active_run_id(p))}
     affected = runner.stop(project_name)
-    event_project = project_name or active_proj
-    if event_project is None and affected:
-        event_project = affected[0]
-    stop_event_payload: dict[str, Any] = {
-        "project": event_project,
-        "affected_projects": affected,
-    }
-    if active_run:
-        stop_event_payload["run_id"] = active_run
-    current_app.config["EVENT_BUS"].publish(
-        "agent_stopped",
-        stop_event_payload,
-    )
-    if active_proj and active_proj != event_project:
-        active_payload = dict(stop_event_payload)
-        active_payload["project"] = active_proj
-        current_app.config["EVENT_BUS"].publish(
-            "agent_stopped",
-            active_payload,
-        )
+    bus = current_app.config["EVENT_BUS"]
+    projects_to_notify = affected if affected else ([project_name] if project_name else [])
+    for proj in projects_to_notify:
+        stop_payload: dict[str, Any] = {"project": proj, "affected_projects": affected}
+        if proj in active_runs:
+            stop_payload["run_id"] = active_runs[proj]
+        # Persisted (not transient): History replays it to settle the UI.
+        bus.publish("agent_stopped", stop_payload)
     return jsonify({
         "stopped": True,
         "affected_projects": affected,
-        "stopped_project": active_proj,
+        "stopped_project": project_name,
     })
 
 
@@ -1007,17 +1150,10 @@ def project_state(project_name: str):
     question = runner.waiting_question(project_name)
     if question:
         return jsonify({"status": "waiting_for_user", "question": question})
-    if runner.is_running():
-        active = runner.active_project()
-        if active == project_name:
-            return jsonify({"status": "running", "run_id": runner.active_run_id()})
-        return jsonify({
-            "status": "idle",
-            "busy_with_other": True,
-            "active_project": active,
-            "run_id": runner.active_run_id(),
-        })
-    return jsonify({"status": "idle", "busy_with_other": False})
+    run_id = runner.active_run_id(project_name)
+    if run_id:
+        return jsonify({"status": "running", "run_id": run_id})
+    return jsonify({"status": "idle"})
 
 
 @agent_bp.get("/api/projects/<project_name>/history")
@@ -1027,31 +1163,16 @@ def project_history(project_name: str):
         project_dir = _project_path(settings, project_name)
     except (ValueError, FileNotFoundError) as error:
         return jsonify({"error": str(error)}), 404
-    log_path = project_dir / "conversation.jsonl"
-    if not log_path.is_file():
-        return jsonify({"events": []})
-    events = []
-    with log_path.open("r", encoding="utf-8") as log:
-        for line in log:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-                if not isinstance(event, dict):
-                    continue
-                if event.get("synthetic"):
-                    continue
-                events.append(_redact_history_event(event))
-            except json.JSONDecodeError:
-                pass
+    raw_events = ConversationStore.read_raw_events(project_dir)
+    events = [_redact_history_event(ev) for ev in raw_events]
     return jsonify({"events": events})
 
 
 @agent_bp.get("/api/stream")
 def stream():
+    project_filter = request.args.get("project", "").strip() or None
     bus = current_app.config["EVENT_BUS"]
-    subscriber = bus.subscribe()
+    subscriber = bus.subscribe(project=project_filter)
 
     @stream_with_context
     def generate():
@@ -1309,38 +1430,42 @@ def list_revisions(project_name: str):
         project_dir = _project_path(current_app.config["SETTINGS"], project_name)
     except (ValueError, FileNotFoundError) as error:
         return jsonify({"error": str(error)}), 404
-    store = RevisionStore(project_dir)
-    try:
-        store.reconcile()
-    except RevisionIntegrityError as error:
-        return jsonify({"error": str(error)}), 422
     try:
         limit = int(request.args.get("limit", 50))
     except (TypeError, ValueError):
         return jsonify({"error": "Revision limit must be an integer."}), 400
     limit = max(1, min(limit, 200))
     before = request.args.get("before")
-    try:
-        active = store.head()
-        lkg = store.last_known_good()
-        revisions = store.list(limit=limit, before=before)
-    except ValueError as error:
-        return jsonify({"error": str(error)}), 400
-    except RevisionIntegrityError as error:
-        return jsonify({"error": str(error)}), 422
-    next_before = revisions[-1].id if len(revisions) == limit else None
-    return jsonify({
-        "revisions": [
-            _revision_summary(
-                store,
-                r,
-                active.id if active else None,
-                lkg.id if lkg else None,
-            )
-            for r in revisions
-        ],
-        "next_before": next_before,
-    })
+
+    runner: AgentRunner = current_app.config["AGENT_RUNNER"]
+    store = RevisionStore(project_dir)
+    with project_model_lock(project_dir):
+        if not runner.is_running(project_name):
+            try:
+                store.reconcile()
+            except RevisionIntegrityError as error:
+                return jsonify({"error": str(error)}), 422
+        try:
+            active = store.head()
+            lkg = store.last_known_good()
+            revisions = store.list(limit=limit, before=before)
+        except ValueError as error:
+            return jsonify({"error": str(error)}), 400
+        except RevisionIntegrityError as error:
+            return jsonify({"error": str(error)}), 422
+        next_before = revisions[-1].id if len(revisions) == limit else None
+        return jsonify({
+            "revisions": [
+                _revision_summary(
+                    store,
+                    r,
+                    active.id if active else None,
+                    lkg.id if lkg else None,
+                )
+                for r in revisions
+            ],
+            "next_before": next_before,
+        })
 
 
 @revisions_bp.get("/api/projects/<project_name>/revisions/<revision_id>")
@@ -1349,25 +1474,31 @@ def revision_detail(project_name: str, revision_id: str):
         project_dir = _project_path(current_app.config["SETTINGS"], project_name)
     except (ValueError, FileNotFoundError) as error:
         return jsonify({"error": str(error)}), 404
+    runner: AgentRunner = current_app.config["AGENT_RUNNER"]
     store = RevisionStore(project_dir)
-    try:
-        store.reconcile()
-        revision = store.get(revision_id)
-    except (ValueError, RevisionIntegrityError) as error:
-        return jsonify({"error": str(error)}), 404
-    active = store.head()
-    lkg = store.last_known_good()
-    summary = _revision_summary(
-        store,
-        revision,
-        active.id if active else None,
-        lkg.id if lkg else None,
-    )
-    try:
-        summary["source"] = store.source(revision_id)
-    except RevisionIntegrityError as error:
-        summary["source_error"] = str(error)
-    return jsonify(summary)
+    with project_model_lock(project_dir):
+        if not runner.is_running(project_name):
+            try:
+                store.reconcile()
+            except RevisionIntegrityError as error:
+                return jsonify({"error": str(error)}), 422
+        try:
+            revision = store.get(revision_id)
+        except (ValueError, RevisionIntegrityError) as error:
+            return jsonify({"error": str(error)}), 404
+        active = store.head()
+        lkg = store.last_known_good()
+        summary = _revision_summary(
+            store,
+            revision,
+            active.id if active else None,
+            lkg.id if lkg else None,
+        )
+        try:
+            summary["source"] = store.source(revision_id)
+        except RevisionIntegrityError as error:
+            summary["source_error"] = str(error)
+        return jsonify(summary)
 
 
 @revisions_bp.get("/api/projects/<project_name>/revisions/<revision_id>/diff")
@@ -1376,49 +1507,55 @@ def revision_diff(project_name: str, revision_id: str):
         project_dir = _project_path(current_app.config["SETTINGS"], project_name)
     except (ValueError, FileNotFoundError) as error:
         return jsonify({"error": str(error)}), 404
+    runner: AgentRunner = current_app.config["AGENT_RUNNER"]
     store = RevisionStore(project_dir)
-    try:
-        store.reconcile()
-        revision = store.get(revision_id)
-    except (ValueError, RevisionIntegrityError) as error:
-        return jsonify({"error": str(error)}), 404
-    # If ``?against=`` is explicitly provided (including empty string),
-    # treat it as the authoritative source. Otherwise fall back to the
-    # revision's parent_id.
-    if "against" in request.args:
-        against_id = request.args.get("against")
-    else:
-        against_id = revision.parent_id
-    if against_id is None or against_id == "":
-        return jsonify({"diff": "", "truncated": False, "against": None})
-    try:
-        against = store.get(against_id)
-    except ValueError as error:
-        return jsonify({"error": str(error)}), 404
-    except RevisionIntegrityError as error:
-        if against_id != revision.parent_id or store.has_manifest(against_id):
+    with project_model_lock(project_dir):
+        if not runner.is_running(project_name):
+            try:
+                store.reconcile()
+            except RevisionIntegrityError as error:
+                return jsonify({"error": str(error)}), 422
+        try:
+            revision = store.get(revision_id)
+        except (ValueError, RevisionIntegrityError) as error:
             return jsonify({"error": str(error)}), 404
-        against = None
-    try:
-        source_a = store.source(against_id) if against is not None else ""
-        source_b = store.source(revision_id)
-    except RevisionIntegrityError as error:
-        return jsonify({"error": str(error)}), 422
-    diff_lines = list(unified_diff(
-        source_a.splitlines(keepends=True),
-        source_b.splitlines(keepends=True),
-        fromfile=f"revision {against.id[:8]}" if against else "retention boundary",
-        tofile=f"revision {revision.id[:8]}",
-        n=3,
-    ))
-    truncated = len(diff_lines) > _MAX_DIFF_LINES
-    if truncated:
-        diff_lines = diff_lines[:_MAX_DIFF_LINES]
-    return jsonify({
-        "diff": "".join(diff_lines),
-        "truncated": truncated,
-        "against": against_id if against else None,
-    })
+        # If ``?against=`` is explicitly provided (including empty string),
+        # treat it as the authoritative source. Otherwise fall back to the
+        # revision's parent_id.
+        if "against" in request.args:
+            against_id = request.args.get("against")
+        else:
+            against_id = revision.parent_id
+        if against_id is None or against_id == "":
+            return jsonify({"diff": "", "truncated": False, "against": None})
+        try:
+            against = store.get(against_id)
+        except ValueError as error:
+            return jsonify({"error": str(error)}), 404
+        except RevisionIntegrityError as error:
+            if against_id != revision.parent_id or store.has_manifest(against_id):
+                return jsonify({"error": str(error)}), 404
+            against = None
+        try:
+            source_a = store.source(against_id) if against is not None else ""
+            source_b = store.source(revision_id)
+        except RevisionIntegrityError as error:
+            return jsonify({"error": str(error)}), 422
+        diff_lines = list(unified_diff(
+            source_a.splitlines(keepends=True),
+            source_b.splitlines(keepends=True),
+            fromfile=f"revision {against.id[:8]}" if against else "retention boundary",
+            tofile=f"revision {revision.id[:8]}",
+            n=3,
+        ))
+        truncated = len(diff_lines) > _MAX_DIFF_LINES
+        if truncated:
+            diff_lines = diff_lines[:_MAX_DIFF_LINES]
+        return jsonify({
+            "diff": "".join(diff_lines),
+            "truncated": truncated,
+            "against": against_id if against else None,
+        })
 
 
 @revisions_bp.post("/api/projects/<project_name>/revisions/<revision_id>/restore")

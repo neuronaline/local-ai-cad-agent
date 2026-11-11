@@ -31,6 +31,7 @@ from agent.llm_base import (
     StreamResponseError,
     _force_close_response,
     attach_thought_signature,
+    check_moderation_rejection,
     _stream_error_detail,
     extract_text_tool_calls,
     extract_think_tags,
@@ -829,6 +830,13 @@ def parse_interactions_stream(
             call["id"] = cid
             tool_calls[cid] = call
 
+    check_moderation_rejection(
+        provider_label=provider_label,
+        finish_reason=finish_reason,
+        content=content,
+        tool_calls=tool_calls,
+    )
+
     finish_norm = str(finish_reason or "").strip().lower()
     if finish_norm in ("length", "max_tokens"):
         raise CompletionTruncatedError(
@@ -970,6 +978,13 @@ def parse_interactions_response(body: dict[str, Any]) -> dict[str, Any]:
         tool_calls = text_calls
 
     finish_reason = body.get("finish_reason") or body.get("status")
+    check_moderation_rejection(
+        provider_label="Google AI Studio",
+        finish_reason=finish_reason,
+        content=content,
+        tool_calls=tool_calls,
+    )
+
     finish_norm = str(finish_reason or "").strip().lower()
     if finish_norm in ("length", "max_tokens"):
         raise CompletionTruncatedError(

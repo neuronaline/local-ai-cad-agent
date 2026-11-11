@@ -432,6 +432,14 @@ TOOL_HINTS = {
         "(3) Prevent coplanar faces in difference() by overshooting cutters with EPS."
     ),
     "VALIDATION_ERROR": "Correct the parameter values named in the message before retrying.",
+    "EDIT_MATCH_FAILED": (
+        "Call read_file to inspect the exact current lines in model.scad, then retry edit_file "
+        "with a unique matching old_string block (or use write_file for a complete rewrite)."
+    ),
+    "OPENSCAD_PREFLIGHT_FAILED": (
+        "Fix the OpenSCAD syntax error, delimiter mismatch, or blocked construct reported in "
+        "message before retrying write_file or edit_file."
+    ),
     "FILE_NOT_FOUND": "Create the required file using write_file first.",
     "TOOL_EXECUTION_FAILED": "Review the error details to adjust the tool arguments before retrying.",
     "IMAGE_RUN_CAD_BUILD_FIRST": "Run cad_build(views=[...]) to compile and render view images first.",

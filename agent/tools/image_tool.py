@@ -23,6 +23,7 @@ from pathlib import Path
 
 from PIL import Image
 
+from agent.io import atomic_write_bytes
 from agent.prompt import TOOL_HINTS
 from agent.review_paths import review_dir
 from agent.revisions import compute_model_sha256
@@ -178,7 +179,7 @@ class ImageTool:
                 target_path = review_root / rel_path
                 target_path.parent.mkdir(parents=True, exist_ok=True)
                 if not target_path.is_file() or target_path.stat().st_size == 0:
-                    target_path.write_bytes(crop_bytes)
+                    atomic_write_bytes(target_path, crop_bytes)
                 return {
                     "view": f"{view_id}_crop",
                     "cropped": True,

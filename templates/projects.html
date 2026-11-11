@@ -84,6 +84,7 @@
       </div>
     </main>
 
+    <script src="{{ url_for('static', filename='js/stream-client.js') }}?v={{ cache_bust }}"></script>
     <script type="module" src="{{ url_for('static', filename='js/projects.js') }}?v={{ cache_bust }}"></script>
   </body>
 </html>

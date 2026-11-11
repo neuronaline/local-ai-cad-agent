@@ -1,39 +1,65 @@
 # Copy this file to config.yaml and adjust it for your machine.
+# All settings in config.yaml override the built-in system defaults.
+
+# Root directory where all CAD agent projects, generated OpenSCAD scripts,
+# 3D assets (STL, 3MF), renders, and logs are stored. Tilde expansion is supported.
+# Default: ~/CAD-Agent-Projects
 workspace_root: ~/CAD-Agent-Projects
 
 # ── 1. Active LLM Provider ───────────────────────────────────────────────────
-# Supported providers: openrouter | gemini (aistudio) | vertex | openai | ollama | mimo
-# Set either a provider name ("openrouter") or "<provider>:<model>"
-# ("gemini:gemini-3.8-flash"). If only a provider name is given, the first
-# model listed under that provider below is used as its default.
+# Supported providers: openrouter | gemini (or aistudio) | vertex | openai | ollama | mimo
+# Set either a provider slug ("openrouter") or pin a specific model ("<provider>:<model>",
+# e.g. "gemini:gemini-3.8-flash"). If only a provider name is given, the first model
+# listed under that provider's `models` section below is used as its default.
 llm:
+  # Primary provider used for agent execution and code generation.
   provider: openrouter
-  # Optional backup provider (same forms as `provider`, e.g. "vertex"), used
-  # once if the primary fails after its own retries. Must differ from provider.
+
+  # Optional backup/fallback provider (same format as `provider`, e.g. "vertex" or "gemini:gemini-3.8-flash").
+  # Used once if the primary client experiences a transient failure (network errors, rate limits, 5xx server errors)
+  # after its own retries. Must differ from `provider`. Leave empty ("") to disable fallback.
   fallback_provider: ""
-  # Optional limit across providers (Gemini API enforces maxOutputTokens <= 65535).
-  # Defaults to 16384 when omitted.
-  # max_completion_tokens: 16384
+
+  # Optional maximum completion/generation tokens ceiling across providers.
+  # Gemini API enforces maxOutputTokens <= 65535. Defaults to 32768 when omitted.
+  # max_completion_tokens: 32768
 
 # ── 2. Providers & Per-Model Settings ────────────────────────────────────────
-# Each provider groups its own connection settings and models in one place.
-# Every model can define its own `reasoning_effort` ("" | none | minimal | low | medium | high | xhigh | max).
-# Models configured below appear automatically in the Web UI model picker.
-# Optional provider keys (shown values are defaults where applicable):
-#   all:        base_url, timeout_seconds, reasoning_effort (default for its models)
-#   openrouter: provider_order: [], force_provider: false, reasoning_max_tokens: 4096
-#               (defaults for its models; 4096 bounds reasoning so tool calls never truncate, 0 = unlimited),
+# Each provider groups its connection settings, authentication, and model catalog.
+# Models configured below appear automatically in the Web UI model switcher dropdown.
+#
+# Reasoning Effort:
+#   Supported levels: "" (or enabled/default) | none (disabled) | minimal | low | medium | high | xhigh | max
+#
+# Common provider-level keys (shown values are defaults where applicable):
+#   all:        base_url, timeout_seconds (default: 300), reasoning_effort (default for its models)
+#   openrouter: provider_order: [], force_provider: false, reasoning_max_tokens: 4096 (0 = unlimited),
 #               app_title, app_url, session_prefix, enable_anthropic_cache: true, enable_gemini_cache: true
-#   gemini:     store: true, project_id / location (auth_mode: gcloud only)
+#   gemini:     store: true, auth_mode: api_key (or gcloud), project_id / location (gcloud only)
+#   vertex:     project_id, location: us-central1 (uses Google Cloud ADC credentials)
+#   ollama:     base_url: http://localhost:11434/v1, think: true/false
+#   openai:     base_url: https://api.openai.com/v1
+#   mimo:       base_url: https://api.xiaomimimo.com/v1, timeout_seconds: 600, thinking: enabled/disabled
 
 openrouter:
-  # In OpenRouter, each model is hosted by different upstream sub-providers.
+  # Requires OPENROUTER_API_KEY in .env.
+  # In OpenRouter, each model is hosted by different upstream sub-providers (e.g. Novita, DeepInfra, Crusoe).
   # You can bind `providers` (priority routing order), `force_provider`, and
   # `reasoning_effort` directly per model so switching models in the UI
-  # automatically switches the OpenRouter sub-providers too:
-  # reasoning_max_tokens: 4096   # Default 4096 caps thinking tokens so complex tool calls never truncate (0 = unlimited)
+  # automatically switches the upstream routing and thinking settings:
+  # base_url: https://openrouter.ai/api/v1
+  # timeout_seconds: 300
+  # reasoning_max_tokens: 4096   # Default 4096 bounds thinking tokens so complex tool calls never truncate (0 = unlimited)
+  # provider_order: []           # Global fallback routing order, e.g. [novita/fp8, deepinfra/fp4]
+  # force_provider: false        # If true, strictly pins to single provider in provider_order
+  # app_title: "Local AI CAD Agent"
+  # app_url: ""
+  # session_prefix: "local-ai-cad-agent"
+  # enable_anthropic_cache: true # Enable Anthropic prompt caching
+  # enable_gemini_cache: true    # Enable Gemini prompt caching
   models: {}
     # deepseek/deepseek-r1:
+    #   label: "DeepSeek R1"         # Optional custom display label in Web UI picker
     #   reasoning_effort: high       # Takes precedence over reasoning_max_tokens when set
     #   providers: [novita/fp8, deepinfra/fp4]
     #   force_provider: false
@@ -42,74 +68,100 @@ openrouter:
     #   providers: [z-ai/fp8]
 
 gemini:
-  auth_mode: api_key            # api_key (GEMINI_API_KEY in .env) | gcloud
+  # Google AI Studio / Gemini Interactions API adapter.
+  # Requires GEMINI_API_KEY in .env when auth_mode is api_key.
+  auth_mode: api_key            # Authentication mode: api_key (GEMINI_API_KEY in .env) | gcloud (Application Default Credentials)
+  # base_url: https://generativelanguage.googleapis.com
+  # timeout_seconds: 300         # API request timeout in seconds
+  # store: true                  # Interactions API context caching and trajectory storage flag
+  # project_id: ""               # GCP Project ID (only used when auth_mode is gcloud)
+  # location: us-central1        # GCP Region (only used when auth_mode is gcloud)
   models:
-    gemini-3.8-flash:
-      reasoning_effort: ""
-    gemini-4-argon:
-      reasoning_effort: ""
+    # gemini-3.8-flash:
+      # reasoning_effort: ""      # "" or enabled uses model default; none disables thinking; or low|medium|high
+    # gemini-4-argon:
+      # reasoning_effort: ""
 
 vertex:
-  project_id: ""                # Auto-detected from gcloud / GCP_PROJECT if blank
-  location: us-central1
+  # Google Cloud Vertex AI adapter using Google Cloud ADC (gcloud auth application-default login).
+  project_id: ""                # GCP Project ID; auto-detected from gcloud or GCP_PROJECT env var if left empty
+  location: us-central1         # Vertex AI deployment region (e.g. us-central1, europe-west4)
+  # timeout_seconds: 300         # API request timeout in seconds
   models:
-    gemini-3.8-flash:
-      reasoning_effort: ""
-    gemini-4-argon:
-      reasoning_effort: ""
+    # gemini-3.8-flash:
+      # reasoning_effort: ""      # Reasoning effort level ("" for default, none, low, medium, high)
+    # gemini-4-carbon:
+      # reasoning_effort: ""
 
 ollama:
-  base_url: http://localhost:11434/v1
+  # Local offline LLM inference via Ollama (no API key required).
+  base_url: http://localhost:11434/v1   # Ollama OpenAI-compatible server endpoint
+  # timeout_seconds: 300                # Request timeout in seconds (increase for large local models or slow GPUs)
+  # think: false                        # Provider-level thinking toggle (true/false) for reasoning models
   models:
-    qwen3.8:27b:
-      reasoning_effort: ""
+    # qwen3.8:27b:
+      # reasoning_effort: ""              # Reasoning effort level ("" for default, none to disable, low, medium, high)
 
 openai:
+  # OpenAI Chat Completions adapter.
+  # Requires OPENAI_API_KEY in .env.
+  # base_url: https://api.openai.com/v1 # OpenAI API endpoint or compatible proxy
+  # timeout_seconds: 300                # Request timeout in seconds
   models: {}
-    # gpt-5:
-    #   reasoning_effort: medium
+    # gpt-6.1-sol:
+    #   reasoning_effort: medium        # none | minimal | low | medium | high | xhigh | max
 
 mimo:
+  # Xiaomi MiMo Chat Completions adapter.
+  # Requires MIMO_API_KEY in .env.
   # base_url: https://api.xiaomimimo.com/v1   # Standard pay-as-you-go endpoint (or https://token-plan-cn.xiaomimimo.com/v1 for Token Plan)
   # timeout_seconds: 600                     # Extended timeout for deep reasoning models (mimo-v2.6-pro)
   # thinking: enabled                        # Deep Thinking: enabled (default) | disabled
   models:
-    mimo-v2.6-flash:
-      thinking: enabled                      # Deep Thinking: enabled (default) | disabled
-    mimo-v2.6-pro:
-      thinking: enabled
+    # mimo-v2.6-flash:
+      # thinking: enabled                      # Deep Thinking: enabled (default) | disabled
+    # mimo-v2.6-pro:
+      # thinking: enabled
 
 # ── 3. Agent, Server & Viewport ──────────────────────────────────────────────
 agent:
-  tool_call_limit: 12
-  revision_retention_count: 0   # 0 keeps all model revisions
-  # off | errors (<project>/debug-errors.jsonl) | debug (rolling activity.jsonl)
-  # | dataset (untrimmed trajectories/<run_id>.jsonl)
-  log_mode: off
+  tool_call_limit: 12           # Max consecutive tool iterations per run to prevent runaway agent loops (default: 12)
+  max_concurrent_runs: 8        # Max simultaneous active project generation runs across browser tabs (range: 1-32)
+  max_parallel_builds: 2        # Max concurrent heavy OpenSCAD compilation and multi-view render subprocesses (range: 1-16)
+  revision_retention_count: 0   # Number of CAD revisions retained per project (0 = unlimited history, >0 = keep last N revisions)
+  # Activity and diagnostics logging mode:
+  #   off:     logging disabled
+  #   errors:  record only failed tool calls and exceptions to <project>/debug-errors.jsonl (default)
+  #   debug:   record rolling trace of LLM requests and tool execution to <project>/.cad-agent/activity.jsonl
+  #   dataset: export full untrimmed interaction trajectories to trajectories/<run_id>.jsonl
+  log_mode: errors
 
 server:
-  host: 127.0.0.1
-  port: 8000
+  host: 127.0.0.1               # Network interface binding (127.0.0.1 for local machine only, 0.0.0.0 for LAN access)
+  port: 8000                    # HTTP port for the web interface (1-65535, default: 8000)
 
 ui:
-  show_info_messages: true
+  show_info_messages: true      # Display informational toasts and status badges in the Web UI (true | false)
 
 viewer:
   grid:
-    size: 200                   # Square ground grid in mm (X and Z)
-    divisions: 20
+    size: 200                   # Square ground plane reference grid dimension in millimeters (covers X and Z axes)
+    divisions: 20               # Number of grid subdivisions per axis (e.g. 200 mm / 20 = 10 mm grid cells)
 
 review:
-  render_workers: 4
-  required_views: 8
+  render_workers: 4             # Number of parallel worker processes for multi-view rasterization / preview rendering
+  required_views: 8             # Number of canonical camera angles generated during cad_build verification (default: 8 views)
 
 openscad:
   bosl2:
-    enabled: true               # Inject BOSL2 library playbook into the agent's system prompt
+    enabled: true               # Bundle BOSL2 (Belfry OpenSCAD Library v2) and inject its syntax & cheat sheet into the agent prompt
 
 # ── 4. User 3D Printing Setup ────────────────────────────────────────────────
+# Injected into the CAD agent prompt, Printability Advisor, and /3mf export engine.
+# Configuring your physical printer, nozzle, and filament helps the agent tailor wall thickness,
+# overhang angles, bridging tolerances, and slicer profiles to your specific setup.
 user:
-  printer: ""                   # 3D printer / device model (e.g. Bambu Lab A1, Prusa MK4, Ender 3)
-  nozzle: "0.4 mm"              # Nozzle type & diameter (e.g. Stainless Steel 0.6 mm, Hardened Steel 0.4 mm, Brass 0.4 mm)
-  filament: PLA                 # Favorite filament material (PLA, PETG, ABS, ASA, TPU, etc.)
-  additional_info: ""           # Extra instructions / setup notes (e.g. textured PEI sheet, enclosed chamber, custom tolerances)
+  printer: ""                   # 3D printer / device model (e.g. Bambu Lab A1, Bambu Lab X1C, Prusa MK4, Ender 3 V3)
+  nozzle: "0.4 mm"              # Nozzle type & diameter (e.g. Stainless Steel 0.4 mm, Hardened Steel 0.6 mm, Brass 0.4 mm)
+  filament: PLA                 # Default filament material (e.g. PLA, PETG, ABS, ASA, TPU, PA-CF)
+  additional_info: ""           # Extra instructions / setup notes (e.g. textured PEI sheet, enclosed chamber, 0.2mm clearance for snap-fits)
