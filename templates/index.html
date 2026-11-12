@@ -51,7 +51,12 @@
           </div>
         </template>
         <div id="question-area"></div>
-        <div id="usage-bar" class="usage-bar" hidden aria-label="Token usage">
+        <div id="usage-bar" class="usage-bar" hidden aria-label="Token usage and context memory">
+          <div id="usage-pill-context" class="usage-pill usage-pill-context" hidden>
+            <span class="usage-pill-label">Context</span>
+            <span id="usage-context-track" class="context-meter-track" aria-hidden="true"><span id="usage-context-fill" class="context-meter-fill"></span></span>
+            <span id="usage-context-metrics" class="usage-pill-metrics"></span>
+          </div>
           <div id="usage-pill-turn" class="usage-pill" hidden>
             <span class="usage-pill-label">Last Turn</span>
             <span id="usage-turn-metrics" class="usage-pill-metrics"></span>
@@ -69,49 +74,50 @@
           <textarea id="message" placeholder="Describe the part, dimensions, fit, and required features…" rows="2" required aria-label="Part description"></textarea>
           <div id="attachment-preview" class="attachment-preview" aria-live="polite"></div>
           <div class="action-bar">
-            <label id="dropzone" class="attach-button icon-only" for="attachments" title="Add reference images" aria-label="Add reference images">
-              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                <path d="M20.5 11.6 12.3 19.8a5.4 5.4 0 0 1-7.6-7.6l8.6-8.6a3.6 3.6 0 0 1 5.1 5.1l-8.6 8.6a1.8 1.8 0 0 1-2.5-2.5l7.7-7.7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
-              </svg>
-              <input id="attachments" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden>
-            </label>
-            <span id="attachment-label" class="sr-only">Attach reference images</span>
-            <div class="model-picker" title="Select AI model">
-              <svg class="icon model-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
-              </svg>
-              <select id="model-select" class="model-select" aria-label="Select AI model" title="Select AI model">
-                {% for item in available_models or [] %}
-                <option value="{{ item.key }}"{% if item.key == active_model_key %} selected{% endif %}>
-                  {{ item.provider_label }} · {{ item.label }}
-                </option>
-                {% endfor %}
-              </select>
+            <div class="composer-tools">
+              <label id="dropzone" class="attach-button icon-only" for="attachments" title="Add reference images" aria-label="Add reference images">
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                  <path d="M20.5 11.6 12.3 19.8a5.4 5.4 0 0 1-7.6-7.6l8.6-8.6a3.6 3.6 0 0 1 5.1 5.1l-8.6 8.6a1.8 1.8 0 0 1-2.5-2.5l7.7-7.7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                <input id="attachments" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden>
+              </label>
+              <span id="attachment-label" class="sr-only">Attach reference images</span>
+              <div class="model-picker" title="Select AI model">
+                <svg class="icon model-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                  <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                <select id="model-select" class="model-select" aria-label="Select AI model" title="Select AI model">
+                  {% for item in available_models or [] %}
+                  <option value="{{ item.key }}"{% if item.key == active_model_key %} selected{% endif %}>
+                    {{ item.provider_label }} · {{ item.label }}
+                  </option>
+                  {% endfor %}
+                </select>
+              </div>
+              {% set is_mimo_active = (active_model_key or '').startswith('mimo:') or (active_model_key or '').startswith('xiaomi:') %}
+              <div class="effort-picker" title="{% if is_mimo_active %}MiMo Deep Thinking (enabled / disabled){% else %}Model reasoning effort{% endif %}">
+                <svg class="icon effort-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                  <path d="M12 2a7 7 0 0 0-7 7c0 2.38 1.19 4.47 3 5.74V17a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1v-2.26c1.81-1.27 3-3.36 3-5.74a7 7 0 0 0-7-7M9 21a1 1 0 0 0 1 1h4a1 1 0 0 0 1-1v-1H9z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                <select id="reasoning-effort" class="effort-select" aria-label="{% if is_mimo_active %}MiMo Deep Thinking{% else %}Model reasoning effort{% endif %}" title="{% if is_mimo_active %}MiMo Deep Thinking{% else %}Model reasoning effort{% endif %}">
+                  <option value=""{% if not reasoning_effort %} selected{% endif %}>{% if is_mimo_active %}Enabled (Default){% else %}Default{% endif %}</option>
+                  <option value="none"{% if reasoning_effort == 'none' %} selected{% endif %}>{% if is_mimo_active %}Disabled{% else %}None{% endif %}</option>
+                  <option value="minimal"{% if reasoning_effort == 'minimal' %} selected{% endif %}{% if is_mimo_active %} hidden disabled{% endif %}>Minimal</option>
+                  <option value="low"{% if reasoning_effort == 'low' %} selected{% endif %}{% if is_mimo_active %} hidden disabled{% endif %}>Low</option>
+                  <option value="medium"{% if reasoning_effort == 'medium' %} selected{% endif %}{% if is_mimo_active %} hidden disabled{% endif %}>Medium</option>
+                  <option value="high"{% if reasoning_effort == 'high' %} selected{% endif %}{% if is_mimo_active %} hidden disabled{% endif %}>High</option>
+                  <option value="xhigh"{% if reasoning_effort == 'xhigh' %} selected{% endif %}{% if is_mimo_active %} hidden disabled{% endif %}>XHigh</option>
+                  <option value="max"{% if reasoning_effort == 'max' %} selected{% endif %}{% if is_mimo_active %} hidden disabled{% endif %}>Max</option>
+                </select>
+              </div>
+              <button id="hardware-picker-btn" type="button" class="hardware-picker-btn toolbar-pill quiet" title="Printer & Filament Preferences" aria-label="Printer & Filament Preferences">
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                  <path d="M6 18h12M6 14h12M8 10h8M9 6h6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+                  <rect x="3" y="3" width="18" height="18" rx="3" fill="none" stroke="currentColor" stroke-width="1.6"/>
+                </svg>
+                <span id="hardware-picker-label">FDM Profile</span>
+              </button>
             </div>
-            {% set is_mimo_active = (active_model_key or '').startswith('mimo:') or (active_model_key or '').startswith('xiaomi:') %}
-            <div class="effort-picker" title="{% if is_mimo_active %}MiMo Deep Thinking (enabled / disabled){% else %}Model reasoning effort{% endif %}">
-              <svg class="icon effort-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                <path d="M12 2a7 7 0 0 0-7 7c0 2.38 1.19 4.47 3 5.74V17a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1v-2.26c1.81-1.27 3-3.36 3-5.74a7 7 0 0 0-7-7M9 21a1 1 0 0 0 1 1h4a1 1 0 0 0 1-1v-1H9z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
-              </svg>
-              <select id="reasoning-effort" class="effort-select" aria-label="{% if is_mimo_active %}MiMo Deep Thinking{% else %}Model reasoning effort{% endif %}" title="{% if is_mimo_active %}MiMo Deep Thinking{% else %}Model reasoning effort{% endif %}">
-                <option value=""{% if not reasoning_effort %} selected{% endif %}>{% if is_mimo_active %}Enabled (Default){% else %}Default{% endif %}</option>
-                <option value="none"{% if reasoning_effort == 'none' %} selected{% endif %}>{% if is_mimo_active %}Disabled{% else %}None{% endif %}</option>
-                <option value="minimal"{% if reasoning_effort == 'minimal' %} selected{% endif %}{% if is_mimo_active %} hidden disabled{% endif %}>Minimal</option>
-                <option value="low"{% if reasoning_effort == 'low' %} selected{% endif %}{% if is_mimo_active %} hidden disabled{% endif %}>Low</option>
-                <option value="medium"{% if reasoning_effort == 'medium' %} selected{% endif %}{% if is_mimo_active %} hidden disabled{% endif %}>Medium</option>
-                <option value="high"{% if reasoning_effort == 'high' %} selected{% endif %}{% if is_mimo_active %} hidden disabled{% endif %}>High</option>
-                <option value="xhigh"{% if reasoning_effort == 'xhigh' %} selected{% endif %}{% if is_mimo_active %} hidden disabled{% endif %}>XHigh</option>
-                <option value="max"{% if reasoning_effort == 'max' %} selected{% endif %}{% if is_mimo_active %} hidden disabled{% endif %}>Max</option>
-              </select>
-            </div>
-            <button id="hardware-picker-btn" type="button" class="hardware-picker-btn toolbar-pill quiet" title="Printer & Filament Preferences" aria-label="Printer & Filament Preferences">
-              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                <path d="M6 18h12M6 14h12M8 10h8M9 6h6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
-                <rect x="3" y="3" width="18" height="18" rx="3" fill="none" stroke="currentColor" stroke-width="1.6"/>
-              </svg>
-              <span id="hardware-picker-label">FDM Profile</span>
-            </button>
-            <span class="composer-hint">Enter sends · Shift+Enter adds a line · / for commands</span>
             <button id="send-toggle" type="button" class="send-toggle" title="Send" aria-label="Send">
               <span class="send-toggle-icon" data-mode="send">
                 <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
@@ -126,6 +132,9 @@
             </button>
           </div>
         </form>
+        <div class="composer-footer">
+          <span class="composer-hint">Enter sends · Shift+Enter adds a line · / for commands</span>
+        </div>
       </section>
       <div id="panel-resizer" class="panel-resizer" role="separator" aria-orientation="vertical" aria-label="Resize panels" tabindex="0"></div>
       <section class="viewer-panel">

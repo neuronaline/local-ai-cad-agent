@@ -32,7 +32,8 @@ llm:
 #   Supported levels: "" (or enabled/default) | none (disabled) | minimal | low | medium | high | xhigh | max
 #
 # Common provider-level keys (shown values are defaults where applicable):
-#   all:        base_url, timeout_seconds (default: 300), reasoning_effort (default for its models)
+#   all:        base_url, timeout_seconds (default: 300), reasoning_effort (default for its models),
+#               context_length (optional context window override in tokens; also supported per model)
 #   openrouter: provider_order: [], force_provider: false, reasoning_max_tokens: 4096 (0 = unlimited),
 #               app_title, app_url, session_prefix, enable_anthropic_cache: true, enable_gemini_cache: true
 #   gemini:     store: true, auth_mode: api_key (or gcloud), project_id / location (gcloud only)

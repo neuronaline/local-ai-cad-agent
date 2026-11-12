@@ -91,6 +91,7 @@ class ModelOption:
     provider_order: tuple[str, ...] = ()
     force_provider: bool = False
     reasoning_max_tokens: int | None = None
+    context_length: int | None = None
 
     @property
     def key(self) -> str:
@@ -104,6 +105,7 @@ class ModelOption:
             "model": self.model,
             "label": self.label,
             "reasoning_effort": self.reasoning_effort,
+            "context_length": self.context_length,
         }
 
 DEFAULT_OPENROUTER_REASONING_MAX_TOKENS = 4096
@@ -487,7 +489,7 @@ def _validate_auth_mode(val: Any, field_name: str) -> str:
     return s
 
 
-_MODEL_KEYS = {"label", "reasoning_effort"}
+_MODEL_KEYS = {"label", "reasoning_effort", "context_length"}
 _OPENROUTER_MODEL_KEYS = _MODEL_KEYS | {"providers", "force_provider", "reasoning_max_tokens"}
 _MIMO_MODEL_KEYS = _MODEL_KEYS | {"thinking", "think"}
 
@@ -559,6 +561,11 @@ def _parse_model_options(
                     if "reasoning_max_tokens" in cfg
                     else defaults.reasoning_max_tokens
                 ),
+                context_length=(
+                    _optional_positive_int(cfg["context_length"], f"{field}.context_length")
+                    if "context_length" in cfg
+                    else defaults.context_length
+                ),
             )
         )
     return options
@@ -610,7 +617,7 @@ def load_settings(project_root: Path | None = None) -> Settings:
     )
     _reject_unknown(
         ollama,
-        {"base_url", "model", "models", "timeout_seconds", "reasoning_effort", "think"},
+        {"base_url", "model", "models", "timeout_seconds", "reasoning_effort", "think", "context_length"},
         "ollama",
     )
     _reject_unknown(
@@ -625,17 +632,18 @@ def load_settings(project_root: Path | None = None) -> Settings:
             "auth_mode",
             "project_id",
             "location",
+            "context_length",
         },
         "gemini",
     )
     _reject_unknown(
         vertex,
-        {"project_id", "location", "model", "models", "timeout_seconds", "reasoning_effort"},
+        {"project_id", "location", "model", "models", "timeout_seconds", "reasoning_effort", "context_length"},
         "vertex",
     )
     _reject_unknown(
         mimo,
-        {"base_url", "model", "models", "timeout_seconds", "reasoning_effort", "thinking", "think"},
+        {"base_url", "model", "models", "timeout_seconds", "reasoning_effort", "thinking", "think", "context_length"},
         "mimo",
     )
     _reject_unknown(
@@ -766,6 +774,9 @@ def load_settings(project_root: Path | None = None) -> Settings:
             model="",
             label="",
             reasoning_effort=_optional_effort(section.get("reasoning_effort")),
+            context_length=_optional_positive_int(
+                section.get("context_length"), f"{name}.context_length"
+            ),
         )
         for name, section in sections.items()
     }

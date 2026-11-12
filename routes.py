@@ -34,6 +34,10 @@ from flask import (
 )
 
 from agent.balance import fetch_provider_balance
+from agent.context_info import (
+    get_project_context_snapshot,
+    resolve_context_limit,
+)
 from agent.conversation import ConversationStore
 from agent.converter import (
     EXPORT_MIME_TYPES,
@@ -589,6 +593,18 @@ def _persist_project_selection(
         _write_project_metadata(project_dir, {**meta, **updates})
 
 
+def _serialize_available_models(settings: Settings) -> list[dict[str, Any]]:
+    models: list[dict[str, Any]] = []
+    for opt in settings.available_models:
+        entry = opt.to_dict()
+        if not entry.get("context_length"):
+            entry["context_length"] = resolve_context_limit(
+                settings, opt.key, allow_network=False
+            )
+        models.append(entry)
+    return models
+
+
 @projects_bp.get("/project/<name>")
 def project_view(name: str) -> str:
     try:
@@ -606,7 +622,7 @@ def project_view(name: str) -> str:
         reasoning_effort=proj_effort,
         active_model_key=proj_model_key,
         has_project_model=has_model,
-        available_models=[opt.to_dict() for opt in settings.available_models],
+        available_models=_serialize_available_models(settings),
         user_preferences={
             "printer": settings.user_printer,
             "nozzle": settings.user_nozzle,
@@ -701,12 +717,17 @@ def reset_project(project_name: str):
                 {"error": "Cannot reset while an agent task is running."}
             ), 409
         removed = runner.clear_history(project_dir)
-        (project_dir / ".agent_state.json").unlink(missing_ok=True)
+        context_snapshot = get_project_context_snapshot(
+            project_dir,
+            current_app.config["SETTINGS"],
+            raw_events=[],
+            allow_network=False,
+        )
     current_app.config["EVENT_BUS"].publish(
         "conversation_reset",
-        {"project": project_name, "removed": removed},
+        {"project": project_name, "removed": removed, "context": context_snapshot},
     )
-    return jsonify({"reset": True, "removed": removed})
+    return jsonify({"reset": True, "removed": removed, "context": context_snapshot})
 
 
 @projects_bp.put("/api/projects/<project_name>/rename")
@@ -904,6 +925,12 @@ def chat_retry():
         )
         if not last_user_turn:
             return jsonify({"error": "No previous user message found to retry."}), 400
+        context_snapshot = get_project_context_snapshot(
+            project_dir,
+            current_app.config["SETTINGS"],
+            model_key=model_key,
+            allow_network=False,
+        )
         prompt_text = ""
         user_content = last_user_turn.get("content")
         if isinstance(user_content, str):
@@ -925,7 +952,7 @@ def chat_retry():
     if not started:
         _publish_start_failure(project_name, "Unable to start retry task.")
         return jsonify({"error": "Unable to start retry task."}), 409
-    return jsonify({"accepted": True}), 202
+    return jsonify({"accepted": True, "context": context_snapshot}), 202
 
 
 @agent_bp.get("/api/settings/models")
@@ -952,7 +979,7 @@ def get_models():
         "provider": provider,
         "model": model,
         "reasoning_effort": effort,
-        "models": [opt.to_dict() for opt in settings.available_models],
+        "models": _serialize_available_models(settings),
     })
 
 
@@ -979,12 +1006,17 @@ def update_model():
             if not isinstance(project_dir, Path):
                 return project_dir
             _persist_project_selection(project_dir, model_key=model_key, effort=effort)
+            context_snapshot = get_project_context_snapshot(
+                project_dir, settings, model_key=model_key, allow_network=True
+            )
         return jsonify({
             "project": project_name,
             "active_key": model_key,
             "provider": option.provider,
             "model": option.model,
             "reasoning_effort": effort,
+            "context_length": context_snapshot["limit_tokens"],
+            "context": context_snapshot,
         })
 
     return jsonify({
@@ -992,6 +1024,7 @@ def update_model():
         "provider": settings.llm_provider,
         "model": settings.llm_model,
         "reasoning_effort": settings.reasoning_effort or "",
+        "context_length": resolve_context_limit(settings, settings.active_model_key, allow_network=True),
     })
 
 
@@ -1165,7 +1198,29 @@ def project_history(project_name: str):
         return jsonify({"error": str(error)}), 404
     raw_events = ConversationStore.read_raw_events(project_dir)
     events = [_redact_history_event(ev) for ev in raw_events]
-    return jsonify({"events": events})
+    context_snapshot = get_project_context_snapshot(
+        project_dir, settings, raw_events=raw_events, allow_network=True
+    )
+    return jsonify({"events": events, "context": context_snapshot})
+
+
+@agent_bp.get("/api/projects/<project_name>/context")
+def project_context(project_name: str):
+    try:
+        settings: Settings = current_app.config["SETTINGS"]
+        project_dir = _project_path(settings, project_name)
+    except (ValueError, FileNotFoundError) as error:
+        return jsonify({"error": str(error)}), 404
+    try:
+        req_model_key = _sync_model_selection(
+            request.args.get("model_key"), persist=False
+        )
+    except ValueError as err:
+        return jsonify({"error": str(err)}), 400
+    snapshot = get_project_context_snapshot(
+        project_dir, settings, model_key=req_model_key, allow_network=True
+    )
+    return jsonify(snapshot)
 
 
 @agent_bp.get("/api/stream")

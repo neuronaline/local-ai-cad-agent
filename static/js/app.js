@@ -46,6 +46,10 @@ const slashPopup = document.querySelector('#slash-popup');
 const slashPopupList = document.querySelector('#slash-popup-list');
 const questionArea = document.querySelector('#question-area');
 const usageBar = document.querySelector('#usage-bar');
+const usagePillContext = document.querySelector('#usage-pill-context');
+const usageContextTrack = document.querySelector('#usage-context-track');
+const usageContextFill = document.querySelector('#usage-context-fill');
+const usageContextMetrics = document.querySelector('#usage-context-metrics');
 const usagePillTurn = document.querySelector('#usage-pill-turn');
 const usageTurnMetrics = document.querySelector('#usage-turn-metrics');
 const usagePillTotal = document.querySelector('#usage-pill-total');
@@ -199,11 +203,18 @@ function setActiveModelKey(key, adoptModelEffort = false) {
   } catch {}
   const payload = { model_key: key };
   if (currentProject) payload.project = currentProject;
+  applyActiveModelContextLimit(key);
   return api('/api/settings/models', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(payload),
   }).then(res => {
+    if (res?.context) {
+      applyContextSnapshot(res.context);
+    } else if (res?.context_length && Number(res.context_length) > 0) {
+      contextState.modelLimits[key] = Number(res.context_length);
+      applyActiveModelContextLimit(key);
+    }
     if (adoptModelEffort && res && VALID_EFFORTS.has(res.reasoning_effort ?? '')) {
       const supported = getSupportedEffortsForModel(key);
       const nextEffort = supported.has(res.reasoning_effort ?? '') ? (res.reasoning_effort ?? '') : '';
@@ -437,6 +448,7 @@ function addMessage(text, type = 'agent', options = {}) {
     const item = createAgentCardElement({ streaming: isStreaming, showSkeleton: isStreaming && !text });
     item._rawText = text || '';
     item._rawReasoning = options.reasoning || '';
+    if (!isStreaming) item.dataset.finalized = 'true';
     if (options.messageId) item.dataset.messageId = options.messageId;
     ensureThoughtDisclosure(item, options.reasoning, false, false);
     target.appendChild(item);
@@ -668,8 +680,9 @@ function appendDetailSection(container, label, text, { isCode = false, isError =
   labelEl.textContent = label;
   section.appendChild(labelEl);
 
+  const MAX_DETAIL_CHARS = 100000;
   const raw = String(text);
-  const clipped = raw.length > 3500 ? `${raw.slice(0, 3500)}\n… [truncated]` : raw;
+  const clipped = raw.length > MAX_DETAIL_CHARS ? `${raw.slice(0, MAX_DETAIL_CHARS)}\n… [truncated]` : raw;
   if (isCode) {
     const pre = document.createElement('pre');
     pre.className = 'tool-detail-code';
@@ -832,8 +845,7 @@ function addToolMessage(data, { target = feed } = {}) {
     container.querySelector('.empty-state')?.remove();
     if (container === feed && activeRunCard?.isConnected && activeRunCard.parentElement === container) {
       if (activeRunCard._rawText?.trim() || activeRunCard._rawReasoning?.trim()) {
-        setCardState(activeRunCard, 'done');
-        activeRunCard = null;
+        lockCompletedStepCard(activeRunCard);
       } else {
         activeRunCard.remove();
         activeRunCard = null;
@@ -882,8 +894,122 @@ function markActivityRecovered(terminalStatus = 'completed') {
   }
 }
 
-// ── Dual Token Usage Bar (Last Turn & All Chat) ──
+// ── Context Memory & Dual Token Usage Bar ──
 let turnUsageBuckets = [];
+
+const initialModelLimits = {};
+for (const m of availableModels) {
+  if (m?.key && Number(m.context_length) > 0) {
+    initialModelLimits[m.key] = Number(m.context_length);
+  }
+}
+
+const contextState = {
+  used: null,
+  limit: null,
+  source: 'estimated',
+  modelKey: appConfig.activeModelKey || '',
+  modelLimits: initialModelLimits,
+};
+
+function inferClientContextLimit(modelKey) {
+  if (!modelKey) return null;
+  const limit = Number(contextState.modelLimits[modelKey]);
+  return Number.isFinite(limit) && limit > 0 ? limit : null;
+}
+
+function applyActiveModelContextLimit(modelKey) {
+  const key = modelKey || getActiveModelKey();
+  contextState.modelKey = key;
+  contextState.limit = inferClientContextLimit(key);
+  renderUsageBar();
+}
+
+function applyContextSnapshot(snapshot) {
+  if (!snapshot || typeof snapshot !== 'object') return;
+  if (snapshot.model_limits && typeof snapshot.model_limits === 'object') {
+    for (const [k, v] of Object.entries(snapshot.model_limits)) {
+      if (Number(v) > 0) contextState.modelLimits[k] = Number(v);
+    }
+  }
+  if (snapshot.model_key) {
+    contextState.modelKey = snapshot.model_key;
+  }
+  if (Number.isFinite(Number(snapshot.used_tokens)) && Number(snapshot.used_tokens) >= 0) {
+    contextState.used = Math.round(Number(snapshot.used_tokens));
+  }
+  const activeKey = getActiveModelKey() || contextState.modelKey;
+  if (snapshot.model_key && snapshot.model_key === activeKey && Number(snapshot.limit_tokens) > 0) {
+    contextState.limit = Number(snapshot.limit_tokens);
+    contextState.modelLimits[activeKey] = Number(snapshot.limit_tokens);
+  } else {
+    contextState.limit = inferClientContextLimit(activeKey);
+  }
+  if (snapshot.source) {
+    contextState.source = snapshot.source;
+  }
+  renderUsageBar();
+}
+
+function formatContextTokens(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return '—';
+  if (n >= 1000000) {
+    if (Math.abs(n - 1048576) < 20000) return '1M';
+    if (Math.abs(n - 2097152) < 30000) return '2M';
+    const m = n / 1000000;
+    return `${Number.isInteger(m) ? m : m.toFixed(1).replace(/\.0$/, '')}M`;
+  }
+  if (n >= 100000) {
+    return `${Math.round(n / 1000)}k`;
+  }
+  if (n >= 1000) {
+    const k = n / 1000;
+    return `${k >= 10 ? Math.round(k * 10) / 10 : Number(k.toFixed(1))}k`.replace(/\.0k$/, 'k');
+  }
+  return String(Math.round(n));
+}
+
+function renderContextPill() {
+  if (!usagePillContext || !usageContextMetrics) return false;
+  const used = contextState.used;
+  if (used == null || !Number.isFinite(used) || used < 0) {
+    usagePillContext.hidden = true;
+    delete usagePillContext.dataset.level;
+    return false;
+  }
+  const limit = contextState.limit || inferClientContextLimit(getActiveModelKey());
+  const isEst = contextState.source === 'estimated';
+  const prefix = isEst ? '~' : '';
+  const usedLabel = `${prefix}${formatContextTokens(used)}`;
+
+  if (limit && limit > 0) {
+    const rawPct = (used / limit) * 100;
+    const clampedPct = Math.min(100, Math.max(0, rawPct));
+    const pctLabel = rawPct > 0 && rawPct < 10
+      ? `${rawPct.toFixed(1).replace(/\.0$/, '')}%`
+      : `${Math.round(rawPct)}%`;
+    const level = rawPct >= 90 ? 'critical' : (rawPct >= 75 ? 'warn' : 'normal');
+    usagePillContext.dataset.level = level;
+    if (usageContextTrack) usageContextTrack.hidden = false;
+    if (usageContextFill) usageContextFill.style.width = `${clampedPct.toFixed(1)}%`;
+    usageContextMetrics.textContent = `${usedLabel} / ${formatContextTokens(limit)} · ${pctLabel}`;
+    const remaining = Math.max(0, limit - used);
+    usagePillContext.title =
+      `Active Context Memory${isEst ? ' (estimated baseline)' : ''} — ` +
+      `${prefix}${used.toLocaleString()} / ${limit.toLocaleString()} tokens ` +
+      `(${rawPct.toFixed(1)}% full · ${prefix}${remaining.toLocaleString()} remaining)`;
+  } else {
+    usagePillContext.dataset.level = 'normal';
+    if (usageContextTrack) usageContextTrack.hidden = true;
+    usageContextMetrics.textContent = `${usedLabel} used`;
+    usagePillContext.title =
+      `Active Context Memory${isEst ? ' (estimated baseline)' : ''} — ` +
+      `${prefix}${used.toLocaleString()} tokens in context`;
+  }
+  usagePillContext.hidden = false;
+  return true;
+}
 
 function createUsageBucket(runId = null) {
   return {
@@ -965,11 +1091,12 @@ function applyUsageBadge(pillEl, metricsEl, scopeTitle, snapshot) {
 
 function renderUsageBar() {
   if (!usageBar) return;
+  const hasContext = renderContextPill();
   const activeBuckets = turnUsageBuckets.filter(b => b.calls > 0);
   if (!activeBuckets.length) {
-    usageBar.hidden = true;
     if (usagePillTurn) usagePillTurn.hidden = true;
     if (usagePillTotal) usagePillTotal.hidden = true;
+    usageBar.hidden = !hasContext;
     return;
   }
 
@@ -1004,6 +1131,31 @@ function updateUsagePill(data = {}) {
     return;
   }
 
+  const ctxUsed = Number(data.context_used_tokens);
+  if (Number.isFinite(ctxUsed) && ctxUsed > 0) {
+    contextState.used = Math.round(ctxUsed);
+    contextState.source = 'provider';
+  } else if (Number.isFinite(prompt) && prompt > 0) {
+    contextState.used = Math.round(prompt + (Number.isFinite(completion) && completion > 0 ? completion : 0));
+    contextState.source = 'provider';
+  }
+  const ctxLimit = Number(data.context_limit_tokens);
+  const activeKey = getActiveModelKey();
+  const eventModelKey = typeof data.model_key === 'string' && data.model_key ? data.model_key : null;
+  if (Number.isFinite(ctxLimit) && ctxLimit > 0) {
+    if (eventModelKey) {
+      contextState.modelLimits[eventModelKey] = ctxLimit;
+      if (!activeKey || eventModelKey === activeKey) {
+        contextState.limit = ctxLimit;
+      }
+    } else if (!inferClientContextLimit(activeKey)) {
+      contextState.limit = ctxLimit;
+    }
+  }
+  if (!contextState.limit) {
+    contextState.limit = inferClientContextLimit(activeKey);
+  }
+
   let bucket = turnUsageBuckets.at(-1);
   if (!bucket) {
     bucket = startNewTurnUsageBucket(data.run_id || null);
@@ -1027,7 +1179,8 @@ function updateUsagePill(data = {}) {
 
 function resetUsagePill() {
   turnUsageBuckets = [];
-  if (usageBar) usageBar.hidden = true;
+  contextState.used = null;
+  contextState.source = 'estimated';
   if (usagePillTurn) {
     usagePillTurn.hidden = true;
     delete usagePillTurn.dataset.cache;
@@ -1038,6 +1191,7 @@ function resetUsagePill() {
     delete usagePillTotal.dataset.cache;
   }
   if (usageTotalMetrics) usageTotalMetrics.textContent = '';
+  renderUsageBar();
 }
 
 // ── Run-Card & Streaming State Machine ──
@@ -1106,22 +1260,35 @@ function scrollFeedToBottom(force = false) {
   }
 }
 
-function resolveRunCard(runId = null) {
-  if (activeRunCard?.isConnected) {
+function lockCompletedStepCard(card) {
+  if (!card) return;
+  setCardState(card, 'done');
+  card.dataset.finalized = 'true';
+  if (activeRunCard === card) activeRunCard = null;
+}
+
+function resolveRunCard(runId = null, messageId = null) {
+  if (messageId && feed) {
+    const byMsgId = feed.querySelector(`.message.agent[data-message-id="${CSS.escape(messageId)}"]`);
+    if (byMsgId) return byMsgId;
+  }
+  if (activeRunCard?.isConnected && activeRunCard.dataset.finalized !== 'true') {
     if (!runId || !activeRunCard.dataset.runId || activeRunCard.dataset.runId === runId) {
       if (runId && !activeRunCard.dataset.runId) activeRunCard.dataset.runId = runId;
       return activeRunCard;
     }
   }
   if (runId && feed) {
-    const matching = feed.querySelectorAll(`.message.agent[data-run-id="${CSS.escape(runId)}"]`);
+    const matching = feed.querySelectorAll(
+      `.message.agent[data-run-id="${CSS.escape(runId)}"]:not([data-finalized="true"])`
+    );
     if (matching.length) {
       const last = matching[matching.length - 1];
       activeRunCard = last;
       return last;
     }
   }
-  const streaming = feed?.querySelector('.message.agent.streaming');
+  const streaming = feed?.querySelector('.message.agent.streaming:not([data-finalized="true"])');
   if (streaming) {
     if (runId && !streaming.dataset.runId) streaming.dataset.runId = runId;
     activeRunCard = streaming;
@@ -1130,9 +1297,9 @@ function resolveRunCard(runId = null) {
   return null;
 }
 
-function getActiveCard(runId = null) {
-  const card = resolveRunCard(runId);
-  if (!card) return null;
+function getActiveCard(runId = null, messageId = null) {
+  const card = resolveRunCard(runId, messageId);
+  if (!card || card.dataset.finalized === 'true') return null;
   const state = card.dataset.state;
   return (state !== 'done' && state !== 'error' && state !== 'stopped') ? card : null;
 }
@@ -1176,20 +1343,23 @@ function finalizeAllActiveCards() {
   feed?.querySelectorAll('.message.agent.streaming').forEach(c => candidates.add(c));
 
   for (const card of candidates) {
+    if (!card._rawText && !card._rawReasoning) {
+      card.remove();
+      continue;
+    }
     if (card.dataset.state !== 'done' && card.dataset.state !== 'error' && card.dataset.state !== 'stopped') {
       setCardState(card, 'done');
     }
-    if (!card._rawText && !card._rawReasoning) {
-      card.remove();
-    }
+    card.dataset.finalized = 'true';
   }
-  if (activeRunCard && !activeRunCard.isConnected) activeRunCard = null;
+  activeRunCard = null;
 }
 
-function getOrCreateRunCard(runId, { target = feed } = {}) {
-  const existing = getActiveCard(runId);
+function getOrCreateRunCard(runId, { target = feed, messageId = null } = {}) {
+  const existing = getActiveCard(runId, messageId);
   if (existing) {
     if (runId) existing.dataset.runId = runId;
+    if (messageId) existing.dataset.messageId = messageId;
     return existing;
   }
 
@@ -1197,6 +1367,7 @@ function getOrCreateRunCard(runId, { target = feed } = {}) {
   target.querySelector('.empty-state')?.remove();
 
   const item = createAgentCardElement({ runId, streaming: true, showSkeleton: true });
+  if (messageId) item.dataset.messageId = messageId;
   target.appendChild(item);
   activeRunCard = item;
   scrollFeedToBottom(true);
@@ -1253,34 +1424,42 @@ function flushStreamingRender() {
 
 function appendStreamingReasoningDelta(runId, delta, messageId = null) {
   if (!delta || /^[A-Za-z0-9+/=]{50,}\s*$/.test(delta.trim())) return;
-  const card = getOrCreateRunCard(runId);
+  const card = getOrCreateRunCard(runId, { messageId });
   if (card.dataset.state !== 'thinking' && card.dataset.state !== 'writing') {
     setCardState(card, 'thinking');
   }
   if (messageId && card.dataset.lastReasoningTurnId && card.dataset.lastReasoningTurnId !== messageId && card._rawReasoning) {
     if (!card._rawReasoning.endsWith('\n\n')) card._rawReasoning += '\n\n';
   }
-  if (messageId) card.dataset.lastReasoningTurnId = messageId;
+  if (messageId) {
+    card.dataset.lastReasoningTurnId = messageId;
+    card.dataset.messageId = messageId;
+  }
   card._rawReasoning = (card._rawReasoning || '') + delta;
   scheduleStreamingRender(card);
 }
 
 function appendStreamingDelta(runId, delta, messageId = null) {
   if (!delta) return;
-  const card = getOrCreateRunCard(runId);
+  const card = getOrCreateRunCard(runId, { messageId });
   if (card.dataset.state !== 'writing') {
     setCardState(card, 'writing');
   }
   if (messageId && card.dataset.lastContentTurnId && card.dataset.lastContentTurnId !== messageId && card._rawText) {
     if (!card._rawText.endsWith('\n\n')) card._rawText += '\n\n';
   }
-  if (messageId) card.dataset.lastContentTurnId = messageId;
+  if (messageId) {
+    card.dataset.lastContentTurnId = messageId;
+    card.dataset.messageId = messageId;
+  }
   card._rawText = (card._rawText || '') + delta;
   scheduleStreamingRender(card);
 }
 
 function handleStreamingToolDelta(runId, data) {
-  const card = getActiveCard(runId) || getOrCreateRunCard(runId);
+  const msgId = data?.message_id || null;
+  const card = getActiveCard(runId, msgId) || getOrCreateRunCard(runId, { messageId: msgId });
+  if (msgId) card.dataset.messageId = msgId;
   const toolName = data?.name || data?.tool || (data?.function && data.function.name) || '';
   const slot = `${data?.index ?? data?.id ?? 0}`;
   if (!card._streamedToolCalls) card._streamedToolCalls = new Map();
@@ -1309,14 +1488,20 @@ function handleStreamingToolDelta(runId, data) {
   setCardState(card, 'working', label);
 }
 
-function finalizeRunCard(runId, finalText, incomingReasoning) {
+function selectTurnReasoning(cardReasoning, incomingReasoning) {
+  const cleanCard = stripEncryptedReasoning(cardReasoning || '');
+  const cleanIncoming = stripEncryptedReasoning(incomingReasoning || '');
+  return cleanIncoming.length > cleanCard.length ? cleanIncoming : (cleanCard || cleanIncoming);
+}
+
+function finalizeRunCard(runId, finalText, incomingReasoning, messageId = null) {
   flushStreamingRender();
-  const card = resolveRunCard(runId);
-  const cardText = card?._rawText || '';
-  const cardReasoning = card?._rawReasoning || '';
+  const card = resolveRunCard(runId, messageId);
+  const rawContent = finalText || card?._rawText || '';
+  const bestReasoning = selectTurnReasoning(card?._rawReasoning, incomingReasoning);
   const { text, reasoning } = normalizeAgentTurn({
-    content: finalText || cardText,
-    reasoning: cardReasoning || incomingReasoning,
+    content: rawContent,
+    reasoning: bestReasoning,
   });
 
   if (card) {
@@ -1329,20 +1514,19 @@ function finalizeRunCard(runId, finalText, incomingReasoning) {
     card._rawText = text;
     card._rawReasoning = reasoning;
     renderAgentContent(card, text);
-    setCardState(card, 'done');
     if (reasoning) {
       ensureThoughtDisclosure(card, reasoning, false, false);
     } else {
       card.querySelector('.thought-disclosure')?.remove();
     }
-    if (activeRunCard === card) activeRunCard = null;
+    lockCompletedStepCard(card);
     finalizeAllActiveCards();
     scrollFeedToBottom();
     return card;
   }
 
   if (text || reasoning) {
-    const item = addMessage(text || '', 'agent', { reasoning });
+    const item = addMessage(text || '', 'agent', { reasoning, messageId });
     scrollFeedToBottom();
     return item;
   }
@@ -1466,6 +1650,7 @@ async function handleRetry(errorElement = null, context = null, triggerBtn = nul
       ? context.userIndex
       : -1;
     pruneFeedAfterUserMessage(userIndex);
+    contextState.used = null;
     rewindUsageBucketsToUserIndex(userIndex);
     activeRunningTools.clear();
     finalizeAllActiveCards();
@@ -1489,6 +1674,9 @@ async function handleRetry(errorElement = null, context = null, triggerBtn = nul
     });
     if (!response.accepted) {
       throw new Error(response.error || 'Retry request not accepted.');
+    }
+    if (response.context) {
+      applyContextSnapshot(response.context);
     }
   } catch (error) {
     finalizeAllActiveCards();
@@ -1682,6 +1870,11 @@ async function loadHistory(projectName) {
       }
     }
     flushAccumulatedReasoning();
+    if (data.context) {
+      applyContextSnapshot(data.context);
+    } else {
+      applyActiveModelContextLimit(getActiveModelKey());
+    }
     if (!isAgentActive()) {
       markActivityRecovered();
     }
@@ -1805,10 +1998,13 @@ async function executeResetContext() {
   );
   if (!proceed) return;
   try {
-    await api(`/api/projects/${encodeURIComponent(currentProject)}/reset`, {
+    const res = await api(`/api/projects/${encodeURIComponent(currentProject)}/reset`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
     });
+    if (res?.context) {
+      applyContextSnapshot(res.context);
+    }
   } catch (error) {
     addMessage(error.message, 'error');
   }
@@ -1817,7 +2013,7 @@ async function executeResetContext() {
 function autoResizeMessage() {
   if (!message) return;
   message.style.height = 'auto';
-  message.style.height = `${Math.min(Math.max(message.scrollHeight, 46), 140)}px`;
+  message.style.height = `${Math.min(Math.max(message.scrollHeight, 56), 200)}px`;
 }
 
 message?.addEventListener('input', () => {
@@ -2374,10 +2570,17 @@ async function syncAfterStreamReset() {
   ]);
 }
 
-function applyConversationReset() {
+function applyConversationReset(contextSnapshot = null) {
   flushStreamingRender();
   activeRunCard = null;
   clearActivity({ resetUsage: true });
+  if (contextSnapshot) {
+    applyContextSnapshot(contextSnapshot);
+  } else if (currentProject) {
+    api(`/api/projects/${encodeURIComponent(currentProject)}/context`)
+      .then(snap => applyContextSnapshot(snap))
+      .catch(() => {});
+  }
   feed?.replaceChildren();
   clearQuestionArea();
   restoreEmptyState(feed, currentProject);
@@ -2436,6 +2639,7 @@ function connectStream() {
         if (modelSelect && validModelKeys.has(data.model_key)) {
           modelSelect.value = data.model_key;
           syncEffortOptionsForModel(data.model_key);
+          applyActiveModelContextLimit(data.model_key);
         }
         const activeCard = card || getOrCreateRunCard(runId);
         if (activeCard) {
@@ -2474,6 +2678,7 @@ function connectStream() {
       const runId = data.run_id;
       const card = getActiveCard(runId);
       if (card) {
+        if (data.message_id) card.dataset.messageId = data.message_id;
         card._rawText = '';
         card._rawReasoning = '';
         card._streamedToolCalls = null;
@@ -2504,17 +2709,20 @@ function connectStream() {
       if (data.project !== currentProject) return;
       flushStreamingRender();
       const runId = data.run_id || data.message_id;
-      const card = resolveRunCard(runId);
+      const isStepBoundary = Boolean(data.has_tools || data.intermediate);
+      let card = resolveRunCard(runId, data.message_id);
+      if (!card && isStepBoundary && (stripToolCallTags(data.message || '').trim() || stripEncryptedReasoning(data.reasoning || ''))) {
+        card = getOrCreateRunCard(runId, { messageId: data.message_id });
+      }
       if (card) {
+        if (data.message_id) card.dataset.messageId = data.message_id;
         card._streamedToolCalls = null;
-        const combined = stripEncryptedReasoning(card._rawReasoning || data.reasoning || '');
+        const combined = selectTurnReasoning(card._rawReasoning, data.reasoning);
         if (combined) {
           card._rawReasoning = combined;
           ensureThoughtDisclosure(card, combined, Boolean(data.has_tools || data.continuing), false);
         }
-        const text = data.continuing
-          ? stripToolCallTags(data.message || '').trim()
-          : stripToolCallTags(data.message || card._rawText || '').trim();
+        const text = stripToolCallTags(data.message || (data.continuing ? '' : card._rawText) || '').trim();
         if (text) {
           card._rawText = text;
           renderAgentContent(card, text);
@@ -2522,27 +2730,31 @@ function connectStream() {
           card._rawText = '';
           renderAgentContent(card, '');
         }
-        if (data.has_tools) {
+        if (isStepBoundary) {
           if (text || combined) {
             if (combined) {
               ensureThoughtDisclosure(card, combined, false, false);
             }
-            setCardState(card, 'done');
-            if (activeRunCard === card) activeRunCard = null;
+            lockCompletedStepCard(card);
           } else {
             card.remove();
             if (activeRunCard === card) activeRunCard = null;
           }
         } else if (data.continuing) {
           setCardState(card, 'thinking', 'Continuing');
-        } else {
+        } else if (card.dataset.state !== 'stopped' && card.dataset.state !== 'error') {
           setCardState(card, 'done');
         }
       }
     },
     agent_message: data => {
       if (data.project !== currentProject) return;
-      finalizeRunCard(data.run_id || data.message_id, data.message || '', stripEncryptedReasoning(data.reasoning || ''));
+      finalizeRunCard(
+        data.run_id || data.message_id,
+        data.message || '',
+        stripEncryptedReasoning(data.reasoning || ''),
+        data.message_id || null
+      );
       markActivityRecovered();
       setThinking(false);
       scrollFeedToBottom();
@@ -2622,7 +2834,7 @@ function connectStream() {
       }
     },
     conversation_reset: data => {
-      if (data?.project === currentProject) applyConversationReset();
+      if (data?.project === currentProject) applyConversationReset(data?.context || null);
     },
     user_message: data => {
       if (data?.project !== currentProject) return;

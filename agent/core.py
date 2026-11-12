@@ -28,6 +28,7 @@ from typing import Any
 
 from agent.activity_log import ActivityLogger, get_logger
 from agent.activity_log import is_enabled as activity_logging_enabled
+from agent.context_info import resolve_context_limit
 from agent.conversation import ConversationStore
 from agent.converter import export_project_model
 from agent.dispatcher import (
@@ -44,6 +45,7 @@ from agent.llm_base import (
     CompletionTruncatedError,
     RequestCancelled,
     create_llm_client,
+    ensure_closed_code_fences,
     extract_text_tool_calls,
     extract_usage_summary,
     provider_label,
@@ -1017,10 +1019,19 @@ class AgentRunner:
                 usage = trunc_err.usage or getattr(state.client, "last_usage", None)
                 self._accumulate_state_usage(state, usage)
                 self._publish_usage(state.project, usage, state=state)
-                content = trunc_err.partial_content.strip() if trunc_err.partial_content else ""
+                raw_partial = trunc_err.partial_content or ""
+                cleaned_partial, extra_tcs = extract_text_tool_calls(raw_partial)
+                raw_text = cleaned_partial.strip()
+                has_real_prose = bool(raw_text) and not state.export_3mf
+                published_text = (
+                    ensure_closed_code_fences(raw_text) if has_real_prose else ""
+                )
+                partial_tcs = list(trunc_err.partial_tool_calls or [])
+                if not partial_tcs and extra_tcs:
+                    partial_tcs = extra_tcs
                 truncated_tools: list[str] = []
                 partial_arg_snippets: list[str] = []
-                for tc in (trunc_err.partial_tool_calls or []):
+                for tc in partial_tcs:
                     if not isinstance(tc, dict):
                         continue
                     fn = tc.get("function") or {}
@@ -1030,7 +1041,7 @@ class AgentRunner:
                     if raw_args:
                         tail = raw_args[-300:] if len(raw_args) > 300 else raw_args
                         partial_arg_snippets.append(f"{t_name} tail: ...{tail}")
-                stored_content = content
+                stored_content = published_text if has_real_prose else raw_text
                 if not stored_content and truncated_tools:
                     tail_info = (
                         f" ({'; '.join(partial_arg_snippets)})"
@@ -1042,32 +1053,45 @@ class AgentRunner:
                     "role": "assistant",
                     "content": stored_content,
                 }
-                if trunc_err.reasoning_text:
-                    if len(trunc_err.reasoning_text) > 4000:
+                turn_reasoning = (trunc_err.reasoning_text or "").strip()
+                if turn_reasoning and (
+                    not state.run_reasonings
+                    or state.run_reasonings[-1] != turn_reasoning
+                ):
+                    state.run_reasonings.append(turn_reasoning)
+                published_reasoning = turn_reasoning
+                if has_real_prose and state.run_reasonings:
+                    combined_reasoning = "\n\n".join(state.run_reasonings)
+                    if combined_reasoning and combined_reasoning.strip() != published_text:
+                        published_reasoning = combined_reasoning
+                stored_reasoning = (
+                    published_reasoning if has_real_prose else turn_reasoning
+                )
+                if stored_reasoning:
+                    if len(stored_reasoning) > 4000:
                         partial_msg["reasoning"] = (
                             "...[earlier reasoning truncated]...\n"
-                            + trunc_err.reasoning_text[-4000:]
+                            + stored_reasoning[-4000:]
                         )
                     else:
-                        partial_msg["reasoning"] = trunc_err.reasoning_text
-                    if (
-                        not state.run_reasonings
-                        or state.run_reasonings[-1] != trunc_err.reasoning_text
-                    ):
-                        state.run_reasonings.append(trunc_err.reasoning_text)
+                        partial_msg["reasoning"] = stored_reasoning
                 self.publish(
                     "agent_stream_end",
                     {
                         "project": state.project,
                         "run_id": state.run_id,
                         "message_id": state.current_message_id,
-                        "message": content,
-                        "reasoning": trunc_err.reasoning_text or "",
+                        "message": published_text,
+                        "reasoning": published_reasoning,
                         "has_tools": False,
-                        "continuing": True,
+                        "intermediate": has_real_prose,
+                        "continuing": not has_real_prose,
                     },
                 )
-                partial_msg["synthetic"] = True
+                if has_real_prose:
+                    state.run_reasonings.clear()
+                else:
+                    partial_msg["synthetic"] = True
                 state.messages.append(partial_msg)
                 ConversationStore.append(state.project_dir, partial_msg)
                 cad_pending = self._should_nudge_incomplete_turn(state)
@@ -1136,6 +1160,7 @@ class AgentRunner:
             assistant_message["tool_calls"] = tool_calls
             state.tool_call_count += len(tool_calls)
             state.truncation_continuations = 0
+            invalid_final = False
         else:
             assistant_message.pop("tool_calls", None)
             if not raw_content and turn_reasoning:
@@ -1214,9 +1239,11 @@ class AgentRunner:
                 )
                 self._publish_terminal_failure(state.project, run_id=state.run_id)
                 return _TurnOutcome.DRAWING_NOT_CREATED
-            if not raw_content:
+            invalid_final = self._should_nudge_incomplete_turn(
+                state, assistant_message
+            )
+            if not raw_content and not invalid_final:
                 assistant_message["content"] = "Task completed."
-        invalid_final = not tool_calls and self._should_nudge_incomplete_turn(state, assistant_message)
         self._publish_assistant_turn(state, assistant_message, invalid_final)
         if not tool_calls:
             return self._handle_no_tool_calls(state, assistant_message)
@@ -1296,22 +1323,51 @@ class AgentRunner:
                     "message": status_msg,
                 },
             )
-            self.publish(
-                "agent_stream_end",
-                {
-                    "project": state.project,
-                    "run_id": state.run_id,
-                    "message_id": state.current_message_id,
-                    "message": "",
-                    "reasoning": reasoning,
-                    "has_tools": False,
-                    "continuing": True,
-                },
-            )
-            self._append_message(
-                state.project_dir,
-                {**assistant_message, "synthetic": True},
-            )
+            raw_text = (assistant_message.get("content") or "").strip()
+            preserve_prose = bool(raw_text) and not state.export_3mf
+            if preserve_prose:
+                published_reasoning = reasoning
+                if state.run_reasonings:
+                    combined_reasoning = "\n\n".join(state.run_reasonings)
+                    if combined_reasoning and combined_reasoning.strip() != raw_text:
+                        published_reasoning = combined_reasoning
+                self.publish(
+                    "agent_stream_end",
+                    {
+                        "project": state.project,
+                        "run_id": state.run_id,
+                        "message_id": state.current_message_id,
+                        "message": raw_text,
+                        "reasoning": published_reasoning,
+                        "has_tools": False,
+                        "intermediate": True,
+                        "continuing": False,
+                    },
+                )
+                stored_invalid = (
+                    {**assistant_message, "reasoning": published_reasoning}
+                    if published_reasoning and assistant_message.get("reasoning") != published_reasoning
+                    else assistant_message
+                )
+                self._append_message(state.project_dir, stored_invalid)
+                state.run_reasonings.clear()
+            else:
+                self.publish(
+                    "agent_stream_end",
+                    {
+                        "project": state.project,
+                        "run_id": state.run_id,
+                        "message_id": state.current_message_id,
+                        "message": "",
+                        "reasoning": reasoning,
+                        "has_tools": False,
+                        "continuing": True,
+                    },
+                )
+                self._append_message(
+                    state.project_dir,
+                    {**assistant_message, "synthetic": True},
+                )
         else:
             published_reasoning = reasoning
             if state.run_reasonings:
@@ -1404,7 +1460,13 @@ class AgentRunner:
                 )
                 self._publish_terminal_failure(state.project, run_id=state.run_id)
                 return _TurnOutcome.DRAWING_NOT_CREATED
-            self._complete(state.project, content, reasoning=full_reasoning, run_id=state.run_id)
+            self._complete(
+                state.project,
+                content,
+                reasoning=full_reasoning,
+                run_id=state.run_id,
+                message_id=state.current_message_id,
+            )
             return _TurnOutcome.COMPLETED
         if state.model_mutated and state.cad_fix_required:
             if state.verification_nudge_count < 2:
@@ -1443,7 +1505,13 @@ class AgentRunner:
             state.messages.append(reminder)
             self._append_message(state.project_dir, reminder)
             return _TurnOutcome.CONTINUE
-        self._complete(state.project, content, reasoning=full_reasoning, run_id=state.run_id)
+        self._complete(
+            state.project,
+            content,
+            reasoning=full_reasoning,
+            run_id=state.run_id,
+            message_id=state.current_message_id,
+        )
         return _TurnOutcome.COMPLETED
 
     def _finalize_3mf_export(
@@ -1541,7 +1609,13 @@ class AgentRunner:
             self._publish_terminal_failure(state.project, run_id=state.run_id)
             return _TurnOutcome.DRAWING_NOT_CREATED
 
-        self._complete(state.project, content, reasoning=full_reasoning, run_id=state.run_id)
+        self._complete(
+            state.project,
+            content,
+            reasoning=full_reasoning,
+            run_id=state.run_id,
+            message_id=state.current_message_id,
+        )
         return _TurnOutcome.COMPLETED
 
     def _handle_tool_calls(
@@ -2237,6 +2311,7 @@ class AgentRunner:
         history: list[dict] | None = None,
         *,
         is_retry: bool = False,
+        persist: bool = True,
         user_printer: str = "",
         user_nozzle: str = "",
         user_filament: str = "",
@@ -2250,7 +2325,7 @@ class AgentRunner:
         model receives.
         """
         existed, code = cls._initial_model_state(
-            project_dir, history, is_retry=is_retry
+            project_dir, history, is_retry=is_retry, persist=persist
         )
         content = format_project_state(
             existed,
@@ -2281,6 +2356,7 @@ class AgentRunner:
         history: list[dict] | None = None,
         *,
         is_retry: bool = False,
+        persist: bool = True,
     ) -> tuple[bool, str]:
         """Determine whether model.scad existed and its content at the start of this conversation.
 
@@ -2295,7 +2371,12 @@ class AgentRunner:
                 if isinstance(data, dict) and "existed" in data:
                     existed = bool(data["existed"])
                     content = str(data.get("content", ""))
-                    if not is_retry and (not history or len(history) <= 1):
+                    should_refresh = (
+                        not history
+                        if not persist
+                        else (not is_retry and (not history or len(history) <= 1))
+                    )
+                    if should_refresh:
                         model_file = project_dir / MODEL_FILENAME
                         real_exists = model_file.is_file()
                         current_content = (
@@ -2306,13 +2387,14 @@ class AgentRunner:
                         if real_exists != existed or current_content != content:
                             existed = real_exists
                             content = current_content
-                            try:
-                                atomic_write_json(
-                                    state_file,
-                                    {"existed": existed, "content": content},
-                                )
-                            except OSError:
-                                pass
+                            if persist:
+                                try:
+                                    atomic_write_json(
+                                        state_file,
+                                        {"existed": existed, "content": content},
+                                    )
+                                except OSError:
+                                    pass
                     return existed, content
             except (OSError, json.JSONDecodeError, UnicodeDecodeError):
                 pass
@@ -2351,13 +2433,14 @@ class AgentRunner:
             except OSError:
                 pass
 
-        try:
-            atomic_write_json(
-                state_file,
-                {"existed": existed, "content": content},
-            )
-        except OSError:
-            pass
+        if persist:
+            try:
+                atomic_write_json(
+                    state_file,
+                    {"existed": existed, "content": content},
+                )
+            except OSError:
+                pass
         return existed, content
 
     @staticmethod
@@ -2486,8 +2569,14 @@ class AgentRunner:
         cached_tokens = summary["cached_tokens"]
         p_val = summary["prompt_tokens"]
         c_val = summary["completion_tokens"]
+        r_val = summary["reasoning_tokens"]
         cost_val = summary["cost"]
         total_cost = round(state.total_cost, 6) if state and state.total_cost > 0 else cost_val
+        preserve_r = bool(state and getattr(state.client, "preserve_reasoning", False))
+        persisted_out = c_val if preserve_r else max(0, c_val - r_val)
+        eff_settings = state.settings if state and state.settings else self.settings
+        context_used = (p_val + persisted_out) if p_val > 0 else None
+        context_limit = resolve_context_limit(eff_settings, allow_network=False)
         usage_payload: dict[str, Any] = {
             "project": project,
             "prompt_tokens": usage.get("prompt_tokens"),
@@ -2500,6 +2589,9 @@ class AgentRunner:
             "total_prompt_tokens": state.total_prompt_tokens if state else p_val,
             "total_completion_tokens": state.total_completion_tokens if state else c_val,
             "total_cached_tokens": state.total_cached_tokens if state else cached_tokens,
+            "context_used_tokens": context_used,
+            "context_limit_tokens": context_limit,
+            "model_key": eff_settings.active_model_key,
         }
         if state and state.run_id:
             usage_payload["run_id"] = state.run_id
@@ -2707,6 +2799,7 @@ class AgentRunner:
         message: str,
         reasoning: str = "",
         run_id: str = "",
+        message_id: str = "",
     ) -> None:
         """Persist the final assistant turn and publish it.
 
@@ -2733,6 +2826,8 @@ class AgentRunner:
         msg_payload: dict[str, Any] = {"project": project, "message": message}
         if run_id:
             msg_payload["run_id"] = run_id
+        if message_id:
+            msg_payload["message_id"] = message_id
         if reasoning:
             msg_payload["reasoning"] = reasoning
         self.publish("agent_message", msg_payload)

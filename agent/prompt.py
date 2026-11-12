@@ -518,9 +518,9 @@ TOOL_DESCRIPTIONS = {
             "Supports parallel execution: call in parallel alongside write_file or edit_file to programmatically assert Z-stack continuity, wall/hole clearances, overhang angles (<= 45 deg), and Center of Mass stability, or call first (single or parallel batch) when solving unknown coordinates. "
             "Use NumPy (`import numpy as np` or pre-imported `np`) as the primary backbone for coordinate arrays, vectors, matrices, polygon vertices, and trigonometry. "
             "Use SymPy (`import sympy as sp` or pre-imported `sp`) as the engineering constraint solver for symbolic equations (sp.solve, sp.Eq, sp.symbols), tangents, gear/thread geometry, and tolerances. "
-            "Use standard `math` for simple scalar operations. Multi-line scripts with print() and automatic return of the last expression are supported."
+            "Use standard `math` for simple scalar operations. Only `numpy`, `sympy`, and whitelisted Python stdlib math/utility modules are available; third-party packages (`scipy`, `shapely`, `trimesh`, etc.) are not installed and are blocked. Multi-line scripts with print() and automatic return of the last expression are supported."
         ),
-        "code": "Python code or expression to execute. Pre-imported: np (numpy), sp (sympy), math, cmath, Fraction, Decimal, statistics, itertools, functools, collections, json.",
+        "code": "Python code or expression to execute. Pre-imported: np (numpy), sp (sympy), math, cmath, Fraction, Decimal, statistics, itertools, functools, collections, json, re. Do not import scipy, shapely, or other external packages.",
     },
 }
 

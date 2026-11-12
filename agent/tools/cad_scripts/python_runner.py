@@ -128,6 +128,16 @@ def _is_blocked_submodule(mod_name: str) -> bool:
     )
 
 
+_ALLOWED_IMPORT_HINT = (
+    "Use pre-imported numpy (np), sympy (sp), or standard math modules instead."
+)
+
+
+def _node_loc(node: ast.AST) -> str:
+    lineno = getattr(node, "lineno", None)
+    return f" (line {lineno})" if lineno is not None else ""
+
+
 def _validate_ast(tree: ast.AST) -> None:
     """Enforce syntax-level security constraints before execution."""
     for node in ast.walk(tree):
@@ -135,25 +145,31 @@ def _validate_ast(tree: ast.AST) -> None:
             attr = node.attr
             if attr in DANGEROUS_ATTRIBUTES:
                 raise ValueError(
-                    f"Access to restricted attribute '{attr}' is not permitted."
+                    f"Access to restricted attribute '{attr}' is not permitted{_node_loc(node)}."
                 )
         elif isinstance(node, ast.Name):
             name = node.id
             if name in FORBIDDEN_NAMES or name in DANGEROUS_ATTRIBUTES:
-                raise ValueError(f"Use of '{name}' is restricted.")
+                raise ValueError(f"Use of '{name}' is restricted{_node_loc(node)}.")
         elif isinstance(node, ast.Import):
             for alias in node.names:
                 mod_name = alias.name
                 root = mod_name.split(".")[0]
                 if root not in ALLOWED_ROOTS or _is_blocked_submodule(mod_name):
-                    raise ValueError(f"Importing module '{mod_name}' is restricted.")
+                    raise ValueError(
+                        f"Importing module '{mod_name}' is restricted{_node_loc(node)}. {_ALLOWED_IMPORT_HINT}"
+                    )
         elif isinstance(node, ast.ImportFrom):
             if node.level != 0 or not node.module:
-                raise ValueError("Relative imports are restricted.")
+                raise ValueError(
+                    f"Relative imports are restricted{_node_loc(node)}. {_ALLOWED_IMPORT_HINT}"
+                )
             mod_name = node.module
             root = mod_name.split(".")[0]
             if root not in ALLOWED_ROOTS or _is_blocked_submodule(mod_name):
-                raise ValueError(f"Importing from module '{mod_name}' is restricted.")
+                raise ValueError(
+                    f"Importing from module '{mod_name}' is restricted{_node_loc(node)}. {_ALLOWED_IMPORT_HINT}"
+                )
 
 
 _REAL_IMPORT = builtins.__import__
@@ -173,13 +189,15 @@ def _safe_import(
         and not name.startswith("numpy")
         and not name.startswith("sympy")
     ):
-        raise ImportError(f"Importing module '{name}' is restricted.")
+        raise ImportError(f"Importing module '{name}' is restricted. {_ALLOWED_IMPORT_HINT}")
     if _is_blocked_submodule(name):
-        raise ImportError(f"Importing submodule '{name}' is restricted.")
+        raise ImportError(f"Importing submodule '{name}' is restricted. {_ALLOWED_IMPORT_HINT}")
     if fromlist:
         for item in fromlist:
             if isinstance(item, str) and _is_blocked_submodule(f"{name}.{item}"):
-                raise ImportError(f"Importing submodule '{name}.{item}' is restricted.")
+                raise ImportError(
+                    f"Importing submodule '{name}.{item}' is restricted. {_ALLOWED_IMPORT_HINT}"
+                )
     return _REAL_IMPORT(name, globals, locals, fromlist, level)
 
 
